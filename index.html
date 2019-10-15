@@ -430,14 +430,14 @@
 <h2 id="传输延迟"><a href="#传输延迟" class="headerlink" title="传输延迟"></a>传输延迟</h2><p>关闭 repl-disable-tcp-nodelay 可以降低延迟，但整体带宽使用比较大。</p>
 <h1 id="拓扑"><a href="#拓扑" class="headerlink" title="拓扑"></a>拓扑</h1><h2 id="一主一从"><a href="#一主一从" class="headerlink" title="一主一从"></a>一主一从</h2><p><img src="https://s2.ax1x.com/2019/10/07/u2ashj.png" alt="一主一从"></p>
 <p>这种思路是把 slave 当做 standby，只在从节点打开持久化（RDB 或 AOF）。这种场景如果主节点重启，则主节点会自动清空数据（因为没有打开持久化-实际上如果没有打开 AOF 持久化，Redis 的优雅关闭也会回退到 RDB 持久化），从节点也可能清空数据。为了预防这种情况出现，在主节点重启以前从节点要<code>slaveof no one</code>断开主从复制-但这种措施无法阻挡主节点宕机引起的数据丢失。</p>
-<p><strong>这种一主一从的架构设计和 MySQL 的主从复制很相似，但只打开一端持久化的思路还是比较特别的，不那么安全。</strong></p>
+<p><strong>这种一主一从的架构设计和 MySQL 的主从复制很相似，但只打开一端持久化的思路还是比较特别的，不那么安全。而且主节点 flush 数据会导致从节点也 flush 数据，本身也是一种很危险的行为</strong></p>
 <h2 id="一主多从"><a href="#一主多从" class="headerlink" title="一主多从"></a>一主多从</h2><p><img src="https://s2.ax1x.com/2019/10/07/u2a2j0.png" alt="一主多从"></p>
 <p>这种拓扑又被叫做星形拓扑。这种拓扑比较像 MySQL 的读写分离设计，主节点承担写命令的操作，而从节点也分担读命令的操作，。其中还可以设计一些特殊的读节点，专门执行 keys，sort 操作。但这种操作会占用太多的网络带宽。</p>
 <h2 id="树状结构"><a href="#树状结构" class="headerlink" title="树状结构"></a>树状结构</h2><p><img src="https://s2.ax1x.com/2019/10/07/u2afBT.png" alt="此处输入图片的描述"></p>
 <p>这种树形架构通过<strong>分层架构来分层放大流量</strong>，平衡了带宽和冗余复制的需要，但下层的节点的同步时延变大了。</p>
 <h1 id="原理"><a href="#原理" class="headerlink" title="原理"></a>原理</h1><p><img src="https://s2.ax1x.com/2019/10/07/u2weL6.jpg" alt="主从复制过程流程"></p>
-<h2 id="过程"><a href="#过程" class="headerlink" title="过程"></a>过程</h2><p>1 如果使用配置文件配置主从关系，这一步几乎可以说是一闪而过。这一步只保存 master 的 ip 和 port 。如果这个时候从 master 节点去看 client 信息的话，会看到一个刚刚建立的 client（从主节点的角度来看，从节点实际上也是client）。</p>
-<p>2 从节点内部有个每秒运行的定时任务（大致上是一个定时线程）维护复制相关逻辑，当定时任务发现新的主节点后，会尝试与该节点建立网络连接。从节点会单独打开一个 port（而不是当前从节点的 server 的 port），尝试建立新的 socket。</p>
+<h2 id="过程"><a href="#过程" class="headerlink" title="过程"></a>过程</h2><p>1 如果使用配置文件配置主从关系，这一步几乎可以说是一闪而过。这一步只保存 master 的 ip 和 port 。如果这个时候从 master 节点去看 client 信息的话，会看到一个刚刚建立的 client（从主节点的角度来看，从节点实际上也是client，类似某些 kafka 的数据迁移方案迁移的端点把自己伪装成一个 consumer）。</p>
+<p>2 从节点内部有个每秒运行的定时任务（大致上是一个定时线程）维护复制相关逻辑，当定时任务发现新的主节点后，会尝试与该节点建立网络连接。从节点会单独打开一个 port（而不是当前从节点的 server 的 port），尝试建立新的 socket。<strong>所以 Redis 的主从复制的连接建立是一个拉过程。</strong></p>
 <blockquote>
 <p>34020:S 06 Oct 2019 23:09:28.709 <em> Connecting to MASTER localhost:6379<br>34020:S 06 Oct 2019 23:09:28.712 </em> MASTER <-> REPLICA sync started</-></p>
 </blockquote>
@@ -465,17 +465,17 @@
 </blockquote>
 <p>证明了部分复制不可能，必须打开全量复制。注意PID 34020:S意味着当前 节点是个 Slave（M意味着 Master 而 C 意味着子进程）。</p>
 <p>其全流程如下：</p>
-<p><img src="https://s2.ax1x.com/2019/10/07/u2q6w6.jpg" alt="此处输入图片的描述"></p>
+<p><img src="https://s2.ax1x.com/2019/10/07/u2q6w6.jpg" alt="全量复制全流程"></p>
 <p>注意：</p>
 <ul>
-<li>主节点和从节点之间的 复制超时时间一般为 60s，如果数据量很大要调高这个超时阈值，否则从节点会放弃全量复制。</li>
+<li>主节点和从节点之间的 复制超时时间一般为 60s，如果数据量很大要调高这个超时阈值，否则从节点会放弃全量复制。- 不要复制太大的数据量！否则就要调高超时</li>
 <li>主节点在生成 rdb 的过程中，还在不断接受新的命令（因为 bgsave 是由子进程进行操作的），这些新的命令会被保存在一个单独的客户端复制缓冲区里面（<strong>注意，和部分复制的replication-backlog 不一样，这里的 buffer 属于未被发送的命令的 buffer</strong>）。在 send RDB 以后还要单独再 send buffer 一遍。</li>
-<li>从节点得到了一个完整的 RDB 文件以后要先 flush old data，然后再进行 load，这个全过程都是阻塞的。</li>
-<li>如果从节点自己开启了 AOF 功能，为了保证同步完成以后 AOF 文件立刻可用，先启动一段 bgrewriteaof，子进程 rewrite 完成以后全量复制才算收尾。</li>
+<li>从节点得到了一个完整的 RDB 文件以后要先 flush old data，然后再进行 load，这个全过程都是阻塞的-这也是 MySQL 不具有，Redis 独有的。</li>
+<li>如果从节点自己开启了 AOF 功能，为了保证同步完成以后 AOF 文件立刻可用，先启动一段 bgrewriteaof，子进程 rewrite 完成以后全量复制才算收尾-##增加了阻塞点##。</li>
 <li>全量复制过程中，子节点的数据可以算是 stale 的。如果关闭了 slave-serve-stale-data，则全量复制过程中从节点是不接受读命令的（写命令更加不会被接受），<strong>属于完全阻塞状态</strong>。</li>
 </ul>
 <h3 id="部分复制（partial-replication）"><a href="#部分复制（partial-replication）" class="headerlink" title="部分复制（partial replication）"></a>部分复制（partial replication）</h3><p>在出现网络闪断等情况时，主节点可以只发送一部分数据给从节点以弥补丢失，效率会很高。</p>
-<p>普通的主从建立时，会出现若干次部分复制失败的日志，最终会直接通过全量复制成功。也就是说 Redis 会优先考虑部分复制的策略。</p>
+<p>普通的主从建立时，会出现若干次部分复制失败的日志，最终会直接通过全量复制成功-##Redis 会优先考虑部分复制的策略##。</p>
 <p><code>psync</code>命令需要组件支持以下特性：</p>
 <ul>
 <li>主从节点各自复制、保存偏移量</li>
