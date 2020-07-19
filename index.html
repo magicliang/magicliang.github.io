@@ -417,7 +417,7 @@
 <h2 id="可重复读"><a href="#可重复读" class="headerlink" title="可重复读"></a>可重复读</h2><p>锁定正在读写的数据。此时依然多个事务还是可以并行化不相互阻塞的。</p>
 <p>禁当前读写区域的update。</p>
 <p>克服了不可重复读，但会出现幻读。即有些行本身是不被读写的，不能阻止相邻行的插入，也就是说会影响aggregate的结果或者where里的条件判断。</p>
-<p>InnoDB 在查询和更新的时候，使用 Next-Key-Lock 同时锁定 record + 相关的范围，防止相关查询条件涉及范围内不会插入新的记录被插入，不再出现幻读。</p>
+<p>InnoDB 在查询和更新的时候，使用 Next-Key-Lock 同时锁定 record + 相关的范围，防止相关查询条件涉及范围内不会插入新的记录被插入，不再出现幻读 - 但这种优化并不是真正序列化，只能保证事务里的 select 不会出现不可重复的结果，事务里有 insert 还是会触发冲突。有人因此<a href="http://blog.sina.com.cn/s/blog_499740cb0100ugs7.html" target="_blank" rel="noopener">认为 InnoDB 不能阻止幻</a>读，还有<a href="https://github.com/Yhzhtk/note/issues/42#issuecomment-424079787" target="_blank" rel="noopener">另一个例子</a>。对这个问题的完整解释在<a href="https://github.com/Yhzhtk/note/issues/42#issuecomment-515672774" target="_blank" rel="noopener">这里</a>。</p>
 <h2 id="序列化"><a href="#序列化" class="headerlink" title="序列化"></a>序列化</h2><p>禁掉正在读写的所有相关数据，其实就是锁定表。</p>
 <p>禁掉当前表的insert和update。</p>
 <p>克服了一切并发事务的污染。</p>
@@ -549,9 +549,9 @@
 </tr>
 </tbody>
 </table>
-<p>注意，s 和 x 锁都是<strong>行锁</strong>。<br>可以看出，x 锁跟所有锁都不兼容。<br>意向锁和非意向锁之间相互兼容。</p>
+<p>注意，s 和 x 锁都是<strong>行锁</strong>。<br>可以看出，x 锁跟所有锁都不兼容。<br>意向锁和非意向锁之间相互兼容。<br><strong>同类的意向锁总是兼容的（否则不相关的行会相互 block）。</strong></p>
 <h1 id="MVCC"><a href="#MVCC" class="headerlink" title="MVCC"></a>MVCC</h1><p>MySQL InnoDB存储引擎，实现的是基于多版本的并发控制协议——MVCC (Multi-Version Concurrency Control) (与MVCC相对的，是基于锁的并发控制，Lock-Based Concurrency Control)。MVCC 的好处是读不加锁，读写不冲突。在读多写少的OLTP应用中，读写不冲突是非常重要的，极大的增加了系统的并发性能，这也是为什么现阶段，几乎所有的RDBMS，都支持了MVCC。</p>
-<p>在MVCC并发控制中，读操作可以分成两类：快照读 (snapshot read)与当前读 (current read)。快照读，读取的是记录的可见版本 (有可能是历史版本)，不用加锁。当前读，读取的是记录的最新版本，并且，当前读返回的记录，都会加上锁，保证其他事务不会再并发修改这条记录。注意，MVCC 本质上是追求无锁读。因此，即使是加 S 锁的读（select * from table in share mode），也算是一种当前读而不是快照读。</p>
+<p>在MVCC并发控制中，读操作可以分成两类：快照读 (snapshot read)与当前读 (current read)。快照读，读取的是记录的可见版本 (有可能是历史版本)，不用加锁。当前读，读取的是记录的最新版本，并且，当前读返回的记录，都会加上锁（或者说，锁保证了当前读），保证其他事务不会再并发修改这条记录。注意，MVCC 本质上是追求无锁读。因此，即使是加 S 锁的读（select * from table in share mode），也算是一种当前读而不是快照读。</p>
 <p><img src="MVCC.png" alt="MVCC.png"><br><a href="MVCC.xmind">MVCC.xmind</a></p>
 <p>如果同时看 MVCC 和锁，则会得到这幅图：</p>
 <p>!(innodb-隔离级别.png)[innodb-隔离级别.png]</p>
@@ -595,7 +595,7 @@
 <h1 id="死锁"><a href="#死锁" class="headerlink" title="死锁"></a>死锁</h1><p><img src="死锁1.png" alt="死锁1.png"></p>
 <p>注意回顾两阶段加锁的原理，可以看到逆序加锁就会发生死锁。</p>
 <p><img src="死锁2.png" alt="死锁2.png"></p>
-<p>第二个用例，虽然每个Session都只有一条语句，仍旧会产生死锁。要分析这个死锁，首先必须用到本文前面提到的MySQL加锁的规则。针对Session 1，从name索引出发，读到的[hdc, 1]，[hdc, 6]均满足条件，不仅会加name索引上的记录X锁，而且会加聚簇索引上的记录X锁，加锁顺序为先[1,hdc,100]，后[6,hdc,10]。而Session 2，从pubtime索引出发，[10,6],[100,1]均满足过滤条件，同样也会加聚簇索引上的记录X锁，加锁顺序为[6,hdc,10]，后[1,hdc,100]。发现没有，跟Session 1的加锁顺序正好相反，如果两个Session恰好都持有了第一把锁，请求加第二把锁，死锁就发生了。即索引的锁交叉了，但聚簇索引（记录）上的锁却冲突了。</p>
+<p>第二个用例，虽然每个Session都只有一条语句，仍旧会产生死锁。要分析这个死锁，首先必须用到本文前面提到的MySQL加锁的规则。针对Session 1，从name索引出发，读到的[hdc, 1]，[hdc, 6]均满足条件，不仅会加name索引上的记录X锁，而且会加聚簇索引上的记录X锁，加锁顺序为先[1,hdc,100]，后[6,hdc,10]。而Session 2，从pubtime索引出发，[10,6],[100,1]均满足过滤条件，同样也会加聚簇索引上的记录X锁，加锁顺序为[6,hdc,10]，后[1,hdc,100]。发现没有，跟Session 1的加锁顺序正好相反，如果两个Session恰好都持有了第一把锁，请求加第二把锁，死锁就发生了。即索引的锁交叉了，但聚簇索引（记录）上的锁却冲突了（<strong>如果持有锁的事务总不 commit，则因为 2PL 的存在，死锁必然发生</strong>）。为了预防死锁，一般应用中推荐使用一次封锁法，就是在方法的开始阶段，已经预先知道会用到哪些数据，然后全部锁住，在方法运行之后，再全部解锁。这种方式可以有效的避免循环死锁，但在数据库中却不适用，因为在事务开始阶段，数据库并不知道会用到哪些数据。这就会导致问题 2。</p>
 <p>结论：死锁的发生与否，并不在于事务中有多少条SQL语句，死锁的关键在于：两个(或以上)的Session加锁的顺序不一致。而使用本文上面提到的，分析MySQL每条SQL语句的加锁规则，分析出每条语句的加锁顺序，然后检查多个并发SQL间是否存在以相反的顺序加锁的情况，就可以分析出各种潜在的死锁情况，也可以分析出线上死锁发生的原因。</p>
 <h1 id="锁状态"><a href="#锁状态" class="headerlink" title="锁状态"></a>锁状态</h1><p>了解了死锁产生的原因，如何知道数据库当前锁的状态呢？如何查看死锁情况呢？</p>
 <p>目前在MySQL中锁相关的视图如下：</p>
