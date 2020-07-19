@@ -418,6 +418,11 @@
 <p>禁当前读写区域的update。</p>
 <p>克服了不可重复读，但会出现幻读。即有些行本身是不被读写的，不能阻止相邻行的插入，也就是说会影响aggregate的结果或者where里的条件判断。</p>
 <p>InnoDB 在查询和更新的时候，使用 Next-Key-Lock 同时锁定 record + 相关的范围，防止相关查询条件涉及范围内不会插入新的记录被插入，不再出现幻读 - 但这种优化并不是真正序列化，只能保证事务里的 select 不会出现不可重复的结果，事务里有 insert 还是会触发冲突。有人因此<a href="http://blog.sina.com.cn/s/blog_499740cb0100ugs7.html" target="_blank" rel="noopener">认为 InnoDB 不能阻止幻</a>读，还有<a href="https://github.com/Yhzhtk/note/issues/42#issuecomment-424079787" target="_blank" rel="noopener">另一个例子</a>。对这个问题的完整解释在<a href="https://github.com/Yhzhtk/note/issues/42#issuecomment-515672774" target="_blank" rel="noopener">这里</a>。</p>
+<p>总结一下：</p>
+<ul>
+<li>单纯的 RR 读是无锁的，而且依赖于 MVCC，只读取 insert_tx_version &lt; tx_ version &lt; delete_tx_version 的最新记录。</li>
+<li>如果 RR 中使用了任何触发锁的 DML，则锁在事务提交以前不会释放，触发了 Next-Key-Lock 中的 Gap-Lock，也可以直接阻塞掉其他事务的 insert，而且一下子把当前事务的操作同步到当前的 tx，从某种意义上将快照读升级为当前读（比如tx2 插入一条记录，tx1 update 修改了新纪录，然后 tx1 就可以把这条新纪录取出来，这叫作 write skew）。</li>
+</ul>
 <h2 id="序列化"><a href="#序列化" class="headerlink" title="序列化"></a>序列化</h2><p>禁掉正在读写的所有相关数据，其实就是锁定表。</p>
 <p>禁掉当前表的insert和update。</p>
 <p>克服了一切并发事务的污染。</p>
@@ -550,13 +555,24 @@
 </tbody>
 </table>
 <p>注意，s 和 x 锁都是<strong>行锁</strong>。<br>可以看出，x 锁跟所有锁都不兼容。<br>意向锁和非意向锁之间相互兼容。<br><strong>同类的意向锁总是兼容的（否则不相关的行会相互 block）。</strong></p>
-<h1 id="MVCC"><a href="#MVCC" class="headerlink" title="MVCC"></a>MVCC</h1><p>MySQL InnoDB存储引擎，实现的是基于多版本的并发控制协议——MVCC (Multi-Version Concurrency Control) (与MVCC相对的，是基于锁的并发控制，Lock-Based Concurrency Control)。MVCC 的好处是读不加锁，读写不冲突。在读多写少的OLTP应用中，读写不冲突是非常重要的，极大的增加了系统的并发性能，这也是为什么现阶段，几乎所有的RDBMS，都支持了MVCC。</p>
+<h1 id="MVCC"><a href="#MVCC" class="headerlink" title="MVCC"></a>MVCC</h1><h2 id="mvcc-与语句之间的关系"><a href="#mvcc-与语句之间的关系" class="headerlink" title="mvcc 与语句之间的关系"></a>mvcc 与语句之间的关系</h2><p>MySQL InnoDB存储引擎，实现的是基于多版本的并发控制协议——MVCC (Multi-Version Concurrency Control) (与MVCC相对的，是基于锁的并发控制，Lock-Based Concurrency Control)。MVCC 的好处是读不加锁，读写不冲突。在读多写少的OLTP应用中，读写不冲突是非常重要的，极大的增加了系统的并发性能，这也是为什么现阶段，几乎所有的RDBMS，都支持了MVCC。</p>
 <p>在MVCC并发控制中，读操作可以分成两类：快照读 (snapshot read)与当前读 (current read)。快照读，读取的是记录的可见版本 (有可能是历史版本)，不用加锁。当前读，读取的是记录的最新版本，并且，当前读返回的记录，都会加上锁（或者说，锁保证了当前读），保证其他事务不会再并发修改这条记录。注意，MVCC 本质上是追求无锁读。因此，即使是加 S 锁的读（select * from table in share mode），也算是一种当前读而不是快照读。</p>
 <p><img src="MVCC.png" alt="MVCC.png"><br><a href="MVCC.xmind">MVCC.xmind</a></p>
 <p>如果同时看 MVCC 和锁，则会得到这幅图：</p>
 <p>!(innodb-隔离级别.png)[innodb-隔离级别.png]</p>
+<h2 id="MVCC在MySQL的InnoDB中的实现"><a href="#MVCC在MySQL的InnoDB中的实现" class="headerlink" title="MVCC在MySQL的InnoDB中的实现"></a>MVCC在MySQL的InnoDB中的实现</h2><p>MVCC 的多版本，就是乐观锁。每一行记录都有两个隐藏的版本列，一列记录创建这列的事务版本号，另一列记录删除这列的事务版本号。</p>
+<ul>
+<li>SELECT时，读取创建版本号&lt;=当前事务版本号（不是已读未提交），删除版本号为空或&gt;当前事务版本号（不是已删除）。</li>
+<li>INSERT时，保存当前事务版本号为行的创建版本号。</li>
+<li>DELETE时，保存当前事务版本号为行的删除版本号</li>
+<li>UPDATE时，插入一条新纪录，保存当前事务版本号为行创建版本号，同时保存当前事务版本号到原来删除的行（隐藏了一个新老交替的软删除，update = insert + delete）。</li>
+</ul>
+<p>transaction version over row version。</p>
 <h1 id="两阶段锁"><a href="#两阶段锁" class="headerlink" title="两阶段锁"></a>两阶段锁</h1><p>传统RDBMS加锁的一个原则，就是2PL (二阶段锁)：Two-Phase Locking。相对而言，2PL比较容易理解，说的是锁操作分为两个阶段：加锁阶段与解锁阶段，并且保证加锁阶段与解锁阶段不相交。</p>
 <p><img src="2PL.jpg" alt="2PL.jpg"></p>
+<p>可以看出，每个加锁是在单行语句执行的时候加上的，但解锁是事务提交的时候执行的。</p>
+<p>两段锁协议可以保证事务的并发调度是串行化（串行化很重要，尤其是在数据恢复和备份的时候）的。</p>
+<p>两段式加锁可以使用无意的 update 直接触发 gap-lock，进而 block 掉其他事务的 insert，见 <a href="https://tech.meituan.com/2014/08/20/innodb-lock.html" target="_blank" rel="noopener">Next-Key 锁的例子</a>。</p>
 <h1 id="锁的实战"><a href="#锁的实战" class="headerlink" title="锁的实战"></a>锁的实战</h1><h2 id="SQL1：select-from-t1-where-id-10"><a href="#SQL1：select-from-t1-where-id-10" class="headerlink" title="SQL1：select * from t1 where id = 10;"></a>SQL1：select * from t1 where id = 10;</h2><p>不加锁。因为MySQL是使用多版本并发控制的，读不加锁。</p>
 <p><img src="sql1.jpeg" alt="sql1.jpeg"></p>
 <h2 id="SQL2：delete-from-t1-where-id-10"><a href="#SQL2：delete-from-t1-where-id-10" class="headerlink" title="SQL2：delete from t1 where id = 10;"></a>SQL2：delete from t1 where id = 10;</h2><p>这个问题没有简单答案，真正加锁的顺序，取决于“where 涉及的列 + 隔离级别的组合关系”。</p>
