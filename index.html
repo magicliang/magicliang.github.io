@@ -574,15 +574,28 @@
 <h2 id="SQL2：delete-from-t1-where-id-10"><a href="#SQL2：delete-from-t1-where-id-10" class="headerlink" title="SQL2：delete from t1 where id = 10;"></a>SQL2：delete from t1 where id = 10;</h2><p>这个问题没有简单答案，真正加锁的顺序，取决于“where 涉及的列 + 隔离级别的组合关系”。</p>
 <p>在 RC 的隔离级别之下：</p>
 <ul>
-<li>如果 id 是主键，update 不会回表，所以只要在聚簇索引（也就是数据行）上加 record-lock 即可。<br><img src="id主键+RC.png" alt="id主键+RC.png"></li>
-<li>若id列是unique列，其上有unique索引。那么SQL需要加两个X锁，一个对应于id unique索引上的id = 10的记录，另一把锁对应于聚簇索引上的[name=’d’,id=10]的记录。</li>
-<li>若id列上有非唯一索引，那么对应的所有满足SQL查询条件的记录，都会被加锁。同时，这些记录在主键索引上的记录，也会被加锁。</li>
-<li>若 id列上没有索引，只能走聚簇索引，进行全部扫描。从图中可以看到，满足删除条件的记录有两条，但是，聚簇索引上所有的记录，都被加上了X锁。无论记录是否满足条件，全部被加上X锁。既不是加表锁，也不是在满足条件的记录上加行锁。为什么不是只在满足条件的记录上加锁呢？这是由于MySQL的实现决定的。<strong>如果一个条件无法通过索引快速过滤，那么存储引擎层面就会将所有记录加锁后返回，然后由MySQL Server层进行过滤</strong>。因此也就把所有的记录，都锁上了。</li>
+<li>如果 id 是主键，update 不会回表，所以只要在行上加 record-lock 即可。</li>
 </ul>
+<p><img src="id主键+RC.png" alt="id主键+RC.png"></p>
+<ul>
+<li>若id列是unique列，其上有unique索引。那么SQL需要加两个X锁，一个对应于id unique索引上的id = 10的记录，另一把锁对应于聚簇索引上的[name=’d’,id=10]的记录。为什么聚簇索引上的记录也要加锁？试想一下，如果并发的一个SQL，是通过主键索引来更新：update t1 set id = 100 where name = ‘d’; 此时，如果delete语句没有将主键索引上的记录加锁，那么并发的update就会感知不到delete语句的存在，违背了同一记录上的更新/删除需要串行执行的约束。- <strong>锁就要锁到底，把相关索引都锁住。索引本身即锁。</strong></li>
+</ul>
+<p><img src="id唯一索引+RC.png" alt="id唯一索引+RC.png"></p>
+<ul>
+<li>若id列上有非唯一索引，那么对应的所有满足SQL查询条件的记录，都会被加锁。同时，这些记录在主键索引上的记录，也会被加锁。</li>
+</ul>
+<p><img src="id非唯一索引+RC.png" alt="id非唯一索引+RC.png"></p>
+<ul>
+<li>若 id列上没有索引，只能走聚簇索引，进行全部扫描。从图中可以看到，满足删除条件的记录有两条，但是，聚簇索引上所有的记录，都被加上了X锁。无论记录是否满足条件，全部被加上X锁。既不是加表锁，也不是在满足条件的记录上加行锁。为什么不是只在满足条件的记录上加锁呢？这是由于MySQL的实现决定的。<strong>如果一个条件无法通过索引快速过滤，那么存储引擎层面就会将所有记录加锁后返回，然后由MySQL Server层进行过滤</strong>。因此也就把所有的记录，都锁上了。注：在实际的实现中，MySQL有一些改进，在MySQL Server过滤条件，发现不满足后，会调用unlock_row方法，<strong>把不满足条件的记录放锁 (违背了2PL的约束)</strong>。这样做，保证了最后只会持有满足条件记录上的锁，但是每条记录的加锁操作还是不能省略的。也就是说，最终长期锁定的行，还是少数。</li>
+</ul>
+<p><img src="id无索引+RC.png" alt="id无索引+RC.png"></p>
 <p>在 RR 的隔离级别之下：</p>
 <ul>
-<li>id非唯一索引，则同时加上 record-lock + gap-lock。<br><img src="RR-update.png" alt="RR-update.png"></li>
+<li>id 主键，x 锁锁定一行记录。</li>
+<li>id 唯一索引，x 锁锁定唯一索引上的记录，对应的聚簇索引上的记录一个。</li>
+<li>id 非唯一索引，则同时加上 record-lock + gap-lock。</li>
 </ul>
+<p><img src="RR-update.png" alt="RR-update.png"></p>
 <p>GAP锁有何用？</p>
 <p>其实这个多出来的GAP锁，就是RR隔离级别，相对于RC隔离级别，不会出现幻读的关键。确实，GAP锁锁住的位置，也不是记录本身，而是两条记录之间的GAP。所谓幻读，就是同一个事务，连续做两次当前读 (例如：select * from t1 where id = 10 for update;)，那么这两次当前读返回的是完全相同的记录 (记录数量一致，记录本身也一致)，第二次的当前读，不会比第一次返回更多的记录 (幻象)。</p>
 <p>如何保证两次当前读返回一致的记录，那就需要在第一次当前读与第二次当前读之间，其他的事务不会插入新的满足条件的记录并提交。为了实现这个功能，GAP锁应运而生。</p>
@@ -597,12 +610,12 @@
 <ul>
 <li>索引越精细加锁越少，索引不精细可能锁表。</li>
 <li>在 RR 的级别下，如果涉及非唯一的索引（不管是不是主键），都会防止幻读而插入 Next-Key—Lock</li>
-<li>在MySQL/InnoDB中，所谓的读不加锁，并不适用于所有的情况，而是隔离级别相关的。Serializable隔离级别，读不加锁就不再成立，所有的读操作，都是当前读。</li>
+<li>在MySQL/InnoDB中，所谓的读不加锁，并不适用于所有的情况，而是隔离级别相关的。Serializable 隔离级别，读不加锁就不再成立，所有的读操作，都是当前读。</li>
 <li>索引上 GAP lock 的实际 x-lock 锁定范围，是索引里面命中的 index filter 的 range。</li>
 <li>而记录上 record-lock 的锁定范围，则由回表以后定位到的 record 确定。</li>
 </ul>
 <h2 id="SQL3"><a href="#SQL3" class="headerlink" title="SQL3"></a>SQL3</h2><p><img src="SQL3.png" alt="SQL3.png"><br><img src="SQL-3-加锁情况.png" alt="SQL-3-加锁情况.png"></p>
-<p>从图中可以看出，在Repeatable Read隔离级别下，由Index Key所确定的范围，被加上了GAP锁；Index Filter锁给定的条件 (userid = ‘hdc’)何时过滤，视MySQL的版本而定，在MySQL 5.6版本之前，不支持Index Condition Pushdown(ICP)，因此Index Filter在MySQL Server层过滤；在5.6后支持了Index Condition Pushdown，则在index上读取数据后到引擎层进行过滤（也就是说现代版本的 MySQL 能让 index 过滤条件之外的 where 语句也可以在存储引擎层执行）。若不支持ICP，不满足Index Filter的记录，也需要加上记录X锁，若支持ICP，则不满足Index Filter的记录，无需加记录X锁 (图中，用红色箭头标出的X锁，是否要加，视是否支持ICP而定)；而Table Filter对应的过滤条件，则在聚簇索引中读取后，在MySQL Server层面过滤，因此聚簇索引上也需要X锁。最后，选取出了一条满足条件的记录[8,hdc,d,5,good]，但是加锁的数量，要远远大于满足条件的记录数量。</p>
+<p>从图中可以看出，在Repeatable Read隔离级别下，由Index Key所确定的范围，被加上了GAP锁；Index Filter 锁给定的条件 (userid = ‘hdc’)何时过滤，视MySQL的版本而定，在MySQL 5.6版本之前，不支持Index Condition Pushdown(ICP)，因此Index Filter在MySQL Server层过滤；在5.6后支持了Index Condition Pushdown，则在index上读取数据后到引擎层进行过滤（也就是说现代版本的 MySQL 能让 index 过滤条件之外的 where 语句也可以在存储引擎层执行）。若不支持ICP，不满足Index Filter的记录，也需要加上记录X锁，若支持ICP，则不满足Index Filter的记录，无需加记录X锁 (图中，用红色箭头标出的X锁，是否要加，视是否支持ICP而定)；而Table Filter对应的过滤条件，则在聚簇索引中读取后，在MySQL Server层面过滤，因此聚簇索引上也需要X锁。最后，选取出了一条满足条件的记录[8,hdc,d,5,good]，但是加锁的数量，要远远大于满足条件的记录数量。</p>
 <p>结论：在Repeatable Read隔离级别下，针对一个复杂的SQL，首先需要提取其where条件。Index Key 确定的范围，需要加上 GAP 锁；Index Filter过滤条件，视MySQL版本是否支持ICP，若支持ICP，则不满足 Index Filter 的记录，不加X锁，否则需要X锁；Table Filter过滤条件，无论是否满足，都需要加X锁。</p>
 <h1 id="死锁"><a href="#死锁" class="headerlink" title="死锁"></a>死锁</h1><p><img src="死锁1.png" alt="死锁1.png"></p>
 <p>注意回顾两阶段加锁的原理，可以看到逆序加锁就会发生死锁。</p>
