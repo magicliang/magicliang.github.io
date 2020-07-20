@@ -111,7 +111,9 @@
 <meta property="og:image" content="http://yoursite.com/2020/07/20/MySQL-中的日志/主从复制1.png">
 <meta property="og:image" content="http://yoursite.com/2020/07/20/MySQL-中的日志/主从复制2.png">
 <meta property="og:image" content="http://yoursite.com/2020/07/20/MySQL-中的日志/并行复制.png">
-<meta property="og:updated_time" content="2020-07-20T12:49:51.882Z">
+<meta property="og:image" content="http://yoursite.com/2020/07/20/MySQL-中的日志/按库并行.png">
+<meta property="og:image" content="http://yoursite.com/2020/07/20/MySQL-中的日志/redo-log组提交.png">
+<meta property="og:updated_time" content="2020-07-20T13:07:33.630Z">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="MySQL 中的日志">
 <meta name="twitter:description" content="Binlog初始定义BinLog 是记录 MySQL 实例数据变更的一个组件，日志中包含了一系列变更数据的操作，例如变更表结构、删除数据、更改/添加数据等 DML、DDL。这些操作在 BinLog 中统称为事件。 BinLog 记录什么，不记录什么BinLog 也会记录一些可能会发生数据变更的事件，例如没有找到对应行的 Delete 操作。 BinLog 不会记录纯查询，如 Select 和 Sh">
@@ -545,7 +547,7 @@
 <p>1、只读节点与主库的DDL同步是串行进行，如果DDL操作在主库执行时间很长，那么从库也会消耗同样的时间，比如在主库对一张500W的表添加一个字段耗费了10分钟，那么只读节点上也会耗费10分钟。</p>
 <p>2、只读节点上有一个执行时间非常长的的查询正在执行，那么这个查询会堵塞来自主库的DDL，读节点表被锁，直到查询结束为止，进而导致了只读节点的数据延迟。</p>
 <p>5、锁冲突</p>
-<p>锁冲突问题也可能导致从机的SQL线程执行慢，比如从机上有一些select  ….  for update的SQL，或者使用了MyISAM引擎等。</p>
+<p>锁冲突问题也可能导致从机的SQL线程执行慢，比如从机上有一些select  …. for update的SQL，或者使用了MyISAM引擎等。</p>
 <p>6、从库的复制能力</p>
 <p>一般场景中，因偶然情况导致从库延迟了几分钟，都会在从库恢复之后追上主库。但若是从库执行速度低于主库，且主库持续具有压力，就会导致长时间主从延迟，很有可能就是从库复制能力的问题。</p>
 <p>回头再看下主从复制的流程，主要看下红色的箭头：</p>
@@ -553,6 +555,52 @@
 <p> 2、从库上的执行，即sql_thread更新逻辑，在5.6版本之前，是只支持单线程，那么在主库并发高、TPS高时，就会出现较大的主从延迟。 </p>
 <p>因此，在随后演进的版本中，官方的 MySQL提出了不断改进的多线程复制方法，用于减少主从延迟。</p>
 <h2 id="并行复制的原理"><a href="#并行复制的原理" class="headerlink" title="并行复制的原理"></a>并行复制的原理</h2><h3 id="多线程复制"><a href="#多线程复制" class="headerlink" title="多线程复制"></a>多线程复制</h3><p><img src="并行复制.png" alt="并行复制.png"></p>
+<p>图中的coordinator是上图的sql_thread，但其功能已不再是更新数据，而是负责读取中转日志和分发事务，进行更新操作的是work线程，该线程数量由slave_parallel_workers控制。</p>
+<p>coordinator作为重要的一环，那么其进行分发是具有一定的要求：</p>
+<p>不能造成更新覆盖，要求更新同一行的两个事务须分配到同一个work</p>
+<p>如：更新同一行的两个事务被分配给了两个work，由于各个work之间是独立执行，就有可能出现第二个事务比第一个事务先执行，结果两个事务在主库和从库的执行顺序不一致，导致主从不一致。</p>
+<p>同一个事务不能被拆分，须分配到同一个work</p>
+<p>如：同一个事务更新表1和表2的各一行，分配到两个work，最终执行结果一致，但如果在表1执行完成的瞬间，来一个查询请求，则就会看到事务执行到一半的结果，破坏了事务的隔离性。</p>
+<h4 id="a、按库并行"><a href="#a、按库并行" class="headerlink" title="a、按库并行"></a>a、按库并行</h4><p>这是MySQL最先推出的并行复制策略，模型如下：</p>
+<p><img src="按库并行.png" alt="按库并行.png"></p>
+<p>如图所示，每个 worker 线程对应一个 hash 表，用于保存当前正在这个worker的执行队列里的事务所涉及到的库。其中hash表里的key是数据库名，用于决定分发策略。该策略的优点是构建hash值快，只需要库名，同时对于binlog的格式没有要求。</p>
+<p>但这个策略的效果，只有在主库上存在多个DB，且各个DB的压力均衡的情况下，这个策略效果好。因此，对于主库上的表都放在同一个DB或者不同DB的热点不同，则起不到多大效果。</p>
+<h4 id="b、redo-log-组提交-group-commit-优化"><a href="#b、redo-log-组提交-group-commit-优化" class="headerlink" title="b、redo log 组提交 (group commit) 优化"></a>b、redo log 组提交 (group commit) 优化</h4><p>最先使用这个特性的是MariaDB，该特性如下：</p>
+<p>1、能够同一组里提交的事务，定不会修改同一行；</p>
+<p>2、主库上可以并行执行的事务，从库上也一定可以并行执行。</p>
+<p>具体是如何实现：</p>
+<p>1、在同一组里面一起提交的事务，会有一个相同的commit_id，下一组为commit_id+1，该commit_id会直接写道binlog中；</p>
+<p>2、在从库使用时，相同commit_id的事务会被分发到多个worker并行执行，直到这一组相同的commit_id执行结束后，coordinator再取下一批。</p>
+<p>该实现逻辑，就好比模拟了主库的并行模式，但仔细分析对比，其并没有真正做到模拟主库的并行模式，可以看下图：</p>
+<p><img src="redo-log组提交.png" alt="redo-log组提交.png"></p>
+<p>   从图中可以看出主库在事务提交完后下一组事务很快就会进入commit状态，而从库需要等到第一组事务完全执行完成后，第二组事务才能开始执行。这种模式下，大事务的劣势尤为明显，比如TRA2是个大事务，在从库执行时，其他两个事务均已完成，但TRA2未完成，那么需等待他完全执行完，下一组才能执行，导致这段时间内只有一个work线程运行，造成资源浪费。</p>
+<p>后续MySQL也提供了相应的类似功能，由参数slave-parallel-type进行控制，当其配置为LOGICAL_CLOCK即运行类似于MariaDB的策略，但MySQL在其并行策略基础上进行了优化。</p>
+<pre><code>MariaDB的核心是”所有处于commit“状态的事务可以并行，而MySQL认为只要是”同时处于prepare状态，或处于prepare与commit状态之间“的事务，就可以在从库里并行执行。因为只要是到达了prepare阶段，表示事务已经通过了锁冲突的检测。
+</code></pre><p>具体怎么提升并发度，这里就涉及到了binlog组提交的两个参数（可以去了解一下binlog提交的过程）：</p>
+<p>binlog_group_commit_sync_delay ，表示延迟多少微秒调用fsync；</p>
+<p>binlog_group_commit_sync_no_delay_count， 表示累积多少次以后才调用fsync。</p>
+<p>通过控制这两个参数，制造更多同时处于prepare的事务，也就是让主库提交慢点，从库执行快点，从而增加从库复制的并行度。</p>
+<h4 id="c、WRITESET的并行复制"><a href="#c、WRITESET的并行复制" class="headerlink" title="c、WRITESET的并行复制"></a>c、WRITESET的并行复制</h4><p>MySQL5.7.22提出了一个基于WRITESET的并行复制，通过binlog-transation-dependency-tracking进行控制，有三种模式：</p>
+<p>COMMIT_ORDER，即redo log 组提交 (group commit) 优化。</p>
+<p>WRITESET，表示对于事务中关联到的每一行，计算出hash值，组成writeset。如果两个事务没有操作相同的行，即writeset没有交集，可以并行。hash值通过”库名+表名+索引名+值“计算，若表上还有其他唯一索引，那么对每一个唯一索引，在insert语句上会多一个hash值。</p>
+<p>WRITESET_SESSION，在WRITESET上多一层限制，即在主库上同一个线程执行的两个事务，在从库执行时，也要保证相同的先后顺序。</p>
+<pre><code>该策略的优点是：
+</code></pre><p>WRITESET在主库生成后写在binlog中，在从库执行时，不需要解析，节省工作量</p>
+<p>不需扫整个binlog来决定分发到哪个worker</p>
+<p>从库的分发策略不依赖于binlog内容，对于statement格式也适合。</p>
+<h2 id="怎么减少主从延迟"><a href="#怎么减少主从延迟" class="headerlink" title="怎么减少主从延迟"></a>怎么减少主从延迟</h2><p>主从同步问题永远都是一致性和性能的权衡（不要期望主库执行大规模的写操作，否则读会受到影响），得看实际的应用场景，若想要减少主从延迟的时间，可以采取下面的办法：</p>
+<ol>
+<li><p>降低多线程大事务并发的概率，优化业务逻辑</p>
+</li>
+<li><p>优化SQL，避免慢SQL，减少批量操作，建议写脚本以 update-sleep 这样的形式完成。</p>
+</li>
+<li><p>提高从库机器的配置，减少主库写binlog和从库读binlog的效率差。</p>
+</li>
+<li><p>尽量采用短的链路，也就是主库和从库服务器的距离尽量要短，提升端口带宽，减少binlog传输的网络延时。</p>
+</li>
+<li><p>实时性要求的业务读强制走主库，从库只做灾备，备份。</p>
+</li>
+</ol>
 <h1 id="Redo-Undo-log"><a href="#Redo-Undo-log" class="headerlink" title="Redo/Undo log"></a>Redo/Undo log</h1>
       
     </div>
@@ -759,7 +807,7 @@
             
 
             
-              <div class="post-toc-content"><ol class="nav"><li class="nav-item nav-level-1"><a class="nav-link" href="#Binlog"><span class="nav-number">1.</span> <span class="nav-text">Binlog</span></a><ol class="nav-child"><li class="nav-item nav-level-2"><a class="nav-link" href="#初始定义"><span class="nav-number">1.1.</span> <span class="nav-text">初始定义</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-记录什么，不记录什么"><span class="nav-number">1.2.</span> <span class="nav-text">BinLog 记录什么，不记录什么</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#用途"><span class="nav-number">1.3.</span> <span class="nav-text">用途</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-结构"><span class="nav-number">1.4.</span> <span class="nav-text">BinLog 结构</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-分组"><span class="nav-number">1.5.</span> <span class="nav-text">BinLog 分组</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#日志格式"><span class="nav-number">1.6.</span> <span class="nav-text">日志格式</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#日志事件结构"><span class="nav-number">1.7.</span> <span class="nav-text">日志事件结构</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#主从同步"><span class="nav-number">1.8.</span> <span class="nav-text">主从同步</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#数据恢复"><span class="nav-number">1.9.</span> <span class="nav-text">数据恢复</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#Binlog-不同于-Redo-log"><span class="nav-number">1.10.</span> <span class="nav-text">Binlog 不同于 Redo log</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#丢失-binlog-造成的事故"><span class="nav-number">1.11.</span> <span class="nav-text">丢失 binlog 造成的事故</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#主从延迟的原因"><span class="nav-number">1.12.</span> <span class="nav-text">主从延迟的原因</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#并行复制的原理"><span class="nav-number">1.13.</span> <span class="nav-text">并行复制的原理</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#多线程复制"><span class="nav-number">1.13.1.</span> <span class="nav-text">多线程复制</span></a></li></ol></li></ol></li><li class="nav-item nav-level-1"><a class="nav-link" href="#Redo-Undo-log"><span class="nav-number">2.</span> <span class="nav-text">Redo/Undo log</span></a></li></ol></div>
+              <div class="post-toc-content"><ol class="nav"><li class="nav-item nav-level-1"><a class="nav-link" href="#Binlog"><span class="nav-number">1.</span> <span class="nav-text">Binlog</span></a><ol class="nav-child"><li class="nav-item nav-level-2"><a class="nav-link" href="#初始定义"><span class="nav-number">1.1.</span> <span class="nav-text">初始定义</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-记录什么，不记录什么"><span class="nav-number">1.2.</span> <span class="nav-text">BinLog 记录什么，不记录什么</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#用途"><span class="nav-number">1.3.</span> <span class="nav-text">用途</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-结构"><span class="nav-number">1.4.</span> <span class="nav-text">BinLog 结构</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-分组"><span class="nav-number">1.5.</span> <span class="nav-text">BinLog 分组</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#日志格式"><span class="nav-number">1.6.</span> <span class="nav-text">日志格式</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#日志事件结构"><span class="nav-number">1.7.</span> <span class="nav-text">日志事件结构</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#主从同步"><span class="nav-number">1.8.</span> <span class="nav-text">主从同步</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#数据恢复"><span class="nav-number">1.9.</span> <span class="nav-text">数据恢复</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#Binlog-不同于-Redo-log"><span class="nav-number">1.10.</span> <span class="nav-text">Binlog 不同于 Redo log</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#丢失-binlog-造成的事故"><span class="nav-number">1.11.</span> <span class="nav-text">丢失 binlog 造成的事故</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#主从延迟的原因"><span class="nav-number">1.12.</span> <span class="nav-text">主从延迟的原因</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#并行复制的原理"><span class="nav-number">1.13.</span> <span class="nav-text">并行复制的原理</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#多线程复制"><span class="nav-number">1.13.1.</span> <span class="nav-text">多线程复制</span></a><ol class="nav-child"><li class="nav-item nav-level-4"><a class="nav-link" href="#a、按库并行"><span class="nav-number">1.13.1.1.</span> <span class="nav-text">a、按库并行</span></a></li><li class="nav-item nav-level-4"><a class="nav-link" href="#b、redo-log-组提交-group-commit-优化"><span class="nav-number">1.13.1.2.</span> <span class="nav-text">b、redo log 组提交 (group commit) 优化</span></a></li><li class="nav-item nav-level-4"><a class="nav-link" href="#c、WRITESET的并行复制"><span class="nav-number">1.13.1.3.</span> <span class="nav-text">c、WRITESET的并行复制</span></a></li></ol></li></ol></li><li class="nav-item nav-level-2"><a class="nav-link" href="#怎么减少主从延迟"><span class="nav-number">1.14.</span> <span class="nav-text">怎么减少主从延迟</span></a></li></ol></li><li class="nav-item nav-level-1"><a class="nav-link" href="#Redo-Undo-log"><span class="nav-number">2.</span> <span class="nav-text">Redo/Undo log</span></a></li></ol></div>
             
 
           </div>
