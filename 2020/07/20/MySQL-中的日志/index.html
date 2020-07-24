@@ -113,7 +113,7 @@
 <meta property="og:image" content="http://yoursite.com/2020/07/20/MySQL-中的日志/并行复制.png">
 <meta property="og:image" content="http://yoursite.com/2020/07/20/MySQL-中的日志/按库并行.png">
 <meta property="og:image" content="http://yoursite.com/2020/07/20/MySQL-中的日志/redo-log组提交.png">
-<meta property="og:updated_time" content="2020-07-21T09:56:22.146Z">
+<meta property="og:updated_time" content="2020-07-24T13:36:27.134Z">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="MySQL 中的日志">
 <meta name="twitter:description" content="Binlog初始定义BinLog 是记录 MySQL 实例数据变更的一个组件，日志中包含了一系列变更数据的操作，例如变更表结构、删除数据、更改/添加数据等 DML、DDL。这些操作在 BinLog 中统称为事件。 BinLog 记录什么，不记录什么BinLog 也会记录一些可能会发生数据变更的事件，例如没有找到对应行的 Delete 操作。 BinLog 不会记录纯查询，如 Select 和 Sh">
@@ -554,7 +554,7 @@
 <p>是T2-T1么？</p>
 <p>NO。正常情况下，如果网络不延迟，那么日志从主库传给从库的时间是相当短，所以T2-T1可以基本忽略。</p>
 <p>是T3-T2 么？</p>
-<p>YES，最直接的影响就是从库消费中转日志（relaylog）的时间段，而造成原因一般是以下几种：</p>
+<p>YES，<strong>最直接的影响就是从库消费中转日志（relaylog）的时间段</strong>，而造成原因一般是以下几种：</p>
 <p>1、从库的机器性能比主库要差</p>
 <p>比如将20台主库放在4台机器，把从库放在一台机器。这个时候进行更新操作，由于更新时会触发大量读操作，导致从库机器上的多个从库争夺资源，导致主从延迟。</p>
 <p>不过，目前大部分部署都是采取主从使用相同规格的机器部署。</p>
@@ -614,16 +614,31 @@
 <ol>
 <li><p>降低多线程大事务并发的概率，优化业务逻辑</p>
 </li>
-<li><p>优化SQL，避免慢SQL，减少批量操作，建议写脚本以 update-sleep 这样的形式完成。</p>
+<li><p>优化SQL，避免慢SQL，减少批量操作，建议写脚本以 <strong>update-sleep</strong> 这样的形式完成。</p>
 </li>
 <li><p>提高从库机器的配置，减少主库写binlog和从库读binlog的效率差。</p>
 </li>
-<li><p>尽量采用短的链路，也就是主库和从库服务器的距离尽量要短，提升端口带宽，减少binlog传输的网络延时。</p>
+<li><p>尽量采用短的链路，也就是主库和从库服务器的距离尽量要短（同机房部署、同城部署），提升端口带宽，减少binlog传输的网络延时。</p>
 </li>
 <li><p>实时性要求的业务读强制走主库，从库只做灾备，备份。</p>
 </li>
 </ol>
-<h1 id="Redo-Undo-log"><a href="#Redo-Undo-log" class="headerlink" title="Redo/Undo log"></a>Redo/Undo log</h1>
+<h1 id="Redo-Undo-Log"><a href="#Redo-Undo-Log" class="headerlink" title="Redo/Undo Log"></a>Redo/Undo Log</h1><p>在 MySQL 里，既有数据文件（data file），也有日志文件（log file）。日志在内存中也是有缓存 Log Buffer，也有磁盘文件 log file。Redo Log 和 Undo Log 都是 log file 的一种。</p>
+<p>当数据 crash-recovery 时：</p>
+<ol>
+<li>通过 Redo Log 将所有已经在存储引擎内部提交的事务应用 Redo log 恢复。-这提供了原子性（保证事务不会部分成功）和持久性（数据最终能存到 data file 里）</li>
+<li>所有已经 prepared 但是没有 commit 的 transactions 将会应用 Undo log 做 roll back，也保证了原子性和隔离性（通过对 MVCC 的支持）。</li>
+</ol>
+<p>事务执行时会先写 undo log，再执行 statement，再写 redolog，事务执行完前的一瞬间写 binlog。</p>
+<p>acid 里面的 c 特指数据完整性（三大完整性），与这两种 log 无关系。</p>
+<h2 id="Redo-Log"><a href="#Redo-Log" class="headerlink" title="Redo Log"></a>Redo Log</h2><p>Redo log 是重做日志，提供前滚操作。Redo Log 记录<strong>某数据块</strong>被修改<strong>后</strong>的值，可以用来恢复未写入 data file 的已成功事务更新的数据。</p>
+<p>Redo Log 通常是物理日志，记录的是数据页的物理修改，而不是某一行或某几行修改成什么样。它用来恢复提交后的物理数据页（恢复数据页，且只能恢复到<strong>最后一次提交的位置</strong>）。</p>
+<p>Redo Log 的出现有一个背景，那就是 MySQL 是必须依赖于 WAL 类的日志的：我们对数据库中的数据进行修改时，实际上是对 buffer pool 中的数据页进行修改，生成相应的 dirty page 的数据。这种 dirty page 的变更在 crash 的时候如果要不丢，则必须依赖 WAL。必定会产生 binlog + 其他日志，这通常需要一次顺序 io。这时候如果还要立即更新 data file 的话，会产生一次随机 io，如果有办法只写 wal，然后缓冲多次对 datafile 的随机 io 到一次顺序 io，则整体的写吞吐量会上升。</p>
+<p>Redo Log 是 storage engine 层产生的。Binlog 是 Server 层产生的。Redo Log 记录的是数据库的数据库的新值，每执行一条 statement 就产生一条 redo log；而 Binlog 记录的是可以被重放的操作记录，每个 transaction 提交前产生一条 binlog。binlog 是 MySQL 4.x 以后引入的复制机制，之前一直都使用 redo log 进行复制。</p>
+<h2 id="Undo-Log"><a href="#Undo-Log" class="headerlink" title="Undo Log"></a>Undo Log</h2><p>Undo Log 是回退日志，提供回滚操作，Undo 记录某数据被修改前的记录，可以在事务失败时进行 rollback。它一般是逻辑日志，根据每行记录进行记录（配合 MVCC 进行使用）。</p>
+<p>当使用 MVCC 进行事务操作时，InnoDB 会通过 DB_ROLL_PTR（与 delete 这行的 transaction 有关）关联的 undo log 来保证事务的回滚，事务提交后，这个 undo log 会被放入删除列表中，通过 purge 线程来删除。</p>
+<p>对数据的变更操作，主要来自 INSERT UPDATE DELETE，而UNDO LOG中分为两种类型，一种是 INSERT_UNDO（INSERT操作），记录插入的唯一键值；一种是 UPDATE_UNDO（包含UPDATE及DELETE操作），记录修改的唯一键值以及old column记录。</p>
+
       
     </div>
     
@@ -829,7 +844,7 @@
             
 
             
-              <div class="post-toc-content"><ol class="nav"><li class="nav-item nav-level-1"><a class="nav-link" href="#Binlog"><span class="nav-number">1.</span> <span class="nav-text">Binlog</span></a><ol class="nav-child"><li class="nav-item nav-level-2"><a class="nav-link" href="#初始定义"><span class="nav-number">1.1.</span> <span class="nav-text">初始定义</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-记录什么，不记录什么"><span class="nav-number">1.2.</span> <span class="nav-text">BinLog 记录什么，不记录什么</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#用途"><span class="nav-number">1.3.</span> <span class="nav-text">用途</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-结构"><span class="nav-number">1.4.</span> <span class="nav-text">BinLog 结构</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-分组"><span class="nav-number">1.5.</span> <span class="nav-text">BinLog 分组</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#日志格式"><span class="nav-number">1.6.</span> <span class="nav-text">日志格式</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#日志事件结构"><span class="nav-number">1.7.</span> <span class="nav-text">日志事件结构</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#主从同步"><span class="nav-number">1.8.</span> <span class="nav-text">主从同步</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#数据恢复"><span class="nav-number">1.9.</span> <span class="nav-text">数据恢复</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#Binlog-不同于-Redo-log"><span class="nav-number">1.10.</span> <span class="nav-text">Binlog 不同于 Redo log</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#丢失-binlog-造成的事故"><span class="nav-number">1.11.</span> <span class="nav-text">丢失 binlog 造成的事故</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#主从延迟的原因"><span class="nav-number">1.12.</span> <span class="nav-text">主从延迟的原因</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#并行复制的原理"><span class="nav-number">1.13.</span> <span class="nav-text">并行复制的原理</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#多线程复制"><span class="nav-number">1.13.1.</span> <span class="nav-text">多线程复制</span></a><ol class="nav-child"><li class="nav-item nav-level-4"><a class="nav-link" href="#a、按库并行"><span class="nav-number">1.13.1.1.</span> <span class="nav-text">a、按库并行</span></a></li><li class="nav-item nav-level-4"><a class="nav-link" href="#b、redo-log-组提交-group-commit-优化"><span class="nav-number">1.13.1.2.</span> <span class="nav-text">b、redo log 组提交 (group commit) 优化</span></a></li><li class="nav-item nav-level-4"><a class="nav-link" href="#c、WRITESET的并行复制"><span class="nav-number">1.13.1.3.</span> <span class="nav-text">c、WRITESET的并行复制</span></a></li></ol></li></ol></li><li class="nav-item nav-level-2"><a class="nav-link" href="#怎么减少主从延迟"><span class="nav-number">1.14.</span> <span class="nav-text">怎么减少主从延迟</span></a></li></ol></li><li class="nav-item nav-level-1"><a class="nav-link" href="#Redo-Undo-log"><span class="nav-number">2.</span> <span class="nav-text">Redo/Undo log</span></a></li></ol></div>
+              <div class="post-toc-content"><ol class="nav"><li class="nav-item nav-level-1"><a class="nav-link" href="#Binlog"><span class="nav-number">1.</span> <span class="nav-text">Binlog</span></a><ol class="nav-child"><li class="nav-item nav-level-2"><a class="nav-link" href="#初始定义"><span class="nav-number">1.1.</span> <span class="nav-text">初始定义</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-记录什么，不记录什么"><span class="nav-number">1.2.</span> <span class="nav-text">BinLog 记录什么，不记录什么</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#用途"><span class="nav-number">1.3.</span> <span class="nav-text">用途</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-结构"><span class="nav-number">1.4.</span> <span class="nav-text">BinLog 结构</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#BinLog-分组"><span class="nav-number">1.5.</span> <span class="nav-text">BinLog 分组</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#日志格式"><span class="nav-number">1.6.</span> <span class="nav-text">日志格式</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#日志事件结构"><span class="nav-number">1.7.</span> <span class="nav-text">日志事件结构</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#主从同步"><span class="nav-number">1.8.</span> <span class="nav-text">主从同步</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#数据恢复"><span class="nav-number">1.9.</span> <span class="nav-text">数据恢复</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#Binlog-不同于-Redo-log"><span class="nav-number">1.10.</span> <span class="nav-text">Binlog 不同于 Redo log</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#丢失-binlog-造成的事故"><span class="nav-number">1.11.</span> <span class="nav-text">丢失 binlog 造成的事故</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#主从延迟的原因"><span class="nav-number">1.12.</span> <span class="nav-text">主从延迟的原因</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#并行复制的原理"><span class="nav-number">1.13.</span> <span class="nav-text">并行复制的原理</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#多线程复制"><span class="nav-number">1.13.1.</span> <span class="nav-text">多线程复制</span></a><ol class="nav-child"><li class="nav-item nav-level-4"><a class="nav-link" href="#a、按库并行"><span class="nav-number">1.13.1.1.</span> <span class="nav-text">a、按库并行</span></a></li><li class="nav-item nav-level-4"><a class="nav-link" href="#b、redo-log-组提交-group-commit-优化"><span class="nav-number">1.13.1.2.</span> <span class="nav-text">b、redo log 组提交 (group commit) 优化</span></a></li><li class="nav-item nav-level-4"><a class="nav-link" href="#c、WRITESET的并行复制"><span class="nav-number">1.13.1.3.</span> <span class="nav-text">c、WRITESET的并行复制</span></a></li></ol></li></ol></li><li class="nav-item nav-level-2"><a class="nav-link" href="#怎么减少主从延迟"><span class="nav-number">1.14.</span> <span class="nav-text">怎么减少主从延迟</span></a></li></ol></li><li class="nav-item nav-level-1"><a class="nav-link" href="#Redo-Undo-Log"><span class="nav-number">2.</span> <span class="nav-text">Redo/Undo Log</span></a><ol class="nav-child"><li class="nav-item nav-level-2"><a class="nav-link" href="#Redo-Log"><span class="nav-number">2.1.</span> <span class="nav-text">Redo Log</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#Undo-Log"><span class="nav-number">2.2.</span> <span class="nav-text">Undo Log</span></a></li></ol></li></ol></div>
             
 
           </div>
