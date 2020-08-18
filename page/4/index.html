@@ -1970,11 +1970,32 @@
 <li>储存引擎不能使用索引中范围条件右边的列</li>
 <li>尽量使用覆盖索引（只访问索引的查询（索引列和查询列一致）），减少select *（特别是生成 orm 映射的时候，尽量把所有的列写入select 段中）。</li>
 <li>mysql在使用不等于(!=或者&lt;&gt;)的时候无法使用索引会导致全表扫描</li>
-<li>is null，is not null也会无法使用索引</li>
-<li>like以通配符开头</li>
-<li>字符串不加单引号</li>
+<li>is null，is not null也可能会无法使用索引</li>
+<li>like 以通配符开头</li>
+<li>字符串不加单引号（引发了隐式转化）</li>
 <li>少用or（在大多数情况下用 in 代替，in 也不好，有时候会导致全表扫描）</li>
 </ol>
+<h3 id="与-null-的关系"><a href="#与-null-的关系" class="headerlink" title="与 null 的关系"></a>与 null 的关系</h3><p>参考<a href="https://juejin.im/post/6844903921450745863#heading-3" target="_blank" rel="noopener">《MySQL中IS NULL、IS NOT NULL、!=不能用索引？胡扯！》</a>。</p>
+<h4 id="破除偏见"><a href="#破除偏见" class="headerlink" title="破除偏见"></a>破除偏见</h4><p>首先，null 列会存在于 MySQL 的索引里。一般传言认为：null 值必然会全表扫描，是不准确的；null 值不会存储在索引里，也是不准确的。</p>
+<p><img src="is-null使用索引.png" alt="is-null使用索引.png"></p>
+<h4 id="NULL-与-B-树的存储"><a href="#NULL-与-B-树的存储" class="headerlink" title="NULL 与 B+ 树的存储"></a>NULL 与 B+ 树的存储</h4><p>一条记录的主键值不允许存储 NULL 值。设置为 NOT NULL 的列也不允许存储 NULL 值。</p>
+<p>对于索引列值为NULL的二级索引记录来说，它们被放在B+树的最左边。</p>
+<blockquote>
+<p>We define the SQL null to be the smallest possible value of a field.</p>
+</blockquote>
+<p>在通过二级索引idx_key1对应的B+树快速定位到叶子节点中符合条件的最左边的那条记录后，就可以顺着每条记录都有的 next_record 属性沿着由记录组成的单向链表去获取记录了，直到某条记录的key1列不为 NULL。</p>
+<h4 id="是否使用索引的决策依据到底是什么"><a href="#是否使用索引的决策依据到底是什么" class="headerlink" title="是否使用索引的决策依据到底是什么"></a>是否使用索引的决策依据到底是什么</h4><p>MySQL 的执行计划是由查询优化器产出的。查询优化器在这个场景里最重要的参考因子是成本（cost-based optimizing 的优化策略是数据库领域最常见的优化策略）。</p>
+<ul>
+<li>读取二级索引记录的成本。</li>
+<li>将二级索引记录执行回表操作，也就是到聚簇索引中找到完整的用户记录的操作所付出的成本。</li>
+</ul>
+<p>换言之，回表意味着 IO 被放大了（简单来说，读至少乘以一个系数 2）。如果回表比简单地全表扫描聚簇索引成本还要高，那么查询优化器就会选择不走索引。</p>
+<p>比方说对于下边这个查询：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> * <span class="keyword">FROM</span> s1 <span class="keyword">WHERE</span> key1 <span class="keyword">IS</span> <span class="literal">NULL</span>;</span><br></pre></td></tr></table></figure>
+<p>复制代码优化器会分析出此查询只需要查找key1值为NULL的记录，然后访问一下二级索引idx_key1，看一下值为NULL的记录有多少（如果符合条件的二级索引记录数量较少，那么统计结果是精确的，如果太多的话，会采用一定的手段计算一个模糊的值）- 这种在查询真正执行前优化器就率先访问索引来计算需要扫描的索引记录数量的方式称之为 index dive。当然，对于某些查询，比方说WHERE子句中有IN条件，并且IN条件中包含许多参数的话，比方说这样：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> * <span class="keyword">FROM</span> s1 <span class="keyword">WHERE</span> key1 <span class="keyword">IN</span> (<span class="string">'a'</span>, <span class="string">'b'</span>, <span class="string">'c'</span>, ... , <span class="string">'zzzzzzz'</span>);</span><br></pre></td></tr></table></figure>
+<p>复制代码这样的话需要统计的key1值所在的区间就太多了，这样就不能采用index dive的方式去真正的访问二级索引idx_key1，而是需要采用之前在背地里产生的一些统计数据去估算匹配的二级索引记录有多少条（很显然根据统计数据去估算记录条数比index dive的方式精确性差了很多）。<br>反正不论采用index dive还是依据统计数据估算，最终要得到一个需要扫描的二级索引记录条数，如果这个条数占整个记录条数的比例特别大，那么就趋向于使用全表扫描执行查询，否则趋向于使用这个索引执行查询。</p>
+<p>理解了这个也就好理解为什么在WHERE子句中出现IS NULL、IS NOT NULL、!=这些条件仍然可以使用索引，本质上都是优化器去计算一下对应的二级索引数量占所有记录数量的比值而已。</p>
 <h3 id="其他优化建议"><a href="#其他优化建议" class="headerlink" title="其他优化建议"></a>其他优化建议</h3><ol>
 <li>批量insert语句最好采用bulk insert的方法，如insert into table(xxx) values (xxx),(xxx),每个批次以执行时间小于100ms为原则。</li>
 <li>禁止使用Select <em>，</em>用所需字段代替。</li>
