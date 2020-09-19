@@ -4933,7 +4933,7 @@
 <li>在应用层做关联，可以更容易对数据库做拆分。</li>
 <li>查询本身的效率也会变高-通常单一的 JOIN ON 不如使用 in（）这种有跑徐的顺序查询效率高。</li>
 <li>可以减少冗余记录。MySQL 的 nested loop join 本身可能会使内层循环重复访问一些数据。</li>
-<li>更进一步，这样做其实在应用层实现了 hash join，在某些场景这比 nested loop join 效率高得多。</li>
+<li>更进一步，这样做其实在应用层实现了 hash join（这种 join 最好实现为 hashmap，或者直接上上一个查询的值填入下一个查询的 where 中，否则在 in memory 的实现里，也很容易实现为 nested loop join），在某些场景这比 nested loop join 效率高得多。</li>
 </ul>
 <h2 id="查询执行的基础"><a href="#查询执行的基础" class="headerlink" title="查询执行的基础"></a>查询执行的基础</h2><p><img src="MySQL的执行路径.png" alt="MySQL的执行路径.png"></p>
 <ol>
@@ -4972,8 +4972,8 @@
 <li>预估并转化为常数表达式：在 where、on、using 里出现的常量，很容易让表查询的 where 产生 ref 为 const 的效果。MySQL 很只智能，分析完 where 之后，就知道要扫描的范围了。</li>
 <li>覆盖索引扫描</li>
 <li>子查询优化</li>
-<li>提前终止查询：当存储引擎需要判断存在性或者检索不同取值的时候，MySQL 可以使用这类优化。DISTING、NOT EXIST、LEFT JOIN。</li>
-<li>等值传播 使用了 using（等价于 on a.id = b.id），则外部表 where 条件里的条件可以传播到内部表的查询里。</li>
+<li>提前终止查询（early termination algorithm）：当存储引擎需要判断存在性或者检索不同取值的时候，MySQL 可以使用这类优化。DISTING、NOT EXIST、LEFT JOIN。</li>
+<li>等值传播 使用了 using（等价于 on a.id = b.id），则外部表 where 条件里的条件可以传播到内部表的查询里（下面我们会看到一个 in 的例子）。</li>
 <li>列表 IN（）的比较：MySQL 里 IN（）不完全等价于 OR，MySQL 会先将 IN 列表中的数据先排序，然后通过二分查找的方式来确定列表中的值是否满足条件，这种方案的时间复杂度是对数复杂度。OR 的时间复杂度是线性复杂度。</li>
 </ul>
 <p>总而言之，不要自以为比优化器聪明。当然优化器缺少某些功能特性，如哈希索引。</p>
@@ -5011,9 +5011,108 @@
 <li>MySQL 会首先使用索引进行排序。</li>
 <li>如果不行，MySQL 会在内存中排序，内存不够会使用磁盘。不管内存够不够，这一过程都叫作 file sort。</li>
 </ol>
-<p>第二�步中的内存是内存中的</p>
-<pre><code class="SQL">
-</code></pre>
+<p>第二步中的内存是内存中的“排序缓冲区”（sort buffer）。在排序缓冲区内的排序是快排；如果排序缓冲区不够大，则 MySQL 会把数据分块，对每个独立的块使用“快排”，然后将排序结果放到磁盘上，进行归并排序。</p>
+<p>进行排序的时候，先排序还是先查找完所有的列，会诞生了两种不同的排序算法。当代的 MySQL 支持两种不同的排序算法。</p>
+<p>查询很容易产生临时结果（using temporary; Using filesort），排序占用的空间会更大（特别是对于 varchar 类型的列，MySQL 会按照它能预估到的最大的空间来进行空间占用）。</p>
+<h3 id="查询执行引擎"><a href="#查询执行引擎" class="headerlink" title="查询执行引擎"></a>查询执行引擎</h3><p>优化器生成了执行计划这一数据结构以后，交给执行引擎执行。执行引擎会调用存储引擎实现的接口，也就是“handler API”（查询涉及的每张表都由一个 handler 代表）来逐步执行执行计划。这种逐步执行相对于查询优化器的数据操作，简单了许多。</p>
+<p>这种可以“搭积木组合”的 API 可以完成复杂查询，也支撑起了 MySQL 存储引擎的插件化架构。</p>
+<h3 id="返回结果给客户端"><a href="#返回结果给客户端" class="headerlink" title="返回结果给客户端"></a>返回结果给客户端</h3><p>如果查询可以被缓存，那么在这阶段 MySQL 会将结果放在缓存中。</p>
+<p>MySQL 在关联执行完，开始返回第一行结果的时候，就可以给客户端返回响应了。所以MySQL 无需存储太多的结果，也不会消耗太多内存。这样也可以让 MySQL 客户端第一时间获得返回的结果。</p>
+<p>题外话：从这点来看，通常在 JDBC 里看到 last packet recieved 之类的错误，往往意味着 MySQL 一开始就没有返回任何数据。所以人们才怀疑连接才死了。注意区分 duration 和 fetch time。</p>
+<h2 id="MySQL-查询优化器的局限"><a href="#MySQL-查询优化器的局限" class="headerlink" title="MySQL 查询优化器的局限"></a>MySQL 查询优化器的局限</h2><h3 id="关联子查询"><a href="#关联子查询" class="headerlink" title="关联子查询"></a>关联子查询</h3><p>MySQL 的子查询实现得非常糟糕。我们期待着 in + 子查询 查询会先执行子查询，然后再查询原始 in 查询。</p>
+<p>但实际上 MySQL 会把 in 改写为 exists 查询，通过 explain extened 可以看到先执行了外部的查询，然后执行了第二个子查询，这个子查询为 dependent subquery。</p>
+<p>此处参考<a href="https://blog.csdn.net/zsx157326/article/details/80039235" target="_blank" rel="noopener">《MySQL关于in和exists的优化》</a>：<br>exist 的语义是将主查询的数据，放到子查询中做条件验证，根据验证结果（true或false Traditionally, an EXISTS subquery starts with SELECT *, but it could begin with SELECT 5 or SELECT column1 or anything at all. MySQL ignores the SELECT list in such a subquery, so it makes no difference.）来决定主查询的数据结果是否得以保留。in 的语义是确定给定的值是否与子查询或列表中的值相匹配。in在查询的时候，首先查询子查询的表，然后将内表和外表做一个笛卡尔积，然后按照条件进行筛选。in 是把外表和内表作hash 连接，而 exists 是对外表作loop循环，每次 loop 循环再对内表进行查询（<strong>笛卡尔积意味着 hash join</strong>）。一直以来认 为exists 比 in 效率高的说法是不准确的。<strong>所以外表比小表大的时候，应该用 in，反之应该使用 exists。</strong></p>
+<p>所以早期版本的 MySQL 查询优化不当，往往会让用户在 Server 层进行 hash join。另外一种方法是，把 in 的列表查询直接转化为 exist 查询（但其实 直接使用 in，MySQL 也会做等价查询，不知道为什么这样会产生优化。）。但对于当代的 MySQL 而言，直接使用 in，听任底层的查询优化器去优化是个好主意。</p>
+<h3 id="如何用好关联子查询"><a href="#如何用好关联子查询" class="headerlink" title="如何用好关联子查询"></a>如何用好关联子查询</h3><p>可不可以在 join 里面使用 subquery？可以。</p>
+<p>不要通过主观猜测，要用测试来验证猜想。</p>
+<h3 id="等值传递"><a href="#等值传递" class="headerlink" title="等值传递"></a>等值传递</h3><p>如果有一个查询是 where in + 用其他条件 join 其他表，MySQL 会把 in 也下推到其他表里。如果 in 很大，则 MySQL 实际执行会非常慢。</p>
+<h3 id="并行查询"><a href="#并行查询" class="headerlink" title="并行查询"></a>并行查询</h3><p>MySQL 无法对某个查询进行并行优化-这和我们经常可以在服务器层面进行的 fork-join 优化不一样。</p>
+<h3 id="哈希关联"><a href="#哈希关联" class="headerlink" title="哈希关联"></a>哈希关联</h3><p>当代版本的 MySQL 不支持哈希关联（但 8.0 以后的 MySQL 就支持了，Mariadb 很早就支持了）。我们可以使用哈希索引来巧妙地实现哈希关联。但正如我们上面看到的，使用了哈希索引就无法触发覆盖索引，也不能按值排序。</p>
+<h3 id="松散索引扫描"><a href="#松散索引扫描" class="headerlink" title="松散索引扫描"></a>松散索引扫描</h3><p>相当于 Oracle 中的跳跃索引扫描（skip index scan）。</p>
+<p>MySQL 8.0 才正式支持这一特性。</p>
+<h3 id="最大值和最小值优化"><a href="#最大值和最小值优化" class="headerlink" title="最大值和最小值优化"></a>最大值和最小值优化</h3><p>对于无索引的查询 min 和 max，可以使用 using index（pk） limit 1 的方式进行优化。</p>
+<h3 id="在同一个表上查询和更新"><a href="#在同一个表上查询和更新" class="headerlink" title="在同一个表上查询和更新"></a>在同一个表上查询和更新</h3><p>只有使用 deffered join 可以绕开 MySQL 的限制。</p>
+<h2 id="查询优化器的提示（hint）"><a href="#查询优化器的提示（hint）" class="headerlink" title="查询优化器的提示（hint）"></a>查询优化器的提示（hint）</h2><ul>
+<li>优先操作 HIGH_PRIORITY</li>
+</ul>
+<p>HIGH_PRIORITY可以使用在select和insert操作中，让MYSQL知道，这个操作优先进行。<br>SELECT HIGH_PRIORITY * FROM TABLE1;</p>
+<ul>
+<li>滞后操作 LOW_PRIORITY</li>
+</ul>
+<p>LOW_PRIORITY可以使用在select,delete,insert和update操作中，让mysql知道，这个操作滞后。<br>update LOW_PRIORITY table1 set field1= where field1= …</p>
+<p>这两个提示都只在基于表锁的存储引擎非常有效。在innoDB和其他基于行锁的存储引擎，你可能永远用不上。在MyISAM中使用它们时，也要十分小心，因为它们会让并发插入失效，可能会严重下降性能。</p>
+<ul>
+<li>延时插入 DELAYED</li>
+</ul>
+<p>这个操作只能用于 insert 和 replace<br>INSERT DELAYED INTO table1 set field1= …<br>INSERT DELAYED INTO，是客户端提交数据给MySQL，MySQL返回OK状态给客户端。而这是并不是已经将数据插入表，而是存储在内存里面等待排队。<br>当mysql有 空余时，再插入。另一个重要的好处是，来自许多客户端的插入被集中在一起，并被编写入一个块。这比执行许多独立的插入要快很多。<br>坏处是，不能返回自动递增 的ID，以及系统崩溃时，MySQL还没有来得及插入数据的话，这些数据将会丢失。并且导致last_insert_id()无法正常工作。</p>
+<ul>
+<li>强制连接顺序straight_join<br>SELECT TABLE1.FIELD1, TABLE2.FIELD2 FROM TABLE1 STRAIGHT_JOIN TABLE2 WHERE…;</li>
+</ul>
+<p>由上面的SQL语句可知，通过STRAIGHT_JOIN强迫MySQL按TABLE1、TABLE2的顺序连接表。如果你认为按自己的顺序比MySQL推荐的顺序进行连接的效率高的话，就可以通过STRAIGHT_JOIN来确定连接顺序。</p>
+<ul>
+<li>分组使用临时表 SQL_BIG_RESULT和SQL_SMALL_RESULT</li>
+</ul>
+<p>SELECT SQL_BUFFER_RESULT FIELD1, COUNT(*) FROM TABLE1 GROUP BY FIELD1;<br>这两个提示只对select语句有效，它们告诉优化器对 group by 或者 distinct 查询如何使用临时表及排序。<br>sql_small_result 告诉优化器结果集会很小，可以将结果集放在内存中的索引临时表，以避免排序操作；<br>sql_big_result 则告诉优化器结果集会很大，建议使用磁盘临时表做排序操作；</p>
+<ul>
+<li>强制使用临时表sql_buffer_result</li>
+</ul>
+<p>SELECT SQL_BUFFER_RESULT * FROM TABLE1 WHERE …;<br>这个提示告诉优化器将查询放入到一个临时表，然后尽可能地释放锁。这和前面提到的由客户端缓存结果不同。当你设法使用客户端缓存的时候，使用服务器端的缓存通常很有效。<br>带来的好处是无须在客户端消耗太多的内存，还可以尽可能快的释放对应的表锁。代价是，服务器端需要更多的内存。<br>查询缓冲<br>sql_cache 和 sql_no_cache<br>这个提示告诉mysql是否讲结果集缓存在查询缓存中。</p>
+<ul>
+<li>关闭查询缓冲 SQL_NO_CACHE</li>
+</ul>
+<p>SELECT SQL_NO_CACHE field1, field2 FROM TABLE1;</p>
+<p>有一些SQL语句需要实时地查询数据，或者并不经常使用(可能一天就执行一两次),这样就需要把缓冲关了,不管这条SQL语句是否被执行过，服务器都不会在缓冲区中查找，每次都会执行它。<br>强制查询缓冲 SQL_CACHE</p>
+<p>SELECT SQL_CALHE * FROM TABLE1;</p>
+<p>如果在my.ini中的query_cache_type设成2，这样只有在使用了SQL_CACHE后，才使用查询缓冲。<br>sql_calc_found_rows<br>严格来说，这并不是一个优化器提示。它不会告诉优化器任何关于执行计划的东西。<br>它会让mysql返回的结果集包含更多的信息。查询中加上该提示，mysql会计算出去limit子句后这个查询返回的结果集的总数。<br>而实际上只返回limit要求的结果集。可以通过函数found_row()获得这个值。</p>
+<ul>
+<li>锁相关 for update 和 lock in share mode</li>
+</ul>
+<p>这两个提示主要控制select 语句的锁机制。但只对实现了行级锁的存储引擎有效。使用该提示会对符合查询条件的数据加锁。<br>对于 insert…select 语句不需要这两个提示，因为会默认添加上锁。<br>唯一内置的支持这两个提示的引擎是innoDB。另外需要记住的是，这两个提示会让某些优化无法进行。例如索引覆盖扫描。<br>innoDB不能在不访问主键的情况下用排他锁锁定行，因为行的信息锁定在主键中。</p>
+<ul>
+<li>USE INDEX、IGNORE INDEX 和 FORCE INDEX</li>
+</ul>
+<p>USE INDEX 基本等于 FORCE INDEX，IGNORE INDEX 的语义和他们相反。</p>
+<h2 id="优化特定类型的查询"><a href="#优化特定类型的查询" class="headerlink" title="优化特定类型的查询"></a>优化特定类型的查询</h2><h3 id="优化-COUNT"><a href="#优化-COUNT" class="headerlink" title="优化 COUNT()"></a>优化 COUNT()</h3><p>COUNT() 的语义是，统计<strong>非空列</strong>。如果 COUNT() 里有表达式，则统计的是表达式有值的列。但因为 COUNT(<em>)的</em>不能为空，所以它会统计所有的行。</p>
+<p>如果 MySQL 坚信 COUNT(某列)中的某列不可能为空，它会把这个查询优化为COUNT(*)。</p>
+<p>某些情况下，如果查询的条件是互斥的，可以通过查询补集的数量来反推特定集合的数量。</p>
+<h3 id="优化关联查询"><a href="#优化关联查询" class="headerlink" title="优化关联查询"></a>优化关联查询</h3><ul>
+<li>如果查询 计划的关联顺序是 B、A，B 和 A 之间通过列 c 进行关联，<strong>则 B 上的 c 不需要加索引</strong>。</li>
+<li><strong>GROUP BY 和 ORDER BY 不要跨表找列，否则无法使用索引，而且必 filesort。</strong></li>
+<li>升级 MySQL 以后，关联的查询计划会发生变化。</li>
+</ul>
+<h3 id="优化子查询"><a href="#优化子查询" class="headerlink" title="优化子查询"></a>优化子查询</h3><p>虽然前面我们说过子查询不是不可以用。<br>但大多数情况下，<strong>子查询最好通过改写为 join（using、on，而不是 from 里的 select where）代替</strong>。</p>
+<h3 id="优化-GROUP-BY-和-DISTINCT"><a href="#优化-GROUP-BY-和-DISTINCT" class="headerlink" title="优化 GROUP BY 和 DISTINCT"></a>优化 GROUP BY 和 DISTINCT</h3><p>不要在 SELECT 中直接使用非分组列。</p>
+<h3 id="优化-LIMIT-分页"><a href="#优化-LIMIT-分页" class="headerlink" title="优化 LIMIT 分页"></a>优化 LIMIT 分页</h3><p>常见的几种方法：</p>
+<ul>
+<li>延迟查询：把 by 和 limit 下推到子查询里，order by 一定要命中索引，然后只查出 pk（即不回表），用 pk 查出所有列。</li>
+<li>计算出真正的边界值：where position between a 和 b。</li>
+<li>每次翻页的时候把上一次查询的时候的 id 查出来，然后在 id 的索引上进行其他 where 和 order by。</li>
+</ul>
+<p>这几种方法都不一定性能好。在更复杂的场景下，真正性能好的方法是构造索引表，索引表要包含的数据有：原始表的主键、排序列和查询条件列，查出真正的主键以后，再回表查一次原始表，得到所有目标列。</p>
+<h3 id="优化-SQL-CALC-FOUND-ROWS"><a href="#优化-SQL-CALC-FOUND-ROWS" class="headerlink" title="优化 SQL_CALC_FOUND_ROWS"></a>优化 SQL_CALC_FOUND_ROWS</h3><p>可以优化“找到的结果多余 1000 条”的场景。大部分场景下可能用不着。</p>
+<h3 id="优化-UNION-查询"><a href="#优化-UNION-查询" class="headerlink" title="优化 UNION 查询"></a>优化 UNION 查询</h3><p>MySQL 总是通过创建和填充临时表的方式来执行 UNION 查询。只要涉及临时表，就无法使用索引优化，所以需要尽量下推查询。</p>
+<p>除非确实需要服务器消除重复的行，否则一定要使用 UNION ALL。如果不这样做，MySQL 会隐式地给临时表加上 DISTINCT 选项，会导致对整个临时表的唯一性检查。</p>
+<h3 id="静态查询分析"><a href="#静态查询分析" class="headerlink" title="静态查询分析"></a>静态查询分析</h3><p>依赖于 pt-query-advisor。</p>
+<h3 id="使用用户自定义变量"><a href="#使用用户自定义变量" class="headerlink" title="使用用户自定义变量"></a>使用用户自定义变量</h3><p>用户自定义变量有诸多限制，很复杂，现实中的编程不应该使用。</p>
+<h2 id="案例学习"><a href="#案例学习" class="headerlink" title="案例学习"></a>案例学习</h2><h3 id="使用-MySQL-构建一个对列表"><a href="#使用-MySQL-构建一个对列表" class="headerlink" title="使用 MySQL 构建一个对列表"></a>使用 MySQL 构建一个对列表</h3><p>对列表有个常见的难题，就是随着列表越来越大和索引深度加深，找到未处理记录的速度会越来越慢。</p>
+<p>给出一张表：</p>
+ <figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"> <span class="keyword">CREATE</span> <span class="keyword">TABLE</span> unsent_emails (</span><br><span class="line"><span class="keyword">Id</span> <span class="built_in">INT</span> <span class="keyword">NOT</span> <span class="literal">NULL</span> PRIMARY <span class="keyword">KEY</span> AUTO_INCREMETN,</span><br><span class="line"><span class="comment">-- columns for the message, from, to subject, etc.</span></span><br><span class="line"><span class="keyword">status</span> ENUM(‘unsent’, ‘claimed’, ‘sent’),</span><br><span class="line">owner <span class="built_in">INT</span> <span class="keyword">UNSIGNED</span> <span class="keyword">NOT</span> <span class="literal">NULL</span> <span class="keyword">DEFAULT</span> <span class="number">0</span>,</span><br><span class="line">ts <span class="keyword">TIMESTAMP</span>,</span><br><span class="line"><span class="keyword">KEY</span> (ownet, <span class="keyword">status</span>, ts)</span><br><span class="line">);</span><br></pre></td></tr></table></figure>
+<p>这样表的通常的查询模式通常是加锁（带锁的钥匙加锁）：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">BEGIN</span>;</span><br><span class="line">    <span class="keyword">SELECT</span> <span class="keyword">id</span> <span class="keyword">FROM</span> unsent_emails</span><br><span class="line">    <span class="keyword">WHERE</span> owner=<span class="number">0</span> <span class="keyword">AND</span> <span class="keyword">status</span> = ‘unsent’</span><br><span class="line">    <span class="keyword">LIMIT</span> <span class="number">10</span> <span class="keyword">FOR</span> <span class="keyword">UPDATE</span>;</span><br><span class="line">    <span class="comment">-- RESULT: 123, 456, 789</span></span><br><span class="line">    <span class="keyword">UPDATE</span> unsent_emails</span><br><span class="line">    <span class="keyword">SET</span> <span class="keyword">status</span> = ‘claimed’, owner = CONNECTION_ID()</span><br><span class="line">    <span class="keyword">WHERE</span> <span class="keyword">id</span> <span class="keyword">IN</span>(<span class="number">123</span>, <span class="number">456</span>, <span class="number">789</span>);</span><br><span class="line"><span class="keyword">COMMIT</span>;</span><br></pre></td></tr></table></figure>
+<p>但这样整个事务的阻塞性太高了。我们使用阻塞事务归根结底是为了实现隔离。我们可以使用 where 条件隔离：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SET</span> AUTOCOMMIT = <span class="number">1</span>;</span><br><span class="line"><span class="keyword">COMMIT</span>;</span><br><span class="line"><span class="keyword">UPDATE</span> unsent_emails</span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">status</span> = ‘claimed’, owner = CONNECTION_ID()</span><br><span class="line"><span class="keyword">WHERE</span> owner = <span class="number">0</span> <span class="keyword">AND</span> <span class="keyword">status</span> = ‘unsent’</span><br><span class="line"><span class="keyword">LIMIT</span> <span class="number">10</span>;</span><br><span class="line"><span class="keyword">SELECT</span> <span class="keyword">id</span> <span class="keyword">FROM</span> unsent_emails</span><br><span class="line"><span class="keyword">WHERE</span> owner = CONNECTION_ID() <span class="keyword">AND</span> <span class="keyword">status</span> = ‘claimed’;</span><br><span class="line"><span class="comment">-- result: 123, 456, 789</span></span><br></pre></td></tr></table></figure>
+<p>但这种锁模式有个缺点，就是如果原始要处理这些记录的进程（持有特定的 CONNECTION_ID）突然退出，则需要定时扫描，将他们解锁。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">UPDATE</span> unsent_emails</span><br><span class="line"><span class="keyword">SET</span> owner = <span class="number">0</span>, <span class="keyword">status</span> = ‘unsent’</span><br><span class="line"><span class="keyword">WHERE</span> owner <span class="keyword">NOT</span> <span class="keyword">IN</span> (<span class="number">10</span>, <span class="number">20</span>, <span class="number">30</span>) <span class="keyword">AND</span> <span class="keyword">status</span> = ‘claimed’</span><br><span class="line"><span class="keyword">AND</span> ts &lt; <span class="keyword">CURRENT_TIMESTAMP</span> – <span class="built_in">INTERVAL</span> <span class="number">10</span> <span class="keyword">MINUTE</span>;</span><br></pre></td></tr></table></figure>
+<p>总结一下这个案例中的基础原则：</p>
+<ul>
+<li>尽量少做事。</li>
+<li>尽可能快地完成需要做的事情。用 UPDATE 代替 SELECT FOR UPDATE。</li>
+<li>如果查询无法被优化，则我们需要使用不同的查询或者不同的策略去实现相同的目的。</li>
+</ul>
+<h3 id="计算两点之间的距离"><a href="#计算两点之间的距离" class="headerlink" title="计算两点之间的距离"></a>计算两点之间的距离</h3><p>省略</p>
+<h3 id="使用用户自定义函数"><a href="#使用用户自定义函数" class="headerlink" title="使用用户自定义函数"></a>使用用户自定义函数</h3><p>省略。</p>
+<h2 id="总结-3"><a href="#总结-3" class="headerlink" title="总结"></a>总结</h2><p>如果把创建高性能应用程序比作是一个环环相扣的“谜题”，除了 schema、索引和查询语句设计之外，查询优化应该是“解开难题”的最后一步了。</p>
+<p>除此之外的原则：不做，少做，快速地做（一定要加上测试）。</p>
 
           
         
