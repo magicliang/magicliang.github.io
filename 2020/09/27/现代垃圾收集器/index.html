@@ -108,7 +108,10 @@
 <meta property="og:image" content="http://yoursite.com/2020/09/27/现代垃圾收集器/g1-younggc-log.png">
 <meta property="og:image" content="http://yoursite.com/2020/09/27/现代垃圾收集器/global-concurrent-marking.png">
 <meta property="og:image" content="http://yoursite.com/2020/09/27/现代垃圾收集器/zgc%20过程.png">
-<meta property="og:updated_time" content="2020-09-29T09:53:20.307Z">
+<meta property="og:image" content="http://yoursite.com/2020/09/27/现代垃圾收集器/zgc%20的%2064%20位地址空间.png">
+<meta property="og:image" content="http://yoursite.com/2020/09/27/现代垃圾收集器/着色指针.png">
+<meta property="og:image" content="http://yoursite.com/2020/09/27/现代垃圾收集器/zgc%20并发标记示范.png">
+<meta property="og:updated_time" content="2020-09-29T11:15:56.508Z">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="现代垃圾收集器">
 <meta name="twitter:description" content="所有的垃圾收集器，都基于弱分代假设。实际的垃圾回收效率取决于堆内对象的分布状况。垃圾回收并不能解决内存泄漏或者应用程序逻辑的不良分配习惯问题，要处理 JVM 内存回收问题的根本方法是对程序进行调优：  减少临时对象，尽量复用内存 使用对象池 主动提前释放对象 主动 gc  其他情况，可以通过 tuning garbage collector 来解决。 CMSCMS 的垃圾收集器默认在新生代就使用">
@@ -463,6 +466,37 @@
 <p>ZGC只有三个STW阶段：初始标记，再标记，初始转移。其中，初始标记和初始转移分别都只需要扫描所有GC Roots，其处理时间和GC<br>Roots的数量成正比，一般情况耗时非常短；再标记阶段STW时间很短，最多1ms，超过1ms则再次进入并发标记阶段。即，ZGC几乎所有暂停都只依赖于GC<br>Roots集合大小，停顿时间不会随着堆的大小或者活跃对象的大小而增加。与ZGC对比，G1的转移阶段完全STW的，且停顿时间随存活对象的大小增加而增加。</p>
 <p>ZGC通过着色指针和读屏障技术，解决了转移过程中准确访问对象的问题，实现了并发转移。大致原理描述如下：并发转移中“并发”意味着GC线程在转移对象的过程中，应用线程也在不停地访问对象。假设对象发生转移，但对象地址未及时更新，那么应用线程可能访问到旧地址，从而造成错误。而在ZGC中，应用线程访问对象将触发“读屏障”，如果发现对象被移动了，那么“读屏障”会把读出来的指针更新到对象的新地址上，这样应用线程始终访问的都是对象的新地址。那么，JVM是如何判断对象被移动过呢？就是利用对象引用的地址，即着色指针。下面介绍着色指针和读屏障技术细节。</p>
 </blockquote>
+<h2 id="着色指针"><a href="#着色指针" class="headerlink" title="着色指针"></a>着色指针</h2><p><img src="zgc 的 64 位地址空间.png" alt="zgc 的 64 位地址空间.png"></p>
+<blockquote>
+<p>其中，[0~4TB) 对应Java堆，[4TB ~ 8TB) 称为M0地址空间，[8TB ~ 12TB) 称为M1地址空间，[12TB ~<br>16TB) 预留未使用，[16TB ~ 20TB) 称为Remapped空间。</p>
+<p>当应用程序创建对象时，首先在堆空间申请一个虚拟地址，但该虚拟地址并不会映射到真正的物理地址。ZGC同时会为该对象在M0、M1和Remapped地址空间分别申请一个虚拟地址，且这三个虚拟地址对应同一个物理地址，但这三个空间在同一时间有且只有一个空间有效。ZGC之所以设置三个虚拟地址空间，是因为它使用“空间换时间”思想，去降低GC停顿时间。“空间换时间”中的空间是虚拟空间，而不是真正的物理空间。后续章节将详细介绍这三个空间的切换过程。</p>
+<p>与上述地址空间划分相对应，ZGC实际仅使用64位地址空间的第0~41位，而第42~45位存储元数据，第47~63位固定为0。</p>
+</blockquote>
+<p><img src="着色指针.png" alt="着色指针.png"></p>
+<blockquote>
+<p>ZGC将对象存活信息存储在42~45位中，这与传统的垃圾回收并将对象存活信息放在对象头中完全不同。</p>
+</blockquote>
+<h2 id="读屏障"><a href="#读屏障" class="headerlink" title="读屏障"></a>读屏障</h2><blockquote>
+<p>读屏障是JVM向应用代码插入一小段代码的技术。当应用线程从堆中读取对象引用时，就会执行这段代码。需要注意的是，仅“从堆中读取对象引用”才会触发这段代码。</p>
+</blockquote>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">Object o = obj.FieldA   <span class="comment">// 从堆中读取引用，需要加入屏障</span></span><br><span class="line">&lt;Load barrier&gt;</span><br><span class="line">Object p = o  <span class="comment">// 无需加入屏障，因为不是从堆中读取引用</span></span><br><span class="line">o.dosomething() <span class="comment">// 无需加入屏障，因为不是从堆中读取引用</span></span><br><span class="line"><span class="keyword">int</span> i =  obj.FieldB  <span class="comment">//无需加入屏障，因为不是对象引用</span></span><br></pre></td></tr></table></figure>
+<blockquote>
+<p>ZGC中读屏障的代码作用：在对象标记和转移过程中，用于确定对象的引用地址是否满足条件，并作出相应动作。</p>
+</blockquote>
+<h2 id="ZGC并发处理演示"><a href="#ZGC并发处理演示" class="headerlink" title="ZGC并发处理演示"></a>ZGC并发处理演示</h2><blockquote>
+<p>接下来详细介绍ZGC一次垃圾回收周期中地址视图的切换过程：</p>
+<ul>
+<li>初始化：ZGC初始化之后，整个内存空间的地址视图被设置为Remapped。程序正常运行，在内存中分配对象，满足一定条件后垃圾回收启动，此时进入标记阶段。</li>
+<li>并发标记阶段：第一次进入标记阶段时视图为M0，如果对象被GC标记线程或者应用线程访问过，那么就将对象的地址视图从Remapped调整为M0。所以，在标记阶段结束之后，对象的地址要么是M0视图，要么是Remapped。如果对象的地址是M0视图，那么说明对象是活跃的；如果对象的地址是Remapped视图，说明对象是不活跃的。</li>
+<li>并发转移阶段：标记结束后就进入转移阶段，此时地址视图再次被设置为Remapped。如果对象被GC转移线程或者应用线程访问过，那么就将对象的地址视图从M0调整为Remapped。</li>
+</ul>
+<p>其实，在标记阶段存在两个地址视图M0和M1，上面的过程显示只用了一个地址视图。之所以设计成两个，是为了区别前一次标记和当前标记。也即，第二次进入并发标记阶段后，地址视图调整为M1，而非M0。</p>
+<p>着色指针和读屏障技术不仅应用在并发转移阶段，还应用在并发标记阶段：将对象设置为已标记，传统的垃圾回收器需要进行一次内存访问，并将对象存活信息放在对象头中；而在ZGC中，只需要设置指针地址的第42~45位即可，并且因为是寄存器访问，所以速度比访问内存更快。</p>
+</blockquote>
+<p>注意可能会有多轮并发标记。</p>
+<p><img src="zgc 并发标记示范.png" alt="zgc 并发标记示范.png"></p>
+<pre><code class="java">
+</code></pre>
 <p>参考：</p>
 <ol>
 <li><a href="https://tech.meituan.com/2020/08/06/new-zgc-practice-in-meituan.html" target="_blank" rel="noopener">《新一代垃圾回收器ZGC的探索与实践》</a></li>
@@ -673,7 +707,7 @@
             
 
             
-              <div class="post-toc-content"><ol class="nav"><li class="nav-item nav-level-1"><a class="nav-link" href="#CMS"><span class="nav-number">1.</span> <span class="nav-text">CMS</span></a></li><li class="nav-item nav-level-1"><a class="nav-link" href="#G1"><span class="nav-number">2.</span> <span class="nav-text">G1</span></a></li><li class="nav-item nav-level-1"><a class="nav-link" href="#ZGC"><span class="nav-number">3.</span> <span class="nav-text">ZGC</span></a></li></ol></div>
+              <div class="post-toc-content"><ol class="nav"><li class="nav-item nav-level-1"><a class="nav-link" href="#CMS"><span class="nav-number">1.</span> <span class="nav-text">CMS</span></a></li><li class="nav-item nav-level-1"><a class="nav-link" href="#G1"><span class="nav-number">2.</span> <span class="nav-text">G1</span></a></li><li class="nav-item nav-level-1"><a class="nav-link" href="#ZGC"><span class="nav-number">3.</span> <span class="nav-text">ZGC</span></a><ol class="nav-child"><li class="nav-item nav-level-2"><a class="nav-link" href="#着色指针"><span class="nav-number">3.1.</span> <span class="nav-text">着色指针</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#读屏障"><span class="nav-number">3.2.</span> <span class="nav-text">读屏障</span></a></li><li class="nav-item nav-level-2"><a class="nav-link" href="#ZGC并发处理演示"><span class="nav-number">3.3.</span> <span class="nav-text">ZGC并发处理演示</span></a></li></ol></li></ol></div>
             
 
           </div>
