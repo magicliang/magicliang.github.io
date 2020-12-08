@@ -71,6 +71,363 @@
       <div class="outer">
         <section id="main">
   
+    <article id="post-ThreadLocal-的设计模式" class="article article-type-post" itemscope itemprop="blogPost">
+  <div class="article-meta">
+    <a href="/2020/04/01/ThreadLocal-的设计模式/" class="article-date">
+  <time datetime="2020-04-01T12:29:29.000Z" itemprop="datePublished">2020-04-01</time>
+</a>
+    
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 itemprop="name">
+      <a class="article-title" href="/2020/04/01/ThreadLocal-的设计模式/">ThreadLocal 的设计模式</a>
+    </h1>
+  
+
+      </header>
+    
+    <div class="article-entry" itemprop="articleBody">
+      
+        <!-- Table of Contents -->
+        
+        <h1 id="基础版本"><a href="#基础版本" class="headerlink" title="基础版本"></a>基础版本</h1><pre><code class="java">// 定义基础的 Context 类型
+public class ServerContext {
+}
+// 为这个基础类型装载一个 threadlocal 容器，然后为这个容器准备一个静态工具类
+public class Context {
+    // 这个容器如果是泛型的（如存储 dapper 的 trace 或者 span），可以考虑用 T 或者用 Object。
+    private static final ThreadLocal&lt;Object&gt; SERVER_CONTEXT = new ThreadLocal&lt;Object&gt;();
+
+    public static Object getServerContext() {
+        return SERVER_CONTEXT.get();
+    }
+
+    public static void setServerContext(Object obj) {
+        SERVER_CONTEXT.set(obj);
+    }
+
+    public static void removeServerContext() {
+        SERVER_CONTEXT.remove();
+    }
+}
+
+// 一个更大的 context，来汇总各种容器工具类
+public class BizContext {
+
+    public static void setCurrentServerContext(final ServerContext span) {
+        // 注意这里把 null 拿来 clear，而不是直接 put 的逻辑，类似 spring 的例子
+        if (span == null) {
+            Context.removeServerContext();
+        } else {
+            Context.setServerContext(span);
+        }
+    }
+}
+</code></pre>
+<h1 id="用-map-来取消第一层工具类的方案（map-容易腐化）"><a href="#用-map-来取消第一层工具类的方案（map-容易腐化）" class="headerlink" title="用 map 来取消第一层工具类的方案（map 容易腐化）"></a>用 map 来取消第一层工具类的方案（map 容易腐化）</h1><pre><code class="java">public class ContextFactory {
+
+    /**
+     * 私有构造器
+     */
+    protected ContextFactory() {
+        // no op
+    }
+
+    /**
+     * 上下文持有器
+     * 全局静态变量，保存真正的交易上下文。因为是静态成员，所以无法引用每个实例特有的类型实参。
+     * withInitial 没有被重载过，必须赋值给 ThreadLocal 类型，面向抽象类型编程更好。
+     */
+    private static final ThreadLocal&lt;Map&lt;String, Object&gt;&gt; CONTEXT_HOLDER = InheritableThreadLocal.withInitial(() -&gt; new ConcurrentHashMap&lt;&gt;(CONTEXT_CACHE_SIZE));
+
+    /**
+     * 清理本线程上下文的内容
+     */
+    public static void clear() {
+        CONTEXT_HOLDER.remove();
+    }
+
+    /**
+     * 获取上下文持有器
+     *
+     * @return 上下文持有器
+     */
+    public static ThreadLocal&lt;Map&lt;String, Object&gt;&gt; getContextHolder() {
+        return CONTEXT_HOLDER;
+    }
+}
+
+public class InsTransactionContextFactory extends ContextFactory {
+
+    /**
+     * 私有构造器
+     */
+    private InsTransactionContextFactory() {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * InsTransactionContext key
+     */
+    private static final String INS_TRANSACTION_CONTEXT_KEY = &quot;InsTransactionContext&quot;;
+
+    /**
+     * 静态工厂方法，获取交易上下文实例。
+     * 正确的使用实践，是在第一次 getInstance 的时候就 initContext - 免得接下来的使用出问题
+     * 因为线程封闭和线程隔离，这里无需加锁和 double check
+     *
+     * @return 交易上下文实例
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public static &lt;R, T extends TransactionModel&gt; InsTransactionContext&lt;R, T&gt; getInsTransactionContext() {
+        // 1. 获取当前上下文的映射表
+        Map&lt;String, Object&gt; realContextHolder = getContextHolder().get();
+        if (null == realContextHolder) {
+            realContextHolder = new ConcurrentHashMap&lt;&gt;(CONTEXT_CACHE_SIZE);
+            getContextHolder().set(realContextHolder);
+        }
+        InsTransactionContext&lt;R, T&gt; realContext;
+        Object mapValue = realContextHolder.get(INS_TRANSACTION_CONTEXT_KEY);
+        // instanceof 包含 != null 的检查
+        if (mapValue instanceof InsTransactionContext) {
+            // 1. 如果持有这个上下文的类型是InsTransactionContext，直接 type casting
+            realContext = (InsTransactionContext&lt;R, T&gt;) mapValue;
+        } else {
+            // 2. 否则使用标准类型覆盖原有 value
+            realContext = new InsTransactionContext&lt;&gt;();
+            realContextHolder.put(INS_TRANSACTION_CONTEXT_KEY, realContext);
+        }
+        return realContext;
+    }
+</code></pre>
+<p>对这个 map 的加强版本</p>
+<pre><code class="java">@Override
+    public void put(final String key, final String value) {
+        if (!useMap) {
+            return;
+        }
+        Map&lt;String, String&gt; map = localMap.get();
+        map = map == null ? new HashMap&lt;String, String&gt;(1) : new HashMap&lt;&gt;(map);
+        map.put(key, value);
+        localMap.set(Collections.unmodifiableMap(map));
+    }
+</code></pre>
+<p>绑定一个容器到线程上，并重建上一个状态-状态里还带有另一个 previous。</p>
+<pre><code class="java">private void bindToThread() {
+            // Expose current TransactionStatus, preserving any existing TransactionStatus
+            // for restoration after this transaction is complete.
+            this.oldTransactionInfo = transactionInfoHolder.get();
+            transactionInfoHolder.set(this);
+        }
+
+        private void restoreThreadLocalStatus() {
+            // Use stack to restore old transaction TransactionInfo.
+            // Will be null if none was set.
+            transactionInfoHolder.set(this.oldTransactionInfo);
+        }
+</code></pre>
+<h1 id="ThreadLocal-变策略模式"><a href="#ThreadLocal-变策略模式" class="headerlink" title="ThreadLocal 变策略模式"></a>ThreadLocal 变策略模式</h1><pre><code class="java">// 不要使用 map，要把多个 threadlocal 用具体的类型区隔开来，每个类型配一个 threadlocal
+
+final class InheritableThreadLocalSecurityContextHolderStrategy implements
+        SecurityContextHolderStrategy {
+    // ~ Static fields/initializers
+    // =====================================================================================
+
+    private static final ThreadLocal&lt;SecurityContext&gt; contextHolder = new InheritableThreadLocal&lt;&gt;();
+
+    // ~ Methods
+    // ========================================================================================================
+
+    public void clearContext() {
+        contextHolder.remove();
+    }
+
+    public SecurityContext getContext() {
+        SecurityContext ctx = contextHolder.get();
+
+        if (ctx == null) {
+            ctx = createEmptyContext();
+            contextHolder.set(ctx);
+        }
+
+        return ctx;
+    }
+
+    public void setContext(SecurityContext context) {
+        Assert.notNull(context, &quot;Only non-null SecurityContext instances are permitted&quot;);
+        contextHolder.set(context);
+    }
+
+    public SecurityContext createEmptyContext() {
+        return new SecurityContextImpl();
+    }
+}
+
+public class SecurityContextHolder {
+    // ~ Static fields/initializers
+    // =====================================================================================
+
+    public static final String MODE_THREADLOCAL = &quot;MODE_THREADLOCAL&quot;;
+    public static final String MODE_INHERITABLETHREADLOCAL = &quot;MODE_INHERITABLETHREADLOCAL&quot;;
+    public static final String MODE_GLOBAL = &quot;MODE_GLOBAL&quot;;
+    public static final String SYSTEM_PROPERTY = &quot;spring.security.strategy&quot;;
+    private static String strategyName = System.getProperty(SYSTEM_PROPERTY);
+    private static SecurityContextHolderStrategy strategy;
+    private static int initializeCount = 0;
+
+    static {
+        initialize();
+    }
+
+    // ~ Methods
+    // ========================================================================================================
+
+    /**
+     * Explicitly clears the context value from the current thread.
+     */
+    public static void clearContext() {
+        strategy.clearContext();
+    }
+
+    /**
+     * Obtain the current &lt;code&gt;SecurityContext&lt;/code&gt;.
+     *
+     * @return the security context (never &lt;code&gt;null&lt;/code&gt;)
+     */
+    public static SecurityContext getContext() {
+        return strategy.getContext();
+    }
+
+    /**
+     * Primarily for troubleshooting purposes, this method shows how many times the class
+     * has re-initialized its &lt;code&gt;SecurityContextHolderStrategy&lt;/code&gt;.
+     *
+     * @return the count (should be one unless you&#39;ve called
+     * {@link #setStrategyName(String)} to switch to an alternate strategy.
+     */
+    public static int getInitializeCount() {
+        return initializeCount;
+    }
+
+    private static void initialize() {
+        if (!StringUtils.hasText(strategyName)) {
+            // Set default
+            strategyName = MODE_THREADLOCAL;
+        }
+
+        if (strategyName.equals(MODE_THREADLOCAL)) {
+            strategy = new ThreadLocalSecurityContextHolderStrategy();
+        }
+        else if (strategyName.equals(MODE_INHERITABLETHREADLOCAL)) {
+            strategy = new InheritableThreadLocalSecurityContextHolderStrategy();
+        }
+        else if (strategyName.equals(MODE_GLOBAL)) {
+            strategy = new GlobalSecurityContextHolderStrategy();
+        }
+        else {
+            // Try to load a custom strategy
+            try {
+                Class&lt;?&gt; clazz = Class.forName(strategyName);
+                Constructor&lt;?&gt; customStrategy = clazz.getConstructor();
+                strategy = (SecurityContextHolderStrategy) customStrategy.newInstance();
+            }
+            catch (Exception ex) {
+                ReflectionUtils.handleReflectionException(ex);
+            }
+        }
+
+        initializeCount++;
+    }
+
+    /**
+     * Associates a new &lt;code&gt;SecurityContext&lt;/code&gt; with the current thread of execution.
+     *
+     * @param context the new &lt;code&gt;SecurityContext&lt;/code&gt; (may not be &lt;code&gt;null&lt;/code&gt;)
+     */
+    public static void setContext(SecurityContext context) {
+        strategy.setContext(context);
+    }
+
+    /**
+     * Changes the preferred strategy. Do &lt;em&gt;NOT&lt;/em&gt; call this method more than once for
+     * a given JVM, as it will re-initialize the strategy and adversely affect any
+     * existing threads using the old strategy.
+     *
+     * @param strategyName the fully qualified class name of the strategy that should be
+     * used.
+     */
+    public static void setStrategyName(String strategyName) {
+        SecurityContextHolder.strategyName = strategyName;
+        initialize();
+    }
+
+    /**
+     * Allows retrieval of the context strategy. See SEC-1188.
+     *
+     * @return the configured strategy for storing the security context.
+     */
+    public static SecurityContextHolderStrategy getContextHolderStrategy() {
+        return strategy;
+    }
+
+    /**
+     * Delegates the creation of a new, empty context to the configured strategy.
+     */
+    public static SecurityContext createEmptyContext() {
+        return strategy.createEmptyContext();
+    }
+
+    @Override
+    public String toString() {
+        return &quot;SecurityContextHolder[strategy=&#39;&quot; + strategyName + &quot;&#39;; initializeCount=&quot;
+                + initializeCount + &quot;]&quot;;
+    }
+}
+</code></pre>
+<h1 id="带名字的-ThreadLocal"><a href="#带名字的-ThreadLocal" class="headerlink" title="带名字的 ThreadLocal"></a>带名字的 ThreadLocal</h1><pre><code class="java">public class NamedThreadLocal&lt;T&gt; extends ThreadLocal&lt;T&gt; {
+
+    private final String name;
+
+
+    /**
+     * Create a new NamedThreadLocal with the given name.
+     * @param name a descriptive name for this ThreadLocal
+     */
+    public NamedThreadLocal(String name) {
+        Assert.hasText(name, &quot;Name must not be empty&quot;);
+        this.name = name;
+    }
+
+    @Override
+    public String toString() {
+        return this.name;
+    }
+
+}
+</code></pre>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="http://yoursite.com/2020/04/01/ThreadLocal-的设计模式/" data-id="ckifkfwf400buaca1mngcaemc" class="article-share-link">分享</a>
+      
+      
+      
+  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Java/">Java</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/设计模式/">设计模式</a></li></ul>
+
+    </footer>
+  </div>
+  
+</article>
+ 
+
+
+  
     <article id="post-Java-注解和配置" class="article article-type-post" itemscope itemprop="blogPost">
   <div class="article-meta">
     <a href="/2020/03/29/Java-注解和配置/" class="article-date">
@@ -1403,7 +1760,7 @@ random.uuid=${random.uuid}
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/03/29/Java-注解和配置/" data-id="ckifk9ofd00bmc3a1vu4mla8e" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/03/29/Java-注解和配置/" data-id="ckifkfwf600byaca1qca27x22" class="article-share-link">分享</a>
       
       
       
@@ -1446,7 +1803,7 @@ random.uuid=${random.uuid}
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/03/29/Mac-使用技巧/" data-id="ckifk9of800bhc3a10m18qimf" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/03/29/Mac-使用技巧/" data-id="ckifkfwf000bnaca1alxo77bg" class="article-share-link">分享</a>
       
       
       
@@ -1569,7 +1926,7 @@ public List&lt;User&gt; getUsers(Collection&lt;Integer&gt; userIds) {
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/03/23/Optional-的正确用法/" data-id="ckifk9of700bfc3a1yggqftrh" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/03/23/Optional-的正确用法/" data-id="ckifkfwey00biaca1rry9j4vd" class="article-share-link">分享</a>
       
       
       
@@ -2425,7 +2782,7 @@ public class DefaultCustomerService implements CustomerService {
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/03/23/缓存的套路/" data-id="ckifk9of900bjc3a13fb7zmdk" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/03/23/缓存的套路/" data-id="ckifkfwf100bpaca158k4g2w8" class="article-share-link">分享</a>
       
       
       
@@ -2499,7 +2856,7 @@ public class DefaultCustomerService implements CustomerService {
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/03/21/5why分析法/" data-id="ckifk9of600bcc3a1d3bp6zmd" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/03/21/5why分析法/" data-id="ckifkfwez00bkaca1f78rpirc" class="article-share-link">分享</a>
       
       
       
@@ -2568,7 +2925,7 @@ public class DefaultCustomerService implements CustomerService {
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/03/13/Java-线程状态切换/" data-id="ckifk9of400b7c3a1wkpi1bbb" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/03/13/Java-线程状态切换/" data-id="ckifkfwew00bdaca1g1gv1v3o" class="article-share-link">分享</a>
       
       
       
@@ -2611,7 +2968,7 @@ public class DefaultCustomerService implements CustomerService {
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/03/13/认证要素/" data-id="ckifk9of500bac3a1ce85kzqz" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/03/13/认证要素/" data-id="ckifkfwex00bfaca1i0vxinfk" class="article-share-link">分享</a>
       
       
       
@@ -2806,7 +3163,7 @@ public class A {
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/03/11/Java-Logging/" data-id="ckifk9of100b2c3a1rjxegslz" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/03/11/Java-Logging/" data-id="ckifkfwev00baaca1mtyfr97a" class="article-share-link">分享</a>
       
       
       
@@ -2882,236 +3239,11 @@ public class A {
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/03/11/maven-enforcer-plugin-解决包冲突设计方案/" data-id="ckifk9of300b5c3a1dzoei21x" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/03/11/maven-enforcer-plugin-解决包冲突设计方案/" data-id="ckifkfweu00b8aca1z1drgayy" class="article-share-link">分享</a>
       
       
       
   <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Java/">Java</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/maven/">maven</a></li></ul>
-
-    </footer>
-  </div>
-  
-</article>
- 
-
-
-  
-    <article id="post-JMX-深度历险" class="article article-type-post" itemscope itemprop="blogPost">
-  <div class="article-meta">
-    <a href="/2020/03/08/JMX-深度历险/" class="article-date">
-  <time datetime="2020-03-08T05:14:53.000Z" itemprop="datePublished">2020-03-08</time>
-</a>
-    
-  </div>
-  <div class="article-inner">
-    
-    
-      <header class="article-header">
-        
-  
-    <h1 itemprop="name">
-      <a class="article-title" href="/2020/03/08/JMX-深度历险/">JMX 深度历险</a>
-    </h1>
-  
-
-      </header>
-    
-    <div class="article-entry" itemprop="articleBody">
-      
-        <!-- Table of Contents -->
-        
-        <h1 id="JMX-常见指标"><a href="#JMX-常见指标" class="headerlink" title="JMX 常见指标"></a>JMX 常见指标</h1><h2 id="JVM-指标"><a href="#JVM-指标" class="headerlink" title="JVM 指标"></a>JVM 指标</h2><h3 id="系统指标"><a href="#系统指标" class="headerlink" title="系统指标"></a>系统指标</h3><table>
-<thead>
-<tr>
-<th style="text-align:center">System 相关指标</th>
-<th style="text-align:center">描述</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td style="text-align:center">system.load.average</td>
-<td style="text-align:center">系统load，如果是docker，此指标收集的物理机的load</td>
-</tr>
-<tr>
-<td style="text-align:center">cpu.system.load.percent</td>
-<td style="text-align:center">系统所有进程占用cpu的百分比</td>
-</tr>
-<tr>
-<td style="text-align:center">cpu.jvm.load.percent</td>
-<td style="text-align:center">jvm占用cpu的百分比</td>
-</tr>
-<tr>
-<td style="text-align:center">system.process.used.phyical.memory</td>
-<td style="text-align:center">系统使用的物理内存</td>
-</tr>
-<tr>
-<td style="text-align:center">system.process.used.swap.size</td>
-<td style="text-align:center">系统使用的swap内存</td>
-</tr>
-</tbody>
-</table>
-<h3 id="JVM-内存指标"><a href="#JVM-内存指标" class="headerlink" title="JVM 内存指标"></a>JVM 内存指标</h3><table>
-<thead>
-<tr>
-<th style="text-align:center">JVM相关指标</th>
-<th style="text-align:center">描述</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td style="text-align:center">jvm.gc.count</td>
-<td style="text-align:center">GC的次数</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.gc.time</td>
-<td style="text-align:center">GC的时间，单位毫秒</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.younggc.count</td>
-<td style="text-align:center">年轻代GC的次数 ，包括的GC算法（Copy，ParNew，PS Scavenge，G1 Young Generation）</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.younggc.time</td>
-<td style="text-align:center">年轻代GC的时间，单位毫秒</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.fullgc.count</td>
-<td style="text-align:center">年老代GC的次数，包括的GC算法</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.fullgc.time</td>
-<td style="text-align:center">年老代GC的时间，单位毫秒</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.used</td>
-<td style="text-align:center">内存使用总量</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.used.percent</td>
-<td style="text-align:center">内存使用总量占比</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.thread.count</td>
-<td style="text-align:center">JVM的线程数</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.thread.deadlock.count</td>
-<td style="text-align:center">deadlock线程数</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.nonheap.used</td>
-<td style="text-align:center">nonheap使用总量</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.nonheap.used.percent</td>
-<td style="text-align:center">nonheap使用总量占比</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.oldgen.used</td>
-<td style="text-align:center">oldgen使用总量</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.oldgen.used.percent</td>
-<td style="text-align:center">oldgen使用总量占比</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.oldgen.used.percent.after.fullgc</td>
-<td style="text-align:center">触发fullgc之后使用oldgen的内存使用占比,此时基本剩下不可以回收对象</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.eden.used</td>
-<td style="text-align:center">eden使用总量</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.eden.used.percent</td>
-<td style="text-align:center">eden使用总量占比</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.survivor.used</td>
-<td style="text-align:center">survivor使用总量</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.survivor.used.percent</td>
-<td style="text-align:center">survivor使用总量占比</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.perm.used</td>
-<td style="text-align:center">perm使用总量</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.memory.perm.used.percent</td>
-<td style="text-align:center">perm使用总量占比</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.nio.directbuffer.used</td>
-<td style="text-align:center">directbuffer使用总量,这个一般是nio一些框架会用到</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.nio.mapped.used</td>
-<td style="text-align:center">mapped使用总量，这个一般是使用java内存文件映射用到</td>
-</tr>
-</tbody>
-</table>
-<h3 id="线程指标"><a href="#线程指标" class="headerlink" title="线程指标"></a>线程指标</h3><table>
-<thead>
-<tr>
-<th style="text-align:center">JVM Thread 相关指标</th>
-<th style="text-align:center">描述</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td style="text-align:center">vm.thread.count</td>
-<td style="text-align:center">线程</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.thread.daemon.count</td>
-<td style="text-align:center">daemon线程数</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.thread.totalstarted.count</td>
-<td style="text-align:center">totalstarted线程数</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.thread.new.count</td>
-<td style="text-align:center">new线程数</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.thread.runnable.count</td>
-<td style="text-align:center">runnable线程数</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.thread.blocked.count</td>
-<td style="text-align:center">blocked线程数</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.thread.waiting.count</td>
-<td style="text-align:center">waiting线程数</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.thread.time_waiting.count</td>
-<td style="text-align:center">time_waiting线程数</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.thread.terminated.count</td>
-<td style="text-align:center">terminated线程数</td>
-</tr>
-<tr>
-<td style="text-align:center">jvm.thread.deadlock.count</td>
-<td style="text-align:center">deadlock线程数</td>
-</tr>
-</tbody>
-</table>
-<h1 id="jmx-bean"><a href="#jmx-bean" class="headerlink" title="jmx bean"></a>jmx bean</h1><p><a href="https://www.yourkit.com/docs/kb/" target="_blank" rel="noopener">https://www.yourkit.com/docs/kb/</a><br><a href="https://docs.oracle.com/javase/8/docs/technotes/guides/jmx/examples.html" target="_blank" rel="noopener">https://docs.oracle.com/javase/8/docs/technotes/guides/jmx/examples.html</a></p>
-
-      
-    </div>
-    <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/03/08/JMX-深度历险/" data-id="ckifk9oez00b0c3a1qpdguo9q" class="article-share-link">分享</a>
-      
-      
-      
-  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/JVM/">JVM</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Java/">Java</a></li></ul>
 
     </footer>
   </div>
@@ -3147,6 +3279,10 @@ public class A {
       <ul>
         
           <li>
+            <a href="/2020/12/08/活动保障性体系建设和实践的总结/">活动保障性体系建设和实践的总结</a>
+          </li>
+        
+          <li>
             <a href="/2020/12/02/服务治理组件笔记/">服务治理组件笔记</a>
           </li>
         
@@ -3160,10 +3296,6 @@ public class A {
         
           <li>
             <a href="/2020/11/23/《未来简史》/">《未来简史》</a>
-          </li>
-        
-          <li>
-            <a href="/2020/11/21/《人类群星闪烁时》/">《人类群星闪烁时》</a>
           </li>
         
       </ul>
