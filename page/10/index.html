@@ -71,6 +71,283 @@
       <div class="outer">
         <section id="main">
   
+    <article id="post-重述双亲委派模型" class="article article-type-post" itemscope itemprop="blogPost">
+  <div class="article-meta">
+    <a href="/2019/09/05/重述双亲委派模型/" class="article-date">
+  <time datetime="2019-09-05T06:41:05.000Z" itemprop="datePublished">2019-09-05</time>
+</a>
+    
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 itemprop="name">
+      <a class="article-title" href="/2019/09/05/重述双亲委派模型/">重述双亲委派模型</a>
+    </h1>
+  
+
+      </header>
+    
+    <div class="article-entry" itemprop="articleBody">
+      
+        <!-- Table of Contents -->
+        
+        <h2 id="何时加载类"><a href="#何时加载类" class="headerlink" title="何时加载类"></a>何时加载类</h2><ol>
+<li>遇到 new、getstatic、putstatic 等指令时。</li>
+<li>对类进行反射调用的时候。</li>
+<li>初始化某个类的子类的时候。</li>
+<li>虚拟机启动时会先加载设置的程序主类。</li>
+<li>使用 dynamic 动态语言支持等相关特性时。</li>
+</ol>
+<h2 id="从-Java-到-cpp-源码分析"><a href="#从-Java-到-cpp-源码分析" class="headerlink" title="从 Java 到 cpp 源码分析"></a>从 Java 到 cpp 源码分析</h2><blockquote>
+<p>JVM<br>默认用于加载用户程序的ClassLoader为AppClassLoader，不过无论是什么ClassLoader，它的根父类都是java.lang.ClassLoader。在上面那个例子中，loadClass（）方法最终会调用到ClassLoader.definClass1（）中，这是一个<br>Native 方法。</p>
+</blockquote>
+<pre><code class="java">static native Class&lt;?&gt; defineClass1(ClassLoader loader, String name, byte[] b, int off, int len,
+                                        ProtectionDomain pd, String source); 
+</code></pre>
+<blockquote>
+<p>definClass1（）对应的 JNI 方法为 Java_java_lang_ClassLoader_defineClass1（）。</p>
+</blockquote>
+<pre><code class="java">JNIEXPORT jclass JNICALL
+Java_java_lang_ClassLoader_defineClass1(JNIEnv *env,
+                                        jclass cls,
+                                        jobject loader,
+                                        jstring name,
+                                        jbyteArray data,
+                                        jint offset,
+                                        jint length,
+                                        jobject pd,
+                                        jstring source)
+{
+    ......
+    result = JVM_DefineClassWithSource(env, utfName, loader, body, length, pd, utfSource);
+    ......
+    return result;
+}
+</code></pre>
+<blockquote>
+<p>Java_java_lang_ClassLoader_defineClass1<br>主要是调用了JVM_DefineClassWithSource（）加载类，跟着源码往下走，会发现最终调用的是 jvm.cpp 中的<br>jvm_define_class_common（）方法。</p>
+</blockquote>
+<pre><code class="cpp">static jclass jvm_define_class_common(JNIEnv *env, const char *name,
+                                      jobject loader, const jbyte *buf,
+                                      jsize len, jobject pd, const char *source,
+                                      TRAPS) {
+  ......
+  ClassFileStream st((u1*)buf, len, source, ClassFileStream::verify);
+  Handle class_loader (THREAD, JNIHandles::resolve(loader));
+  if (UsePerfData) {
+    is_lock_held_by_thread(class_loader,
+                           ClassLoader::sync_JVMDefineClassLockFreeCounter(),
+                           THREAD);
+  }
+  Handle protection_domain (THREAD, JNIHandles::resolve(pd));
+  Klass* k = SystemDictionary::resolve_from_stream(class_name,
+                                                   class_loader,
+                                                   protection_domain,
+                                                   &amp;st,
+                                                   CHECK_NULL);
+  ......
+
+  return (jclass) JNIHandles::make_local(env, k-&gt;java_mirror());
+}
+</code></pre>
+<p>其上的步骤细分下来共三步：</p>
+<ol>
+<li>将 class 文件转化为字节流。</li>
+<li>求当前线程是否持有锁，并且显式地进入 protection_domain。</li>
+<li>将字节流转化成 Klass 的实例（class 文件在 JVM 中的内存代表），注册进 SystemDictionary 里。</li>
+</ol>
+<p>Klass 是 JVM 用来定义 Java Class 的数据结构。不过 Klass 只是一个基类，Java Class 真正的数据结构定义在 InstanceKlass 中。</p>
+<pre><code class="cpp">class InstanceKlass: public Klass {
+
+ protected:
+
+  Annotations*    _annotations;
+  ......
+  ConstantPool* _constants;
+  ......
+  Array&lt;jushort&gt;* _inner_classes;
+  ......
+  Array&lt;Method*&gt;* _methods;
+  Array&lt;Method*&gt;* _default_methods;
+  ......
+  Array&lt;u2&gt;*      _fields;
+}
+</code></pre>
+<p>这个类型定义了 Java 类的所有属性，包括注解、常量、内部类、方法、内部方法、字段等信息。<strong>这些信息本来被记录在 Class 文件中，</strong>，InstanceKlass 是 它的内存形式。</p>
+<p>可以和 Class 文件的结构图对比看。</p>
+<p><img src="https://s2.ax1x.com/2019/09/05/nmR3gP.jpg" alt="此处输入图片的描述"></p>
+<p>可以看到，在 class 文件里的 constant pool，只能映射到 InstanceKlass 里的 constant 上。</p>
+<h2 id="resolve-from-stream-详解"><a href="#resolve-from-stream-详解" class="headerlink" title="resolve_from_stream 详解"></a>resolve_from_stream 详解</h2><h3 id="判断是否允许并行加载类，并根据判断结果进行加锁"><a href="#判断是否允许并行加载类，并根据判断结果进行加锁" class="headerlink" title="判断是否允许并行加载类，并根据判断结果进行加锁"></a>判断是否允许并行加载类，并根据判断结果进行加锁</h3><pre><code class="cpp">bool DoObjectLock = true;
+if (is_parallelCapable(class_loader)) {
+  DoObjectLock = false;
+}
+ClassLoaderData* loader_data = register_loader(class_loader, CHECK_NULL);
+Handle lockObject = compute_loader_lock_object(class_loader, THREAD);
+check_loader_lock_contention(lockObject, THREAD);
+ObjectLocker ol(lockObject, THREAD, DoObjectLock);
+</code></pre>
+<p><strong>如果允许并行加载，则不会对ClassLoader进行加锁，只对SystemDictionary加锁。否则，便会利用 ObjectLocker 对ClassLoader 加锁，保证同一个ClassLoader在同一时刻只能加载一个类。</strong>ObjectLocker 会在其构造函数中获取锁，并在析构函数中释放锁。</p>
+<p>允许并行加载的好处便是精细化了锁粒度，这样可以在同一时刻加载多个Class文件。</p>
+<h3 id="解析文件流，生成-InstanceKlass"><a href="#解析文件流，生成-InstanceKlass" class="headerlink" title="解析文件流，生成 InstanceKlass"></a>解析文件流，生成 InstanceKlass</h3><pre><code class="cpp">InstanceKlass* k = NULL;
+
+k = KlassFactory::create_from_stream(st,
+                                         class_name,
+                                         loader_data,
+                                         protection_domain,
+                                         NULL, // host_klass
+                                         NULL, // cp_patches
+                                         CHECK_NULL);
+</code></pre>
+<h3 id="利用SystemDictionary注册生成的-Klass"><a href="#利用SystemDictionary注册生成的-Klass" class="headerlink" title="利用SystemDictionary注册生成的 Klass"></a>利用SystemDictionary注册生成的 Klass</h3><blockquote>
+<p>SystemDictionary 是用来帮助保存 ClassLoader 加载过的类信息的。准确点说，SystemDiction<br>并不是一个容器，真正用来保存类信息的容器是 Dictionary，每个 ClassLoaderData 都保存着一个私有的<br>Dictionary，而 SystemDictionary 只是一个拥有很多静态方法的工具类而已。</p>
+</blockquote>
+<p>注册的代码：</p>
+<pre><code class="cpp">if (is_parallelCapable(class_loader)) {
+  InstanceKlass* defined_k = find_or_define_instance_class(h_name, class_loader, k, THREAD);
+  if (!HAS_PENDING_EXCEPTION &amp;&amp; defined_k != k) {
+    // If a parallel capable class loader already defined this class, register &#39;k&#39; for cleanup.
+    assert(defined_k != NULL, &quot;Should have a klass if there&#39;s no exception&quot;);
+    loader_data-&gt;add_to_deallocate_list(k);
+    k = defined_k;
+  }
+} else {
+  define_instance_class(k, THREAD);
+}
+</code></pre>
+<p>如果允许并行加载，那么前面就不会对 ClassLoader 加锁，所以在同一时刻，可能对同一 Class 文件加载多次-但同一个 Class 必须在同一 ClassLoader 里保持唯一，所以先利用 SystemDictionary 查询 ClassLoader 是否已经加载过相同 Class。 </p>
+<ul>
+<li>如果已经加载过，那么就将刚刚加载的 InstanceKlass 加入待回收列表，并将 InstanceKlass * k 重新指向利用 SystemDictionary 查询到的 InstanceKlass。（<strong>允许重复加载，弃新存旧</strong>）</li>
+<li>如果没有查询到，那么就将刚刚加载的 InstanceKlass 注册到 ClassLoader的 Dictionary 中 中。</li>
+</ul>
+<p>如果禁止了并行加载，那么直接利用SystemDictionary将 InstanceKlass 注册到 ClassLoader的 Dictionary 中即可。<strong>此时由锁保证数据唯一性。</strong></p>
+<h2 id="ClassFileParser"><a href="#ClassFileParser" class="headerlink" title="ClassFileParser"></a>ClassFileParser</h2><p>resolve_from_stream（）最重要的是第二步，从文件流生成InstanceKlass，这依赖于调用 KlassFactory::create_from_stream（）方法：</p>
+<pre><code class="cpp">ClassFileParser parser(stream,
+                       name,
+                       loader_data,
+                       protection_domain,
+                       host_klass,
+                       cp_patches,
+                       ClassFileParser::BROADCAST, // publicity level
+                       CHECK_NULL);
+
+InstanceKlass* result = parser.create_instance_klass(old_stream != stream, CHECK_NULL);
+</code></pre>
+<p>这又依赖于 ClassFileParser。</p>
+<p><strong>ClassFileParser 加载Class文件的入口便是 create_instance_klass（）。顾名思义，用来创建InstanceKlass的。</strong></p>
+<p>create_instance_klass（）主要就干了两件事：</p>
+<ol>
+<li>为 InstanceKlass 分配内存：</li>
+</ol>
+<pre><code class="cpp">InstanceKlass* const ik =
+    InstanceKlass::allocate_instance_klass(*this, CHECK_NULL);
+</code></pre>
+<p>内存分配代码如下：</p>
+<pre><code class="cpp">const int size = InstanceKlass::size(parser.vtable_size(),
+                                       parser.itable_size(),
+                                       nonstatic_oop_map_size(parser.total_oop_map_count()),
+                                       parser.is_interface(),
+                                       parser.is_anonymous(),
+                                       should_store_fingerprint(parser.is_anonymous()));
+ClassLoaderData* loader_data = parser.loader_data();
+InstanceKlass* ik;
+ik = new (loader_data, size, THREAD) InstanceKlass(parser, InstanceKlass::_misc_kind_other);
+</code></pre>
+<p>这里首先计算了InstanceKlass在内存中的大小，要知道，这个大小在Class 文件编译后就被确定了。</p>
+<p>然后便 new 了一个新的 InstanceKlass 对象。这里并不是简单的在堆上分配内存，要注意的是Klass 对 new 操作符进行了重载：</p>
+<pre><code class="cpp">void* Klass::operator new(size_t size, ClassLoaderData* loader_data, size_t word_size, TRAPS) throw() {
+  return Metaspace::allocate(loader_data, word_size, MetaspaceObj::ClassType, THREAD);
+}
+</code></pre>
+<p>分配 InstanceKlass 的时候调用了 Metaspace::allocate（）：</p>
+<pre><code class="cpp">MetaWord* Metaspace::allocate(ClassLoaderData* loader_data, size_t word_size,
+                              MetaspaceObj::Type type, TRAPS) {
+  ......
+  MetadataType mdtype = (type == MetaspaceObj::ClassType) ? ClassType : NonClassType;
+  ......
+  MetaWord* result = loader_data-&gt;metaspace_non_null()-&gt;allocate(word_size, mdtype);
+  ......
+  return result;
+}
+</code></pre>
+<p>*<em>由此可见，InstanceKlass 是分配在 ClassLoader的 Metaspace（元空间） 的方法区中。从 JDK8 开始，HotSpot 就没有了永久代，类都分配在 Metaspace 中。Metaspace 和永久代不一样，采用的是 Native Memory，永久代由于受限于 MaxPermSize，所以当内存不够时会内存溢出。</em></p>
+<ol start="2">
+<li>分析Class文件，填充 InstanceKlass 内存区域：</li>
+</ol>
+<pre><code class="cpp">fill_instance_klass(ik, changed_by_loadhook, CHECK_NULL);
+</code></pre>
+<p>ClassFileParser 在构造的时候就会开始分析Class文件，所以fill_instance_klass（）中只需要填充即可。填充结束后，还会调用 java_lang_Class::create_mirror（）创建 InstanceKlass 在Java 层的 Class 对象。<strong>双层对象。</strong></p>
+<pre><code class="cpp">void ClassFileParser::fill_instance_klass(InstanceKlass* ik, bool changed_by_loadhook, TRAPS) {
+  .....
+  ik-&gt;set_class_loader_data(_loader_data);
+  ik-&gt;set_nonstatic_field_size(_field_info-&gt;nonstatic_field_size);
+  ik-&gt;set_has_nonstatic_fields(_field_info-&gt;has_nonstatic_fields);
+  ik-&gt;set_static_oop_field_count(_fac-&gt;count[STATIC_OOP]);
+  ik-&gt;set_name(_class_name);
+  ......
+
+  java_lang_Class::create_mirror(ik,
+                                 Handle(THREAD, _loader_data-&gt;class_loader()),
+                                 module_handle,
+                                 _protection_domain,
+                                 CHECK);
+}
+</code></pre>
+<p>至此，系统保证了“不同ClassLoader加载的类是互相隔离的”。其基本流程为：每一个 classloader 有一个私有的 Dictionary，在加载类的过程中，Dictionary 有锁机制保证 InstanceKlass 的唯一性。如果存在不同的 ClassLoader 加载同一个 Class 文件，就会在内存里保存多份 InstanceKlass。而不同的 InstanceKlass 之间是不能相互强制转换的。</p>
+<pre><code class="java">public class Test {
+
+    public static void main(String[] args) throws Exception {
+        URL url[] = new URL[1];
+        url[0] = Thread.currentThread().getContextClassLoader().getResource(&quot;&quot;);
+
+        CustomClassloader customClassloader = new CustomClassloader(url);
+        Class clazz = customClassloader.loadClass(&quot;a.b.c&quot;);
+
+        Student student = (Student) clazz.newInstance();
+    }
+}
+</code></pre>
+<p>上述代码运行一定会出错。</p>
+<pre><code>Exception in thread &quot;main&quot; java.lang.ClassCastException:
+     a.b.c cannot be cast to a.b.c
+</code></pre><p>那是因为目标 a.b.c 类型存在于当前类加载器中，而 clazz 这个Class实例则存在于 customClassloader 中，它的 clazz.newInstance() 的类型本身不能跨类加载器相互转化。</p>
+<h2 id="一种-hack-技巧"><a href="#一种-hack-技巧" class="headerlink" title="一种 hack 技巧"></a>一种 hack 技巧</h2><pre><code class="java">public class Test {
+
+    public static void main(String[] args) throws Exception {
+        URL url[] = new URL[1];
+        url[0] = Thread.currentThread().getContextClassLoader().getResource(&quot;&quot;);
+        final CustomClassloader customClassloader = new CustomClassloader(url);
+        Thread.currentThread().setContextClassLoader(customClassloader);
+        Class clazz = customClassloader.loadClass(&quot;a.b.c&quot;);
+        Object object = clazz.newInstance();
+        Method method = clazz.getDeclaredMethod(&quot;test&quot;);
+        method.invoke(object);
+    }
+}
+
+</code></pre>
+<p>注意，这里面并不直接调用 c c = clazz.newInstance()，而是调用<br> Object object = clazz.newInstance()，并且必须使用反射才能调用 test。因为如果显式地使用了 C 这个类型，进行常量解析时，还是会跑到系统默认的 ClassLoader 加载的 C。</p>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="http://yoursite.com/2019/09/05/重述双亲委派模型/" data-id="ckil9yw4r007zfda1bui2l7wb" class="article-share-link">分享</a>
+      
+      
+      
+  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/JVM/">JVM</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Java/">Java</a></li></ul>
+
+    </footer>
+  </div>
+  
+</article>
+ 
+
+
+  
     <article id="post-《流水型-FO》笔记" class="article article-type-post" itemscope itemprop="blogPost">
   <div class="article-meta">
     <a href="/2019/09/02/《流水型-FO》笔记/" class="article-date">
@@ -114,7 +391,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/09/02/《流水型-FO》笔记/" data-id="ckik3we0w007ne5a1yw8mcibw" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/09/02/《流水型-FO》笔记/" data-id="ckil9yw4n007qfda1mrst5dof" class="article-share-link">分享</a>
       
       
       
@@ -232,7 +509,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/09/02/《结构化的思考、做事、成长》笔记/" data-id="ckik3we150082e5a1cxicy3hl" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/09/02/《结构化的思考、做事、成长》笔记/" data-id="ckil9yw4o007tfda1lfmbxslu" class="article-share-link">分享</a>
       
       
       
@@ -287,7 +564,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/09/02/《JVM-问题分析处理总结》笔记/" data-id="ckik3we0x007qe5a1ukp53fwb" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/09/02/《JVM-问题分析处理总结》笔记/" data-id="ckil9yw4m007mfda17mlvkzdq" class="article-share-link">分享</a>
       
       
       
@@ -357,7 +634,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/08/30/《高可用恢复思路》笔记/" data-id="ckik3we0v007le5a1ckd65kjo" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/08/30/《高可用恢复思路》笔记/" data-id="ckil9yw4n007ofda1scmqrt02" class="article-share-link">分享</a>
       
       
       
@@ -407,7 +684,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/08/30/how-to-recognize-domain/" data-id="ckik3we0u007ie5a12vbis8d2" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/08/30/how-to-recognize-domain/" data-id="ckil9yw4k007hfda1nie41gms" class="article-share-link">分享</a>
       
       
       
@@ -808,7 +1085,7 @@ flushall
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/07/22/Redis-笔记之四：常用命令/" data-id="ckik3we0y007se5a1gotmbkb9" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/07/22/Redis-笔记之四：常用命令/" data-id="ckil9yw4l007kfda1nv3vmgo1" class="article-share-link">分享</a>
       
       
       
@@ -862,7 +1139,7 @@ object encoding hello
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/07/22/Redis-笔记之三：数据结构和内部编码/" data-id="ckik3we0q007be5a1liyu9r5r" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/07/22/Redis-笔记之三：数据结构和内部编码/" data-id="ckil9yw4i007cfda18cr3v470" class="article-share-link">分享</a>
       
       
       
@@ -929,7 +1206,7 @@ object encoding hello
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/07/22/Redis-笔记之二：toolkit/" data-id="ckik3we0r007de5a10sdtch38" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/07/22/Redis-笔记之二：toolkit/" data-id="ckil9yw4j007ffda13nhgmrcj" class="article-share-link">分享</a>
       
       
       
@@ -1016,67 +1293,11 @@ object encoding hello
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/07/22/Redis-笔记之一：Redis-特性/" data-id="ckik3we0t007ge5a1mg5yj7az" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/07/22/Redis-笔记之一：Redis-特性/" data-id="ckil9yw4h007afda1skwxcz9g" class="article-share-link">分享</a>
       
       
       
   <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Redis/">Redis</a></li></ul>
-
-    </footer>
-  </div>
-  
-</article>
- 
-
-
-  
-    <article id="post-dc-笔记" class="article article-type-post" itemscope itemprop="blogPost">
-  <div class="article-meta">
-    <a href="/2019/04/08/dc-笔记/" class="article-date">
-  <time datetime="2019-04-08T15:24:22.000Z" itemprop="datePublished">2019-04-08</time>
-</a>
-    
-  </div>
-  <div class="article-inner">
-    
-    
-      <header class="article-header">
-        
-  
-    <h1 itemprop="name">
-      <a class="article-title" href="/2019/04/08/dc-笔记/">dc 笔记</a>
-    </h1>
-  
-
-      </header>
-    
-    <div class="article-entry" itemprop="articleBody">
-      
-        <!-- Table of Contents -->
-        
-        <h2 id="名词解释"><a href="#名词解释" class="headerlink" title="名词解释"></a>名词解释</h2><p>ldc logical data center<br>idc internet data center</p>
-<p>ldc 是 idc 的进化版，是一种单元化部署方案。</p>
-<h2 id="扩展模式-vs-镜像模式"><a href="#扩展模式-vs-镜像模式" class="headerlink" title="扩展模式 vs 镜像模式"></a>扩展模式 vs 镜像模式</h2><p>扩展模式是把服务/数据库分拆，然后部署到不同的机房里面，相当于放大了一个物理机房。</p>
-<p>镜像模式是每个机房里部署的服务都是一样的，每个机房承担一定流量。</p>
-<p>镜像模式的容灾效果更好，难度在如何切分流量上。容灾还要考虑机房级容灾、部署地容灾的问题。多地部署带来距离，距离带来延时，延时带来 replica 的风险。</p>
-<h2 id="单元化部署"><a href="#单元化部署" class="headerlink" title="单元化部署"></a>单元化部署</h2><p>所谓 cell，是一个能完成所有业务操作的自包含集合。一般的 soa 架构，服务是分层的，而且每一层的任一节点都可以被其他机房调用。而单元化部署的结果是，本单元的上层节点，只会调用本单元的下层节点。它具有一个站点全部的功能，但不具有一个站点全部的流量。</p>
-<p>这种单元化部署实际上就要求底层的数据也要做 sharding。单元化的结果是，数据库连接可以更好地被复用-多个单元互相跨 db 连接，其实很浪费资源。</p>
-<h2 id="现实妥协"><a href="#现实妥协" class="headerlink" title="现实妥协"></a>现实妥协</h2><p>架构总有显示的黑暗面。</p>
-<p>如何解决：</p>
-<ul>
-<li>全局数据依赖</li>
-<li>异地时延</li>
-</ul>
-<p>所以有些部署单元要全局冗余，然后对拷。</p>
-
-      
-    </div>
-    <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/04/08/dc-笔记/" data-id="ckik3we0p0078e5a1kfim198i" class="article-share-link">分享</a>
-      
-      
-      
-  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/系统架构/">系统架构</a></li></ul>
 
     </footer>
   </div>
@@ -1112,6 +1333,10 @@ object encoding hello
       <ul>
         
           <li>
+            <a href="/2020/12/12/去屑洗发水/">去屑洗发水</a>
+          </li>
+        
+          <li>
             <a href="/2020/12/08/活动保障性体系建设和实践的总结/">活动保障性体系建设和实践的总结</a>
           </li>
         
@@ -1125,10 +1350,6 @@ object encoding hello
         
           <li>
             <a href="/2020/11/23/《今日简史》/">《今日简史》</a>
-          </li>
-        
-          <li>
-            <a href="/2020/11/23/《未来简史》/">《未来简史》</a>
           </li>
         
       </ul>

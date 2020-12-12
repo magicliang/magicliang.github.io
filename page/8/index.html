@@ -71,6 +71,190 @@
       <div class="outer">
         <section id="main">
   
+    <article id="post-Redis-笔记之十-哨兵-Sentinel" class="article article-type-post" itemscope itemprop="blogPost">
+  <div class="article-meta">
+    <a href="/2019/10/30/Redis-笔记之十-哨兵-Sentinel/" class="article-date">
+  <time datetime="2019-10-30T14:20:55.000Z" itemprop="datePublished">2019-10-30</time>
+</a>
+    
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 itemprop="name">
+      <a class="article-title" href="/2019/10/30/Redis-笔记之十-哨兵-Sentinel/">Redis 笔记之十-哨兵 Sentinel</a>
+    </h1>
+  
+
+      </header>
+    
+    <div class="article-entry" itemprop="articleBody">
+      
+        <!-- Table of Contents -->
+        
+        <p>Redis 有若干套高可用实现方案。2.8 开始提供哨兵功能（不要使用更低版本的哨兵，可能有 bug）。</p>
+<h1 id="基本概念"><a href="#基本概念" class="headerlink" title="基本概念"></a>基本概念</h1><p><img src="https://s2.ax1x.com/2019/10/19/KmgbkD.png" alt="此处输入图片的描述"></p>
+<h2 id="主从复制模式的问题"><a href="#主从复制模式的问题" class="headerlink" title="主从复制模式的问题"></a>主从复制模式的问题</h2><p>Redis 天然就带有主从复制的功能，但主从复制有若干缺点：</p>
+<ul>
+<li>需要手工干预，缺乏自动 FO 机制-分布式高可用问题。</li>
+<li>单机的写能力有限-分布式容量问题。</li>
+<li>单机的存储能力有限-分布式容量问题。</li>
+</ul>
+<h2 id="一个经典的高可用场景"><a href="#一个经典的高可用场景" class="headerlink" title="一个经典的高可用场景"></a>一个经典的高可用场景</h2><p>当一个主从集群的 主节点 失效的时候，经典的恢复步骤如下：</p>
+<ol>
+<li>主节点失效</li>
+<li>选出新的从节点，<code>slaveof no one</code>。</li>
+<li>先更新应用方的连接</li>
+<li>再让其他从节点换主</li>
+<li>再把恢复好的主节点作为新的从节点复制新的主节点。</li>
+</ol>
+<p>3 和 4 的步骤可以互换。</p>
+<h2 id="Sentinel-的高可用性"><a href="#Sentinel-的高可用性" class="headerlink" title="Sentinel 的高可用性"></a>Sentinel 的高可用性</h2><p>Sentinel 方案是在原生的 Master-Slave 集群之外加上一个 Sentinel 集群。</p>
+<p>每个 Sentinel 节点会监控其他 Sentinel 节点和所有 Redis 节点。任何一个不可达的节点，它都会将其做下线标识。</p>
+<p>如果标识的是主节点，它还会：</p>
+<p>1 与其他 Sentinel 节点进行“协商”（negotiate），当大多数 Sentinel节点认为主节点都认为主节点不可达时。<br>2 会先选举出一个 leader Sentinel 节点来完成自动的 FO 工作。<br>3 把集群变化通知 Redis 应用方。</p>
+<p><img src="https://s2.ax1x.com/2019/10/19/KmW2tS.jpg" alt="此处输入图片的描述"></p>
+<h1 id="sentinel-的部署和启动"><a href="#sentinel-的部署和启动" class="headerlink" title="sentinel 的部署和启动"></a>sentinel 的部署和启动</h1><h2 id="单个-sentinel-节点的配置文件"><a href="#单个-sentinel-节点的配置文件" class="headerlink" title="单个 sentinel 节点的配置文件"></a>单个 sentinel 节点的配置文件</h2><pre><code class="properties"># 常见参数有 4 个
+
+# my_redis_master 是主节点的别名，redis1 是主节点的域名，当前 sentinel 起始就要监控一个 redis 节点，意味着 sentinel 的拓扑结构受 redis 集群的拓扑结构影响。3 意味着quorum是 3 ，3个节点认为 master 不可达才形成决议。
+# Redis 集群应该和其他集群一样，尽量设置为大于等于 3 的奇数，兼顾高可用和选举领导的需要
+# 只有集群里的节点达到 max(quorum, num(sentinel)/2 + 1) ，选举才成立。在大多数情况下 quorum = num(sentinel)/2 + 1
+sentinel monitor my_redis_master redis1 6379 3
+# sentinel 会定期发送 ping 到 master（其实也包括所有其他节点），3000 毫秒不回应就意味着不可达
+sentinel down-after-milliseconds my_redis_master 3000
+# 集群故障转移四个阶段的任何一个步骤的失败时延，如果超过这个时间则会重新发起新故障转移
+sentinel failover-timeout my_redis_master 10000
+# redis 同时对从节点进行故障转移的复制的并发度
+sentinel parallel-syncs my_redis_master 1
+
+# 辅助参数
+port 26379
+# 写了这个文件就会导致 stdout 不再输出
+logfile &quot;sentinel.log&quot;
+# 不要乱用镜像中不存在的路径
+#dir /opt/soft/redis/data
+</code></pre>
+<p>实际上每个 sentinel 节点的配置文件都可以写成这样，但每个文件必须单独存在，<strong>因为 sentinel 文件会在启动时重写各自的配置文件</strong>。</p>
+<h2 id="启动命令"><a href="#启动命令" class="headerlink" title="启动命令"></a>启动命令</h2><pre><code class="bash">redis-server /etc/redis-conf/sentinel.conf --sentinel
+</code></pre>
+<p>sentinel 本质上只是一种特殊的 Redis 节点。因此可以使用如下的命令查看哨兵的已知信息：</p>
+<pre><code class="bash">redis-cli -p 26379 info sentinel
+</code></pre>
+<p>sentinel 可以清楚地知道当前监控了多少个集群，集群里有多少个主从节点，一共有几个哨兵节点。</p>
+<p><img src="https://s2.ax1x.com/2019/10/27/KysZ79.png" alt="此处输入图片的描述"></p>
+<h2 id="监控多个集群"><a href="#监控多个集群" class="headerlink" title="监控多个集群"></a>监控多个集群</h2><p>一套 Sentinel 可以监控多个 Redis 集群，只要准备多套<code>sentinel monitor my_redis_master redis1 6379 3</code>里的 master name my_redis_master 即可。</p>
+<h2 id="配置调整"><a href="#配置调整" class="headerlink" title="配置调整"></a>配置调整</h2><pre><code class="bash">sentinel set xxx xxx
+</code></pre>
+<p>需要注意：</p>
+<ol>
+<li>sentinel set 只对当前节点有效。</li>
+<li>sentinel set 命令执行完成以后会立即刷新配置文件，这点和普通节点需要使用<code>config rewrite</code>。</li>
+<li>所有节点的配置应该一致。</li>
+<li>sentinel 堆外不支持 config 命令</li>
+</ol>
+<h2 id="部署技巧"><a href="#部署技巧" class="headerlink" title="部署技巧"></a>部署技巧</h2><ol>
+<li>sentinel 节点应该在物理机层面做隔离。</li>
+<li>sentinel 集群应该有超过 3 个的奇数节点。</li>
+<li>奇数节点对选举的效果是最优的。</li>
+<li>可以一套 sentinel 监控多套集群，也可以多套 sentinel 监控多套集群。取舍的时候需要考虑的是：是否 sentinel 节点自身的失败需要被隔离。</li>
+</ol>
+<h2 id="API"><a href="#API" class="headerlink" title="API"></a>API</h2><pre><code class="bash"># 在 cli 内
+sentinel masters
+sentinel master master-name
+sentinel slaves slave-name
+
+# 强制失效转移
+sentinel failover master-name
+
+# 校验 quorum 是否稳定
+sentinel ckquorum master-name
+
+# 配置刷盘
+sentinel flushconfig
+
+# 取消 sentinel 对集群的监控
+sentinel remove master-name
+
+# 增加 sentinel 对集群的监控
+sentinel monitor &lt;master-name&gt; &lt;host&gt; &lt;port&gt; &lt;quorum&gt;
+</code></pre>
+<h1 id="实现原理"><a href="#实现原理" class="headerlink" title="实现原理"></a>实现原理</h1><p><img src="Sentinel故障转移的原理.png" alt="Sentinel故障转移的原理.png"><br><a href="Sentinel故障转移的原理.xmind">Sentinel故障转移的原理.xmind</a></p>
+<h2 id="三个定时任务"><a href="#三个定时任务" class="headerlink" title="三个定时任务"></a>三个定时任务</h2><ul>
+<li>每隔 10s，sentinel 往所有 M/S 发 info 获取最新的拓扑结构<br>-从主节点可以实时获知从节点的信息</li>
+</ul>
+<p><img src="info 任务.png" alt="info 任务.png"></p>
+<ul>
+<li>每隔 2s，sentinel 节点会向 Redis 数据节点的 <em>sentinel</em>:hello 频道上发送改 Sentinel 节点对主节点的判断，以及当前 Sentinel 节点的信息。同时每隔 Sentinel 节点也会订阅该频道，来了解其他 Sentinel 节点以及它们对主节点的判断。<ul>
+<li>sentinel 可以通过这个频道获取 sentinel 之间的信息</li>
+<li>交换主节点的状态，可以作为后续<strong>客观下线</strong>和领导者选举操作的依据：</li>
+</ul>
+</li>
+</ul>
+<p><img src="发布意见任务.png" alt="发布意见任务.png"></p>
+<ul>
+<li>每隔 1s，sentinel 会向M/S和其他 Sentinel 发送一条 ping 命令做一次心跳检测，来确认节点是否可达。</li>
+</ul>
+<p><img src="ping 任务.png" alt="ping 任务.png"></p>
+<h2 id="主观下线和客观下线"><a href="#主观下线和客观下线" class="headerlink" title="主观下线和客观下线"></a>主观下线和客观下线</h2><h3 id="主观下线"><a href="#主观下线" class="headerlink" title="主观下线"></a>主观下线</h3><p>任意sentinel ping master 超时（sentinel down-after-milliseconds my_redis_master 3000），就可以单节点认为该节点已失败。</p>
+<p>任何一个节点进入主观下线状态时，都会使用<code>new_epoch</code>让当前纪元加一。</p>
+<h3 id="客观下线"><a href="#客观下线" class="headerlink" title="客观下线"></a>客观下线</h3><p>sentinel 一进入主观下线状态，就会发送<code>SENTINEL is-master-down-by-addr &lt;masterip&gt; &lt;masterport&gt; &lt;sentinel.current_epoch&gt; *</code> 命令<strong>直接询问</strong>其他哨兵节点对主节点的判断，<strong>当主观下线的 哨兵数量超过<quorum>的个数（不一定要超过半数）</quorum></strong>，Sentinel 节点认为主节点确实有问题，这时候 Sentinel 就可以客观下线的决定。第一个进入主观下线状态的节点，往往成为进入客观下线的节点-这点特别像 Raft。</p>
+<p><img src="主观下线和客观下线.jpg" alt="主观下线和客观下线.jpg"></p>
+<p>runId等于*时，sentinel 交换的是主节点下线的判定；runId 等于哨兵的runId时，哨兵请求的是其他节点同意它成为领导者。</p>
+<h3 id="客观下线必须举行-Sentinel-节点选举"><a href="#客观下线必须举行-Sentinel-节点选举" class="headerlink" title="客观下线必须举行 Sentinel 节点选举"></a>客观下线必须举行 Sentinel 节点选举</h3><p><strong>主观下线和客观下线本质上只是对 Redis 主节点的一个状态标记，并不会天然将自己标记为领导者，更不会自动故障转移。</strong></p>
+<ol>
+<li>确定进入客观状态的 Sentinel 节点会成为一个 candidate，立刻发送一个<code>SENTINEL is-master-down-by-addr &lt;masterip&gt; &lt;masterport&gt; &lt;sentinel.current_epoch&gt; 自己的 runid</code></li>
+<li>每个 sentinel 节点在收到该命令的后，如果没有同意过其他 Sentinel 节点的 sentinel is-master-down-by-addr 命令，将同意该请求，否则拒绝（<strong>raft 里每个节点每轮选举只能有一票</strong>）。</li>
+<li>发起选举的 Sentinel 要么成为领导者，<strong>要么进入下一轮选举（或者恢复到主观下线以前的状态？）</strong>。</li>
+</ol>
+<h2 id="故障转移"><a href="#故障转移" class="headerlink" title="故障转移"></a>故障转移</h2><p>所有的故障转移其实只是执行命令，把手动步骤编程为自动步骤而已。</p>
+<p>具体步骤为：</p>
+<ul>
+<li>在从节点列表中选择一个节点作为新的主节点。因为从节点本身是有状态的，所以实际上是使用<strong>综合考虑权重、优先级和一致性的类负载均衡选择算</strong>法：<ul>
+<li>过滤不健康节点：主观下线、断线、5s 内没有回复过 Sentinel 的 ping 命令、与主节点失联超过 down-after-miliseconds。</li>
+<li>选择 slave-priority 最高的节点（如何配置？）。</li>
+<li>选择偏移量最大的从节点-复制最完整。</li>
+<li>选择 runid 最小的从节点。</li>
+<li>对选出的节点发出 slave of no one 命令，从节点升为主节点。</li>
+<li>对剩下的从节点发出命令，让它们成为主节点的从节点，复制规则和 parallel-sync 参数有关。</li>
+<li>（<strong>最后</strong>）Sentinel 节点集合会将原来主节点更新为从节点，（这样线上先止血成功），然后持续对其关注，待其恢复后命令其去复制新的主节点。</li>
+</ul>
+</li>
+</ul>
+<h2 id="全流程"><a href="#全流程" class="headerlink" title="全流程"></a>全流程</h2><p><img src="redis 客观下线流程.png" alt="redis 客观下线流程.png"></p>
+<h1 id="节点运维"><a href="#节点运维" class="headerlink" title="节点运维"></a>节点运维</h1><h2 id="节点下线"><a href="#节点下线" class="headerlink" title="节点下线"></a>节点下线</h2><ul>
+<li>临时下线：暂时将节点关掉，之后还会重新启动，继续提供服务。</li>
+<li>永久下线：将节点关掉不再使用，需要做一些清理工作，如删除配置文件，持久化文件、日志文件。</li>
+</ul>
+<h3 id="主节点下线"><a href="#主节点下线" class="headerlink" title="主节点下线"></a>主节点下线</h3><ol>
+<li><p>将一个合适的从节点（如高性能）的 priority 设置为 0。可参考 <a href="https://redis.io/topics/sentinel" target="_blank" rel="noopener">sentinel</a> 中的 Replicas priority section。</p>
+</li>
+<li><p>在任意一个 sentinel 上，执行<code>sentinel failover master-name</code>。</p>
+</li>
+</ol>
+<h3 id="从节点或-sentinel-节点下线"><a href="#从节点或-sentinel-节点下线" class="headerlink" title="从节点或 sentinel 节点下线"></a>从节点或 sentinel 节点下线</h3><p>如果使用了读写分离，要确保读写分离机制能够自动感知拓扑结构的变化。<br>如果只是临时下线（命令下线、kill），sentinel 会对下线节点念念不忘，也就是会不断地对这些节点进行 monitor，浪费硬盘和网络资源，这种时候可以考虑永久下线。</p>
+<h2 id="节点上线"><a href="#节点上线" class="headerlink" title="节点上线"></a>节点上线</h2><h3 id="从节点上线"><a href="#从节点上线" class="headerlink" title="从节点上线"></a>从节点上线</h3><p>配置节点 slave of [masterIp] [masterPort] 让节点上线。master 收到链接后，主从就会自动相互注册发现，而 sentinel 也会自动发现新的从节点。 </p>
+<h3 id="Sentinel-节点上线"><a href="#Sentinel-节点上线" class="headerlink" title="Sentinel 节点上线"></a>Sentinel 节点上线</h3><p>sentinel 只要配了 sentinel monitor，它就会连上 master，进而被 sentinel 网络互相理解发现。</p>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="http://yoursite.com/2019/10/30/Redis-笔记之十-哨兵-Sentinel/" data-id="ckil9yw580093fda19n1k9izr" class="article-share-link">分享</a>
+      
+      
+      
+  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Redis/">Redis</a></li></ul>
+
+    </footer>
+  </div>
+  
+</article>
+ 
+
+
+  
     <article id="post-数据库大表问题" class="article article-type-post" itemscope itemprop="blogPost">
   <div class="article-meta">
     <a href="/2019/10/30/数据库大表问题/" class="article-date">
@@ -205,7 +389,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/30/数据库大表问题/" data-id="ckik3we1s0095e5a16ulhx7hd" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/30/数据库大表问题/" data-id="ckil9yw5a0095fda18h1ybt74" class="article-share-link">分享</a>
       
       
       
@@ -322,7 +506,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/28/复式记账法/" data-id="ckik3we1p0090e5a1f11nd5jv" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/28/复式记账法/" data-id="ckil9yw56008yfda1l0foanf8" class="article-share-link">分享</a>
       
       
       
@@ -366,7 +550,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/28/世界上最简单的会计书/" data-id="ckik3we1n008ve5a1183r2r6m" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/28/世界上最简单的会计书/" data-id="ckil9yw55008vfda1w26nhzs6" class="article-share-link">分享</a>
       
       
       
@@ -424,7 +608,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/28/常见数学术语中英文对照/" data-id="ckik3we1q0092e5a11el8xp44" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/28/常见数学术语中英文对照/" data-id="ckil9yw570090fda1uks38xg9" class="article-share-link">分享</a>
       
       
       
@@ -479,7 +663,7 @@ docker-compose -f docker-compose.yml kill &amp;&amp; docker-compose -f docker-co
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/27/Docker-命令与场景/" data-id="ckik3we1o008xe5a1ufvts2ul" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/27/Docker-命令与场景/" data-id="ckil9yw54008tfda1dxh04f4h" class="article-share-link">分享</a>
       
       
       
@@ -1023,7 +1207,7 @@ man proc
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/23/进程和操作系统的诊断工具/" data-id="ckik3we1m008te5a1a7pzyp25" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/23/进程和操作系统的诊断工具/" data-id="ckil9yw53008rfda1ayic3h3o" class="article-share-link">分享</a>
       
       
       
@@ -1186,7 +1370,7 @@ info memory
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/19/Redis-笔记之九：理解内存/" data-id="ckik3we1i008pe5a18qgcsgs4" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/19/Redis-笔记之九：理解内存/" data-id="ckil9yw53008pfda1f0lduyf8" class="article-share-link">分享</a>
       
       
       
@@ -1238,7 +1422,7 @@ info memory
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/18/JDK-收费问题/" data-id="ckik3we1l008re5a1gqvzv3dc" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/18/JDK-收费问题/" data-id="ckil9yw52008nfda1j47wkw6y" class="article-share-link">分享</a>
       
       
       
@@ -1412,126 +1596,7 @@ info memory
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/07/Redis-笔记之八：复制/" data-id="ckik3we1h008ne5a1zx0pffxl" class="article-share-link">分享</a>
-      
-      
-      
-  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Redis/">Redis</a></li></ul>
-
-    </footer>
-  </div>
-  
-</article>
- 
-
-
-  
-    <article id="post-Redis-笔记之七：持久化" class="article article-type-post" itemscope itemprop="blogPost">
-  <div class="article-meta">
-    <a href="/2019/10/06/Redis-笔记之七：持久化/" class="article-date">
-  <time datetime="2019-10-06T14:46:08.000Z" itemprop="datePublished">2019-10-06</time>
-</a>
-    
-  </div>
-  <div class="article-inner">
-    
-    
-      <header class="article-header">
-        
-  
-    <h1 itemprop="name">
-      <a class="article-title" href="/2019/10/06/Redis-笔记之七：持久化/">Redis 笔记之七：持久化</a>
-    </h1>
-  
-
-      </header>
-    
-    <div class="article-entry" itemprop="articleBody">
-      
-        <!-- Table of Contents -->
-        
-        <p>持久化可以避免进程退出而数据丢失。</p>
-<p>Redis 的持久化文件主要包括两种格式，RDB 格式和 AOF 格式，这两种格式的生成机制各有不同。</p>
-<p><strong>Redis 在重启时优先加载 AOF 文件（因为 AOF 文件颗粒度更细），如果没有 AOF 文件可加载则加载 RDB 文件。</strong></p>
-<p><img src="https://s2.ax1x.com/2019/10/06/ugdqtH.jpg" alt="此处输入图片的描述"></p>
-<h1 id="RDB"><a href="#RDB" class="headerlink" title="RDB"></a>RDB</h1><p>RDB 持久化会把进程内的数据全量快照保存到硬盘上，其触发方式包括手动触发和自动触发。</p>
-<h2 id="手动触发"><a href="#手动触发" class="headerlink" title="手动触发"></a>手动触发</h2><pre><code class="bash"># 阻塞当前 Redis 服务器，直到 RDB dump 完成为止。内存里数据越大，阻塞时间越久。不建议在生产环境使用，未来会被废弃。
-save
-
-# fork 出一个子进程。子进程负责生成 RDB 文件后，通知父进程，主进程还可以继续响应其他命令。只有 fork 的一瞬间会阻塞 Redis 进程。
-bgsave
-</code></pre>
-<p>bgsave 的工作流程如下：</p>
-<p><img src="https://s2.ax1x.com/2019/10/06/ugAtg0.jpg" alt="bgsave 的工作流程"></p>
-<p>注意，RDB 文件本身永远只有一个。子进程产生的都是临时文件，会通过原子替换的方式来维持 RDB 文件的唯一性。</p>
-<p>Redis 内部主动生成 RDB 文件的过程都是采用 bgsave 的方式。</p>
-<h2 id="自动触发"><a href="#自动触发" class="headerlink" title="自动触发"></a>自动触发</h2><ol>
-<li>在 config 里配置<code>save m n</code>。表示 m 内数据集存在 n 次修改时，自动触发 bgsave。</li>
-<li>如果从节点执行<strong>全量复制操作</strong>，主节点自动执行 bgsave生成 RDB 文件并发送给从节点。</li>
-<li>执行 debug reload 命令重新加载 Redis 时，也<strong>自动触发 save 操作</strong>。</li>
-<li>默认情况下执行 shutdown 命令时，如果没有开启 AOF 持久化功能，则自动执行 bgsave-<strong>Redis 自带的优雅关闭流程</strong>。</li>
-</ol>
-<h2 id="RDB-文件的存储"><a href="#RDB-文件的存储" class="headerlink" title="RDB 文件的存储"></a>RDB 文件的存储</h2><p>默认会存在 <code>config set dir {newDir}</code>和<code>config set dbfilename {newFileName}</code>的文件里。也可以动态修改（）比如在硬盘出问题的时候动态修改）。</p>
-<p>默认情况下会对 RDB 文件进行 LZF 压缩处理（可以关闭）。压缩会消耗 CPU 性能，但利于网络传输。</p>
-<h2 id="RDB-的优缺点"><a href="#RDB-的优缺点" class="headerlink" title="RDB 的优缺点"></a>RDB 的优缺点</h2><p>优点：</p>
-<ul>
-<li>紧凑存储，适于全量保存/恢复。</li>
-<li>加载 RDB 的速度远快于 AOF 文件。</li>
-</ul>
-<p>缺点：</p>
-<ul>
-<li>没有办法强实时/秒级持久化。</li>
-<li>版本不兼容</li>
-</ul>
-<h1 id="AOF（append-only-file）"><a href="#AOF（append-only-file）" class="headerlink" title="AOF（append only file）"></a>AOF（append only file）</h1><p>以独立的日志（log）记录每次写命令，重启时再重新执行 AOF 文件中的命令达到恢复数据的目的。<strong>AOF 具有持久化的强实时性，是 RDB 的补充。</strong></p>
-<h2 id="配置方式"><a href="#配置方式" class="headerlink" title="配置方式"></a>配置方式</h2><p>需要设置<code>appendonly yes</code>（默认不开启），开启后就会被自动触发（也就是说无需手动触发）。可以修改文件名和路径。</p>
-<h2 id="工作流程"><a href="#工作流程" class="headerlink" title="工作流程"></a>工作流程</h2><p>aof 的工作流程如下：</p>
-<p><img src="https://s2.ax1x.com/2019/10/06/uguhl9.jpg" alt="此处输入图片的描述"></p>
-<p>其中：</p>
-<ol>
-<li>append 其实是把写命令写入 aof_buf 中。</li>
-<li>sync 是把写入命令从内存持久化到硬盘中。</li>
-<li>rewrite 则会压缩重写 AOF 文件使其达到更紧凑的目的。</li>
-<li>当 Redis 重启后，可以加载 AOF 文件进行数据恢复。</li>
-</ol>
-<p>其中被持久化的命令，是纯文本的格式，遵循 RESP 协议。</p>
-<h2 id="文件同步"><a href="#文件同步" class="headerlink" title="文件同步"></a>文件同步</h2><p>Redis 本身是个单线程架构，如果每次新的写命令都要写入硬盘，则硬盘的负载能力可能成为一个瓶颈。而如果先写入一个 aof_buf，则可以采取多种策略持久化数据到硬盘中。</p>
-<p><strong>这提醒我们，对于零散的多次写 IO，我们都要想办法化零为整，通过 buffer-sync 的分段异步写形式充分协调内存和硬盘的写性能。</strong></p>
-<p>我们可以采用的策略分别是：</p>
-<ul>
-<li>always 命令写入 aof_buf 后调用系统 fsync 操作同步到 AOF 文件，fsync 完成后系统返回。<strong>等于一个强实时的策略。在 sata 上只有几百的 tps。</strong></li>
-<li>everysec 命令写入 aof_buf 后调用系统 write 操作，write 完成后线程返回。fsync 操作由专门线程每秒调用一次。<strong>等于一个中等实时的策略。默认策略，最多丢失 1s 的数据</strong></li>
-<li>no 命令写入 aof_buf后调用系统 write 操作，而不对 AOF 做 fsync 同步操作， fsync 同步操作由操作系统负责，通常同步周期最长 30 秒。<strong>无法保障同步实时性。</strong></li>
-</ul>
-<p>write 其实是一种 delaywrite，写入操作系统的页缓冲区以后线程会立即返回（阻塞期很短），依赖于系统的调度（如时间阈值满或者空间阈值满，期间如果系统宕机则数据会丢失）或者 fsync才能真正持久化到硬盘中。<br>fsync 就是强行同步到硬盘的syscall，阻塞时间会稍长，但持久化更彻底。</p>
-<h2 id="重写机制"><a href="#重写机制" class="headerlink" title="重写机制"></a>重写机制</h2><p>重写主要通过有效地去除无用命令、合并多条有效命令的方式使得 AOF 文件变得更小，更利于加载。</p>
-<p>重写（只是重写这个过程）也同样包括手动触发和被动触发两种机制。</p>
-<p>重写流程：</p>
-<p><img src="https://s2.ax1x.com/2019/10/06/ugwZj0.jpg" alt="此处输入图片的描述"></p>
-<p>其中同时存在两个 aof 文件，新的 aof 文件也会进行一个原子替换。</p>
-<h3 id="手动触发-1"><a href="#手动触发-1" class="headerlink" title="手动触发"></a>手动触发</h3><pre><code class="bash">bgrewrite
-</code></pre>
-<h3 id="自动触发-1"><a href="#自动触发-1" class="headerlink" title="自动触发"></a>自动触发</h3><p>if (aof_current_size &gt; auto-aof-rewrite-min-size &amp;&amp; (aof_current_size - aof_base_size)/aof_base_size &gt;= auto-aof-rewrite-percentage) </p>
-<p>auto-aof-rewrite-min-size 和 auto-aof-rewrite-percentage 是配置文件的配置项。</p>
-<h1 id="相关问题"><a href="#相关问题" class="headerlink" title="相关问题"></a>相关问题</h1><h2 id="fork-问题"><a href="#fork-问题" class="headerlink" title="fork 问题"></a>fork 问题</h2><p>fork 调用会让子进程调用父进程的内存页表，理论上一个进程占用内存越大，它的 fork 命令就越耗时，而且有些虚拟机（如 xen）里 fork 的性能还更差。</p>
-<h2 id="性能优化点"><a href="#性能优化点" class="headerlink" title="性能优化点"></a>性能优化点</h2><h3 id="cpu"><a href="#cpu" class="headerlink" title="cpu"></a>cpu</h3><ol>
-<li>不要和其他 cpu 密集型应用部署在一起。</li>
-<li>如果部署多个 Redis 实例，保证每个时刻只有一个后台进程在工作。</li>
-</ol>
-<h3 id="内存"><a href="#内存" class="headerlink" title="内存"></a>内存</h3><ol>
-<li>如果部署多个 Redis 实例，保证每个时刻只有一个后台进程在工作。</li>
-<li>不要增加 copy-on-write 的负担，尽可能让子进程少一些后台重写的负担（如何做到？）。</li>
-<li>关掉大页（huge page）优化-和 JVM 的优化策略正好相反。</li>
-</ol>
-<h3 id="硬盘"><a href="#硬盘" class="headerlink" title="硬盘"></a>硬盘</h3><p>AOF 对硬盘的写压力更大。</p>
-<h3 id="AOF-追加阻塞"><a href="#AOF-追加阻塞" class="headerlink" title="AOF 追加阻塞"></a>AOF 追加阻塞</h3><p>此外，AOF 体系还存在一个追加阻塞的问题，其流程如下：<br><img src="https://s2.ax1x.com/2019/10/06/ugsBc9.png" alt="AOF 追加阻塞"></p>
-<p>可以看到，主线程如果在写入 AOF 缓冲区时如果上次 fsync 成功的时间（所谓的 checkpoint）还在两秒内，则会持续写入 AOF 缓冲区。这时候 AOF 缓冲区是不安全的。所以实际上 AOF 机制最多会丢两秒内的信息。而如果主线程阻塞，则 Redis 的性能会急剧下降。</p>
-<p><strong>至此为止，我们至少有三种潜在的性能瓶颈：save、fork 和 AOF 的 append 造成的阻塞。</strong></p>
-
-      
-    </div>
-    <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/06/Redis-笔记之七：持久化/" data-id="ckik3we1e008ie5a1fx2ofiab" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/07/Redis-笔记之八：复制/" data-id="ckil9yw51008lfda1tgceg6ow" class="article-share-link">分享</a>
       
       
       
@@ -1571,6 +1636,10 @@ bgsave
       <ul>
         
           <li>
+            <a href="/2020/12/12/去屑洗发水/">去屑洗发水</a>
+          </li>
+        
+          <li>
             <a href="/2020/12/08/活动保障性体系建设和实践的总结/">活动保障性体系建设和实践的总结</a>
           </li>
         
@@ -1584,10 +1653,6 @@ bgsave
         
           <li>
             <a href="/2020/11/23/《今日简史》/">《今日简史》</a>
-          </li>
-        
-          <li>
-            <a href="/2020/11/23/《未来简史》/">《未来简史》</a>
           </li>
         
       </ul>
