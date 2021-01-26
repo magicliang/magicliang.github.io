@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html>
+<head><meta name="generator" content="Hexo 3.9.0">
+  <meta charset="utf-8">
+  
+  <title>TiDB 与 blade | 守株阁</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <meta name="description" content="TiDB 的基础架构Log-Structured Merge-tree (LSM-tree)是一种存储结构，由于其优越的写性能被很多大型分布式存储系统采用，包括Google 的 BigTable, Amazon的 Dynamo, Apache 的 HBase 和Cassandra等；MongoDB的WiredTiger引擎则支持B-tree 和 LSM-tree 两种模式；TiDB 则使用了著名的">
+<meta name="keywords" content="系统架构,存储">
+<meta property="og:type" content="article">
+<meta property="og:title" content="TiDB 与 blade">
+<meta property="og:url" content="http://yoursite.com/2021/01/26/TiDB-与-blade/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="TiDB 的基础架构Log-Structured Merge-tree (LSM-tree)是一种存储结构，由于其优越的写性能被很多大型分布式存储系统采用，包括Google 的 BigTable, Amazon的 Dynamo, Apache 的 HBase 和Cassandra等；MongoDB的WiredTiger引擎则支持B-tree 和 LSM-tree 两种模式；TiDB 则使用了著名的">
+<meta property="og:locale" content="zh-Hans">
+<meta property="og:image" content="http://yoursite.com/2021/01/26/TiDB-与-blade/tidb-architecture.png">
+<meta property="og:updated_time" content="2021-01-26T03:03:40.098Z">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="TiDB 与 blade">
+<meta name="twitter:description" content="TiDB 的基础架构Log-Structured Merge-tree (LSM-tree)是一种存储结构，由于其优越的写性能被很多大型分布式存储系统采用，包括Google 的 BigTable, Amazon的 Dynamo, Apache 的 HBase 和Cassandra等；MongoDB的WiredTiger引擎则支持B-tree 和 LSM-tree 两种模式；TiDB 则使用了著名的">
+<meta name="twitter:image" content="http://yoursite.com/2021/01/26/TiDB-与-blade/tidb-architecture.png">
+  
+    <link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+  
+  
+    <link rel="icon" href="/favicon.png">
+  
+  
+  <link rel="stylesheet" href="/css/style.css">
+  
+
+<link rel="stylesheet" href="/css/prism.css" type="text/css">
+<link rel="stylesheet" href="/css/prism-line-numbers.css" type="text/css"></head>
+</html>
+<body>
+  <div id="container">
+    <div id="wrap">
+      <header id="header">
+  <div id="banner"></div>
+  <div id="header-outer" class="outer">
+    
+    <div id="header-inner" class="inner">
+      <nav id="sub-nav">
+        
+          <a id="nav-rss-link" class="nav-icon" href="/atom.xml" title="RSS Feed"></a>
+        
+        <a id="nav-search-btn" class="nav-icon" title="搜索"></a>
+      </nav>
+      <div id="search-form-wrap">
+        <form action="//google.com/search" method="get" accept-charset="UTF-8" class="search-form"><input type="search" name="q" class="search-form-input" placeholder="Search"><button type="submit" class="search-form-submit">&#xF002;</button><input type="hidden" name="sitesearch" value="http://yoursite.com"></form>
+      </div>
+      <nav id="main-nav">
+        <a id="main-nav-toggle" class="nav-icon"></a>
+        
+          <a class="main-nav-link" href="/">首页</a>
+        
+          <a class="main-nav-link" href="/archives">归档</a>
+        
+          <a class="main-nav-link" href="/about">关于</a>
+        
+      </nav>
+      
+    </div>
+    <div id="header-title" class="inner">
+      <h1 id="logo-wrap">
+        <a href="/" id="logo">守株阁</a>
+      </h1>
+      
+        <h2 id="subtitle-wrap">
+          <a href="/" id="subtitle">一切都是守株待兔，如切如磋，如琢如磨。I am just joking.</a>
+        </h2>
+      
+    </div>
+  </div>
+</header>
+      <div class="outer">
+        <section id="main"><article id="post-TiDB-与-blade" class="article article-type-post" itemscope itemprop="blogPost">
+  <div class="article-meta">
+    <a href="/2021/01/26/TiDB-与-blade/" class="article-date">
+  <time datetime="2021-01-26T03:02:16.000Z" itemprop="datePublished">2021-01-26</time>
+</a>
+    
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 class="article-title" itemprop="name">
+      TiDB 与 blade
+    </h1>
+  
+
+      </header>
+    
+    <div class="article-entry" itemprop="articleBody">
+      
+        <!-- Table of Contents -->
+        
+        <h1 id="TiDB-的基础架构"><a href="#TiDB-的基础架构" class="headerlink" title="TiDB 的基础架构"></a>TiDB 的基础架构</h1><p>Log-Structured Merge-tree (LSM-tree)是一种存储结构，由于其优越的写性能被很多大型分布式存储系统采用，包括Google 的 BigTable, Amazon的 Dynamo, Apache 的 HBase 和Cassandra等；MongoDB的WiredTiger引擎则支持B-tree 和 LSM-tree 两种模式；TiDB 则使用了著名的RocksDB。</p>
+<p>模型介绍如下：</p>
+<p><img src="tidb-architecture.png" alt="tidb-architecture.png"></p>
+<ul>
+<li>采用类似于Google F1/Spanner 的分布式KV存储 (即Blade-kv) + 无状态计算节点 (即BladeSQL) 模型；</li>
+<li>用户表中每一行数据，对应一个 Data K/V + N个Index K/V，N是二级索引的个数(N&gt;=0)；</li>
+<li>-Blade-kv 以Ranged Partition的方式将整个key空间分为多个Region(Partition/Shard)，每个Region对应一段连续范围的key；</li>
+<li>每个Region都有多个副本，副本间通过共识协议 Raft 来达到CAP的平衡；</li>
+<li>每个Region的数据，以一棵独立LSM-tree的形式存储；</li>
+<li>Region在容量超出水位线时，会进行分裂，变成两个独立的Region；</li>
+<li>Blade-root 管理集群元数据信息，提供Region的路由服务以及全局授时服务；</li>
+<li>Blade-sql处理SQL解析、优化和执行，将SQL请求转化为一系列的K/V请求，再根据路由信息，发送对应的Blade-kv 节点；</li>
+<li>采用悲观锁模型，支持分布式事务，支持Read Committed隔离级别</li>
+</ul>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="http://yoursite.com/2021/01/26/TiDB-与-blade/" data-id="ckkdf1f9g00dpsba13ovn36ex" class="article-share-link">分享</a>
+      
+      
+      
+  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/存储/">存储</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/系统架构/">系统架构</a></li></ul>
+
+    </footer>
+  </div>
+  
+    
+ <script src="/jquery/jquery.min.js"></script>
+  <div id="random_posts">
+    <h2>推荐文章</h2>
+    <div class="random_posts_ul">
+      <script>
+          var random_count =4
+          var site = {BASE_URI:'/'};
+          function load_random_posts(obj) {
+              var arr=site.posts;
+              if (!obj) return;
+              // var count = $(obj).attr('data-count') || 6;
+              for (var i, tmp, n = arr.length; n; i = Math.floor(Math.random() * n), tmp = arr[--n], arr[n] = arr[i], arr[i] = tmp);
+              arr = arr.slice(0, random_count);
+              var html = '<ul>';
+            
+              for(var j=0;j<arr.length;j++){
+                var item=arr[j];
+                html += '<li><strong>' + 
+                item.date + ':&nbsp;&nbsp;<a href="' + (site.BASE_URI+item.uri) + '">' + 
+                (item.title || item.uri) + '</a></strong>';
+                if(item.excerpt){
+                  html +='<div class="post-excerpt">'+item.excerpt+'</div>';
+                }
+                html +='</li>';
+                
+              }
+              $(obj).html(html + '</ul>');
+          }
+          $('.random_posts_ul').each(function () {
+              var c = this;
+              if (!site.posts || !site.posts.length){
+                  $.getJSON(site.BASE_URI + 'js/posts.js',function(json){site.posts = json;load_random_posts(c)});
+              } 
+               else{
+                load_random_posts(c);
+              }
+          });
+      </script>
+    </div>
+  </div>
+
+    
+<nav id="article-nav">
+  
+  
+    <a href="/2021/01/09/构建-spring-framework/" id="article-nav-older" class="article-nav-link-wrap">
+      <strong class="article-nav-caption">下一篇</strong>
+      <div class="article-nav-title">构建 spring-framework</div>
+    </a>
+  
+</nav>
+
+  
+</article>
+ 
+     
+  <div class="comments" id="comments">
+    
+     
+       
+      <div id="cloud-tie-wrapper" class="cloud-tie-wrapper"></div>
+    
+       
+      
+      
+  </div>
+ 
+  
+
+</section>
+           
+    <aside id="sidebar">
+  
+    
+
+  
+    
+    <div class="widget-wrap">
+    
+      <div class="widget" id="toc-widget-fixed">
+      
+        <strong class="toc-title">文章目录</strong>
+        <div class="toc-widget-list">
+              <ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#TiDB-的基础架构"><span class="toc-number">1.</span> <span class="toc-text">TiDB 的基础架构</span></a></li></ol>
+          </div>
+      </div>
+    </div>
+
+  
+    
+
+  
+    
+  
+    
+  
+    
+
+  
+    
+  
+    <!--微信公众号二维码-->
+
+
+  
+</aside>
+
+      </div>
+      <footer id="footer">
+  
+  <div class="outer">
+    <div id="footer-left">
+      &copy; 2014 - 2021 magicliang&nbsp;|&nbsp;
+      主题 <a href="https://github.com/giscafer/hexo-theme-cafe/" target="_blank">Cafe</a>
+    </div>
+     <div id="footer-right">
+      联系方式&nbsp;|&nbsp;magicliang@qq.com
+    </div>
+  </div>
+</footer>
+ <script src="/jquery/jquery.min.js"></script>
+    </div>
+    <nav id="mobile-nav">
+  
+    <a href="/" class="mobile-nav-link">首页</a>
+  
+    <a href="/archives" class="mobile-nav-link">归档</a>
+  
+    <a href="/about" class="mobile-nav-link">关于</a>
+  
+</nav>
+    <img class="back-to-top-btn" src="/images/fly-to-top.png"/>
+<script>
+// Elevator script included on the page, already.
+window.onload = function() {
+  var elevator = new Elevator({
+    selector:'.back-to-top-btn',
+    element: document.querySelector('.back-to-top-btn'),
+    duration: 1000 // milliseconds
+  });
+}
+</script>
+      
+
+  
+    <script>
+      var cloudTieConfig = {
+        url: document.location.href, 
+        sourceId: "",
+        productKey: "e2fb4051c49842688ce669e634bc983f",
+        target: "cloud-tie-wrapper"
+      };
+    </script>
+    <script src="https://img1.ws.126.net/f2e/tie/yun/sdk/loader.js"></script>
+    
+
+  
+
+
+
+
+
+
+
+<!-- author:forvoid begin -->
+<!-- author:forvoid begin -->
+
+<!-- author:forvoid end -->
+
+<!-- author:forvoid end -->
+
+
+  
+    <script type="text/x-mathjax-config">
+      MathJax.Hub.Config({
+        tex2jax: {
+          inlineMath: [ ['$','$'], ["\\(","\\)"]  ],
+          processEscapes: true,
+          skipTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+        }
+      })
+    </script>
+
+    <script type="text/x-mathjax-config">
+      MathJax.Hub.Queue(function() {
+        var all = MathJax.Hub.getAllJax(), i;
+        for (i=0; i < all.length; i += 1) {
+          all[i].SourceElement().parentNode.className += ' has-jax';
+        }
+      })
+    </script>
+    <script type="text/javascript" src="https://cdn.rawgit.com/mathjax/MathJax/2.7.1/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+  
+
+
+ <script src="/js/is.js"></script>
+
+
+  <link rel="stylesheet" href="/fancybox/jquery.fancybox.css">
+  <script src="/fancybox/jquery.fancybox.pack.js"></script>
+
+
+<script src="/js/script.js"></script>
+<script src="/js/elevator.js"></script>
+  </div>
+</body>
+</html>
