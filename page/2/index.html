@@ -205,24 +205,62 @@
 </li>
 </ul>
 <p><strong>付出的代价主要是实现上的复杂性，比如全局元数据管理和跨分片操作（分裂、合并）相对单实例管理所有分片需要更精心的设计。</strong></p>
-<h2 id="BladeKV：大-Memtable、少层级"><a href="#BladeKV：大-Memtable、少层级" class="headerlink" title="BladeKV：大 Memtable、少层级"></a>BladeKV：大 Memtable、少层级</h2><p>BladeKV选择了较大的Memtable(即前图中的C0)，大部分时候只有一个持久化层(称之为Level-1)。主要原因如下：</p>
+<h2 id="BladeKV：大-Memtable、少层级"><a href="#BladeKV：大-Memtable、少层级" class="headerlink" title="BladeKV：大 Memtable、少层级"></a>BladeKV：大 Memtable、少层级</h2><p>BladeKV选择了较大的Memtable(即前图中的C0)，大部分时候只有一个持久化层(称之为Level-1)。取舍 1。主要原因如下：</p>
 <ul>
 <li><p>服务器能够为BladeKV分配的内存、磁盘容量比较确定，可以算出内存/磁盘容量比。</p>
 </li>
 <li><p>典型的内存/存储的容量比：按照2.9TB NVME磁盘， 256GB内存计算，内存与存储容量比接近 1/10，即 t 接近于 10。</p>
 </li>
-<li><p>由于对schema的感知，Memtable 中可以只保存修改的列，而不是整行，所以相当于获得了更高的内存/磁盘容量比。这一点leveldb/rocksdb 这种纯K/V接口的引擎是做不到的。</p>
+<li><p>由于对schema的感知，Memtable 中可以只保存修改的列，而不是整行，所以相当于获得了更高的内存/磁盘容量比。这一点leveldb/rocksdb 这种纯K/V接口的引擎是做不到的。取舍2。</p>
 </li>
-<li><p>写流量有明显的局部性，更新的 key 较为集中，不会出现 major compaction 关联大量 L1 文件，每个文件只关联少量数据的情况。</p>
+<li><p>写流量有明显的局部性，更新的 key 较为集中，不会出现 major compaction 关联大量 L1 文件，每个文件只关联少量数据的情况。取舍 3。</p>
 </li>
-<li><p>每个分片一个 LSM 实例，限定了单个实例的大小（目前暂定2G，可能根据实际运行情况调优），也就限制了总的文件数量（千级别），不会对读造成太大的影响。而 leveldb/rocksdb 原生设计需要支持单实例数百上千G的容量，不分级读会很慢。</p>
+<li><p>每个分片一个 LSM 实例，限定了单个实例的大小（目前暂定2G，可能根据实际运行情况调优），也就限制了总的文件数量（千级别），不会对读造成太大的影响。取舍 4。而 leveldb/rocksdb 原生设计需要支持单实例数百上千G的容量，不分级读会很慢。</p>
 </li>
 </ul>
+<p>在此前提下，与 TiDB(TiKV) 相比，这样设计有如下取舍：</p>
+<ul>
+<li><p>写放大大幅降低：每次 compaction 涉及的 SST 文件中实际不需要合并的数据减少；每个 key 经过一次 compaction 就达到了“最终”层。</p>
+</li>
+<li><p>空间放大略微降低：blade 没有空间放大，比 TiDB(rocksdb) 的 1.1 要好些。</p>
+</li>
+<li><p>读放大相当：考虑在数据量 1T 的进程上查询一个不在 memtable/immutable 的 key</p>
+<ul>
+<li><p>由于 region 已经确定，假定是满 region，blade 需要从 1000 个(2G/2M) FileMeta 中找到目标 SST，共要 10 次逻辑查询和 1 次物理查询（ps: SST 文件没有多 level 重叠，bloom filter 的必要性下降了）-这证明了 bloom filter 能够优化 leveling i/o，不适合优化单 i/o。</p>
+</li>
+<li><p>TiDB 所有 region 共用一个 rocksdb，导致潜在的候选文件更多(1T*1.1/8M ~ 144,000)，但由于 Level 和 fractional cascading 机制，逻辑查询较少。物理查询大部分情况下也只需要 1 次，但 bloom filter 误报或范围查询时，需要每层做一次物理查询。</p>
+</li>
+<li><p>Blade 查询耗时较稳定，TiDB 受 key 所在层级和查询方式影响较大。</p>
+</li>
+<li><p>层级较低的“温” key TiDB 占优，能以较少的逻辑查询和相同的物理查询次数获得数据；</p>
+</li>
+<li><p>范围查询 balde 需要的物理查询较少，优势明显；</p>
+</li>
+<li><p>考虑到点查较多，且 blade memtable 远大于 TiDB，读放大两者大致相当。</p>
+</li>
+</ul>
+</li>
+</ul>
+<p>总体上 blade 优势明显，关键在于充分利用已知要查询的数据属于哪个 region 的特性，重新调整了底层存储引擎；TiDB(TiKV) 整个进程用一个 rocksdb 的方式无法利用这点。</p>
+<p>上面有了定性分析，下面我们定量地计算一下写放大。按照t= 10和前面的最优扇出系数 e 计算，最优的持久化层级<br>n=ln(10)=2.3<br>层，取整则是2层。相应地，可以把e向上取整 f=3，最终取整的写放大倍数是3*3=9倍。</p>
+<p>如果BaldeKV 只使用一个持久化层：</p>
+<ul>
+<li><p>扇出系数f=10，写放大倍数是10倍；</p>
+</li>
+<li><p>空间放大较小，没有各层间保存重复key导致的空间浪费；</p>
+</li>
+<li><p>读放大是1；</p>
+</li>
+</ul>
+<p>所以，BladeKV选择了只有一个持久化层Level-1。</p>
+<p>应急处理：</p>
+<p>如果出现大量的突发写，导致内存压力过大，而将 memtable 与磁盘上的 Level-1 做Compaction太慢，Blade-kv会临时启用Level-0，作为Level-1的增量。</p>
+<p>Level-0 是个特殊的层，它允许同层的不同文件间key的重叠。所以写 Level-0 不需要任何Compaction，可以快速缓解内存压力。在高峰过后，可恢复正常的单个持久化层。</p>
 
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/10/11/数据密集型应用系统设计-Designing-Data-Intensive-Applications/" data-id="ckkdgneq800cvmma1fcun7kla" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/10/11/数据密集型应用系统设计-Designing-Data-Intensive-Applications/" data-id="ckkdkm6c100d5exa18wr2tmpf" class="article-share-link">分享</a>
       
       
       
@@ -275,7 +313,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/10/04/亿级订单架构设计/" data-id="ckkdgneq500cnmma186j8tn0p" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/10/04/亿级订单架构设计/" data-id="ckkdkm6bw00cvexa1668qawri" class="article-share-link">分享</a>
       
       
       
@@ -486,7 +524,7 @@ o<span class="token punctuation">.</span><span class="token function">dosomethin
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/27/现代垃圾收集器/" data-id="ckkdgneqa00d0mma18l2rne3b" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/27/现代垃圾收集器/" data-id="ckkdkm6by00d0exa13zcljcgq" class="article-share-link">分享</a>
       
       
       
@@ -547,7 +585,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/14/MySQL-的配置/" data-id="ckkdgneq500clmma1wickgmcu" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/14/MySQL-的配置/" data-id="ckkdkm6bt00coexa1upgn22s0" class="article-share-link">分享</a>
       
       
       
@@ -3002,7 +3040,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/13/英文汇总/" data-id="ckkdgneq700csmma1wus1tyue" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/13/英文汇总/" data-id="ckkdkm6bw00ctexa1oiuoev0q" class="article-share-link">分享</a>
       
       
       
@@ -5458,7 +5496,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/02/异地多活与单元化/" data-id="ckkdgneq700cqmma1kvu44da7" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/02/异地多活与单元化/" data-id="ckkdkm6bu00cqexa1nzgrlm3c" class="article-share-link">分享</a>
       
       
       
@@ -5560,7 +5598,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/08/18/压力测试需要关注的注意事项/" data-id="ckkdgneq300cimma1z060umoo" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/08/18/压力测试需要关注的注意事项/" data-id="ckkdkm6bp00cgexa19vw3yp4c" class="article-share-link">分享</a>
       
       
       
@@ -5619,7 +5657,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/08/15/MySQL-与数据迁移/" data-id="ckkdgneq100cdmma16teud0iq" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/08/15/MySQL-与数据迁移/" data-id="ckkdkm6bs00clexa1iomwtap7" class="article-share-link">分享</a>
       
       
       
@@ -5687,7 +5725,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/08/02/常见的服务器调用堆栈/" data-id="ckkdgneq000cbmma1f9xkp438" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/08/02/常见的服务器调用堆栈/" data-id="ckkdkm6bq00cjexa18qumrk32" class="article-share-link">分享</a>
       
       
       
@@ -5931,7 +5969,7 @@ report-uri //csp.sec.test.github.com/csp-report
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/07/31/CSP/" data-id="ckkdgnepw00c3mma154swmpw9" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/07/31/CSP/" data-id="ckkdkm6bn00cbexa1g6mqkcen" class="article-share-link">分享</a>
       
       
       
