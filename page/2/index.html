@@ -131,7 +131,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/11/21/《人类群星闪烁时》/" data-id="ckkkv5te100d8rma1oku2o7jq" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/11/21/《人类群星闪烁时》/" data-id="ckkl6n0uz00dm6da1t5sapkrf" class="article-share-link">分享</a>
       
       
       
@@ -531,13 +531,124 @@ WITH RECURSIVE
 <h3 id="星型与雪花型分析模式"><a href="#星型与雪花型分析模式" class="headerlink" title="星型与雪花型分析模式"></a>星型与雪花型分析模式</h3><p>不像事务处理领域广泛使用的不同数据模型，数据仓库在分析型业务上相当公式化地使用星型模型，也成为维度建模（dimensional modeling）。</p>
 <p>模式的中心是一张事实表，事实被捕获为单独的事件成为事实表中的每一行。因为事实表在中央而维度表在四周，这个模式被称为星型模式。</p>
 <p>每一行里都有很多属性，和引用其他维度表的外键。这些维度表通常代表事件的对象（who）、什么（what）、地点（where）、时间（when）、方法（how）以及原因（why）。</p>
-<p>星型模式有个变体，其中维度被进一步被细分为子空间-维度表之间还可以再进一步用外键互相引用。雪花模型比星型模型更加规范化了（normalization）。</p>
+<p>星型模式有个变体，其中维度被进一步被细分为子空间-维度表之间还可以再进一步用外键互相引用。雪花模型比星型模型更加规范化了（normalization）。但大多数分析人员，雪花模型比星型模型更简单。星型 -&gt; 雪花</p>
 <p>在典型的数据仓库中，表通常非常宽，事实表通常超过 100 列，有时候有几百列。维度表也可能非常宽。</p>
+<h2 id="列式存储"><a href="#列式存储" class="headerlink" title="列式存储"></a>列式存储</h2><p>如果事实表中有数亿万亿行、PB 大小的数据，则高效地存储和查询这些数据将成为一个具有挑战性的问题。维度表则通常小很多。所以此节中，将主要关注事实表的存储。</p>
+<p>虽然事实表通常超过 100 列，但典型的数据仓库查询往往一次只访问其中的 4 或 5 列。</p>
+<p>通常，面向行的存储引擎仍然需要（如果不能处理覆盖索引）将所有行都加载进内存中进行加载、解析和过滤。</p>
+<p>面向列的存储的想法很简单：不要将一行中的所有值存储在一起，而是将每列中的所有值存储在一起。</p>
+<p>面向列的存储布局依赖一组列文件，每个文件以相同顺序保存着数据行-这样实际上会造成存储的稀疏，但制造了存储上的对齐。</p>
+<h3 id="列压缩"><a href="#列压缩" class="headerlink" title="列压缩"></a>列压缩</h3><p>除了仅从磁盘中加载查询所需的列之外，还可以通过压缩数据进一步降低对磁盘吞吐量的要求。列的值序列有很多重复的话，是压缩的好兆头。在数据仓库中特别有效的一种技术是位图编码（bitmap encoding）。</p>
+<p>一列如果有 n 种值，则可以有 n 种位图，每个位图上的一位，代表一行在上面是不是有值。这样重复的字面量存储空间被减少到一个比特。而且可以使用游程编码，对 product_sk in (30, 68, 69)这样的查询，可以对位图进行按位或，然后用求等。</p>
+<p>这个设计思想可以总结为：拿可枚举值作为位图数量（横向数据有限），事实数量（纵向数据无限）作为比特。</p>
+<p>有一个常见的误解：Cassandra 和 HBase 都源于 BigTable，但它们使用列族，将行主键与列族的列存储在一起，并且不使用列压缩。<strong>所以 BigTable 模型仍然面向行</strong>。</p>
+<h3 id="内存带宽和矢量化处理"><a href="#内存带宽和矢量化处理" class="headerlink" title="内存带宽和矢量化处理"></a>内存带宽和矢量化处理</h3><p>面向列的存储有利于 CPU 利用内存带宽，而且快速矢量化处理。</p>
+<h3 id="列存储中的排序"><a href="#列存储中的排序" class="headerlink" title="列存储中的排序"></a>列存储中的排序</h3><p>在列存储中，行的存储顺序不重要，最简单的方法是按照插入顺序保存，这样插入一个新行只是追加到每个列文件。</p>
+<p>但单独排序某一列没有意义，如果这样的话无法知道列中的某一项具体属于哪一行。如果我们知道某列中的第 k 项一定属于同一行，基于这种约定我们可以重建一行。</p>
+<p>相反，即使数据是按列存储的，它也需要一次排序整行。</p>
+<p>只要涉及到排序，我们就要考虑排序键。第一个排序键往往是最重要的，我们通常选择的排序键是日期之类的列，这类列 selectivity 最高。这样我们进行范围查找的时候，解空间可以一下子收敛到很小的范围，加快查找的结果。</p>
+<p>排序的另一个优点是，他可以帮助进一步压缩列。有大量重复值的列压缩率最好。第一列的压缩率最好，第二第三列的排序键的情况会更复杂。因为它们的值域里面相邻的重复值，可能因为归属于不同的第一键而被切割得七零八落-这就是局部簇聚性的局限了。</p>
+<p><strong>排序优先级进一步下降的列基本上会呈现接近随机的顺序，因此通常无法压缩。</strong></p>
+<h3 id="几种不同的排序"><a href="#几种不同的排序" class="headerlink" title="几种不同的排序"></a>几种不同的排序</h3><p>面向列的存储具有多个排序顺序，这有些类似在面向行的存储汇总具有多个二级索引。但面向行的存储，行的数据只在一处，二级索引里保存的是指向行的指针；对于列存储，通常没有任何指向别处数据的指针，只有包含值的列。<strong>拥有多个维度的存储，对保持查询业务的高可用有一定帮助。</strong></p>
+<h3 id="列存储的写操作"><a href="#列存储的写操作" class="headerlink" title="列存储的写操作"></a>列存储的写操作</h3><p>B-tree 使用原地更新的方式，必然会带来数据页的裂。而列式存储每插入一行就要更新所有列，代价更大，所以选择 LSM-tree 有其必然性。</p>
+<p>通常列式存储在内存中使用的数据结构是面向行还是面向列的，无关紧要（这就是为什么可以使用一个 RB-tree 的原因）。</p>
+<h3 id="聚合：数据立方体和物化视图"><a href="#聚合：数据立方体和物化视图" class="headerlink" title="聚合：数据立方体和物化视图"></a>聚合：数据立方体和物化视图</h3><p>未必每个数据仓库都基于列存储（<strong>但数据仓库的事实表如果有几百列，又会倾向于使用列存储</strong>）。</p>
+<p>我们通常需要使用聚合方法处理原始数据的很多列，每次都重新处理非常浪费时间。所以这诞生了两类解决方案：</p>
+<ul>
+<li>物化视图：将之前的查询结果缓存在磁盘上。我们常说的数据血缘表即是这种表。</li>
+<li>虚拟视图：我们常说的 view，编写查询的快捷方式，隐藏了真实的细节，差异化地管控查询的细节- SQL on hadoop 就是为分布式文件系统设计的虚拟视图。</li>
+</ul>
+<p>物化视图的写入成本很高，但查询效果很好。所以数据仓库喜欢用物化视图而RDBMS 喜欢使用虚拟视图。</p>
+<p>物化视图的一种常见情况被称为数据立方体。</p>
+<p>一个二维的数据立方体是这样的：每个事实只包含两个维度表的外键，每个维度是二维矩阵的一个方向，而二维矩阵格子是事实的完整属性。这样，我们可以沿着任意维度应用聚合操作，得到减少一个维度的总和。</p>
+<p><img src="data-cube.png" alt="data-cube.png"></p>
+<p>注意，这个立方体里有一列专门的聚合列，产生了单一维度的聚合格子（这一列不能存储复合值，它必须从属于这一维度），这个聚合列才是加速的关键。</p>
+<p>一般来说，事实表的维度不止五个。我们很难想象五维超立方体是什么样子的。我们可以简单想象一下：</p>
+<ul>
+<li>数据存放在特定的格子里</li>
+<li>格子上存储了它拥有的所有维度的外键</li>
+<li>格子的内容就是维度1-维度2-维度3-…-维度 x 限定的事实属性</li>
+</ul>
+<p>数据立方体针对某些查询会非常快，因为她已经被预先计算出来了。但它不能解决非特定维度聚合的问题，所以数据仓库还是必须存储原始数据。</p>
+<h2 id="小结-1"><a href="#小结-1" class="headerlink" title="小结"></a>小结</h2><p>OLTP 面向用户，OLAP 面向业务分析师。</p>
+<p>OLTP 方面，有两个流派的存储引擎：</p>
+<ul>
+<li>日志结构流派，它追加更新，后台合并数据页。</li>
+<li>原地更新流派（而不是 B-tree 流派），它原地更新数据页。</li>
+</ul>
+<h1 id="数据编码与演化"><a href="#数据编码与演化" class="headerlink" title="数据编码与演化"></a>数据编码与演化</h1><h2 id="数据编码格式"><a href="#数据编码格式" class="headerlink" title="数据编码格式"></a>数据编码格式</h2><p>编码模式要处理模式变化，才能兼容新旧系统和新旧数据。</p>
+<p>向后兼容：新代码理解老数据。<br>向前兼容：老代码理解新数据-这一条比较难做到，类似软分叉。</p>
+<p>程序通常使用（至少）两种不同的数据表示形式：</p>
+<ol>
+<li>在内存中，保存在专门的数据结构中，使用指针优化 cpu 进行高效访问和操作的优化。</li>
+<li>在传输和存储时，将其编码为某种<strong>自包含的字节序列</strong>，由于指针对其他进程没有意义，所以这个字节序列看起来与内存中使用的数据结构大不一样。</li>
+</ol>
+<p>从 1 到 2 被称为编码，从 2 到 1 被称为解码。</p>
+<p>许多编程语言都内置支持将内存中的对象编码为字节序列。但它有种种缺点：</p>
+<ul>
+<li>不利于异构系统集成</li>
+<li>容易导致安全问题</li>
+<li>不利于版本管理（进而处理向前兼容和向后兼容）</li>
+<li>效率不高</li>
+</ul>
+<p>因此我们产生了一些流行的格式，Json、XML 与二进制变体。这些格式处理数字、模式、二进制数据都有一些小小的问题。</p>
+<p>明文是前后兼容性最好的格式，也是最不紧凑的格式。所以越是大数据量的场合，越要发明一些新颖的格式来解决容量问题。</p>
+<h2 id="数据流格式"><a href="#数据流格式" class="headerlink" title="数据流格式"></a>数据流格式</h2><p><strong>进程内通信是共享内存的通信；进程间通信是基于字节序列的数据编码通信。</strong>我们编写程序时进行函数间调用，就是进程内通信；我们编写 API 进行服务间通信，就是进程间通信。</p>
+<h3 id="基于数据库的数据流"><a href="#基于数据库的数据流" class="headerlink" title="基于数据库的数据流"></a>基于数据库的数据流</h3><p>基于数据库的数据流要注意模式演化和兼容性问题。</p>
+<h3 id="基于服务的数据流：REST-和-PRC"><a href="#基于服务的数据流：REST-和-PRC" class="headerlink" title="基于服务的数据流：REST 和 PRC"></a>基于服务的数据流：REST 和 PRC</h3><p>服务器公开的 API 被称为服务，API 通常包括一组标准的协议和数据格式。Web 浏览器、服务器和网站作者都同意这些标准，所以可以使用任何浏览器访问任何网页。</p>
+<p>Web 浏览器不是唯一的客户端，移动设备或者桌面计算机上的应用程序也可以向服务器发出网络请求。</p>
+<p>此外，服务器本身也可以成为另一项服务的客户端。这种方法可以用于将大型应用程序按照功能区域分解为较小的服务，服务之间通过请求传递数据。这种构建应用程序的方式被称为 SOA 或者微服务架构。</p>
+<p>SOA/微服务体系结构的一个关键设计目标是，通过使服务可独立部署和演化，让程序更易于更改和维护。</p>
+<h4 id="网络服务"><a href="#网络服务" class="headerlink" title="网络服务"></a>网络服务</h4><p>当 HTTP 被用作与服务通信的底层协议时，它被称作 Web 服务。</p>
+<p>REST 不是一种协议，而是一种基于 HTTP 原则的设计理念。它强调：</p>
+<ul>
+<li>简单的数据格式</li>
+<li>使用 URL 来标识资源</li>
+<li>并且使用 HTTP 功能进行缓存控制、身份验证和内容类型协商</li>
+</ul>
+<p>REST 在微服务架构非常受欢迎。</p>
+<p>相比之下，SOAP 是基于 XML 的协议，虽然它最常用于 HTTP，但其设计目的是独立于 HTTP，并避免使用大多数 HTTP 的功能。SOAP 相关的复杂框架通常是 Web Service Framework，被称为 WS-*。因此它的 API 通常使用 WSDL 来生成代码，使用本地类和方法调用来访问远程服务。</p>
+<p>SOAP 过于复杂，对于没有 SOAP 供应商支持的编程语言的用户来说，试图与 SOAP 服务集成非常困难。</p>
+<h4 id="远程过程调用（RPC）的问题"><a href="#远程过程调用（RPC）的问题" class="headerlink" title="远程过程调用（RPC）的问题"></a>远程过程调用（RPC）的问题</h4><p>EJB、RMI、DCOM 和 CORBA，各有其局限性。</p>
+<p><strong>RPC 思想试图使向远程网络服务发出请求看起来与在同一进程中调用编程语言中的函数或方法相同（这种抽象被称作位置透明）。</strong>这种方法有根本的缺陷（我们无法克服这些分布式计算与生俱来的缺陷），网络请求与本地函数调用非常不同：</p>
+<ul>
+<li>本地函数调用是可预测的，并且成功或失败仅取决于控制的参数。而网络请求不可预测，因此必须有所准备，重试所有的请求。</li>
+<li>本地函数调用要么返回一个结果，要么抛出一个异常，或者永远不会返回（因为无限循环或进程崩溃）。网络请求返回时可能没有结果。</li>
+<li>如果重试失败的网络请求，可能会发生请求实际上已完成，只是响应丢失的情况，这又要求我们建立重复数据消除（幂等性）机制。</li>
+<li>调用本地函数的时间大致相同，而网络请求的耗时则不同。</li>
+<li>调用本地函数有时候只要传输指针就行（有时候传递数据，或者说，<strong>针对复杂数据量传递指针，简单数据传递数据</strong>），而远程请求则必须全部传递数据。</li>
+<li>客户端和服务端可能用不同编程语言来实现，所以 RPC 框架必须处理数据类型转换的问题。</li>
+</ul>
+<h4 id="RPC-的发展方向"><a href="#RPC-的发展方向" class="headerlink" title="RPC 的发展方向"></a>RPC 的发展方向</h4><p>RPC 的性能会更好，但 RESTful API 还有其他一些显著的优点：它有利于实验和调试，支持所有的主流编程语言和平台，并且有一个庞大的工具生态系统。</p>
+<h4 id="RPC-的数据编码和演化"><a href="#RPC-的数据编码和演化" class="headerlink" title="RPC 的数据编码和演化"></a>RPC 的数据编码和演化</h4><p>如果 RPC 经常要用于跨组织边界的通信，维护服务的兼容性会变得更加困难。服务的提供者无法控制其客户，也不能强制他们升级。</p>
+<p>管理 API 版本的方法有：</p>
+<ul>
+<li>在 URL 或 HTTP Accept 头中使用版本号</li>
+<li>使用 API 密钥来标识特定客户端的服务</li>
+<li>使用单独的管理接口来更新 API 版本的选项</li>
+</ul>
+<h3 id="基于消息传递的数据流"><a href="#基于消息传递的数据流" class="headerlink" title="基于消息传递的数据流"></a>基于消息传递的数据流</h3><p>消息是介于 RPC 和数据库之间的异步消息传递系统。客户端的请求通过低延迟传递到另一个进程中。</p>
+<p>与 RPC 相比，消息传递有几个优点：</p>
+<ul>
+<li>消息代理可以充当缓冲区</li>
+<li>它可以自动将消息重新发送到崩溃的进程，从而防止消息丢失</li>
+<li>它避免了发送方需要知道接收方的IP 地址和端口号</li>
+<li>它支持将一条消息发送给多个接收方</li>
+<li>它在逻辑上将发送方与接收方分离</li>
+</ul>
+<p>与 RPC 的差异在于，消息传递通信通常是单向的。</p>
+<h4 id="消息代理"><a href="#消息代理" class="headerlink" title="消息代理"></a>消息代理</h4><p>有一类的消息队列，有请求队列，也有回复队列。</p>
+<h4 id="分布式-Actor-框架"><a href="#分布式-Actor-框架" class="headerlink" title="分布式 Actor 框架"></a>分布式 Actor 框架</h4><p>Actor 模型是被用于单个进程内并发的编程模型。逻辑被封装在 Actor 中，而不是直接处理线程。</p>
+<p>每个 Actor 通常代表一个客户端或实体，它可能有某些本地状态（不与其他 Actor 共享），并且它通过发送和接收异步消息与其他 Actor 通信。<strong>不保证消息传送：在某些错误情况下，消息将丢失。</strong>由于每个 actor 一次只处理一条消息，因此不需要担心线程，每个 Actor 都可以由框架独立调度。虽然很相似，但 Goroutine 不同于 Actor，它是 CSP 模型。</p>
+<p>在分布式 Actor 框架中，这个编程模型被用来跨越多个节点来扩展应用程序。</p>
+<p>分布式 Actor 框架实质上是将消息代理和 Actor 编程模型集成到单个框架中。</p>
+<p>Actor 可以很好地支持滚动更新。</p>
+<h2 id="小结-2"><a href="#小结-2" class="headerlink" title="小结"></a>小结</h2><p>预祝你的应用程序可以快速迭代，顺利部署。</p>
 
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/10/11/数据密集型应用系统设计-Designing-Data-Intensive-Applications/" data-id="ckkkv5te400dirma1x4p348yx" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/10/11/数据密集型应用系统设计-Designing-Data-Intensive-Applications/" data-id="ckkl6n0uf00co6da1nneeymoj" class="article-share-link">分享</a>
       
       
       
@@ -590,7 +701,7 @@ WITH RECURSIVE
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/10/04/亿级订单架构设计/" data-id="ckkkv5tdy00d1rma15c8zwn22" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/10/04/亿级订单架构设计/" data-id="ckkl6n0ux00dh6da18898ece0" class="article-share-link">分享</a>
       
       
       
@@ -801,7 +912,7 @@ o<span class="token punctuation">.</span><span class="token function">dosomethin
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/27/现代垃圾收集器/" data-id="ckkkv5te000d6rma1wxdc74xf" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/27/现代垃圾收集器/" data-id="ckkl6n0ub00cg6da15xy77vhi" class="article-share-link">分享</a>
       
       
       
@@ -862,7 +973,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/14/MySQL-的配置/" data-id="ckkkv5tdv00ctrma12xb6k45e" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/14/MySQL-的配置/" data-id="ckkl6n0ua00ce6da1ejueo4ek" class="article-share-link">分享</a>
       
       
       
@@ -3322,7 +3433,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/13/英文汇总/" data-id="ckkkv5tdx00cyrma1z3nbx2bh" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/13/英文汇总/" data-id="ckkl6n0uy00dk6da17j07n9ut" class="article-share-link">分享</a>
       
       
       
@@ -3640,7 +3751,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/02/异地多活与单元化/" data-id="ckkkv5tdw00cwrma1w5r40gyv" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/02/异地多活与单元化/" data-id="ckkl6n0uc00cj6da17o3derbz" class="article-share-link">分享</a>
       
       
       
@@ -3742,7 +3853,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/08/18/压力测试需要关注的注意事项/" data-id="ckkkv5tdu00crrma1luczl6pg" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/08/18/压力测试需要关注的注意事项/" data-id="ckkl6n0u800c96da1x18mmixc" class="article-share-link">分享</a>
       
       
       
@@ -3801,7 +3912,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/08/15/MySQL-与数据迁移/" data-id="ckkkv5tdq00chrma1zv9affx2" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/08/15/MySQL-与数据迁移/" data-id="ckkl6n0u500c46da1n76hf0e1" class="article-share-link">分享</a>
       
       
       
@@ -3869,7 +3980,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/08/02/常见的服务器调用堆栈/" data-id="ckkkv5tdt00cprma1yt2fl1zo" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/08/02/常见的服务器调用堆栈/" data-id="ckkl6n0u300c06da18pchn405" class="article-share-link">分享</a>
       
       
       
