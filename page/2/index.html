@@ -131,7 +131,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/11/21/《人类群星闪烁时》/" data-id="ckkmbmzdx00cqw4a1on93v3tq" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/11/21/《人类群星闪烁时》/" data-id="ckkrnncnu00lctha1gogx52zi" class="article-share-link">分享</a>
       
       
       
@@ -662,20 +662,83 @@ WITH RECURSIVE
 <ul>
 <li>使数据更接近用户</li>
 <li>提高冗余</li>
-<li>读扩展（冗余提供了超量部署）</li>
+<li>读扩展（冗余提供了超量部署，读扩展也降低了延迟，负载和）</li>
+<li>如果复制的数据一成不变，那么复制就非常容易：只需将数据复制到每个节点，一次即可搞定。然而所有的技术挑战都在于处理那些持续更改的数据。</li>
 </ul>
-<p>如果复制的数据一成不变，那么复制就非常容易：只需将数据复制到每个节点，一次即可搞定。然而所有的技术挑战都在于处理那些持续更改的数据。</p>
 <p>目前流行的复制数据变化的方法有：</p>
 <ul>
 <li>主从复制</li>
 <li>多主节点复制</li>
 <li>无节点复制</li>
 </ul>
+<p>复制技术存在许多需要折中考虑的地方，比如<strong>采取同步复制还是异步复制，以及如何处理失败的副本</strong>。</p>
+<p>数据库复制是个很古老的话题，因为网络的基本约束条件，自始至终没有发生过本质的变化（计算机发展的早期就已经摸清楚了这些基本问题，而且推导出了问题的基本解法）。</p>
+<p>实践中大多数开发人员仍然假定数据库只运行在单节点上，分布式数据库成为主流也是最近发生的事情（<strong>长久以来 MySQL 始终是个非分布式数据库，所以才有各种中间件方案</strong>）。</p>
+<p><strong>许多应用开发人员在这方面经验还略显不足，对诸如“最终一致性”等问题存在一些误解。因此，在“复制滞后问题”中，我们会详细讨论最终一致性，包括读自己的写和单调读。</strong></p>
+<h2 id="主节点和从节点"><a href="#主节点和从节点" class="headerlink" title="主节点和从节点"></a>主节点和从节点</h2><p>每个保存数据库完整数据集的节点称之为副本。当有了多副本，不可避免地会引入一个问题：如何确保所有副本之间的数据是一致的？</p>
+<ol>
+<li>指定某一个副本为主副本（或称为主节点）。当客户写数据库时，必须将写请求首先发送给主副本，主副本首先将新数据写入本地存储。</li>
+<li>其他副本则全部称为从副本（或称为从节点）。</li>
+</ol>
+<h3 id="同步复制与异步复制"><a href="#同步复制与异步复制" class="headerlink" title="同步复制与异步复制"></a>同步复制与异步复制</h3><p><img src="同步复制与异步复制.png" alt="同步复制与异步复制.png"></p>
+<p>上图的第一个节点显示了同步复制的工作流程，第二个节点显示了异步复制的工作流程。</p>
+<p>同步的优点是，如果用户收到看  OK，则所有从节点 OK 了。同步复制的缺点是，如果有从节点阻塞，所有写入都会被阻塞（主从延迟是很常见的情形，所以同步复制产生的写阻塞会很频繁）。</p>
+<p>实践中，如果数据库启用了同步复制，通常意味着其中某一个从节点是同步的，而其他节点则是异步模式。万一同步的从节点变得不可用或性能下降，则将另一个异步的从节点提升为同步模式。这样可以保证至少有两个节点（即主节点和一个同步从节点）拥有最新的数据副本。这种配置有时被称为半同步（这项技术可能是 FaceBook 率先提出的）。</p>
+<p>主从复制还可以配置为全异步模式，这样配置性能最高，但可能丢失所有尚未复制到从节点的写请求-这是后面要谈到的“复制滞后问题”的体现。</p>
+<p>异步模式看起来不靠谱，但还是被广泛使用，特别是从节点数量巨大或者分布于广域地理环境。</p>
+<p>复制涉及的问题非常复杂，多副本一致性和共识问题后续再讨论。链式复制（Chain Replication）能够兼容高吞吐和高可用的场景，已经应用在微软的 Azure 存储中。</p>
+<h3 id="配置新的从节点"><a href="#配置新的从节点" class="headerlink" title="配置新的从节点"></a>配置新的从节点</h3><p>新增从节点不能使用直接停机拷贝的方式，除非我们的主节点停写，直至拷贝完成。但停写的时间不能太长，否则高可用不能被保证。所以常见的做法是：</p>
+<ol>
+<li>生成一个<strong>一致性快照</strong>，MySQL 使用 innodbbackupex。</li>
+<li>将一致性快照应用（Apply）到从节点上。</li>
+<li>从节点请求快照点之后发生的数据更改日志。这种日志的快照点位有特别的叫法，PostgreSQL 将其称为“log sequence number”，MySQL 将其称为“binlog coordinates”。</li>
+<li>获得日志后，从节点来应用这些快找点之后的所有数据变更。</li>
+</ol>
+<h3 id="处理节点失效"><a href="#处理节点失效" class="headerlink" title="处理节点失效"></a>处理节点失效</h3><h4 id="从节点失效：追赶式恢复"><a href="#从节点失效：追赶式恢复" class="headerlink" title="从节点失效：追赶式恢复"></a>从节点失效：追赶式恢复</h4><p>如果发生网络闪断，只要从节点明确知道故障之前处理的最后一笔事务，然后连接到主节点，请求从那笔事务之后中断期间所有的数据变更。</p>
+<h4 id="从节点失效：节点失效"><a href="#从节点失效：节点失效" class="headerlink" title="从节点失效：节点失效"></a>从节点失效：节点失效</h4><p><strong>节点切换，极度危险！</strong></p>
+<p>处理主节点故障的情况则比较棘手：选择某个从节点将其提升至主节点；客户端也需要更新，这样之后的写请求会发送给新的主节点，然后其他从节点要接受新的主节点的变更数据，这一过程称之为切换。</p>
+<p>故障切换可以手动执行，也可以自动进行。自动切换的步骤通常如下：</p>
+<ol>
+<li>确认主节点失效。一般基于超时的心跳机制。</li>
+<li>选举新节点。一般基于共识算法选举新节点，需要选出和失效的主节点数据差异最小的从节点。</li>
+<li>重新配置系统使新主节点生效。</li>
+</ol>
+<p>在上述切换过程中还充满了各种各样的变数：</p>
+<ol>
+<li>如果使用了异步的复制，新的主节点未必收到了原主节点的所有数据（任何一种共识算法都解决不了这个问题）。如果这时候新的节点收到了新的冲突的写请求，这时候可能产生脏数据。常见的解决方案（高可用）方法是：<strong>新的主节点丢弃未完成复制的请求，但这可能会未被数据更新持久化的承诺。-另一种强一致性的做法是，在新主和老主确认校验一致之前，禁止新节点的写。这种禁止对可用性伤害很高，如果校验长时间无法完成，集群会瘫痪掉。</strong></li>
+<li>如果在数据库之外有其他系统依赖于数据库的内容并在一起协同使用，丢弃数据的方案就特别危险。<strong>所以强一致性的数据（余额、序列号等交易因子业务）不能使用丢弃后写的数据方案。</strong></li>
+<li>在某些情况下，可能出现两个从节点都认为自己是新主节点，这种情况被称为脑裂。这非常危险，两个主节点都可能接受写请求，并且没有很好地解决冲突的方法（没有办法自动处理，可能需要引入手工处理）。作为一种安全应急方案，有些系统会采取措施来强制关闭其中一个节点。</li>
+<li>如何设置合适的超时时间来检测主节点失效呢？主节点失效后，超时时间设置得越长也意味着总体恢复时间就越长。但如果超时时间设置得太短，可能导致很多不必要的切换，遇到网络流量暴增可能会让系统频繁切换而崩溃。-<strong>超时时间太长或者太短都是陷阱，至少应该让超时时间长于一个应用超时时延的 margin。</strong></li>
+</ol>
+<h3 id="复制日志的实现"><a href="#复制日志的实现" class="headerlink" title="复制日志的实现"></a>复制日志的实现</h3><h4 id="基于语句的复制"><a href="#基于语句的复制" class="headerlink" title="基于语句的复制"></a>基于语句的复制</h4><p>这是最基础的方案。</p>
+<p>最简单的情况，主节点记录锁所执行的每个写请求（操作语句）并将该操作作为日志发送给从节点。</p>
+<p>区块链就是使用这种方案，但这种方案有诸多限制：</p>
+<ul>
+<li>限制语句必须是确定性的语句。</li>
+<li>语句本身不能依赖于本地现有数据（自增列），或者会限制所有语句的执行顺序。这实际上仍然会限制事务的并发执行-只有序列化执行能够无措执行。</li>
+<li>有副作用的语句。</li>
+</ul>
+<p><strong>我们自己做 C/S 类型的数据同步，也可能采取基于语句的复制的方案，如果我们不能解决上面的问题，我们可能会遇到很大的问题。这就看出 Log-Structure 这种设计模式的重要了。</strong></p>
+<h4 id="基于预写日志的复制"><a href="#基于预写日志的复制" class="headerlink" title="基于预写日志的复制"></a>基于预写日志的复制</h4><p>所有对数据库写入的字节序列都被记入日志，这种日志就是 WAL。WAL 的缺点就是它描述的数据结果非常底层，某些磁盘块里的某些字节发生了改变，会让复制方案和存储引擎紧密耦合。</p>
+<h4 id="基于行的逻辑日志复制"><a href="#基于行的逻辑日志复制" class="headerlink" title="基于行的逻辑日志复制"></a>基于行的逻辑日志复制</h4><p>另一种方法是复制和存储引擎采用不同的日志格式，这样复制与存储逻辑剥离。这种复制日志称为逻辑日志。</p>
+<p>MySQL 的 binlog 是这样工作的：针对一个事务，产生涉及多行的多条日志记录，并在后面跟着一条记录，指出该事务已提交。</p>
+<p>（因为 binlog 是逻辑日志，所以它不与存储引擎绑定，是 Server 层日志。 binlog 特别适合用来跨版本复制是它的一个优点，但不适合特种的存储引擎的问题恢复。）</p>
+<h4 id="基于触发器的控制"><a href="#基于触发器的控制" class="headerlink" title="基于触发器的控制"></a>基于触发器的控制</h4><p>这里的触发器不是数据库内置的 trigger，而是应用层程序。基于应用层的程序比较灵活，<strong>也开销更高，而且也更加容易出错</strong>。</p>
+<h2 id="复制滞后问题（replication-lag）"><a href="#复制滞后问题（replication-lag）" class="headerlink" title="复制滞后问题（replication lag）"></a>复制滞后问题（replication lag）</h2><p>主从复制要求所有的写请求都经过主节点。为了保证主从复制的写吞吐量，所以往往会开启异步复制。只要开启异步复制，都可能产生各种复制滞后，这也就意味着我们必然面对现实中的最终一致性。</p>
+<h3 id="读自己的写（read-your-writes）"><a href="#读自己的写（read-your-writes）" class="headerlink" title="读自己的写（read-your-writes）"></a>读自己的写（read-your-writes）</h3><p>许多应用让用户提交一些数据，接下来查看他们自己提交的内容。</p>
+<p>因为（基于主从的）异步复制的存在，所以可能会有一些用户在提交请求后需要（在副本上）查询自己提交的读。这就需要 read-after-write-consistency。</p>
+<p>那么如何保证这种一致性呢？</p>
+<ul>
+<li>如果用户可能访问会被修改的内容，从主节点读；否则，在从节点读取。这需要在业务规则上区分，什么样的数据是属于用户自己的某次修改的，什么样的数据是属于别人的修改的。</li>
+<li>如果大部分的内容可能被大部分用户修改，那么尚书方法将不太有效。如果大部分的数据都需要经由主节点，这就丧失了读操作的扩展性。这时候可以尝试（一个弱时间假设），在更新后一分钟的时间内，读主节点；其他时间读从节点。这就要求：我们的时间假设掐得非常准，也要我们监控那些特别慢的节点。</li>
+<li>客户端可以记住最近更新时的时间戳，并附在读请求中，据此信息，应用可以确定此时读出的数据是不是足够新。如果不够新，要么交给其他副本读，要么等待直至读到相应时间戳的数据为止。这个时间戳可以是逻辑时间戳（日志序列号），也可以是实际系统时钟。通常采取这种方案的系统要具有“写事件驱动读带有时间戳”的特点。</li>
+<li>如果副本分布在多数据中心，情况复杂些，必须先把请求路由到主节点所在的数据中心（该数据中心可能离用户很远）。</li>
+</ul>
 
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/10/11/数据密集型应用系统设计-Designing-Data-Intensive-Applications/" data-id="ckkmbmze800djw4a1me1sbykd" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/10/11/数据密集型应用系统设计-Designing-Data-Intensive-Applications/" data-id="ckkrnncnh00kptha1x0i3wbxl" class="article-share-link">分享</a>
       
       
       
@@ -728,7 +791,7 @@ WITH RECURSIVE
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/10/04/亿级订单架构设计/" data-id="ckkmbmzdw00cow4a1ldxqnx5b" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/10/04/亿级订单架构设计/" data-id="ckkrnncnf00kntha1fk4ch2uo" class="article-share-link">分享</a>
       
       
       
@@ -939,7 +1002,7 @@ o<span class="token punctuation">.</span><span class="token function">dosomethin
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/27/现代垃圾收集器/" data-id="ckkmbmzdy00csw4a1pyqxfzuu" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/27/现代垃圾收集器/" data-id="ckkrnncnj00krtha187czsgoi" class="article-share-link">分享</a>
       
       
       
@@ -1000,7 +1063,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/14/MySQL-的配置/" data-id="ckkmbmzdt00cjw4a1p00xyuth" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/14/MySQL-的配置/" data-id="ckkrnncnb00khtha1ae4huv9b" class="article-share-link">分享</a>
       
       
       
@@ -3466,7 +3529,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/13/英文汇总/" data-id="ckkmbmzdz00cvw4a1rpkklcji" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/13/英文汇总/" data-id="ckkrnncnc00kjtha19o4dwzj7" class="article-share-link">分享</a>
       
       
       
@@ -3784,7 +3847,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/09/02/异地多活与单元化/" data-id="ckkmbmzdv00clw4a1y65i4gwc" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/09/02/异地多活与单元化/" data-id="ckkrnncnk00kttha12kc20yq0" class="article-share-link">分享</a>
       
       
       
@@ -3886,7 +3949,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/08/18/压力测试需要关注的注意事项/" data-id="ckkmbmzdr00cew4a1knqwfcgq" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/08/18/压力测试需要关注的注意事项/" data-id="ckkrnncn900kftha1fgo6bd9t" class="article-share-link">分享</a>
       
       
       
@@ -3945,7 +4008,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/08/15/MySQL-与数据迁移/" data-id="ckkmbmzdn00c6w4a1q9nzom6w" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/08/15/MySQL-与数据迁移/" data-id="ckkrnncn600kbtha12xypvs4o" class="article-share-link">分享</a>
       
       
       
@@ -4013,7 +4076,7 @@ show binlog events in 'binlog.000156';
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/08/02/常见的服务器调用堆栈/" data-id="ckkmbmzdo00c9w4a1y289dv8h" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/08/02/常见的服务器调用堆栈/" data-id="ckkrnncn200k7tha1zysxtrlj" class="article-share-link">分享</a>
       
       
       
