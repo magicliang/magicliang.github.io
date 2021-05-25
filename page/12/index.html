@@ -72,6 +72,169 @@
       <div class="outer">
         <section id="main">
   
+    <article id="post-Redis-笔记之九：理解内存" class="article article-type-post" itemscope itemprop="blogPost">
+  <div class="article-meta">
+    <a href="/2019/10/19/Redis-笔记之九：理解内存/" class="article-date">
+  <time datetime="2019-10-19T06:02:59.000Z" itemprop="datePublished">2019-10-19</time>
+</a>
+    
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 itemprop="name">
+      <a class="article-title" href="/2019/10/19/Redis-笔记之九：理解内存/">Redis 笔记之九：理解内存</a>
+    </h1>
+  
+
+      </header>
+    
+    <div class="article-entry" itemprop="articleBody">
+      
+        <!-- Table of Contents -->
+        
+        <p>内存是昂贵的资源，要合理地使用内存，首先要做到：</p>
+<ul>
+<li>理解 Redis 的内存布局，以及它管理内存的方案</li>
+<li>思考调优的方案</li>
+</ul>
+<p>理解内存而能优化内存。</p>
+<h1 id="内存消耗"><a href="#内存消耗" class="headerlink" title="内存消耗"></a>内存消耗</h1><h2 id="内存使用统计"><a href="#内存使用统计" class="headerlink" title="内存使用统计"></a>内存使用统计</h2><pre class="line-numbers language-bash"><code class="language-bash"><span class="token comment" spellcheck="true"># 这个命令只有 redis-client 可用</span>
+info memory
+<span aria-hidden="true" class="line-numbers-rows"><span></span><span></span></span></code></pre>
+<blockquote>
+<p>used_memory:1050880<br>used_memory_human:1.00M<br>used_memory_rss:2162688<br>used_memory_rss_human:2.06M<br>used_memory_peak:1051776<br>used_memory_peak_human:1.00M<br>used_memory_peak_perc:99.91%<br>used_memory_overhead:1037590<br>used_memory_startup:987792<br>used_memory_dataset:13290<br>used_memory_dataset_perc:21.07%<br>allocator_allocated:1005760<br>allocator_active:2124800<br>allocator_resident:2124800<br>total_system_memory:17179869184<br>total_system_memory_human:16.00G<br>used_memory_lua:37888<br>used_memory_lua_human:37.00K<br>used_memory_scripts:0<br>used_memory_scripts_human:0B<br>number_of_cached_scripts:0<br>maxmemory:0<br>maxmemory_human:0B<br>maxmemory_policy:noeviction<br>allocator_frag_ratio:2.11<br>allocator_frag_bytes:1119040<br>allocator_rss_ratio:1.00<br>allocator_rss_bytes:0<br>rss_overhead_ratio:1.02<br>rss_overhead_bytes:37888<br>mem_fragmentation_ratio:2.15<br>mem_fragmentation_bytes:1156928<br>mem_not_counted_for_evict:0<br>mem_replication_backlog:0<br>mem_clients_slaves:0<br>mem_clients_normal:49694<br>mem_aof_buffer:0<br>mem_allocator:libc<br>active_defrag_running:0<br>lazyfree_pending_objects:0</p>
+</blockquote>
+<p>其中值得关注的值分别是：</p>
+<ul>
+<li>used_memory Redis 分配器（allocator分配的内存总量，也就是内部存储的所有数据内存占用量-实际上等于被实际使用的不包含内存碎片的物理内存和物理内存）</li>
+<li>used_memory_human 以可读的形式返回的 used_memory</li>
+<li>used_memory_rss 以操作系统角度显示 Redis 进程占用的物理内存总量</li>
+<li>used_memory_peak 内存使用的最大值</li>
+<li>used_memory_peak_human 以可读的格式返回的 used_memory_peak</li>
+<li>used_memory_lua lua 引擎锁消耗的内存大小</li>
+<li>used_memory_lua_human 以可读的格式返回的 used_memory_lua</li>
+<li>mem_fragmentation_ratio used_memory_rss/used_memory 的比值，这个值越高，物理内存碎片越高-有时候和内存页对齐有关。这个比值越小，证明有很多内存被调度到了 swap 空间里。</li>
+</ul>
+<p>实际上 Linux 系统的很多系统指标都有 _human  readable版本，Redis 基本模仿了这个设计。</p>
+<h2 id="（主进程）内存消耗划分"><a href="#（主进程）内存消耗划分" class="headerlink" title="（主进程）内存消耗划分"></a>（主进程）内存消耗划分</h2><h3 id="对象内存"><a href="#对象内存" class="headerlink" title="对象内存"></a>对象内存</h3><p>对象内存是 Redis 内存中占用量最大的一块，实际上我们存储的所有数据都存在这个内存区域。</p>
+<p>对象只分为 key 和 value。这一区域的大小大致上等于 sizeof(keys) + sizeof(values)。</p>
+<p>keys 都是字符串。values 就是五种基本类型：字符串、列表、哈希、集合和有序集合（bitmap 和 hyperloglog 本质上是字符串，geo 数据是 zset）。</p>
+<h3 id="缓冲内存"><a href="#缓冲内存" class="headerlink" title="缓冲内存"></a>缓冲内存</h3><h4 id="客户端缓冲内存"><a href="#客户端缓冲内存" class="headerlink" title="客户端缓冲内存"></a>客户端缓冲内存</h4><p>客户端缓冲包括输入缓冲和输出缓冲。</p>
+<p>Redis 的输入缓冲是无法控制的，默认就是每个客户端只能使用最多 1G 内存-<strong>Redis 的自保比较严格</strong>。</p>
+<p>而输出缓冲则通过 client-output-buffer-limit 控制。</p>
+<h5 id="普通客户端"><a href="#普通客户端" class="headerlink" title="普通客户端"></a>普通客户端</h5><p>除了复制和订阅客户端以外的所有客户端。</p>
+<p>Redis 的缺省配置是 client-output-buffer-limit normal 0 0 0。注意，0 意味着限制被禁用了，这是因为 Redis 认为普通客户端大部分情况下没有很多的数据输出，所以 normal 客户端相当于会有无限大的输出空间。但实际上有些特殊场景下还是需要限制输出缓冲的大小。比如如果客户端使用 monitor 命令，会有大量的输出堆积在 Redis 里，导致 Redis 的内存飙升。解决这个问题有两种思路：调整 maxclients 或者调整 client-output-buffer-limit。</p>
+<h5 id="从（Replica）客户端"><a href="#从（Replica）客户端" class="headerlink" title="从（Replica）客户端"></a>从（Replica）客户端</h5><p>Master 会单独为每个 slave 建立一条单连接。每个链接的默认配置是 client-output-buffer-limit replica 256mb 64mb 60。</p>
+<p>其中 256mb 是硬限制，只要一到达连接就关闭。64mb是软限制，只要达到并持续 60s，则连接被关闭。</p>
+<h5 id="订阅（-pubsub）客户端"><a href="#订阅（-pubsub）客户端" class="headerlink" title="订阅（ pubsub）客户端"></a>订阅（ pubsub）客户端</h5><p>尚不明确到底对于同一个 channel的多个 pubsub 客户端是不是共用一个缓冲区。因为 Redis 没有消费组的概念，所有 client 即使是争抢同一个缓冲区也是有可能的-其实这样设计比较自然，因为多个缓冲区可能导致消息的重复 subscribe。另外，<a href="https://github.com/StackExchange/StackExchange.Redis/issues/872" target="_blank" rel="noopener">如果一个 pubsub 客户端订阅了多个 channels，也是共用同一个连接</a>，这更增加了多个客户端共用一个缓冲区的可能性。其默认配置为：</p>
+<p>client-output-buffer-limit pubsub 256mb 64mb 60</p>
+<p>如上所述，订阅客户端的缓冲区大小会稍微大一些。</p>
+<h4 id="复制积压缓冲区"><a href="#复制积压缓冲区" class="headerlink" title="复制积压缓冲区"></a>复制积压缓冲区</h4><p>所有的从节点共用一个复制积压缓冲区，这个复制积压缓冲区还可以被重用，其大小默认只有 1mb，可以调整到 100mb。这样有了更大的应付网络闪断的内存余量。</p>
+<h4 id="AOF-缓冲区"><a href="#AOF-缓冲区" class="headerlink" title="AOF 缓冲区"></a>AOF 缓冲区</h4><p>AOF 重写期间，Redis 接收写命令不会停，必须使用 buffer-<strong>non-blocking的方案 之一就是使用 buffer</strong>，这部分 buffer 不能被定制。</p>
+<h3 id="内存碎片（Memory-Framentation）"><a href="#内存碎片（Memory-Framentation）" class="headerlink" title="内存碎片（Memory Framentation）"></a>内存碎片（Memory Framentation）</h3><p>常见的内存分配器（allocator）有：glibc、tcmalloc和 jemalloc，Redis 使用 jemalloc。</p>
+<p>allocator 为了更好地分配内存，一般总是 fixed-size 地分配对齐的内存块。在 64 位内存空间里，jemalloc 会把内存分为小、大、巨大三个范围。每个范围内有若干种大小不一的内存块。分配器会在分配内存的时候，选择尺寸最接近的大内存块分配内存（5kb 的内存通常会被分配在 8kb 的内存块里）。jemalloc 高度优化过内存碎片问题，通常情况下 mem_fragmentation_ratio 接近 1。</p>
+<p>但当存储的 value 长短差异较大的时候，以下操作一样可以导致高内存碎片问题：</p>
+<ul>
+<li>频繁做更新操作，比如频繁地执行 append、setrange 等更新操作。</li>
+<li>大量过期键操作，会在内存空间里留下大量空洞-实际上批量删除键也一样。</li>
+</ul>
+<p>为了解决这个问题，可以采取的潜在措施有：</p>
+<ul>
+<li>使用数据对齐的内存。</li>
+<li>使用 Sentinel 或者 Redis Cluster 的机制进行定期的主从切换，安全重启。</li>
+</ul>
+<h2 id="（子进程）内存消耗划分"><a href="#（子进程）内存消耗划分" class="headerlink" title="（子进程）内存消耗划分"></a>（子进程）内存消耗划分</h2><p>在进行备份的时候，AOF/RDB 重写会 fork 子进程。因为 COW 机制，大部分情况下子进程和父进程共用一段物理内存，在子进程发生写的时候，子进程单独复制一页出来完成写操作。</p>
+<p>THP（透明大页）的存在会导致内存拷贝时产生的页非常大，拷贝代价增多，这在写命令很多的时候会造成过度内存消耗。所以和 JVM 相反，应该关闭大页优化。</p>
+<p>除此之外，应该设置 vm.overcommit_memory=1，允许内核充分使用物理内存。</p>
+<h1 id="内存管理"><a href="#内存管理" class="headerlink" title="内存管理"></a>内存管理</h1><h2 id="设置内存上限"><a href="#设置内存上限" class="headerlink" title="设置内存上限"></a>设置内存上限</h2><p>内存管理的上限是 maxmemory，这个阈值是为了保护 memory exhausted，触发各种 policy 准备的 - 缓存场景下特别重要。</p>
+<h2 id="动态调整-maxmemory"><a href="#动态调整-maxmemory" class="headerlink" title="动态调整 maxmemory"></a>动态调整 maxmemory</h2><p>这个值可以被动态修改，方便扩容缩容-JVM 就不可以。<br>如果不设置，Redis 默认 maxmemory 无限大。</p>
+<h2 id="内存回收策略"><a href="#内存回收策略" class="headerlink" title="内存回收策略"></a>内存回收策略</h2><h3 id="删除过期对象"><a href="#删除过期对象" class="headerlink" title="删除过期对象"></a>删除过期对象</h3><p><strong>Redis 所有的 Key 都可以 expire</strong>，key 会被保存在过期字典中（Redis数据库主要是由两个字典构成的，一个字典保存键值对，另一个字典就是保存的过期键的过期时间，我们称这个字典叫过期字典）。</p>
+<p>Redis 为了节省 CPU，并不会精准删除 Redis 中的每个 Key，主要采用两个方案：</p>
+<h4 id="惰性删除"><a href="#惰性删除" class="headerlink" title="惰性删除"></a>惰性删除</h4><p><strong>所谓的惰性删除，其实是只有发生特定的事件（读/写）的时候</strong>，才进行删除数据，并返回空值（nil）的一种策略。</p>
+<p>这样做实际上避免了维护 ttl 链表（类似 Java 中的 LinkedHashMap），节省了 CPU。</p>
+<p><strong>惰性删除的缺点是，事件并不一定发生，或者过了很长的时间才发生，内存容易发生泄漏。</strong>这可能是所有事件驱动悬垂事件的缺点。</p>
+<h4 id="定时任务删除"><a href="#定时任务删除" class="headerlink" title="定时任务删除"></a>定时任务删除</h4><p>Redis虽然是个单线程架构，但内部维护一个定时任务，默认每秒运行 10 次（可配置，不知道是不是 event loop 实现的）。</p>
+<p>其基本流程为：</p>
+<p><img src="https://s2.ax1x.com/2019/10/18/KZ3hDK.png" alt="此处输入图片的描述"></p>
+<ul>
+<li>以慢模式启动。</li>
+<li>每次执行时针对每个 db 空间随机采样 20 个 key，进行超时检验并删除 key，并采样统计。</li>
+<li>如果没有 25% 的 key 过期，任务退出。</li>
+<li>否则循环执行删除 key 的操作。</li>
+<li>如果最终执行超过 25 ms 或者统计数据低于 25%以后，直接退出。</li>
+<li>否则每次 Redis 事件发生以前用快模式删除 Key。</li>
+</ul>
+<p>快模式和慢模式的流程一样（也就是和上面一样），但超时时间短很多，只有 1ms，且 2 s 内只能运行一次。</p>
+<h3 id="内存溢出控制策略"><a href="#内存溢出控制策略" class="headerlink" title="内存溢出控制策略"></a>内存溢出控制策略</h3><p>内存使用量(实际上应当是去掉缓冲区内存后的对象内存)一旦到达 maxmemory，Redis 就要开始 evict 操作。基于 maxmemory-policy，Redis 一共有 6 种策略：</p>
+<ul>
+<li>noeviction：默认策略。拒绝写入任何数据而报错。</li>
+<li>volatile-lru：根据 LRU 算法删除设置了 expire 的键，直到腾出空间为止。如果没有可删除的对象（了），回退到 noeviction。</li>
+<li>allkeys-lru：对全 key 进行 lru 删除，直到腾出空间为止-<strong>这也就意味着不设置 expire 也能区分出 lru 的键来</strong>，这也意味着 Redis 可以当做准成的 lru cache 用。</li>
+<li>volatile-random：随机删除过期键，直到腾出空间为止。</li>
+<li>volatile-ttl：根据键值对的 ttl 属性，删除最近将过期的数据。如果（要有 expire 才有 ttl）没有，回退到 noeviction。</li>
+</ul>
+<p>每次执行命令时，Redis 都会检查 maxmemory，尝试进行内存回收工作。内存回收造成的 delete 还会被同步到从节点，造成写放大-凡是主从模式都要考虑写放大问题。</p>
+<p>因为这个值可以动态调整，所以可以动态触发 Redis 缩容，这是 JVM 做不到的。</p>
+<h1 id="内存优化"><a href="#内存优化" class="headerlink" title="内存优化"></a>内存优化</h1><h2 id="redisObject-对象"><a href="#redisObject-对象" class="headerlink" title="redisObject 对象"></a>redisObject 对象</h2><p>Redis 中的<strong>值对象</strong>在内部定义为 redisObject 结构体。</p>
+<p><img src="https://s2.ax1x.com/2019/10/18/Ken8gK.png" alt="此处输入图片的描述"></p>
+<p>其内容为：</p>
+<ul>
+<li>type：type 会返回value（not key）的数据类型。</li>
+<li>encoding：同一种类型的 value，使用不同的 encoding 差别也会非常大。</li>
+<li>lru：记录对象被最后一次访问的时间。这对allkeys-lru 和 volatile-lru 场景下特别有用。</li>
+<li>refcount 记录当前对象被引用的次数。refcount=0 意味着对象可以被安全回收。</li>
+<li>*ptr 如果是整数则储存整数，否则指向数据内存段。</li>
+</ul>
+<h2 id="缩减键值对象"><a href="#缩减键值对象" class="headerlink" title="缩减键值对象"></a>缩减键值对象</h2><p>应该尽量减少 key 和 value 的长度。</p>
+<ul>
+<li>在完整描述业务的情况，key 越短越好。</li>
+<li>value 应该被序列化前尽量精简对象，使用最好的序列化算法+压缩算法（考虑 snappy）。</li>
+</ul>
+<h2 id="共享对象池"><a href="#共享对象池" class="headerlink" title="共享对象池"></a>共享对象池</h2><p>共享对象池就是整数对象池，不像 JVM，不存在其他类型的对象池。</p>
+<p>类似 Java 中的字符串 intern 池和 wrapper cache，Redis 会自动复用[0-9999]的整数对象池。5 种类型的 value 一旦涉及整数，也会引用整数对象池。</p>
+<p>使用</p>
+<blockquote>
+<p>127.0.0.1:6379&gt; set foo 2<br>OK<br>127.0.0.1:6379&gt; object refcount foo<br>(integer) 2147483647</p>
+</blockquote>
+<p>这个对象池的大小可以通过 REDIS_SHARED_INTEGERS 来定义，不能<code>config set</code>。类似 JVM。</p>
+<p>如果 maxmemory-policy 为 volatile-lru 或者 allkeys-lru，整数对象池会无效化，否则这两种策略无法好好工作。</p>
+<h2 id="字符串优化"><a href="#字符串优化" class="headerlink" title="字符串优化"></a>字符串优化</h2><p>字符串没有使用 c 语言的字符串类型，而使用了 sds（simple dynamic string：</p>
+<ul>
+<li>大量操作时间复杂度O（1）。</li>
+<li>可保存字节数组</li>
+<li>有预分配机制-会在 append 场景下造成内存损耗。</li>
+<li>有惰性删除机制。</li>
+</ul>
+<p>某些场景下，使用 hash 来重构字符串类型的数据结构更节省内存。</p>
+<h2 id="编码优化"><a href="#编码优化" class="headerlink" title="编码优化"></a>编码优化</h2><p>Redis 的特点就是“all in memory”。</p>
+<p>可以使用<code>config set</code>来调整某些类型的内部编码的阈值，使数据编码从压缩编码（小编码）向非压缩编码转换（大编码）。其中 ziplist 是一种特别优秀、紧凑的数据结构，会使用线性连续的内存。</p>
+<p>重点值得用是 ：</p>
+<ul>
+<li>ziplist（list，hashtable，zset 都可以用），节省内存但规模大了以后消耗 cpu</li>
+<li>intset 节省内存</li>
+</ul>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="http://yoursite.com/2019/10/19/Redis-笔记之九：理解内存/" data-id="ckp41vrwx008j6ga1v8vksgyj" class="article-share-link">分享</a>
+      
+      
+      
+  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Redis/">Redis</a></li></ul>
+
+    </footer>
+  </div>
+  
+</article>
+ 
+
+
+  
     <article id="post-JDK-收费问题" class="article article-type-post" itemscope itemprop="blogPost">
   <div class="article-meta">
     <a href="/2019/10/18/JDK-收费问题/" class="article-date">
@@ -110,7 +273,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/18/JDK-收费问题/" data-id="ckp3t26jt008o8xa1jw6jynuu" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/18/JDK-收费问题/" data-id="ckp41vrwv008c6ga1qgj4u5vf" class="article-share-link">分享</a>
       
       
       
@@ -284,7 +447,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/07/Redis-笔记之八：复制/" data-id="ckp3t26jr008k8xa1knqlf8wj" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/07/Redis-笔记之八：复制/" data-id="ckp41vrx2008u6ga1bt6by0l7" class="article-share-link">分享</a>
       
       
       
@@ -403,7 +566,7 @@ bgsave
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/06/Redis-笔记之七：持久化/" data-id="ckp3t26jp008g8xa1dtlqm7jy" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/06/Redis-笔记之七：持久化/" data-id="ckp41vrwx008h6ga12ou29k3w" class="article-share-link">分享</a>
       
       
       
@@ -483,7 +646,7 @@ monitor
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/06/Redis-笔记之六：客户端/" data-id="ckp3t26jr008i8xa104iusgl9" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/06/Redis-笔记之六：客户端/" data-id="ckp41vrww008f6ga1c5w0hzs8" class="article-share-link">分享</a>
       
       
       
@@ -818,7 +981,7 @@ geohash cities:locations beijing
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/10/05/Redis-笔记之五：Redis小功能/" data-id="ckp3t26jo008d8xa1znkmbl13" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/10/05/Redis-笔记之五：Redis小功能/" data-id="ckp41vrwu008a6ga1hjr5pyqu" class="article-share-link">分享</a>
       
       
       
@@ -864,7 +1027,7 @@ geohash cities:locations beijing
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/09/26/架构整洁之道笔记/" data-id="ckp3t26jn008b8xa1ghvzudbi" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/09/26/架构整洁之道笔记/" data-id="ckp41vrwr00856ga1c3h28ueq" class="article-share-link">分享</a>
       
       
       
@@ -907,7 +1070,7 @@ geohash cities:locations beijing
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/09/26/jvm-profiling-tools/" data-id="ckp3t26jm00888xa1c4c5qu6o" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/09/26/jvm-profiling-tools/" data-id="ckp41vrws00886ga1walkszsy" class="article-share-link">分享</a>
       
       
       
@@ -952,7 +1115,7 @@ geohash cities:locations beijing
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/09/17/Maven-中-dependencies-与-dependencyManagement-的区别/" data-id="ckp3t26jk00838xa1ul8zjq8s" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/09/17/Maven-中-dependencies-与-dependencyManagement-的区别/" data-id="ckp41vrwq00836ga18sqetb11" class="article-share-link">分享</a>
       
       
       
@@ -1243,74 +1406,11 @@ assertEquals(handleName, &quot;handle-01&quot;);
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/09/09/Petroware-的-Unit-Testing-Guidelines/" data-id="ckp3t26jl00868xa1kpzsizpb" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2019/09/09/Petroware-的-Unit-Testing-Guidelines/" data-id="ckp41vrwy008l6ga1x9l4lan2" class="article-share-link">分享</a>
       
       
       
   <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Test/">Test</a></li></ul>
-
-    </footer>
-  </div>
-  
-</article>
- 
-
-
-  
-    <article id="post-《应用架构之道》笔记" class="article article-type-post" itemscope itemprop="blogPost">
-  <div class="article-meta">
-    <a href="/2019/09/05/《应用架构之道》笔记/" class="article-date">
-  <time datetime="2019-09-05T08:38:18.000Z" itemprop="datePublished">2019-09-05</time>
-</a>
-    
-  </div>
-  <div class="article-inner">
-    
-    
-      <header class="article-header">
-        
-  
-    <h1 itemprop="name">
-      <a class="article-title" href="/2019/09/05/《应用架构之道》笔记/">《应用架构之道》笔记</a>
-    </h1>
-  
-
-      </header>
-    
-    <div class="article-entry" itemprop="articleBody">
-      
-        <!-- Table of Contents -->
-        
-        <h2 id="架构师的职责"><a href="#架构师的职责" class="headerlink" title="架构师的职责"></a>架构师的职责</h2><p>化繁为简。架构师是职责就是把复杂的问题简单化，使得其他人能够更好地在架构里工作。</p>
-<p>架构师要努力训练自己的思维，用它去理解复杂的系统，通过合理的分解和抽象，做出合理的设计。</p>
-<h2 id="软件架构"><a href="#软件架构" class="headerlink" title="软件架构"></a>软件架构</h2><p>软件架构是一个系统的草图。软件架构描述的对象是直接构成系统的抽象组件。各个组件的链接则明确和相对细致地描述组件之间的通信。</p>
-<blockquote>
-<p>软件架构为软件系统提供了结构、行为和属性的高级抽象。，由构件的描述、构件的相互作用、指导构件集成的模式以及这些模式的约束组成。软件架构不仅显示了软件需求和软件结构之间的对应关系，而且指定了整个软件系统的组织和拓扑结构，提供了一些设计决策的基本原理。</p>
-<p>软件架构的核心价值应该只围绕一个核心命题：控制复杂性。</p>
-</blockquote>
-<h2 id="软件架构分类"><a href="#软件架构分类" class="headerlink" title="软件架构分类"></a>软件架构分类</h2><p><img src="https://s2.ax1x.com/2019/09/05/nnC6ED.png" alt="此处输入图片的描述"></p>
-<p>业务架构：由业务架构师负责，也可以称为业务领域专家、行业专家。业务架构属于顶层设计，其对业务的定义和划分会影响组织结构和技术架构。</p>
-<p>应用架构：由应用架构师负责，他需要根据业务场景的需要，设计应用的层次结构，制定应用规范、定义接口和数据交互协议等。并尽量将应用的复杂度控制在一个可以接受的水平，从而在快速的支撑业务发展的同时，在保证系统的可用性和可维护性的同时，确保应用满足非功能属性要求（性能、安全、稳定性等）。</p>
-<p>数据架构：对于规模大一些的公司，数据治理是一个很重要的课题。如何对数据收集、数据处理提供统一的服务和标准，是数据架构需要关注的问题。其目的就是统一数据定义规范，标准化数据表达，形成有效易维护的数据资产，搭建统一的大数据处理平台，形成数据使用闭环。</p>
-<p>物理架构：物理架构关注软件元件是如何放到硬件上的，包括机房搭建、网络拓扑结构，网络分流器、代理服务器、Web服务器、应用服务器、报表服务器、整合服务器、存储服务器和主机等。</p>
-<p>运维架构：负责运维系统的规划、选型、部署上线，建立规范化的运维体系。</p>
-<h2 id="CQRS-架构"><a href="#CQRS-架构" class="headerlink" title="CQRS 架构"></a>CQRS 架构</h2><p>核心思想是不把应用做成一个 CRUD datastore，而是要把读的操作使用query model，写操作使用 command model，来实现 Responsibility Segregation。</p>
-<p><img src="https://s2.ax1x.com/2019/09/05/nnFGHf.png" alt="此处输入图片的描述"></p>
-<h2 id="洋葱架构"><a href="#洋葱架构" class="headerlink" title="洋葱架构"></a>洋葱架构</h2><p>洋葱架构与六边形架构有着相同的思路，它们都通过编写适配器代码将应用核心从对基础设施的关注中解放出来，避免基础设施代码渗透到应用核心之中。这样应用使用的工具和传达机制都可以轻松地替换，可以一定程度地避免技术、工具或者供应商锁定。</p>
-<p>不同的是洋葱架构还告诉我们，企业应用中存在着不止两个层次，它在业务逻辑中加入了一些在领域驱动设计的过程中被识别出来的层次（Application，Domain Service，Domain model，Infrastructure等）。</p>
-<p>在洋葱架构中，明确规定了依赖的方向：</p>
-<pre><code>外层依赖内层；
-内层对外层无感知。
-</code></pre><p><img src="https://s2.ax1x.com/2019/09/05/nnAotO.jpg" alt="此处输入图片的描述"></p>
-
-      
-    </div>
-    <footer class="article-footer">
-      <a data-url="http://yoursite.com/2019/09/05/《应用架构之道》笔记/" data-id="ckp3t26je007u8xa17pkc5j99" class="article-share-link">分享</a>
-      
-      
-      
-  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/系统架构/">系统架构</a></li></ul>
 
     </footer>
   </div>
@@ -1346,6 +1446,10 @@ assertEquals(handleName, &quot;handle-01&quot;);
       <ul>
         
           <li>
+            <a href="/2021/05/25/监控与告警/">监控与告警</a>
+          </li>
+        
+          <li>
             <a href="/2021/05/25/CRM-平台化的思路/">CRM 平台化的思路</a>
           </li>
         
@@ -1359,10 +1463,6 @@ assertEquals(handleName, &quot;handle-01&quot;);
         
           <li>
             <a href="/2021/05/22/操作系统导论-Three-Easy-Pieces/">操作系统导论 Three Easy Pieces</a>
-          </li>
-        
-          <li>
-            <a href="/2021/05/20/数据中心/">数据中心</a>
           </li>
         
       </ul>
