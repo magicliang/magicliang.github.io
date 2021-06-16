@@ -72,6 +72,176 @@
       <div class="outer">
         <section id="main">
   
+    <article id="post-MySQL-的-MGR" class="article article-type-post" itemscope itemprop="blogPost">
+  <div class="article-meta">
+    <a href="/2021/03/11/MySQL-的-MGR/" class="article-date">
+  <time datetime="2021-03-11T07:38:44.000Z" itemprop="datePublished">2021-03-11</time>
+</a>
+    
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 itemprop="name">
+      <a class="article-title" href="/2021/03/11/MySQL-的-MGR/">MySQL 的 MGR</a>
+    </h1>
+  
+
+      </header>
+    
+    <div class="article-entry" itemprop="articleBody">
+      
+        <!-- Table of Contents -->
+        
+        <h1 id="MySQL-高可用架构的历史"><a href="#MySQL-高可用架构的历史" class="headerlink" title="MySQL 高可用架构的历史"></a>MySQL 高可用架构的历史</h1><p>MySQL 自带的主从复制机制，本身并不能实现自动高可用。</p>
+<p>早期使用开源组件来搭 MySQL 集群的方案，使用 MMHA。当代 MySQL 官方自己主推的方案是 MySQL cluster。这些老的方案，优先保证MySQL服务的持续可用，在异常切换情况下，可能出现主机上部分数据未能及时同步到从库，造成主从切换后数据丢失。但是包括金融支付在内的一些业务，对于数据库服务既要求持续可用、也要求数据强一致（可以在性能上做出一些让步）。</p>
+<p>因此，当代的 MySQL 官方提供了组复制（MySQL Group Replication）的方案，构建了新一代的 MySQL 高可用强一致服务。</p>
+<h1 id="Master-Slave（MS）架构高可用概述"><a href="#Master-Slave（MS）架构高可用概述" class="headerlink" title="Master-Slave（MS）架构高可用概述"></a>Master-Slave（MS）架构高可用概述</h1><h2 id="MS架构高可用基础"><a href="#MS架构高可用基础" class="headerlink" title="MS架构高可用基础"></a>MS架构高可用基础</h2><p>高可用MySQL是依赖复制（Replication）技术实现的，复制解决的基本问题就是，让一台数据库服务器的数据同步到其它服务器上。MySQL数据库的复制有如下三个步骤。</p>
+<ol>
+<li><p>在主库上把数据更改记录到二进制日志（Binary Log）中（这些记录被称为二进制日志事件）。</p>
+</li>
+<li><p>备库将主库上的日志复制到自己的中继日志（Relay Log）中。</p>
+</li>
+<li><p>备库读取中继日志中的事件（Event），将其回放到备库数据之上。</p>
+</li>
+</ol>
+<p>以上只是概述，实际上每一步都很复杂，更详细的描述了复制的细节。</p>
+<p><img src="MySQL复制如何工作.png" alt="MySQL复制如何工作.png"></p>
+<h2 id="MS架构高可用痛点"><a href="#MS架构高可用痛点" class="headerlink" title="MS架构高可用痛点"></a>MS架构高可用痛点</h2><p>MS架构围绕着复制方式实现高可用，复制的痛点主要围绕着数据一致性。如果第一个节点的数据进行了更新操作并且更新成功后，却没有使得第二个节点上的数据得到相应的更新，于是在对第二个节点的数据进行读取操作时，获取的依然是老数据，这就是典型的数据不一致的问题。</p>
+<p>在高可用数据库进行Failover时，可能数据还没有复制完毕，这样就出现了数据不一致的风险，反应在实际业务上可能是数据丢失了，或错乱了。MySQL在数据复制上进行了旷日持久的改进，由异步复制（Asynchronous Replication）到半同步复制（Semisynchronous Replication），再到增强半同步复制（Enhanced Semisynchronous Replication），几近使RPO趋于0，直至组复制（Group Replication）的出现。</p>
+<h3 id="异步复制"><a href="#异步复制" class="headerlink" title="异步复制"></a>异步复制</h3><p>MySQL默认的复制就是异步复制，主库在执行完用户提交的事务后，将事务事件写入到Binlog文件中，这时主库只会通知Dump线程发送这些新的Binlog，然后主库就会继续处理用户的提交，而不会保证Binlog传送到任何一个备库上。</p>
+<p>若主库发生Crash，其上已经提交的事务可能并没有传送到备库上，此时Failover，可能就会导致新主库上的数据不完整，出现了数据不一致性的问题。</p>
+<p><img src="异步复制.png" alt="异步复制.png"></p>
+<h3 id="半同步复制"><a href="#半同步复制" class="headerlink" title="半同步复制"></a>半同步复制</h3><p>半同步复制与异步复制不同的是，其在主库执行完用户提交的事务后，等待至少一个备库将接收到的Binlog写入Relay Log后，并返回给主库ACK，主库才会继续处理用户的提交。这里主库等待备库返回ACK的时间点，由参数rpl_semi_sync_master_wait_point=AFTER_COMMIT设置；等待几个备库返回ACK，由参数rpl_semi_sync_master_wait_for_slave_count=1设置。其中还有一个半同步超时的设置，由参数rpl_semi_sync_master_timeout=100控制，超时后半同步复制退化为异步复制。</p>
+<p>半同步复制提高了数据的安全性，同时也会造成一定程度的延迟，该延迟至少是一个RTT（Round Trip Time）。</p>
+<p>从这个方案起，就一定会带来一个写入抬升，很容易导致业务对时延的容忍要翻倍，业务能够逐步容忍超过 30ms -80 ms 的写入抬升（写入性能会下降超过 50%），才能逐步实现同城/异地的多活。</p>
+<p><img src="半同步复制.png" alt="半同步复制.png"></p>
+<h3 id="增强半同步复制"><a href="#增强半同步复制" class="headerlink" title="增强半同步复制"></a>增强半同步复制</h3><p>增强半同步复制与半同步复制的不同之处是，其等待备库返回ACK的时间点不同。在MySQL中一个Commit过程由三个步骤组成：第一，Prepare the transaction in the storage engine (InnoDB)；第二，Write the transaction to the binary logs；第三，Complete the transaction in the storage engine。<strong>增强半同步复制等待备库ACK的时间点，由参数rpl_semi_sync_master_wait_point=AFTER_SYNC配置，是在Commit的第二，和第三步骤之间。不同于半同步复制等待备库ACK的时间点，是在Commit的第三步骤之后。</strong>试想对于增强半同步复制，在主库等待备库返回ACK时发生了Crash，由于该Commit还没最终结束，用户在主库上不会看到变更。当Failover后，用户在新主库上也不会看到变更，不存在数据不一致的问题。而对于半同步复制，由于该Commit已结束，用户在主库上会看到变更。当Failover后，用户在新主库上反而看不到变更，出现了数据不一致的情况。<strong>可见增强半同步复制，比半同步复制，在保证数据一致性上又前进了一步。</strong></p>
+<p><strong>证明同步写远端的部分应该总是在 commit 之前，而不是 commit 之后。</strong>这是一个简单，但不易察觉的问题。</p>
+<p><img src="增强半同步复制.png" alt="增强半同步复制.png"></p>
+<h2 id="MGR跨越"><a href="#MGR跨越" class="headerlink" title="MGR跨越"></a>MGR跨越</h2><p>MySQL Group Replication（后简称MGR）的出现让大家眼前一亮，其建设性的以插件（Plugin）的方式添加到MySQL现有体系架构中，基于原生复制技术，使用了Binary Log，Row-based logging，和GTID等特性，使用了Paxos一致性协议的数据复制逻辑，保证了数据的一致性。</p>
+<p><img src="MGR特性.png" alt="MGR特性.png"></p>
+<p>下图展示了Group Replication插件的层次体系，逐步了解下每个模块的大致作用。</p>
+<ul>
+<li><p>APIs - Capture/Apply/Lifecycle：插件设置的一组API，用于和MySQL Server交互通信。</p>
+</li>
+<li><p>Capture/Applier/Recovery：插件设置的一组组件，Capture组件负责追踪事务执行时的上下文消息；Applier组件负责执行异地事务；Recovery组件管理全局恢复，如节点加入Group时，选择Donor，又或连接Donor失败重连。</p>
+</li>
+<li><p>Replication Protocol Logics：该模块实现了复制协议的逻辑，负责处理事务冲突检测，接收和发送事务消息到Group中。</p>
+</li>
+<li><p>Group Communication System（GCS）：该层属于高层API，其抽象了构建复制状态机的属性，将插件下层通信层的实现和上层进行了解耦。</p>
+</li>
+<li><p>Group Communication Engine（XCom）：通信引擎，Paxos协议的核心实现，负责Group中成员的通信。</p>
+</li>
+</ul>
+<p><img src="组复制插件架构.png" alt="组复制插件架构.png"></p>
+<h3 id="组复制"><a href="#组复制" class="headerlink" title="组复制"></a>组复制</h3><p>下图显示了MGR与普通MySQL复制模式的区别，在MGR中提交事务时，事务在引擎层完成Prepare，写Binlog之前会被MySQL预设的钩子（Hook）before_commit拦截，进入到MGR层，其将事务执行相关的信息打包，通过Paxos一致性协议（Consensus）进行全局排序后发送给MGR各个节点，当超过半数（N/2+1）的节点（包括它自己）回应后，发送消息告诉所有节点，这个数据包同步成功。各节点独自进行认证（Certify）。若认证通过，本地节点写Binlog完成提交。异地节点写Relay Log，由建立的复制通道（Replication Channel）group_replication_applier完成事务并行回放。若认证不通过，就会进行回滚（Rollback）。</p>
+<p>认证类似 Paxos 里面对于 proposal 的 accept，也类似 2PC 里面的 update 后的 canCommit，不然会触发回滚，是一个收集 ballot 的过程。</p>
+<p><img src="组复制.png" alt="组复制.png"></p>
+<blockquote>
+<p>When a read-write transaction is ready to commit at the originating<br>server, the server atomically broadcasts the write values (the rows<br>that were changed) and the corresponding write set (the unique<br>identifiers of the rows that were updated). Because the transaction is<br>sent through an atomic broadcast, either all servers in the group<br>receive the transaction or none do. If they receive it, then they all<br>receive it in the same order with respect to other transactions that<br>were sent before. All servers therefore receive the same set of<br>transactions in the same order, and a global total order is<br>established for the transactions.</p>
+<p>However, there may be conflicts between transactions that execute<br>concurrently on different servers. Such conflicts are detected by<br>inspecting and comparing the write sets of two different and<br>concurrent transactions, in a process called certification. During<br>certification, conflict detection is carried out at row level: if two<br>concurrent transactions, that executed on different servers, update<br>the same row, then there is a conflict. The conflict resolution<br>procedure states that the transaction that was ordered first commits<br>on all servers, and the transaction ordered second aborts, and is<br>therefore rolled back on the originating server and dropped by the<br>other servers in the group.</p>
+</blockquote>
+<p>当代版本的 MGR 先不支持多主模式，虽然上图支持自动冲突检测，但不支持自动冲突解决。</p>
+<p>MGR 的写入性能最差，但读写性能非常好。</p>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="http://yoursite.com/2021/03/11/MySQL-的-MGR/" data-id="ckpz22nru00e1cla1xt9byzxx" class="article-share-link">分享</a>
+      
+      
+      
+  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/MySQL/">MySQL</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/数据库/">数据库</a></li></ul>
+
+    </footer>
+  </div>
+  
+</article>
+ 
+
+
+  
+    <article id="post-秒杀通用解决方案" class="article article-type-post" itemscope itemprop="blogPost">
+  <div class="article-meta">
+    <a href="/2021/03/10/秒杀通用解决方案/" class="article-date">
+  <time datetime="2021-03-10T14:30:13.000Z" itemprop="datePublished">2021-03-10</time>
+</a>
+    
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 itemprop="name">
+      <a class="article-title" href="/2021/03/10/秒杀通用解决方案/">秒杀通用解决方案</a>
+    </h1>
+  
+
+      </header>
+    
+    <div class="article-entry" itemprop="articleBody">
+      
+        <!-- Table of Contents -->
+        
+        <h1 id="秒杀典型时序"><a href="#秒杀典型时序" class="headerlink" title="秒杀典型时序"></a>秒杀典型时序</h1><ol>
+<li>查询库存</li>
+<li>创建订单</li>
+<li>扣减库存（2 和 3 应该在一个事务里）</li>
+<li>更新订单</li>
+<li>付款</li>
+</ol>
+<p>秒杀的实质，是围绕库存管理展开的并发读写。</p>
+<h1 id="秒杀的-3-大挑战"><a href="#秒杀的-3-大挑战" class="headerlink" title="秒杀的 3 大挑战"></a>秒杀的 3 大挑战</h1><h2 id="超卖"><a href="#超卖" class="headerlink" title="超卖"></a>超卖</h2><p>2012 年的双11 产生了大量的超卖。事后复盘，大家发现系统中出现了未知的热点。</p>
+<h2 id="热点问题"><a href="#热点问题" class="headerlink" title="热点问题"></a>热点问题</h2><p>缓存雪崩、缓存击穿，进而导致服务雪崩。</p>
+<h2 id="吞吐瓶颈"><a href="#吞吐瓶颈" class="headerlink" title="吞吐瓶颈"></a>吞吐瓶颈</h2><p>在高并发的情况下，整体吞吐水平会低于正常水平。</p>
+<h1 id="准则"><a href="#准则" class="headerlink" title="准则"></a>准则</h1><h2 id="热点发现"><a href="#热点发现" class="headerlink" title="热点发现"></a>热点发现</h2><ol>
+<li>根据业务场景，提前摸清热点数据。</li>
+<li>智能识别、动态散列，能够根据基线，自动识别热点，并扩容对应分片。</li>
+</ol>
+<h2 id="做好隔离"><a href="#做好隔离" class="headerlink" title="做好隔离"></a>做好隔离</h2><p>链路、机器、系统都要做好隔离、缓存和限流。</p>
+<h2 id="动静分离"><a href="#动静分离" class="headerlink" title="动静分离"></a>动静分离</h2><p>把用户请求的数据分为静态和动态数据。</p>
+<h2 id="基于时间分片削峰"><a href="#基于时间分片削峰" class="headerlink" title="基于时间分片削峰"></a>基于时间分片削峰</h2><ul>
+<li>答题</li>
+<li>排队，同步变异步，从紧耦合变松耦合</li>
+<li>读缓存（舍 c 得 a）</li>
+</ul>
+<p>最终实现漏斗状的写，实现有效写入的数量足够小。</p>
+<h1 id="现实案例分析-1"><a href="#现实案例分析-1" class="headerlink" title="现实案例分析 1"></a>现实案例分析 1</h1><p>热点商品的 sku，同步select for update 的锁定，在秒杀多个商品时冲突很严重，一种解决方案是使用 lua 的原子脚本来实现分布式锁，再异步锁定 sku 行，然后要加上对热点商品的限流，<strong>在前端撞限流来减轻 db 的压力，提前让漏斗变小。</strong></p>
+<p>乐观锁不适合高并发场景，因为重试很容易让系统过载。</p>
+<p>悲观锁适合高并发场景-扣减库存的关键还是要排队，要看业务流程中是否允许异步化，允许就用 mq 排队，不允许就用悲观锁排队。</p>
+<h1 id="现实案例分析-2"><a href="#现实案例分析-2" class="headerlink" title="现实案例分析 2"></a>现实案例分析 2</h1><p>用 nowait 或者 skip locked 来减少锁等待，避免阻塞和死锁。</p>
+<p>每个 sql 的执行时间是 1.25ms，这一行被更新的 tps 就是 800。但实际上单行事务非常少，所以大事务晚释放锁会让行的并发性降低。</p>
+<p>方法：</p>
+<ol>
+<li>合并 update，把热点 key 的更新语句在内存里 merge 一下。</li>
+<li>组提交：把双一写关掉，让 fsync 慢一点。</li>
+<li>删除多余的索引：需要考虑数据库的自治系统的建设。</li>
+</ol>
+<p>秒杀是一种系统工程，需要业务理解数据库，关键还是在业务系统中做优化。</p>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="http://yoursite.com/2021/03/10/秒杀通用解决方案/" data-id="ckpz22nrp00dtcla1w742lftb" class="article-share-link">分享</a>
+      
+      
+      
+  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/数据库/">数据库</a></li></ul>
+
+    </footer>
+  </div>
+  
+</article>
+ 
+
+
+  
     <article id="post-数据库选型" class="article article-type-post" itemscope itemprop="blogPost">
   <div class="article-meta">
     <a href="/2021/03/10/数据库选型/" class="article-date">
@@ -138,7 +308,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/03/10/数据库选型/" data-id="ckpy06inw00e1gza1bmyi65ek" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2021/03/10/数据库选型/" data-id="ckpz22nrr00dycla168p3vqby" class="article-share-link">分享</a>
       
       
       
@@ -712,7 +882,7 @@ rename
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/03/10/MySQL实战45讲/" data-id="ckpy06j8600qagza1581g780e" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2021/03/10/MySQL实战45讲/" data-id="ckpz22o9h00qgcla1epkxa4xu" class="article-share-link">分享</a>
       
       
       
@@ -768,7 +938,7 @@ rename
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/03/09/计算的本质/" data-id="ckpy06inw00dzgza17rb5euko" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2021/03/09/计算的本质/" data-id="ckpz22nrk00drcla1cdmx1jo1" class="article-share-link">分享</a>
       
       
       
@@ -819,7 +989,7 @@ rename
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/03/09/关于编程语言的typing-一些基本概念/" data-id="ckpy06inu00dwgza11pz5s9ma" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2021/03/09/关于编程语言的typing-一些基本概念/" data-id="ckpz22nrr00dwcla18rmyr8t8" class="article-share-link">分享</a>
       
       
       
@@ -894,7 +1064,7 @@ rename
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/03/04/纪要/" data-id="ckpy06inu00dugza1av06gojq" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2021/03/04/纪要/" data-id="ckpz22nrj00docla1vaw71u7v" class="article-share-link">分享</a>
       
       
       
@@ -1058,7 +1228,7 @@ rename
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/03/01/HATP-问题/" data-id="ckpy06inr00dngza1tj3c3d5x" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2021/03/01/HATP-问题/" data-id="ckpz22nri00dmcla1o6z9zp1x" class="article-share-link">分享</a>
       
       
       
@@ -1138,7 +1308,7 @@ rename
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/02/20/中高层领导力/" data-id="ckpy06int00dsgza1guxrckuv" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2021/02/20/中高层领导力/" data-id="ckpz22nrf00decla1jcowqtf2" class="article-share-link">分享</a>
       
       
       
@@ -1251,297 +1421,11 @@ rename
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/02/10/《恰如其分的软件架构》/" data-id="ckpy06ins00dpgza1gnltwu79" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2021/02/10/《恰如其分的软件架构》/" data-id="ckpz22nrg00djcla1psyf30y5" class="article-share-link">分享</a>
       
       
       
   <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/系统架构/">系统架构</a></li></ul>
-
-    </footer>
-  </div>
-  
-</article>
- 
-
-
-  
-    <article id="post-Journal-与-EBS" class="article article-type-post" itemscope itemprop="blogPost">
-  <div class="article-meta">
-    <a href="/2021/01/29/Journal-与-EBS/" class="article-date">
-  <time datetime="2021-01-29T09:55:34.000Z" itemprop="datePublished">2021-01-29</time>
-</a>
-    
-  </div>
-  <div class="article-inner">
-    
-    
-      <header class="article-header">
-        
-  
-    <h1 itemprop="name">
-      <a class="article-title" href="/2021/01/29/Journal-与-EBS/">Journal 与 EBS</a>
-    </h1>
-  
-
-      </header>
-    
-    <div class="article-entry" itemprop="articleBody">
-      
-        <!-- Table of Contents -->
-        
-        <h1 id="EBS-的定义"><a href="#EBS-的定义" class="headerlink" title="EBS 的定义"></a>EBS 的定义</h1><p>EBS — Elastic Block Storage，简言之就是高可用、高性能、弹性可扩展的分布式块存储服务。对于业务来说，它就是一块磁盘，只不过将业务数据存储于远端网络节点，但是使用方法和体验与访问本地磁盘一样。</p>
-<p>EBS 可以作为容器的存储盘，可以解决：</p>
-<ul>
-<li>有状态容器的状态存储问题</li>
-<li>海量存储问题：邮件系统、监控平台、数据库、用户录音、集成测试平台、MySQL 备份（需要测试 OLTP/OLAP 的交互操作和在线交易性能）</li>
-</ul>
-<h1 id="EBS-的文件系统结构"><a href="#EBS-的文件系统结构" class="headerlink" title="EBS 的文件系统结构"></a>EBS 的文件系统结构</h1><p>在EBS分布式块存储系统中，最终存储业务写入数据的服务是ChunkServer。</p>
-<p>单机存储引擎位于每个ChunkServer上，业务的数据读写请求到达ChunkServer后，最终通过单机存储引擎与操作系统文件系统交互来写入或读取数据。</p>
-<p>业务申请的每一块ebs网络盘在我们的系统里都对应一个Volume。Volume本身是一个逻辑概念，每个Volume被切分成多个Chunk，Chunk最终对应到ChunkSever上文件系统中的一个真实文件，因此我们的单机存储引擎最终会管理这一系列Chunk文件的创建，读写，删除等操作。</p>
-<p><img src="EBS-volume-chunk-server.png" alt="EBS-volume-chunk-server.png"></p>
-<p>Journal就是在ChunkServer上的单机存储引擎这一层引入的，上图中最左侧的“big-journal dir”就是用来存储journal的目录。</p>
-<h1 id="其他-Journal-的实现"><a href="#其他-Journal-的实现" class="headerlink" title="其他 Journal 的实现"></a>其他 Journal 的实现</h1><h2 id="Linux-中的日志文件系统"><a href="#Linux-中的日志文件系统" class="headerlink" title="Linux 中的日志文件系统"></a>Linux 中的日志文件系统</h2><p>文件系统要解决的一个关键问题是防止掉电或系统崩溃造成数据损坏。</p>
-<p>我们知道一个文件既包括元数据，又包括真正的用户数据。文件有写入时这两部分数据都需要被写入。因此导致文件系统损坏的根本原因就在于写文件不是原子操作，写操作无法一步完成，如果其中任何一个步骤被打断，就会造成数据的不一致或损坏。</p>
-<p>为解决上面说到的问题，日志文件系统(Journal File System)应运而生。</p>
-<p>日志文件系统的原理是在进行写操作之前，把即将进行的各个步骤（称为transaction）事先记录下来，保存在文件系统上单独开辟的一块空间上，这就是所谓的日志(journal)，也被称为write-ahead logging(WAL)。日志保存成功之后才进行真正的写操作，把文件系统的元数据和用户数据写进硬盘（称为checkpoint），这样万一写操作的过程中掉电，下次挂载文件系统之前把保存好的日志重新执行一遍就行了（称为replay），避免了前述的数据损坏场景。</p>
-<p>结论：所以到达 checkpoint 意味着它之前的 log 不需要 replay 了</p>
-<p><img src="Linux-Journal.png" alt="Linux-Journal.png"></p>
-<h2 id="MySQL-InnoDB引擎的redo-log"><a href="#MySQL-InnoDB引擎的redo-log" class="headerlink" title="MySQL InnoDB引擎的redo log"></a>MySQL InnoDB引擎的redo log</h2><p>InnoDB 的 redo log 是固定大小的，比如可以配置为一组 4 个文件，每个文件的大小是 1GB，那么总共就可以记录 4GB 的操作。从头开始写，写到末尾就又回到开头循环写，如下图所示：</p>
-<p><img src="MySQL-redolog.png" alt="MySQL-redolog.png"></p>
-<p>write pos 是当前记录的位置，一边写一边后移，写到第 3 号文件末尾后就回到 0 号文件开头。</p>
-<p>checkpoint 是当前要擦除的位置，也是往后推移并且循环的，擦除记录前要把记录更新到数据文件。</p>
-<p>write pos 和 checkpoint 之间的是还空闲的部分，可以用来记录新的操作。如果 write pos 追上 checkpoint，这时候不能再执行新的更新，得停下来先把 checkpoint 推进一下。</p>
-<h1 id="EBS-中的-journal"><a href="#EBS-中的-journal" class="headerlink" title="EBS 中的 journal"></a>EBS 中的 journal</h1><p>EBS的ChunkServer可能会同时处理大量的写请求，这样写请求最终会转化为大量的磁盘随机写操作，随机写磁盘性能是很差的。有了journal后，可以将这些大量的随机写请求，转化为对journal文件的基本上是顺序的写请求，从面提升写性能，降低写延迟。</p>
-<p>同时，如果没有journal，那么用户数据将被直接写chunk文件，这会导致在chunkserver挂掉时chunk文件里出现脏数据，从而使得chunk不同副本出现不一致的问题。</p>
-<p>所以日志总有个基本的用处：</p>
-<ul>
-<li>优化随机写</li>
-<li>处理并发写</li>
-</ul>
-
-      
-    </div>
-    <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/01/29/Journal-与-EBS/" data-id="ckpy06inq00dkgza1349rc4hg" class="article-share-link">分享</a>
-      
-      
-      
-  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/存储/">存储</a></li></ul>
-
-    </footer>
-  </div>
-  
-</article>
- 
-
-
-  
-    <article id="post-TiDB-与-blade" class="article article-type-post" itemscope itemprop="blogPost">
-  <div class="article-meta">
-    <a href="/2021/01/26/TiDB-与-blade/" class="article-date">
-  <time datetime="2021-01-26T03:02:16.000Z" itemprop="datePublished">2021-01-26</time>
-</a>
-    
-  </div>
-  <div class="article-inner">
-    
-    
-      <header class="article-header">
-        
-  
-    <h1 itemprop="name">
-      <a class="article-title" href="/2021/01/26/TiDB-与-blade/">TiDB 与 bbb</a>
-    </h1>
-  
-
-      </header>
-    
-    <div class="article-entry" itemprop="articleBody">
-      
-        <!-- Table of Contents -->
-        
-        <h1 id="两种业务场景和相应的架构模式"><a href="#两种业务场景和相应的架构模式" class="headerlink" title="两种业务场景和相应的架构模式"></a>两种业务场景和相应的架构模式</h1><p>偏重事务处理（online transactional processin, OLTP）：此类数据库将不同属性连续存储，也即按行存储。按行存储可以使得插入/更新/删除更快，毕竟一条数据的所有属性是连续存储的。这种存储模型也叫做 N-Ary Storage Model (NSM)。</p>
-<p>偏重数据分析（online analytical processing, OLAP）：此类数据库将不同数据的同一属性连续存储，也即列存储。这种存储可以使得查询操作只读关心的数据属性，而不是一整条数据，减少浪费；按列储存可以更好地支持复杂查询。这种存储模型也叫做 Decomposition Storage Model (DSM)。</p>
-<h1 id="TiDB-的基础架构"><a href="#TiDB-的基础架构" class="headerlink" title="TiDB 的基础架构"></a>TiDB 的基础架构</h1><p>Log-Structured Merge-tree (LSM-tree)是一种存储结构，由于其优越的写性能被很多大型分布式存储系统采用，包括Google 的 BigTable, Amazon的 Dynamo, Apache 的 HBase 和Cassandra等；MongoDB的WiredTiger引擎则支持B-tree 和 LSM-tree 两种模式；TiDB 则使用了著名的RocksDB。</p>
-<p>Balde 2.0 是基于社区TiDB版本，独立重构存储层（改动较大，下面会介绍），深度定制SQL层（改动较小，复用较多的功能）的分布式数据库。bbb 2.0 主要结构如图所示：</p>
-<p><img src="tidb-architecture.png" alt="tidb-architecture.png"></p>
-<p>TiSQL 又叫 TiDB Server，基本实现了 parser、optimizer、executor、cache，是无状态可以无限扩展。但 TiDB 本身并不是 monolithic deployment 部署的，而是和底层的 tikv 分离部署的-这和 MySQL 的架构不一样。</p>
-<p>在最初版本的实现里面，TiSQL 的接口层稳定以后，就能接入 HBase，这点和 Tair 是很像的。</p>
-<p>bbb-root 是一个 pd（placement driver） server 的分布式集群，彼此之间也使用 raft 靠 leader 来维护元数据，元数据是负载均衡至关重要的信息。</p>
-<ul>
-<li>采用类似于Google F1/Spanner 的分布式KV存储 (即bbb-kv) + 无状态计算节点 (即bbbSQL) 模型；</li>
-<li>用户表中每一行数据，对应一个 Data K/V（Key:   tablePrefix{TableID}_recordPrefixSep{RowID}<br>Value: [col1, col2, col3, col4]） + N个Index K/V（Key: tablePrefix{tableID}_indexPrefixSep{indexID}_indexedColumnsValue Value: RowID），N是二级索引的个数(N&gt;=0)；这些 kv 是以 map 的形式组成了 sstable，由 Rocksdb 支持（基于谷歌的 LevelDB，由 facebook 出品）。</li>
-<li>-bbb-kv 以Ranged Partition的方式将整个key空间分为多个Region(Partition/Shard)，每个Region对应一段连续范围的key；这点很类似 HBase。</li>
-<li>每个Region都有多个副本，副本间通过共识协议 Raft 来达到CAP的平衡；多个 region 组成一个 raft-group。</li>
-<li>每个Region的数据，以一棵独立LSM-tree的形式存储；</li>
-<li>Region在容量超出水位线时，会进行分裂，变成两个独立的Region；</li>
-<li>bbb-root 管理集群元数据信息，提供Region的路由服务以及全局授时服务；</li>
-<li>bbb-sql处理SQL解析、优化和执行，将SQL请求转化为一系列的K/V请求，再根据路由信息，发送对应的bbb-kv 节点；</li>
-<li>提供乐观/悲观锁模型，支持分布式事务，支持Read Committed隔离级别。默认使用乐观事务模型，对于写写冲突，只有事务提交时才检测冲突。支持完整的 ACID 语义（TiKV 是个 Transactional Storage Engine）。</li>
-<li>多节点同步都依赖于 Raft，批量事务处理则依赖于谷歌的 Percolator  事务处理模型。</li>
-<li>tidb 本身不能很好地支持自增主键（这会导致单一的写流量集中到一个节点上），改造的方法是引入唯一索引。</li>
-</ul>
-<h1 id="LSM-tree-和一些典型实现"><a href="#LSM-tree-和一些典型实现" class="headerlink" title="LSM-tree 和一些典型实现"></a>LSM-tree 和一些典型实现</h1><h2 id="LSM-tree模型"><a href="#LSM-tree模型" class="headerlink" title="LSM-tree模型"></a>LSM-tree模型</h2><p>LSM-tree [1] 是一种out-of-place（相对于原地更新，暂且译作外地更新） update的结构，它的特点是把新数据写到新的位置，在后台做merge，而不是原地更新。</p>
-<p>所谓out-of-place，是相对B-tree等in-place update的结构而言的，in-place的结构只保持一个最新版本，查询效率更高。但是因为有了随机写，in-place update牺牲了写性能。</p>
-<p>Out-of-place 没有随机写，但是也带来了一些其他开销，尤其是读可能需要查询多个层级。</p>
-<p>注意，C0是内存中的，而C1及其他更大的层级，都是需要持久化存储，且越靠近内存的层数据量越小。</p>
-<p><img src="what-is-lsm-tree.png" alt="what-is-lsm-tree.png"></p>
-<p>Tree的含义：每一层是一颗树。事实上最原始的paper [1]中，每一层都是一个B-tree，只是后来的很多实现中，已经不用B-tree了，但是名称保留了。</p>
-<p>层与层间的增量关系：C0实际上是C1的增量，C1是C2的增量。增量数据可以是Insert/Update/Delete等不同操作产生的。</p>
-<p>Log-Structured 的含义： 像写log一样去顺序磁盘，避免随机写，因为随机写性能太差。</p>
-<p>Merge 是指把上层的增量数据，合并到其基线版本（所以基线版本是 C<sub>k</sub>）中去的过程。例如，C0的数据被merge到C1中。这个过程也称为 Compaction，不过现在已经有跨层compaction等变体。 </p>
-<p>FAQ: 为什么要Compaction/Merge: </p>
-<ol>
-<li><p>提高查询效率：虽然每一层是个有序的集合，但是层级多了后，查询可能要依次查询每一个层级。通过merge，让数据从较多个有序集合，变成较少个有序集合，提高效率。</p>
-</li>
-<li><p>释放空间：重复写的数据，其旧版本可以在Compaction时删除；用户Delete的数据，需要做物理删除。</p>
-</li>
-</ol>
-<h2 id="一些开源的LSM-tree-实现"><a href="#一些开源的LSM-tree-实现" class="headerlink" title="一些开源的LSM-tree 实现"></a>一些开源的LSM-tree 实现</h2><p>LSM-Tree 因为优秀的性能被广泛采用，其中著名的开源产品包括Google的 Jeff Dean的杰作 LevelDB，Facebook 基于LevelDB开发的 RocksDB 等。</p>
-<p>FaceBook 还开发了 MyRocks，在部分业务场景下用 RocksDB 替 InnoDB 作为 mysql 的引擎。下表列出了一些原始的 LSM-tree 概念与LevelDB中概念的对应关系。</p>
-<table>
-<thead>
-<tr>
-<th style="text-align:center">LSM-tree概念</th>
-<th style="text-align:center">LevelDB/RocksDB对应</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td style="text-align:center">C0</td>
-<td style="text-align:center">Mem Table (分为Mutable/Immutable)</td>
-</tr>
-<tr>
-<td style="text-align:center">C1</td>
-<td style="text-align:center">Level-0 (Tiered)</td>
-</tr>
-<tr>
-<td style="text-align:center">C2</td>
-<td style="text-align:center">Level-1 (Leveled）</td>
-</tr>
-<tr>
-<td style="text-align:center">Ck</td>
-<td style="text-align:center">Level-(k-1) (Leveled)</td>
-</tr>
-</tbody>
-</table>
-<h1 id="LSM-tree-的一些问题和-bbbKV-的设计取舍"><a href="#LSM-tree-的一些问题和-bbbKV-的设计取舍" class="headerlink" title="LSM-tree 的一些问题和 bbbKV 的设计取舍"></a>LSM-tree 的一些问题和 bbbKV 的设计取舍</h1><p>bbbKV的存储也是采用LSM-tree的方式。LSM-tree本身是灵活的，自身也存在一些问题，在设计和工程实现方面需要进行取舍。</p>
-<p>这些问题可以用“三个放大”来描述。</p>
-<h2 id="三个放大"><a href="#三个放大" class="headerlink" title="三个放大"></a>三个放大</h2><p>LSM-tree 存储系统在设计实现时需要考虑写放大、读放大和空间放大三个因素，这三个因素都是比率：</p>
-<ul>
-<li><p>写放大： 磁盘数据的写入量 / 用户写入的数据量</p>
-</li>
-<li><p>读放大： 磁盘数据的读入量 / 用户实际要读取的数据量</p>
-</li>
-<li><p>空间放大：磁盘空间占用 / 有效的用户数据量</p>
-</li>
-</ul>
-<p>其中写放大往往是最严重的，对它的计算和分析也相对较多。</p>
-<h3 id="写放大的计算及最优化"><a href="#写放大的计算及最优化" class="headerlink" title="写放大的计算及最优化"></a>写放大的计算及最优化</h3><p>在LSM的原文中，作者提到层与层之间的扇出系数(size ratio)是常量时，写放大最优。但是具体取什么常量是最优的，并没有明确。</p>
-<p>Size Ratio是指相邻两层之间大小的比率，比如，C0层大小是1GB, C1层大小是10GB，那么 Size Ratio 就是10。</p>
-<p>FaceBook的文档中有获得最优写放大倍数具体的计算方式，详细推导参见[2] [3]。这里大致列下推导过程：         </p>
-<p>假定LSM-tree 每一层的扇出系数相同，都是<br>f<br>，即<br>f=sizeof(C<br>l+1<br>​<br> )/sizeof(C<br>l<br>​<br> )<br>，而总的持久化层数为<br>n<br>。</p>
-<p>考虑到数据最终会落到最底层，那么最终写放大倍数为：</p>
-<p>wa=n∗f</p>
-<p> 假设磁盘容量是内存容量的 t 倍，或者说内存/磁盘容量比是1/t，那么<br>t=f<br>n<br> ,即f=t<br>1/n</p>
-<p>。写放大系数<br>wa<br>变为：</p>
-<p>wa=n∗t<br>1/n</p>
-<p>t 是已知常量，把<br>wa<br> 对<br>n<br>求导数，经过一些变换，可以得到式子：</p>
-<p>n<br>′</p>
-<p>(wa)<br>′</p>
-<p>​<br> =t<br>1/n<br> −<br>n<br>1<br>​<br> ×ln(t)×t<br>1/n<br> =t<br>1/n<br> ×(1−<br>n<br>ln(t)<br>​<br> )</p>
-<p>当<br>n=ln(t)<br>时，导数为0，得到最小的写放大倍数。</p>
-<p>在这种情况下，每层的扇出系数是<br>f=t<br>1/n<br> =t<br>1/ln(t)<br> =e<br>。注意，虽然rocksdb的默认扇出系数是10，但是数学上最佳值是自然对数e。</p>
-<p>如果 t = 1024，则对应层数 n 的最佳值是<br>ln(1024)=6.93<br>，取整为7层。</p>
-<p>注意上面假设的1024是个较大的比值，即磁盘容量为内存容量的1024倍。</p>
-<h3 id="读放大"><a href="#读放大" class="headerlink" title="读放大"></a>读放大</h3><p>假设LSM-tree有n层。由于每一层的文件都是有序的且有元数据。对于一个点查， 在每层最多打开一个文件，因此读放大是<br>O(n)<br>。</p>
-<p>常见的缓解读放大方法包括：</p>
-<p>Cache： 尽量缓存容量较小层级的数据在内存中，因为它们访问频率较高。</p>
-<p>Bloom Filter: <strong>可以根据hash值提前确定一些key不存在，从而缓解一部分点查的读放大；但是解决不了Scan类型的范围查询的读放大</strong>。（这个结论非常重要，做读放大的优化，一定要先把问题分成两类问题）。</p>
-<p>Range Filter: 例如SuRF等，可以优化查询范围查询的性能。  </p>
-<p>总的来说，层级越少，对读越友好。Hash 对单一 key 查找有极强的优化作用，但 range 查找可能要借助一些空间局部性优化手段。</p>
-<h3 id="空间放大"><a href="#空间放大" class="headerlink" title="空间放大"></a>空间放大</h3><p>空间放大主要有两个因素：</p>
-<p>不同 Level 有同一key的多个版本;</p>
-<p>用户已经删除的数据没有做物理删除，只是记录了log或者在做了删除标记。</p>
-<p>空间放大一般相对有限。对于第一个因素，层级越少则重复的key越少，相应地，它导致的空间放大越低。</p>
-<p>对于第二个因素，用户已删除的数据何时在物理上被删除，主要依赖于Compaction机制。</p>
-<h2 id="bbbKV：每分片独立的LSM-tree"><a href="#bbbKV：每分片独立的LSM-tree" class="headerlink" title="bbbKV：每分片独立的LSM-tree"></a>bbbKV：每分片独立的LSM-tree</h2><p>有些分布式存储系统选择使用一个 LSM-tree存储整个节点的所有分片的数据，比如 TiKV（架构上简单）；<strong>也有些选择一个 LSM 实例只管理节点上的某个分片，例如 Hbase。（架构上复杂）</strong></p>
-<p>bbb 选择了后者，即一个表有多个分片，每个分片对应一个 LSM-tree，理由是：</p>
-<ul>
-<li><p>表（索引）的迁移、删除效率更高，可以直接通过物理文件的传输、删除实现，无需进行数据遍历，性能优势明显。</p>
-</li>
-<li><p>不同的表物理上就完全分开，隔离性更好，可以做更细粒度的控制，比如表级的缓存预热。</p>
-</li>
-<li><p>限定单个 LSM 的大小后可以进行深度定制，在几乎不影响读放大、空间放大的前提下可以大大降低写放大</p>
-</li>
-</ul>
-<p><strong>付出的代价主要是实现上的复杂性，比如全局元数据管理和跨分片操作（分裂、合并）相对单实例管理所有分片需要更精心的设计。</strong></p>
-<h2 id="bbbKV：大-Memtable、少层级"><a href="#bbbKV：大-Memtable、少层级" class="headerlink" title="bbbKV：大 Memtable、少层级"></a>bbbKV：大 Memtable、少层级</h2><p>bbbKV选择了较大的Memtable(即前图中的C0)，大部分时候只有一个持久化层(称之为Level-1)。取舍 1。主要原因如下：</p>
-<ul>
-<li><p>服务器能够为bbbKV分配的内存、磁盘容量比较确定，可以算出内存/磁盘容量比。</p>
-</li>
-<li><p>典型的内存/存储的容量比：按照2.9TB NVME磁盘， 256GB内存计算，内存与存储容量比接近 1/10，即 t 接近于 10。</p>
-</li>
-<li><p>由于对schema的感知，Memtable 中可以只保存修改的列，而不是整行，所以相当于获得了更高的内存/磁盘容量比。这一点leveldb/rocksdb 这种纯K/V接口的引擎是做不到的。取舍2。</p>
-</li>
-<li><p>写流量有明显的局部性，更新的 key 较为集中，不会出现 major compaction 关联大量 L1 文件，每个文件只关联少量数据的情况。取舍 3。</p>
-</li>
-<li><p>每个分片一个 LSM 实例，限定了单个实例的大小（目前暂定2G，可能根据实际运行情况调优），也就限制了总的文件数量（千级别），不会对读造成太大的影响。取舍 4。而 leveldb/rocksdb 原生设计需要支持单实例数百上千G的容量，不分级读会很慢。</p>
-</li>
-</ul>
-<p>在此前提下，与 TiDB(TiKV) 相比，这样设计有如下取舍：</p>
-<ul>
-<li><p>写放大大幅降低：每次 compaction 涉及的 SST 文件中实际不需要合并的数据减少；每个 key 经过一次 compaction 就达到了“最终”层。</p>
-</li>
-<li><p>空间放大略微降低：bbb 没有空间放大，比 TiDB(rocksdb) 的 1.1 要好些。</p>
-</li>
-<li><p>读放大相当：考虑在数据量 1T 的进程上查询一个不在 memtable/immutable 的 key</p>
-<ul>
-<li><p>由于 region 已经确定，假定是满 region，bbb 需要从 1000 个(2G/2M) FileMeta 中找到目标 SST，共要 10 次逻辑查询和 1 次物理查询（ps: SST 文件没有多 level 重叠，bloom filter 的必要性下降了）-这证明了 bloom filter 能够优化 leveling i/o，不适合优化单 i/o。</p>
-</li>
-<li><p>TiDB 所有 region 共用一个 rocksdb，导致潜在的候选文件更多(1T*1.1/8M ~ 144,000)，但由于 Level 和 fractional cascading 机制，逻辑查询较少。物理查询大部分情况下也只需要 1 次，但 bloom filter 误报或范围查询时，需要每层做一次物理查询。</p>
-</li>
-<li><p>bbb 查询耗时较稳定，TiDB 受 key 所在层级和查询方式影响较大。</p>
-</li>
-<li><p>层级较低的“温” key TiDB 占优，能以较少的逻辑查询和相同的物理查询次数获得数据；</p>
-</li>
-<li><p>范围查询 balde 需要的物理查询较少，优势明显；</p>
-</li>
-<li><p>考虑到点查较多，且 bbb memtable 远大于 TiDB，读放大两者大致相当。</p>
-</li>
-</ul>
-</li>
-</ul>
-<p>总体上 bbb 优势明显，关键在于充分利用已知要查询的数据属于哪个 region 的特性，重新调整了底层存储引擎；TiDB(TiKV) 整个进程用一个 rocksdb 的方式无法利用这点。</p>
-<p>上面有了定性分析，下面我们定量地计算一下写放大。按照t= 10和前面的最优扇出系数 e 计算，最优的持久化层级<br>n=ln(10)=2.3<br>层，取整则是2层。相应地，可以把e向上取整 f=3，最终取整的写放大倍数是3*3=9倍。</p>
-<p>如果BaldeKV 只使用一个持久化层：</p>
-<ul>
-<li><p>扇出系数f=10，写放大倍数是10倍；</p>
-</li>
-<li><p>空间放大较小，没有各层间保存重复key导致的空间浪费；</p>
-</li>
-<li><p>读放大是1；</p>
-</li>
-</ul>
-<p>所以，bbbKV选择了只有一个持久化层Level-1。</p>
-<p>应急处理：</p>
-<p>如果出现大量的突发写，导致内存压力过大，而将 memtable 与磁盘上的 Level-1 做Compaction太慢，bbb-kv会临时启用Level-0，作为Level-1的增量。</p>
-<p>Level-0 是个特殊的层，它允许同层的不同文件间key的重叠。所以写 Level-0 不需要任何Compaction，可以快速缓解内存压力。在高峰过后，可恢复正常的单个持久化层。</p>
-<h1 id="comment"><a href="#comment" class="headerlink" title="comment"></a>comment</h1><blockquote>
-<p>老牌的数据库产品oracle<br>mysql使用的是B-tree加undo的方式实现存储mvcc，而LSM相对来说实现更简单，对于很多热点相对集中的业务，内存使用效率更高，可以借鉴B+tree引擎的思路去优化compaction</p>
-<p>长期来看，并不是非此即彼，它们的融合架构是比较好的方向，比如bbb中的SST存储结构，整体来看已经是支持快照的B+tree结构了；而优化了compaction影响后的架构可以支持更频繁的full<br>compaction，跟oracle/mysql的checkpoint也就很像了。</p>
-<p>1）<br>关于先进和落后（打开链接只看到一点点评论，不知作者怎么论证落后和先进的），LSM在关系数据库领域应用并不少，只是发展的没那么早，不知道说落后是啥理由。例如，单机数据库：FaceBook的MyRocks(MySQL的底座换RocksDB，有对比测试，性能比较强悍)；分布式数据库领域：Google<br>Spanner和阿里的OceanBase。</p>
-<p>2）相比之下，LSM-tree的设计更倾向于写优化，B-Tree则倾向于读优化。为什么近年来LSM-Tree受关注多，跟存储系统的变化也有关。我们逐渐从机械盘过渡到了SSD盘，SSD有几个机械盘所没有的特性，更需要优化写：1)<br>读写性能不均衡(写比读差很多，网上后数据); 2)<br>写需要做擦除(擦除的单位远大于磁盘扇区)，本身又是一次写放大；3)写寿命/擦除次数非常有限。事实上，我知道的做SSD<br>固件的人，基本都是在优化写性能和寿命。</p>
-</blockquote>
-
-      
-    </div>
-    <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/01/26/TiDB-与-blade/" data-id="ckpy06inp00digza1h1bulsq4" class="article-share-link">分享</a>
-      
-      
-      
-  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/存储/">存储</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/系统架构/">系统架构</a></li></ul>
 
     </footer>
   </div>
@@ -1577,6 +1461,14 @@ rename
       <ul>
         
           <li>
+            <a href="/2021/06/16/如何设计一套风险系统/">如何设计一套风险系统</a>
+          </li>
+        
+          <li>
+            <a href="/2021/06/16/OKR-笔记/">OKR 笔记</a>
+          </li>
+        
+          <li>
             <a href="/2021/06/15/Team-Topologies/">Team Topologies</a>
           </li>
         
@@ -1586,14 +1478,6 @@ rename
         
           <li>
             <a href="/2021/06/11/机器学习的几个概念/">机器学习的几个概念</a>
-          </li>
-        
-          <li>
-            <a href="/2021/06/08/管理的几个问题/">管理的几个问题</a>
-          </li>
-        
-          <li>
-            <a href="/2021/06/07/STARR-法则/">STARR 法则</a>
           </li>
         
       </ul>
