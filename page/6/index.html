@@ -72,6 +72,77 @@
       <div class="outer">
         <section id="main">
   
+    <article id="post-Journal-与-EBS" class="article article-type-post" itemscope itemprop="blogPost">
+  <div class="article-meta">
+    <a href="/2021/01/29/Journal-与-EBS/" class="article-date">
+  <time datetime="2021-01-29T09:55:34.000Z" itemprop="datePublished">2021-01-29</time>
+</a>
+    
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 itemprop="name">
+      <a class="article-title" href="/2021/01/29/Journal-与-EBS/">Journal 与 EBS</a>
+    </h1>
+  
+
+      </header>
+    
+    <div class="article-entry" itemprop="articleBody">
+      
+        <!-- Table of Contents -->
+        
+        <h1 id="EBS-的定义"><a href="#EBS-的定义" class="headerlink" title="EBS 的定义"></a>EBS 的定义</h1><p>EBS — Elastic Block Storage，简言之就是高可用、高性能、弹性可扩展的分布式块存储服务。对于业务来说，它就是一块磁盘，只不过将业务数据存储于远端网络节点，但是使用方法和体验与访问本地磁盘一样。</p>
+<p>EBS 可以作为容器的存储盘，可以解决：</p>
+<ul>
+<li>有状态容器的状态存储问题</li>
+<li>海量存储问题：邮件系统、监控平台、数据库、用户录音、集成测试平台、MySQL 备份（需要测试 OLTP/OLAP 的交互操作和在线交易性能）</li>
+</ul>
+<h1 id="EBS-的文件系统结构"><a href="#EBS-的文件系统结构" class="headerlink" title="EBS 的文件系统结构"></a>EBS 的文件系统结构</h1><p>在EBS分布式块存储系统中，最终存储业务写入数据的服务是ChunkServer。</p>
+<p>单机存储引擎位于每个ChunkServer上，业务的数据读写请求到达ChunkServer后，最终通过单机存储引擎与操作系统文件系统交互来写入或读取数据。</p>
+<p>业务申请的每一块ebs网络盘在我们的系统里都对应一个Volume。Volume本身是一个逻辑概念，每个Volume被切分成多个Chunk，Chunk最终对应到ChunkSever上文件系统中的一个真实文件，因此我们的单机存储引擎最终会管理这一系列Chunk文件的创建，读写，删除等操作。</p>
+<p><img src="EBS-volume-chunk-server.png" alt="EBS-volume-chunk-server.png"></p>
+<p>Journal就是在ChunkServer上的单机存储引擎这一层引入的，上图中最左侧的“big-journal dir”就是用来存储journal的目录。</p>
+<h1 id="其他-Journal-的实现"><a href="#其他-Journal-的实现" class="headerlink" title="其他 Journal 的实现"></a>其他 Journal 的实现</h1><h2 id="Linux-中的日志文件系统"><a href="#Linux-中的日志文件系统" class="headerlink" title="Linux 中的日志文件系统"></a>Linux 中的日志文件系统</h2><p>文件系统要解决的一个关键问题是防止掉电或系统崩溃造成数据损坏。</p>
+<p>我们知道一个文件既包括元数据，又包括真正的用户数据。文件有写入时这两部分数据都需要被写入。因此导致文件系统损坏的根本原因就在于写文件不是原子操作，写操作无法一步完成，如果其中任何一个步骤被打断，就会造成数据的不一致或损坏。</p>
+<p>为解决上面说到的问题，日志文件系统(Journal File System)应运而生。</p>
+<p>日志文件系统的原理是在进行写操作之前，把即将进行的各个步骤（称为transaction）事先记录下来，保存在文件系统上单独开辟的一块空间上，这就是所谓的日志(journal)，也被称为write-ahead logging(WAL)。日志保存成功之后才进行真正的写操作，把文件系统的元数据和用户数据写进硬盘（称为checkpoint），这样万一写操作的过程中掉电，下次挂载文件系统之前把保存好的日志重新执行一遍就行了（称为replay），避免了前述的数据损坏场景。</p>
+<p>结论：所以到达 checkpoint 意味着它之前的 log 不需要 replay 了</p>
+<p><img src="Linux-Journal.png" alt="Linux-Journal.png"></p>
+<h2 id="MySQL-InnoDB引擎的redo-log"><a href="#MySQL-InnoDB引擎的redo-log" class="headerlink" title="MySQL InnoDB引擎的redo log"></a>MySQL InnoDB引擎的redo log</h2><p>InnoDB 的 redo log 是固定大小的，比如可以配置为一组 4 个文件，每个文件的大小是 1GB，那么总共就可以记录 4GB 的操作。从头开始写，写到末尾就又回到开头循环写，如下图所示：</p>
+<p><img src="MySQL-redolog.png" alt="MySQL-redolog.png"></p>
+<p>write pos 是当前记录的位置，一边写一边后移，写到第 3 号文件末尾后就回到 0 号文件开头。</p>
+<p>checkpoint 是当前要擦除的位置，也是往后推移并且循环的，擦除记录前要把记录更新到数据文件。</p>
+<p>write pos 和 checkpoint 之间的是还空闲的部分，可以用来记录新的操作。如果 write pos 追上 checkpoint，这时候不能再执行新的更新，得停下来先把 checkpoint 推进一下。</p>
+<h1 id="EBS-中的-journal"><a href="#EBS-中的-journal" class="headerlink" title="EBS 中的 journal"></a>EBS 中的 journal</h1><p>EBS的ChunkServer可能会同时处理大量的写请求，这样写请求最终会转化为大量的磁盘随机写操作，随机写磁盘性能是很差的。有了journal后，可以将这些大量的随机写请求，转化为对journal文件的基本上是顺序的写请求，从面提升写性能，降低写延迟。</p>
+<p>同时，如果没有journal，那么用户数据将被直接写chunk文件，这会导致在chunkserver挂掉时chunk文件里出现脏数据，从而使得chunk不同副本出现不一致的问题。</p>
+<p>所以日志总有个基本的用处：</p>
+<ul>
+<li>优化随机写</li>
+<li>处理并发写</li>
+</ul>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="http://yoursite.com/2021/01/29/Journal-与-EBS/" data-id="ckqtf9zmp00doexa1rjbwtzi0" class="article-share-link">分享</a>
+      
+      
+      
+  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/存储/">存储</a></li></ul>
+
+    </footer>
+  </div>
+  
+</article>
+ 
+
+
+  
     <article id="post-TiDB-与-blade" class="article article-type-post" itemscope itemprop="blogPost">
   <div class="article-meta">
     <a href="/2021/01/26/TiDB-与-blade/" class="article-date">
@@ -273,7 +344,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/01/26/TiDB-与-blade/" data-id="ckqqdefbc00m5vaa1bvudnja0" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2021/01/26/TiDB-与-blade/" data-id="ckqtf9zmp00dmexa12gn1c3qt" class="article-share-link">分享</a>
       
       
       
@@ -347,7 +418,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2021/01/09/构建-spring-framework/" data-id="ckqqdefam00m3vaa12w1aglqn" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2021/01/09/构建-spring-framework/" data-id="ckqtf9zmo00djexa1622cgcn5" class="article-share-link">分享</a>
       
       
       
@@ -420,7 +491,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/12/16/云原生应用/" data-id="ckqqdef9q00m1vaa101n76xc7" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/12/16/云原生应用/" data-id="ckqtf9zmn00dhexa1t87hxhek" class="article-share-link">分享</a>
       
       
       
@@ -472,7 +543,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/12/12/去屑洗发水/" data-id="ckqqdef9300lyvaa1dcr8ad3w" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/12/12/去屑洗发水/" data-id="ckqtf9zmm00deexa1wecxg38i" class="article-share-link">分享</a>
       
       
       
@@ -553,7 +624,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/12/08/活动保障性体系建设和实践的总结/" data-id="ckqqdef8700lwvaa1gyjpd342" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/12/08/活动保障性体系建设和实践的总结/" data-id="ckqtf9zml00dcexa1epkrjtvv" class="article-share-link">分享</a>
       
       
       
@@ -652,7 +723,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/12/02/服务治理组件笔记/" data-id="ckqqdef7h00ltvaa1r360wo9m" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/12/02/服务治理组件笔记/" data-id="ckqtf9zmk00daexa1z7f5keik" class="article-share-link">分享</a>
       
       
       
@@ -760,7 +831,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/11/29/《罪與罰》出場人物筆記/" data-id="ckqqdef6h00lrvaa1z904rrav" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/11/29/《罪與罰》出場人物筆記/" data-id="ckqtf9zmj00d7exa1recixuuf" class="article-share-link">分享</a>
       
       
       
@@ -852,7 +923,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/11/23/《今日简史》/" data-id="ckqqdef3100lkvaa1ev2m1jqx" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/11/23/《今日简史》/" data-id="ckqtf9zmf00d2exa12nn5rj2a" class="article-share-link">分享</a>
       
       
       
@@ -964,84 +1035,11 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/11/23/《未来简史》/" data-id="ckqqdef5a00lpvaa12jhnrzhm" class="article-share-link">分享</a>
+      <a data-url="http://yoursite.com/2020/11/23/《未来简史》/" data-id="ckqtf9zmi00d5exa1b4jhwoda" class="article-share-link">分享</a>
       
       
       
   <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/历史/">历史</a></li></ul>
-
-    </footer>
-  </div>
-  
-</article>
- 
-
-
-  
-    <article id="post-《人类群星闪烁时》" class="article article-type-post" itemscope itemprop="blogPost">
-  <div class="article-meta">
-    <a href="/2020/11/21/《人类群星闪烁时》/" class="article-date">
-  <time datetime="2020-11-21T14:11:48.000Z" itemprop="datePublished">2020-11-21</time>
-</a>
-    
-  </div>
-  <div class="article-inner">
-    
-    
-      <header class="article-header">
-        
-  
-    <h1 itemprop="name">
-      <a class="article-title" href="/2020/11/21/《人类群星闪烁时》/">《人类群星闪烁时》</a>
-    </h1>
-  
-
-      </header>
-    
-    <div class="article-entry" itemprop="articleBody">
-      
-        <!-- Table of Contents -->
-        
-        <p>本书是历史特写，忠于历史，文辞优美，写出了历史关头，人物的选择。</p>
-<ol>
-<li><p>到不朽的事业中寻找庇护（不朽的逃亡者）：1513年9月25日，富有冒险精神的西班牙巴尔沃亚随船到达南美洲，去开拓和寻找财富，他不仅挤走了整支队伍的主人，还赶走了新派来的总督。但是，被他赶走的船队主人却回到了西班牙，向西班牙宫廷举报了他的恶劣行为。为了避免西班牙宫廷的惩罚，他决定率先去寻找南美大陆的财富，以此来庇护自己的安全，在艰苦的旅途之中，他成为了第一个看到太平洋的文明中的人类，并且他知晓了不远的国度中还有存有无限黄金。而就在此时，他的朋友皮萨罗为了抢夺功劳背叛了他，联合国王派下的新总督一起将其暗算 [1]  。</p>
-</li>
-<li><p>拜占庭的陷落：1453年5月29日，奥斯曼土耳其帝国苏丹穆罕默德二世攻占东罗马帝国最后的堡垒：君士坦丁堡，经过数次激战始终不见成效，此时这位天才皇帝想出一幕惊险之棋，将战船从陆地运送到拜占庭防守薄弱的靠海一隅，最终因为拜占庭疏忽的一座小门–凯尔卡门的发现，奥斯曼帝国毁灭了拜占庭这一人类文明的精华。</p>
-</li>
-<li><p>亨德尔的复活：1741年8月21日，落魄而江郎才尽的作曲家亨德尔突然在一首诗中找到灵感，写下了不朽之作《弥赛亚！》，而他自己也因此得到了救赎。</p>
-</li>
-<li><p>一夜天才：1792年4月25日，年轻上尉鲁热受到斯特拉斯堡市长的邀请，为莱茵军创作一首战歌，4月26日凌晨，《马赛曲》诞生了。此歌一出立即传遍全国大街小巷，激励着军人去战斗，去胜利。而此歌的作者鲁热却无为人知，并且一生穷困潦倒，他只做了一夜的天才。</p>
-</li>
-<li><p>滑铁卢的一分钟：1815年6月18日，由于懦弱平庸的副将格鲁希固守成命，拿破仑兵败滑铁卢。</p>
-</li>
-<li><p>玛丽恩巴德哀歌：1823年9月5日，歌德在离开玛丽恩巴德回家的路上，抑制不住心中对于那里一位少女的思念，悲不自胜，写下了晚年最著名的爱情诗篇：《玛丽恩巴德悲歌》。从此歌德痛定思痛，踏入了另一个创作高潮，写出了《浮士德》等伟大著作。</p>
-</li>
-<li><p>黄金国的发现：1848年1月，约翰·奥古斯特·苏特尔在自己的领地，今加利福尼亚，发现了黄金混合在泥沙之中，从而掀起了持续四年横扫世界的“淘金热”。人们不再劳动而是拼命的淘金，世界各地也涌来了无数的淘金者，他们霸占了属于苏特尔的财产和土地，最终使苏特尔家破人亡。</p>
-</li>
-<li><p>壮丽的瞬间：俄罗斯著名作家陀思妥耶夫斯基因参与反动的政治活动被逮捕并处于死刑，在执行死刑之际一纸官文的到来改变的死亡的命运，死刑不再，改判服役和当兵。陀思妥耶夫斯基历经磨难而幸存和日后的军旅生涯给了其丰富的写作素材，是其一生创作和思想的转折点。</p>
-</li>
-<li><p>飞越大洋的一次通话：1858年7月28日，在美国实业家塞勒斯·韦斯特·菲尔德立志要铺设一条连接欧美大陆的海底电报电缆，准备妥当后的首次铺设便遭遇失败，坚定的菲尔德终于在第三次铺设时成功，人人奉菲尔德为英雄。但好景不长，电缆的失灵又使愤怒的人们反过来炮轰抨击他。时隔六年，决心不减的菲尔德再次尝试终于成功。</p>
-</li>
-<li><p>逃向上帝：列夫·托尔斯泰未完成的剧本《黑暗中的光明》之续尾。</p>
-</li>
-<li><p>封闭的列车：1917年4月9日，列宁登上了从瑞士过境德国回到俄国的列车，这列封闭的列车就像一枚炮弹，把革命的导师送回了祖国，打垮了一个帝国。</p>
-</li>
-<li><p>南极争夺战：挪威人阿蒙森和英国人斯科特各自率领一支探险队，为使自己成为世界上第一批到达南极的人而进行激烈的竞争，但是他们之前一个月挪威人阿蒙森的队伍已经先他们到达，失望的斯科特同其他四人在返回的途中不幸遇难，在他留下的笔记本中记述了斯科特对国家的自豪和对家人的思念。</p>
-</li>
-<li><p>西塞罗：古罗马生命最后的4年。</p>
-</li>
-<li><p>威尔逊的梦想与失败：美国总统威尔逊以保障人类永久和平为梦想，却惨遭失败。</p>
-</li>
-</ol>
-
-      
-    </div>
-    <footer class="article-footer">
-      <a data-url="http://yoursite.com/2020/11/21/《人类群星闪烁时》/" data-id="ckqqdef2a00livaa19xnw4s05" class="article-share-link">分享</a>
-      
-      
-      
-  <ul class="article-tag-list"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/文学/">文学</a></li></ul>
 
     </footer>
   </div>
@@ -1077,6 +1075,10 @@
       <ul>
         
           <li>
+            <a href="/2021/07/07/如何写一个消息队列/">如何写一个消息队列</a>
+          </li>
+        
+          <li>
             <a href="/2021/07/03/“描绘人内心的全部深度”——《罪与罚》总序/">“描绘人内心的全部深度”——《罪与罚》总序</a>
           </li>
         
@@ -1090,10 +1092,6 @@
         
           <li>
             <a href="/2021/06/21/结构思考力/">结构思考力</a>
-          </li>
-        
-          <li>
-            <a href="/2021/06/21/《搞定》/">《搞定》</a>
           </li>
         
       </ul>
