@@ -1,0 +1,937 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>分布式事务 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="问题定义 对经典的电商场景而言：下单是个插入操作，扣减金额和库存是个更新操作，操作的模型不同，如果进行分布式的服务拆分，则可能无法在一个本地事务里操作几个模型，涉及跨库事务。 CAP 定义 根据 Eric Brewer 提出的 CAP 理论：  Consistency：All Nodes see the same data at the same time。所有节点看到同一份最新数据（线性一致性）">
+<meta property="og:type" content="article">
+<meta property="og:title" content="分布式事务">
+<meta property="og:url" content="https://magicliang.github.io/2025/09/13/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="问题定义 对经典的电商场景而言：下单是个插入操作，扣减金额和库存是个更新操作，操作的模型不同，如果进行分布式的服务拆分，则可能无法在一个本地事务里操作几个模型，涉及跨库事务。 CAP 定义 根据 Eric Brewer 提出的 CAP 理论：  Consistency：All Nodes see the same data at the same time。所有节点看到同一份最新数据（线性一致性）">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2025/09/13/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/3pc.png">
+<meta property="article:published_time" content="2025-09-13T15:06:11.000Z">
+<meta property="article:modified_time" content="2026-01-24T07:32:08.645Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="系统架构">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2025/09/13/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/3pc.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "分布式事务",
+  "url": "https://magicliang.github.io/2025/09/13/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/",
+  "image": "https://magicliang.github.io/2025/09/13/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/3pc.png",
+  "datePublished": "2025-09-13T15:06:11.000Z",
+  "dateModified": "2026-01-24T07:32:08.645Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2025/09/13/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.2"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.1.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.12.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '分布式事务',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.1"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (false) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2025/09/13/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/3pc.png);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">分布式事务</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"></div></nav><div id="post-info"><h1 class="post-title">分布式事务</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2025-09-13T15:06:11.000Z" title="Created 2025-09-13 23:06:11">2025-09-13</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-01-24T07:32:08.645Z" title="Updated 2026-01-24 15:32:08">2026-01-24</time></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">13.4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>41mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1>问题定义</h1>
+<p>对经典的电商场景而言：下单是个插入操作，扣减金额和库存是个更新操作，操作的模型不同，如果进行分布式的服务拆分，则可能无法在一个本地事务里操作几个模型，涉及跨库事务。</p>
+<h2 id="cap-定义">CAP 定义</h2>
+<p>根据 Eric Brewer 提出的 CAP 理论：</p>
+<ul>
+<li>Consistency：All Nodes see the same data at the same time。所有节点看到同一份最新数据（线性一致性）。</li>
+<li>Availability：Reads and writes always succeed。非故障节点必须在合理时间内响应。</li>
+<li>Partition tolerance：System continues to operate despite arbitrary message loss or failure of part of the system。网络分区时系统继续运行。</li>
+</ul>
+<p>由此诞生三种设计约束和取舍方向：</p>
+<ul>
+<li>CA：放弃P，仅适用于单点系统，非分布式，如 MySQL主从同步。</li>
+<li>AP：放弃强一致性，保证高可用。Cassandra，DynamoDB。Gossip协议可实现最终一致性。</li>
+<li>CP：放弃可用性，保证强一致性与分区容错。ZooKeeper (ZAB)，etcd (Raft) 。2PC，2PC 无法保证吞吐；Paxos可优化吞吐（如Multi-Paxos）。</li>
+</ul>
+<p>在分布式场景下，网络分区不可避免。网络分区带来一个不可解决的基本问题：<strong>执行本地事务的一个节点，无法确知其他节点的事务执行状况</strong>。</p>
+<ul>
+<li>在CP系统中：节点会阻塞操作（如Raft的Leader选举），直到确认多数节点状态，可以确知集群状态。</li>
+<li>在AP系统中：节点继续响应请求但不保证数据一致性，（如Gossip传播延迟）。</li>
+</ul>
+<h3 id="常见误解">常见误解</h3>
+<p><a target="_blank" rel="noopener" href="https://zhuanlan.zhihu.com/p/582488636">《【论文笔记】CAP Twelve Years Later: How the “Rules” Have Changed》</a></p>
+<h4 id="三选二系统的涌现">三选二系统的涌现</h4>
+<p>“三选二”的说法由于过分简化了各个特性间的关系而常常导致误解，而这，现在看来还是挺要紧的。CAP仅仅只封闭了一小片设计空间：在分区情况下完美的可用性和一致性。可是这种情况并不常见。</p>
+<h4 id="同时丢失所有特性">同时丢失所有特性</h4>
+<p>现代CAP的目标应该是在特定应用中最大化一致性和可用性的组合收益。</p>
+<p>某种程度来说，NoSQL的就是要提供一种方案，可用性第一， 一致性第二。而坚持ACID特性（原子性、一致性、隔离性、持久性）的数据库恰恰相反。</p>
+<p>“三选二”的观点在多个方面是有误导性的。首先，由于网络分区很罕见，所以当系统没有发生分区的时候很难让人放弃C或A。其次，在同一个系统的不同颗粒度上，<strong>C和A之间的选择会发生很多次</strong>，不仅子系统会有不同的选择，甚至有可能随着系统运行、特定数据或者用户介入而改变。最后，三个数据是连续的，而非离散的，不是非黑即白的。<strong>可用性很显然是在0到100的百分比区间内连续的。一致性明显也有很多档次。甚至分区也有很多细节</strong>，有些时候大家对于分区是否存在仍有不同意见。</p>
+<p>探索这些细节的过程中，也迫使我们不断优化传统的应对网络分区的方法，这也是最核心的挑战。由于网络分区很少出现，CAP理论可以在绝大部分时间里允许有完美的C和A；可是一旦分区发生，就需要有一个策略来检测并应对网络分区。这个策略应该有三个步骤：</p>
+<ul>
+<li>检测分区</li>
+<li>进入显式的分区状态并限制部分操作</li>
+<li>启动一个过程来恢复一致性并补偿分区期间的错误。</li>
+</ul>
+<blockquote>
+<p>在经典的诠释中，CAP理论不看延迟，虽然在实践中延迟和分区是深度关联的。运作上讲，CAP的本质体现在系统超时之际，这时系统必须做出根本判断一一分区判断：</p>
+<p>取消操作，因此降低了可用性， 或者</p>
+<p>遂行操作，因此承担了不一致的风险。<br>
+通过重试通信来达到一致性，比如通过Paxos或者两阶段提交，仅仅是推迟了上述过程。总有某个时间点，程序必须做出判断；而无穷的重试本质上是选择C，放弃A。</p>
+<p>因此从实际上看，分区是通信过程中的一个时间限制。在时间限制内没有达成一致就意味着分区，以及为当前操作在C和A之间做出选择。这些概念捕获到了和延迟相关的核心设计问题：两边是不是在没有通信的情况下向前推进？</p>
+<p>这个从实际出发的观点带出了几个重要的结果。首先，分区并不是一个全局的概念，因为有的节点可能检测到了分区，而其它的节点没有。第二，节点检测到分区之后进入了分区模式一一介于优化C和A中间的部分。</p>
+<p>有时候为了在广域网络上避免因维护一致性而造成的高延迟，放弃强一致性也是合理的。雅虎的PNUTS系统因为异步维护远端的副本而带来了不一致性。不过，由于它把主副本放在本地，反而降低了延迟。这个策略在实际中运作还不错，根据用户的位置不同，单个用户的数据天然就是分区的。理想情况下，每个用户的主数据都应该在其附近。</p>
+<p>脸书使用了相反的策略。主副本永远在同一个地方，远端的用户一般会有一个更近，但是略有延迟的副本。然而，当用户更新其页面时，更新的内容直接走到主副本中，以便其他用户可以在短期内读到数据，尽管这样有些延迟。20秒之后，用户的流量切回附近的副本，那会儿更新的内容也同步过来了。</p>
+</blockquote>
+<p>通常是先 C 后 A，即在超时以前，不让系统恢复响应-这也是我们一般系统会做的事情。</p>
+<p><strong>只要在业务允许的最大响应时间内，无法让“大多数”相关节点完成一次往返通信，系统就视为“分区”；</strong></p>
+<h4 id="管理分区">管理分区</h4>
+<p><img src="managing-partitions.webp" alt="managing-partitions"></p>
+<h5 id="哪些操作可以继续？">哪些操作可以继续？</h5>
+<p>哪些操作需要被限制？取决于系统需要保持怎样的不变性。给定一组不变性约束，系统设计师必须决定是在分区的时候保持某个特定的不变性，还是冒险打破它并寄希望在分区恢复时重建它。举一个不变性的例子，<strong>某个键在表中的唯一性，设计者一般会选择冒险，允许在分区期间存在重复的键</strong>。重复的键在恢复阶段很容易探查到，假设它们可以合并，设计者边能轻易地重建此不变性。</p>
+<p>然而对于一些在分区时候也需要保持的不变性，设计者必须禁止或者修改那些可能影响它的操作。（总的来说，没有办法来判断某个操作是否会破坏不变性，因为此刻分区的另一侧是不可知的）外部化的事件，比如从信用卡扣钱，通常就是这么处理的。在这种情况下，策略是记录意图，并在分区恢复后执行。这种事务通常是某个大的工作流的一部分，有明确的订单处理状态，将操作推迟到分区结束也没有特别大的坏处。设计者牺牲了一部分A，但是用户感受不到。用户只知道他们下了单，系统稍后会处理。</p>
+<p>一般来说，分区模式给用户界面带来了一个本质上的挑战，告诉他们任务正在进行中，而没有完成。研究者对离线操作，也就是长时间分区的情况进行了探索。比如Bayou的日历程序，用不同的颜色展示潜在的不一致（尚未确定的）条目。这种告知机制在工作流应用，比如带有邮件通知的商务系统，或者带有离线模式的云服务，比如谷歌文档中，都比较常见。</p>
+<p>之所以要关注显式的原子操作，而不仅仅局限于读和写，是因为这样更便于我们分析高层操作对于不变性的影响。尤其是，设计者需要做一个交叉表，针对所有的操作和所有的不变性，来分析每个操作对每个不变性是否有影响。如果是，设计者必须绝对是否要禁止、推迟或者修改此操作。在实践中，这些决定可以建立在已知的状态、依据或者两者同时之上。比如一个系统中，某种数据有其对应的主节点，那么操作就只能在主节点上，而不能在其它节点上进行。</p>
+<p>在分区两侧追踪操作历史最好的办法是使用版本向量（version vectors），它可以捕获操作中的因果依赖。向量的元素是一个数据对（节点、逻辑时间），针对某个对象，所有更新它的节点，每个节点一条记录，记录那些更新了的节点以及更新时间。假设此对象有两个版本，A和B，A比B更新，意味着对于的节点，A的时间要大于或等于B的时间，而且至少有一个节点上，A的时间是大于B的时间的。</p>
+<p>如果无法对向量进行排序，则说明这些更新是同时发生的，而且很有可能已经不一致了。因此，对于分区两次的版本向量，系统可以轻易区分哪些操作已经是有序的，哪些是同时执行的。最近的研究证明了这类因果一致性是设计者在聚焦可用性时最好的方案。</p>
+<h4 id="分区恢复">分区恢复</h4>
+<p>在某个时间点，通信回复，分区结束。在分区的时候，每一侧都是可用的，都在执行命令，但是分区状态推迟了一部分操作，也打破了一些不变性。在这个时候，系统知道分区两侧的状态和历史，因为在分区状态下，它们都记录了详细的日志。历史比状态更管用，因为系统可以从中推导出哪些操作实际打破了不变性，什么操作是外化的，包括发送响应给用户。设计者必须在恢复阶段解决下面两个难题：</p>
+<p>两侧的状态必须重新归于一致<br>
+必须为分区模式下造成的错误进行补偿<br>
+通常来说，可以从分区的时刻开始以某种形式回放两侧的操作，依此来取得一致的状态，这是比较容易的。 Bayou就是这么做的。它显式地将数据库回滚到合适的时间，以合理的确定性的顺序回放所有操作，使得所有节点达成相同的状态。与此类似，源代码控制系统，比如CVS从某个共有的一致状态开始，向前执行更新，来合并分支。</p>
+<p>但大部分系统并不总是能合并冲突。比如，CVS偶尔有些冲突需要用户手动解决。带有离线模式的wiki系统将冲突的内容留在结果文档中，让人手动编辑。</p>
+<p>与之相反，有的系统总是可以通过选择特定的操作来合并冲突。有一个例子是谷歌文档中的文字编辑。它限制了了一些操作，比如加载样式、增加或删除文字。由此，虽然通常而言的结果冲突问题并没有解决，但是在实践中，设计者可以选择在分区阶段限制某些操作的使用来达到恢复阶段自动合并的效果。推迟有风险的操作是这种策略的比较容易的实现方式。</p>
+<p>使用沟通性的操作是最接近状态自动收敛的方法。系统合并日志文件，进行排序，并执行它们。沟通性意味着一种重排操作使之达到一种全局一致的有序状态的能力。不幸的是，使用沟通性操作远比它看起来困难。比如加法是沟通性的，但是带有上下界检查的加法就不是了（比如余额为0）。</p>
+<blockquote>
+<p>设计者可以在分区阶段选择限制部分操作的使用，以便系统可以在恢复阶段自动合并状态。</p>
+</blockquote>
+<p>Marc Shapiro及其在INRIA最近的工作显著地改善了沟通性操作在状态收敛方面的使用。这个团队开发出了CRDTs（沟通性复制数据类型），一种被证明在系统分区之后还能收敛的数据结构，并描述了如何使用这些结构来</p>
+<ul>
+<li>确保分区阶段所有的操作都是沟通性的</li>
+<li>基于网格来表示值，保证分区阶段所有的操作都是相对网格单调递增的。</li>
+</ul>
+<p>后面的方法通过取得分区两侧的最大值来收敛状态。这是对亚马逊处理购物车的方法的形式化表示和改进：在分区之后，收敛值是两个购物车的并集，而并集是一个单调操作。这个方法的后果是已经删除的物品有可能重新出现。</p>
+<p>然而，CRDTs还可以实现分区容忍的集合，两侧都可以增删内容。这种方法的本质是维护两个集合：一个维护增加的内容，一个维护删除的内容，区别在于集合的从属关系。每个简化的集合收敛，而上述区别也一样。在某个时间点，系统可以通过从两个集合中移除已删除的内容来清理集合。然而这种简单的清理只有在系统为分区的时候才是可能的。换句话说，系统设计者必须在分区的时候推迟或者禁止某些操作，但是这些只是不影响可用性的清理操作。所以通过CRDTs来实现状态，设计者可以选择可用性，并保证分区之后状态自动收敛。</p>
+<h4 id="错误补偿">错误补偿</h4>
+<p>除了计算分区消除以后的状态，还有一个更难的问题，也就是补偿在分区阶段造成的错误。通过跟踪和限制分区模式下的操作，我们掌握了哪些不变性被打破了，因而也让设计者可以为每个不变性创建一个恢复策略。一般来说，系统在恢复阶段发现问题，也是在这个阶段进行修正。</p>
+<p>有许多方法可以来修正不变性，包括改动较小的方式，比如“以最后的写入为准”（忽略了部分更新）；更智能的方式，将操作合并；以及上报人工操作。后者的一个例子便是机票的超售：登机过程某种程度上就是一种分区恢复，其不变性在于机上的座位至少要和乘客一样多。如果乘客太多，那么必然有人没位子，理想情况下客服应该补偿这部分乘客。</p>
+<p>机票超售的例子还展示了一种外部性错误：如果航空公司没有承诺乘客一定有位子，那么问题解决起来就更简单了。这也是为什么要推迟有风险的操作：在恢复的时候才知道真相。弥补这些错误的核心便是补偿。设计者必须创建补偿操作，既能恢复不变性，又能够纠正外部化的错误。</p>
+<blockquote>
+<p>ATM机上的补偿问题<br>
+在ATM（自动柜员机）的设计中，强一致性看起来是最符合逻辑的选择，但是在实际中，A胜过C。理由很直白：更高的可用性意味着更高的回报。因此，ATM机的设计是一个很好的案例，在分区打破不变性时，回顾补偿中的种种挑战。<br>
+ATM机的基本操作包括存款、取款和查询余额。其关键的不变性约束在于余额必须大于等于零。因为只有取款才能打破不变性，所以它需要特殊处理，而其它两者则总是可以执行。<br>
+ATM系统的设计者可以选择在分区的时候禁止取款，因为在此时刻不可能知道真正的账户余额，但是这也会削弱可用性。取而代之，通过替身模式（分区模式），现代ATM机限制了净取款额为k，k可以是200美元。在这个限制以下，取款操作顺利进行；当超过这个限额，系统拒绝取款。由此，ATM机在可用性方面选择了一种复杂的限制，既允许取款，又限制了风险。<br>
+当分区状态结束，必须要有一些办法来恢复一致性，并为系统在分区阶段造成的错误进行补偿。恢复状态是简单的，因为所有的操作都是沟通性的，但是错误补偿就有好几种形式了。如果最终账户余额小于零，则破坏了系统的不变性。通常情况下，ATM机就不要这笔钱了，让问题外部化。银行通过收手续费以及期待客户还钱来进行补偿。考虑到风险是有限的，问题也不是很严重。然而，假定在分区期间，账户的余额已经在零以下（ATM机不知道），但是后续的一笔存款将余额拉了上来。在这种情况下，银行可能仍然会追溯收取一笔透支手续费，或者忽略这个问题，因为客户已经支付了足额的款项。<br>
+总的来说，由于通信的延迟，银行系统并不依靠一致性来获取正确性，而是基于审计和补偿。另一个例子是支票风筝（checkkiting），意思是客户从多个支行取走现金，在它们彼此通信之前就溜之大吉。这种透支后面会被抓到，并导致法律层面上的补偿。</p>
+</blockquote>
+<p>技术上来说，CRDTs只允许那些可以在本地验证的不变性，这个限制让人不再需要事后补偿，但是也在某种程度上削减了这个方法的威力。然而使用CRDTs来收敛状态的解决方案可以允许暂时打破全局不变性，在分区恢复后收敛状态，再执行任何所需的补偿。</p>
+<p>从外部化的错误中恢复需要一些外部化输出的历史。看一个酒后打电话的例子，有个人前一晚喝醉了，打了好多电话，这会儿已经记不得了。天亮之后这个人的状态可能不错，但是日志显示了一连串的电话，其中有一部分是错的。这些电话就是这个人的状态（醉酒）的外部化。由于此人不记得打了哪些电话，所以后面要弥补这些错误的话就很困难了。</p>
+<p>在机器的上下文中，电脑可能在分区的时候下了两个定单。如果系统可以区分出确实要下两单，还是两单下重复了，那么就可以取消重复的一单。如果外部化了，一种可能的补偿是自动生成一封邮件给客户，解释系统意外下了两单，现在问题已经恢复，并附上优惠券一张，下次下单时候可以打折。如果没有足够的历史记录，捕获错误的任务就落在客户头上了。</p>
+<p>有的研究者正式探索过，使用补偿事务来处理长时间事务。长时间的事务面临多种分区时的选择：通过长时间持有锁来保证一致性呢？还是早点释放，将未提交的数据暴露给其它事务来换取更高的并发性呢？一个典型的例子是在单个事务中更新所有员工的记录。通常的序列化执行事务会锁上所有的记录，不允许并发。补偿事务则用了另一种方式，将大的事务分成一段段子事务，每个事务依次提交。当需要终止事务的时候，系统必须回滚所有已经提交的子事务，这就需要开启一个新事务来纠正前面的影响，也就是补偿事务。</p>
+<p>通常来说，目标就是避免终止其它已经用了那些错误提交数据的事务（不要级联终止）。这个方案的正确性不依赖于序列化或者隔离性，而是事务序列对状态和输出的净影响。换句话说，在补偿之后，数据库是否处于一种状态，这个状态等价于哪些子事务从未执行过。这个等价性必须包含外部化操作，比如对重复支付进行退款，和一开始就没对客户收款，是不一样的，但是也可以有争议地认为是一致的。同样的想法在分区恢复的时候也是一样。服务或者产品的供应商并不总能直接回滚错误，但是他们的目标是承认错误，并采取新的补偿措施。如何最好地将这个理念用于分区恢复，是一个开放性的问题。前面“ATM机上的补偿问题”一文描述了在某一个应用领域中的关注点。</p>
+<h4 id="结语">结语</h4>
+<p>当分区发生时，系统设计者不应该盲目地牺牲一致性或可用性。使用前面提出的方案，设计者可以通过仔细管理分区期间的不变性，同时优化A和C。对于更新的技术，比如版本向量和CRDTs，通过框架来简化使用，可以让这类技术得到更广泛的传播。不过，不像ACID事务，这个方法相比传统策略需要更细致的部署。最优的策略重度依赖于服务的不变性和操作的细节。</p>
+<h2 id="cap-工程流程速查表">CAP 工程流程速查表</h2>
+<blockquote>
+<p>CAP 不是宗教，而是工程流程：<br>
+<strong>先给超时 → 进分区模式 → 限制+记账 → 用 CRDT/版本向量收敛 → 最后补偿错误</strong><br>
+把“三选二”变成“分区时最大化可用，恢复时最大化一致”。</p>
+</blockquote>
+<h3 id="1-把-分区-当成限时通信问题-而非断网">1. 把“分区”当成限时通信问题，而非断网</h3>
+<ul>
+<li>给每一次写操作设 <strong>业务超时（SLA）</strong></li>
+<li>超时前凑不够多数派 → <strong>立即进入分区模式</strong></li>
+<li>超时未到 → <strong>继续重试，不急着二选一</strong></li>
+</ul>
+<h3 id="2-进入分区模式后-显式限制操作-而非直接降维">2. 进入分区模式后，显式限制操作（而非直接降维）</h3>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>梳理</td>
+<td>拉出“操作 × 不变性”交叉表</td>
+</tr>
+<tr>
+<td>限制</td>
+<td>推迟 / 限额 / 记录意图</td>
+</tr>
+<tr>
+<td>记账</td>
+<td>外部化操作（扣款、下单、发邮件）<strong>必须先记日志</strong>，留待恢复阶段补偿</td>
+</tr>
+</tbody>
+</table>
+<h3 id="3-分区期间两侧都跑原子操作-但不跑全局事务">3. 分区期间两侧都跑原子操作，但不跑全局事务</h3>
+<ul>
+<li>单侧仍用 <strong>本地 ACID 事务</strong>，保证可回滚</li>
+<li><strong>放弃跨区锁、跨区可串行化</strong>——锁不住，也等不起</li>
+</ul>
+<h3 id="4-用版本向量或-crdt-记录因果-让状态自动收敛">4. 用版本向量或 CRDT 记录因果，让状态自动收敛</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>版本向量</td>
+<td>判断哪些更新<strong>并发</strong>，哪些<strong>有序</strong></td>
+</tr>
+<tr>
+<td>CRDT</td>
+<td>并发更新<strong>数学可合并</strong>，恢复阶段<strong>无需人工冲突解决</strong></td>
+</tr>
+<tr>
+<td>目标</td>
+<td>恢复时只需“取最大值 / 并集”即可得到一致状态</td>
+</tr>
+</tbody>
+</table>
+<h3 id="5-恢复阶段两步走：先合并状态-再补偿错误">5. 恢复阶段两步走：先合并状态，再补偿错误</h3>
+<h4 id="①-合并状态">① 合并状态</h4>
+<ul>
+<li>回滚到分区快照 → 按因果顺序重放操作 → 得到全局一致 S′</li>
+<li><strong>或</strong>直接用 CRDT 收敛函数一次性算出 S′</li>
+</ul>
+<h4 id="②-补偿错误">② 补偿错误</h4>
+<ul>
+<li>对已外部化的结果（多扣款、超售、重复邮件）发起<strong>反向业务动作</strong></li>
+<li>补偿本身也是事务，必须<strong>可重试、可审计、对用户可见</strong>（退款、优惠券、致歉信）</li>
+</ul>
+<h3 id="一句话带走">一句话带走</h3>
+<p><strong>CAP 不是非黑即白，而是“超时+限制+记账+收敛+补偿”的五步曲。</strong><br>
+按流程落地，就能在分区时尽量保持可用，恢复时尽量还原一致，避免拍脑袋砍功能。</p>
+<h2 id="base-定义">BASE 定义</h2>
+<h3 id="强一致性-零窗口；实现：共识算法-复制状态机-2pc">强一致性（零窗口；实现：共识算法 + 复制状态机 / 2PC）</h3>
+<p>任一更新一旦成功返回客户端，后续所有读操作（无论从哪个副本）<strong>立即</strong>拿到最新值；系统内<strong>不存在中间状态</strong>可被外界观察。<br>
+例子：用户下单后，任意节点查询库存、余额、积分，全部是<strong>已扣减后的最新值</strong>。</p>
+<h3 id="弱一致性-无限窗口">弱一致性（无限窗口）</h3>
+<p>写成功后，<strong>不承诺何时、甚至是否</strong>能读到最新值；中间状态<strong>可能被看到，也可能看不到</strong>。<br>
+例子：刚发的微博，自己刷新有时可见、有时不可见；不同好友看到的时间点不同。</p>
+<h3 id="最终一致性-有限窗口；liveness-safety">最终一致性（有限窗口；liveness + safety）</h3>
+<p>弱一致性的特例，系统<strong>保证在有限且确定的时间内</strong>把所有副本收敛到同一最新值（liveness），且一旦收敛不再回退（safety）。<br>
+例子：DNS 修改、Amazon 购物车、Cassandra 读写级别 ONE → ALL 的收敛过程。</p>
+<h1>事务模型</h1>
+<h2 id="2pc">2PC</h2>
+<p>当代的 2PC 有两种实现方案：经典的 XA 事务（经典 2PC 在数据库里叫 XA 协议（JTA/JDBC 的 XAResource）），谷歌的 Percolator。</p>
+<h3 id="xa-事务简述">XA 事务简述</h3>
+<p>对于经典的 XA 事务，⼆阶段提交协议，即将事务的提交过程分为两个阶段来进⾏处理：准备阶段和提交阶段。事务的发起者称协调者（coordinator），事务的执⾏者称参与者（participant）。当⼀个事务跨多个节点时，为了了保持事务的原⼦子性与⼀致性，需要引⼊入⼀个协调者（Coordinator）来统⼀掌控所有参与者的操作结果，并指示它们是否要把操作结果进⾏真正的提交或者回滚。</p>
+<h3 id="2pc-的-failover">2PC 的 Failover</h3>
+<p>Safety：不会出现一个 participant 提交一个 participant 回滚的情况，即无矛盾态。<br>
+Liveness：最终一个分布式事务处于全局提交或者回滚的状态，即无悬垂态（2PC 中的阻塞操作可能引发异常等待）。</p>
+<h3 id="一个典型的-2pc-的例子">一个典型的 2PC 的例子</h3>
+<p>一个 TC 的主要操作有： 对 participant prepare、对 participant confirm、对 participant abort/cancel。</p>
+<p>一个 participant 的主要操作有：返回 ok，返回 not ok，返回 commit 成功，返回 commit 失败，返回 abort/cancel 成功，返回 abort/cancel 失败。</p>
+<p><img src="Two-Phase-Commit-Diagram.jpg" alt="Two-Phase-Commit-Diagram.jpg"></p>
+<p>节点超时和宕机会严重降低系统的整体吞吐量。节点中要不断引入重试才能度过各种各样的宕机的困难。</p>
+<p>如果没有<strong>重试</strong>和<strong>超时</strong>，则任一 participant 节点失灵，都可能导致已经做了 pre-commit 的其他 participant 永久 hang 住（<strong>阻塞单点</strong>），因为 coordinator 会收集不到足够的签名（vote/ballot）而 hang 住。</p>
+<p>而如果 coordinator hang 住，结果会更糟，因为再起一个 coordinator 也无法让 hang 住的节点真正提交或者回滚。</p>
+<p>这两种情况都是死锁，只有<strong>超时检测 + cancel</strong> 操作能解决这个问题（见下方的 TCC）。</p>
+<h3 id="中心化和去中心化的-2pc">中心化和去中心化的 2PC</h3>
+<blockquote>
+<p>如果存在一个没有业务逻辑的 coordinator，则这种 2PC 是中心化的；如果某个 participant 自己带有<br>
+coordinator 的职能，则这种 2PC 可以认为是近于去中心化的。</p>
+</blockquote>
+<p>把 coordinator 的代码“塞”进某个 participant 进程里，决策权仍然唯一，崩溃后其他节点依旧无法自决，本质上还是单点；只是“物理部署”上的同进程，并未解决 2PC 的中心化故障域问题。真正的“去中心化 2PC”需要共识协议（Paxos/Raft）选出新 coordinator，让多数节点能共同决定提交或回滚，否则仍属于中心化 2PC的变种。</p>
+<h3 id="总结">总结</h3>
+<p>2PC 简单易懂、能保证原子性，但同步阻塞 + 单点故障 + 低吞吐决定它只适用于 低频跨库事务（如订单-支付核心链路）或 内部 XA 场景；<br>
+高并发长链路业务请改用 TCC / Saga / 本地消息表 等柔性方案，或直接用 Paxos/Raft 共识协议替代 coordinator。</p>
+<h2 id="3pc">3PC</h2>
+<p><img src="3pc.png" alt="3pc.png"></p>
+<p>这幅图的出处在<a target="_blank" rel="noopener" href="https://en.wikipedia.org/wiki/Three-phase_commit_protocol#Disadvantages">这里</a>。</p>
+<p>三个阶段：CanCommit -&gt; preCommit -&gt; doCommit</p>
+<p>第一阶段CanCommit ≈ 可行性预检（无锁）<br>
+第二阶段PreCommit ≈ 真正加锁 + 写日志。<br>
+第三阶段协调者指示手动提交。</p>
+<h2 id="3pc-完整时序与超时行为">3PC 完整时序与超时行为</h2>
+<ol>
+<li>
+<p>CanCommit（阶段 1）</p>
+<ul>
+<li>协调者询问所有参与者 <strong>“能否提交？”</strong></li>
+<li>参与者仅做语法/权限/容量检查，<strong>不申请锁、不预扣资源、不写日志</strong></li>
+<li>超时：任一节点无响应 → <strong>协调者直接 abort</strong></li>
+<li>作用：<strong>提前过滤失败请求，减少后续锁占用时间</strong>，并不能解决网络分区或协调者宕机导致的不一致</li>
+</ul>
+</li>
+<li>
+<p>PreCommit（阶段 2）</p>
+<ul>
+<li>协调者收到 <strong>全局 Yes</strong> 后，广播 <strong>preCommit</strong></li>
+<li>参与者动作：
+<ol>
+<li>申请本地<strong>排他锁</strong>（预扣资源）</li>
+<li>写 <strong>undo/redo 日志</strong> 并刷盘</li>
+<li>向协调者回复 <strong>ACK</strong></li>
+</ol>
+</li>
+<li>超时行为：
+<ul>
+<li><strong>协调者侧超时</strong>（未收齐 ACK）→ 发送 <strong>abort</strong></li>
+<li><strong>参与者侧超时</strong>（迟迟等不到 preCommit 或 abort）→ <strong>仍保持阻塞</strong>，不会自提交；只有收到 <strong>preCommit ACK</strong> 且 <strong>阶段 3 报文全丢失</strong>时才进入下一条规则</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p>DoCommit（阶段 3）</p>
+<ul>
+<li>协调者收齐阶段 2 ACK 后，广播 <strong>doCommit</strong></li>
+<li>参与者收到即：<strong>释放锁、刷盘、返回成功</strong></li>
+<li>超时行为：
+<ul>
+<li><strong>协调者超时</strong> → 重试或向上层报错，已发 doCommit 视为成功</li>
+<li><strong>参与者超时</strong>（等不到 doCommit/abort）→ <strong>自提交</strong>（关键！）<br>
+前提：它在阶段 2 已成功 <strong>ACK preCommit</strong>，即全局 Yes 已确立，因此才敢“姑且走下去”</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p>总结：</p>
+<ul>
+<li><strong>加锁 + 预扣资源 + 写日志</strong>仅发生在 <strong>PreCommit</strong></li>
+<li><strong>自提交</strong>仅出现在 <strong>阶段 3 参与者超时</strong>且<strong>已 ACK preCommit</strong>的场景</li>
+<li>阶段 1、2、3 都给<strong>协调者</strong>设超时；阶段 3 给<strong>参与者</strong>再设一次超时，用以<strong>缓解</strong>（而非根除）2PC 的无限阻塞</li>
+<li>前提一旦被打破（全局 Yes 不成立或 PreCommit 广播失败），自提交就可能导致<strong>部分提交 / 部分回滚</strong>——3PC 只是<strong>降低死锁概率</strong>，并未消除不一致风险</li>
+</ul>
+<h2 id="tcc">TCC</h2>
+<p><img src="try-confirm-cancel.png" alt="try-confirm-cancel.png"></p>
+<h3 id="tcc-分布式事务详解">TCC 分布式事务详解</h3>
+<h4 id="角色">角色</h4>
+<ul>
+<li><strong>业务应用</strong>：事务发起方，负责调用 Try / Confirm / Cancel</li>
+<li><strong>事务协调器</strong>（可内嵌或独立）：记录事务状态，按结果调度 Confirm / Cancel</li>
+<li><strong>参与服务</strong>（库存、钱包等）：提供对应 TCC 接口，真正的资源在其本地</li>
+</ul>
+<h4 id="协调器调用模式的灵活性">协调器调用模式的灵活性</h4>
+<p>TCC 规范只定义三个语义接口和幂等补偿原则，不强制要求调用权归属：</p>
+<ol>
+<li>
+<p><strong>内嵌协调器模式</strong>：</p>
+<ul>
+<li>业务进程自己记录事务状态</li>
+<li>发起方直接调用 Try → Confirm/Cancel</li>
+<li>无额外协调器进程（如 Seata 的 @LocalTCC、ByteTCC）</li>
+</ul>
+</li>
+<li>
+<p><strong>独立协调器模式</strong>：</p>
+<ul>
+<li>发起方只调用 Try，提交事务 ID 给独立 coordinator</li>
+<li>Coordinator 负责后续批量/定时调用 Confirm/Cancel</li>
+<li>适合多服务、长链路场景</li>
+</ul>
+</li>
+<li>
+<p><strong>混合驱动模式</strong>：</p>
+<ul>
+<li>Try 由发起方同步调用</li>
+<li>Confirm/Cancel 可通过本地定时任务、消息队列或 server 回调触发</li>
+<li>只需保证至少一次调用 + 接口幂等性</li>
+</ul>
+</li>
+</ol>
+<h4 id="参与者接口要求">参与者接口要求</h4>
+<p>每个参与服务必须实现三个幂等接口：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-type">boolean</span> <span class="hljs-title function_">tryXxx</span><span class="hljs-params">(BizParams)</span>   <span class="hljs-comment">// 预扣资源，返回成功/失败</span><br><span class="hljs-type">boolean</span> <span class="hljs-title function_">confirm</span><span class="hljs-params">(BizParams)</span>  <span class="hljs-comment">// 转正资源（幂等）</span><br><span class="hljs-type">boolean</span> <span class="hljs-title function_">cancel</span><span class="hljs-params">(BizParams)</span>   <span class="hljs-comment">// 释放资源（幂等）</span><br></code></pre></td></tr></table></figure>
+<h4 id="三阶段语义">三阶段语义</h4>
+<h5 id="1-try-阶段-1-业务层-prepare">1. Try（阶段 1 → 业务层 “prepare”）</h5>
+<ul>
+<li>做一致性校验（库存是否足、余额是否够）</li>
+<li>预扣资源（冻结库存、冻结金额）→ 本地锁 + 业务状态机，不写最终业务数据</li>
+<li>返回结果给协调器；失败立即触发全局 Cancel</li>
+</ul>
+<h5 id="2-confirm-阶段-2-提交">2. Confirm（阶段 2 → 提交）</h5>
+<ul>
+<li>不再做业务检查，只把 Try 的预留资源转正（冻结→实扣）</li>
+<li>幂等实现：重复调用结果相同</li>
+<li>成功即释放本地锁，事务对外可见</li>
+</ul>
+<h5 id="3-cancel-阶段-2-回滚">3. Cancel（阶段 2 → 回滚）</h5>
+<ul>
+<li>释放 Try 预留的资源（冻结归还）</li>
+<li>同样需幂等；可多次重试直到确认归还完成</li>
+<li>业务数据保持无变更或补偿后等价无影响</li>
+</ul>
+<h4 id="与-2pc-的关系">与 2PC 的关系</h4>
+<ul>
+<li><strong>阶段映射</strong>：Try ≈ 2PC Prepare，Confirm/Cancel ≈ 2PC Commit/Rollback</li>
+<li><strong>核心区别</strong>：
+<ul>
+<li>锁粒度从数据库页/行上升到业务资源</li>
+<li>回滚动作由业务补偿（Cancel）代替数据库回滚段</li>
+</ul>
+</li>
+<li><strong>效果</strong>：锁时间缩短到 Try 阶段，支持跨数据库、跨微服务、跨存储的混合事务</li>
+</ul>
+<h4 id="核心设计原则">核心设计原则</h4>
+<ol>
+<li><strong>接口规范</strong>：只约束三个语义接口（Try/Confirm/Cancel）+ 幂等补偿</li>
+<li><strong>调用权解耦</strong>：
+<ul>
+<li>业务方可同时担任发起方和协调器</li>
+<li>也可将驱动责任移交独立 coordinator/MQ/定时任务</li>
+</ul>
+</li>
+<li><strong>实现选择</strong>：根据团队运维能力选择部署模式（内嵌/独立/混合）</li>
+</ol>
+<h4 id="事务流程">事务流程</h4>
+<p>发起方先调 <strong>Try</strong> 冻结资源 → 协调器收齐成功响应后触发 <strong>Confirm</strong> 转正；任一服务 Try 失败或超时即触发 <strong>Cancel</strong> 释放冻结。<strong>全程通过业务补偿实现回滚，不依赖数据库事务机制</strong>。</p>
+<h3 id="本地模式">本地模式</h3>
+<p>其中 tcc 接口不一定要实现在被调用方，可以实现在调用方（<strong>类 RMI 模式，bingo！</strong>）</p>
+<p><img src="tcc-%E7%9A%84%E6%9C%AC%E5%9C%B0%E6%A8%A1%E5%BC%8F.png" alt="tcc-的本地模式.png"></p>
+<h3 id="try-和-catch-的使用方法">try 和 catch 的使用方法</h3>
+<p>要注意 try 的独立 try-catch 块，且 cancel 时要先检查 try 的状态。</p>
+<p><img src="try-cancel-%E6%A8%A1%E5%BC%8F.png" alt="try-cancel-模式.png"></p>
+<h3 id="空回滚和事务悬挂">空回滚和事务悬挂</h3>
+<p>要注意空回滚的忽略问题和事务悬挂的超时检查且释放的功能：</p>
+<p><img src="%E7%A9%BA%E5%9B%9E%E6%BB%9A-%E4%BA%8B%E5%8A%A1%E6%82%AC%E6%8C%82.jpg" alt="空回滚-事务悬挂.jpg"></p>
+<h3 id="适用-tcc-的业务场景">适用 TCC 的业务场景</h3>
+<ol>
+<li>对事务隔离性有要求的服务，Try 阶段的存在可以很好地保证 TCC 事务之间的隔离性 - 这里的隔离指的是 Try 一定要带有预扣资源的功能（而不是像 MVCC 那样的 SNAPSHOT ISOLATION）。</li>
+<li>对性能有要求的服务，TCC 仅第一阶段加锁，因此性能较好。</li>
+<li>改造成本小，没有历史包袱的服务-比如新服务，可以方便地抽象出 TCC 的三个阶段。</li>
+</ol>
+<h2 id="saga-模型">Saga 模型</h2>
+<p><img src="saga-%E6%A8%A1%E5%9E%8B.jpg" alt="saga-模型.jpg"></p>
+<p>假设一个分布式场景涉及三个服务，我们要有随时能够从某个失败链条上反向补偿回去，保证全局追平的能力。</p>
+<p>这里面要考虑正反操作的请求要线性编排，严格有序。<strong>如果有必要，还是要加入类似 update where 的语义。</strong></p>
+<h3 id="saga-的中心化实现">saga 的中心化实现</h3>
+<p>SAGA 通常有两种模型，一种是事务协调器器集中协调，由它来收集分支状态并发号施令；另⼀种是基于事件订阅的⽅式让分支之间根据“信号”进⾏交互（我们经常使用的一个服务用一个 MQ 来驱动下一个的服务来追平状态，是一种去中心化的 saga 模型）。</p>
+<p><img src="saga%E7%9A%84%E4%B8%AD%E5%BF%83%E5%8C%96%E5%AE%9E%E7%8E%B0.jpg" alt="saga的中心化实现.jpg"></p>
+<table>
+<thead>
+<tr>
+<th style="text-align:left">特性对比</th>
+<th style="text-align:left">协调中心模式 (Orchestration)</th>
+<th style="text-align:left">事件驱动模式 (Choreography)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left"><strong>核心思想</strong></td>
+<td style="text-align:left">由一个<strong>中央协调器</strong>负责全局事务的调度与协调</td>
+<td style="text-align:left">无中心协调器，各服务通过<strong>发布/订阅事件</strong>进行协作</td>
+</tr>
+<tr>
+<td style="text-align:left"><strong>控制流</strong></td>
+<td style="text-align:left"><strong>同步、命令式</strong>。协调器直接调用各个服务的接口</td>
+<td style="text-align:left"><strong>异步、响应式</strong>。服务间通过<strong>消息 (MQ)</strong> 传递事件来驱动</td>
+</tr>
+<tr>
+<td style="text-align:left"><strong>职责归属</strong></td>
+<td style="text-align:left">协调器<strong>集中管理</strong>流程逻辑、状态和错误处理</td>
+<td style="text-align:left">流程逻辑<strong>分散</strong>在各个服务中，每个服务只知道如何响应相关事件</td>
+</tr>
+<tr>
+<td style="text-align:left"><strong>优点</strong></td>
+<td style="text-align:left">流程逻辑集中，<strong>易于理解、监控和调试</strong></td>
+<td style="text-align:left"><strong>松耦合</strong>，服务自治性高，扩展性好</td>
+</tr>
+<tr>
+<td style="text-align:left"><strong>缺点</strong></td>
+<td style="text-align:left">协调器可能成为<strong>单点瓶颈</strong>，耦合性相对较高</td>
+<td style="text-align:left">流程逻辑分散，<strong>难以全局监控和调试</strong>，对设计要求高</td>
+</tr>
+<tr>
+<td style="text-align:left"><strong>您的描述对应</strong></td>
+<td style="text-align:left">“事务协调器集中协调，收集分支状态并发号施令”</td>
+<td style="text-align:left">“基于事件订阅的方式让分支之间根据‘信号’进行交互”</td>
+</tr>
+</tbody>
+</table>
+<h3 id="saga-的两种恢复策略">saga 的两种恢复策略</h3>
+<p><img src="saga%E7%9A%84%E6%81%A2%E5%A4%8D%E7%AD%96%E7%95%A5.jpg" alt="saga的恢复策略.jpg"></p>
+<p>从这里至少可以抽象出三种接口 compensation、reverseCompensation、needRetry。</p>
+<h3 id="saga-的适用场景">saga 的适用场景</h3>
+<ol>
+<li>业务流程多、业务流程⻓，期间调⽤用若⼲干个分⽀支事务。</li>
+<li>⽆法抽象出 TCC 的 Try 阶段（即无法预扣资源，实现隔离），但是可以很方便地实现补偿⽅法。</li>
+<li>要求框架支持业务流程既能向前重试⼜可以逆序回滚的（正逆向幂等）。</li>
+<li>对不不同事务间的隔离性要求不不高，可以在业务层⾯面通过代码解决的。</li>
+</ol>
+<p>长事务不能容忍长期锁定，又不需要长期锁定，可以考虑 saga（现实中的分布式事务往往暗合 saga 模型）；反之则可以使用 tcc。</p>
+<h2 id="对比所有的基于消息的方案">对比所有的基于消息的方案</h2>
+<pre><code class="hljs mermaid">graph TD
+    A[分布式事务模式] --&gt; B[基础设施层]
+    A --&gt; C[业务逻辑层]
+    B --&gt; B1[事务消息（MQ内置协议）]
+    B --&gt; B2[全局事务（Seata AT/TCC）]
+    C --&gt; C1[事件驱动 SAGA]
+    C --&gt; C2[本地消息表（业务自研）]</code></pre>
+<p>我们不能把本地消息表当做事务消息的实现，只能把它当做是事务消息的某种实现的一个组件或者某种组件的一个实现。</p>
+<p>谷歌的回答是：</p>
+<blockquote>
+<p>No, a local message table is not inherently transactional; instead, it<br>
+is a component of the “local message” mode used in distributed<br>
+transactions as an alternative to pure transactional message systems.<br>
+The core concept of the local message mode is to group business<br>
+operations and the act of recording a “to be sent” message into the<br>
+same local transaction. If the business operation succeeds, the<br>
+message is recorded in the local table, and a separate scheduled task<br>
+handles the actual sending of the message to the message queue,<br>
+ensuring that messages are not lost and are retried if sending fails.</p>
+</blockquote>
+<h2 id="tcc-和-saga-的比较">TCC 和 saga 的比较</h2>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>TCC 模式</th>
+<th>SAGA 模式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>核心思想</strong></td>
+<td><strong>“预留-确认”</strong><br>（业务层两阶段提交）</td>
+<td><strong>“直接提交-事后补偿”</strong><br>（最终一致性事务链）</td>
+</tr>
+<tr>
+<td><strong>一阶段行为</strong></td>
+<td><strong>Try</strong>：预留资源（冻结库存/金额）<br>▪ 本地事务提交<strong>预扣状态</strong><br>▪ <strong>不修改最终业务数据</strong></td>
+<td><strong>直接提交本地事务</strong><br>▪ 真实更新数据（如扣款/减库存）<br>▪ <strong>业务数据立即可见</strong></td>
+</tr>
+<tr>
+<td><strong>二阶段行为</strong></td>
+<td><strong>Confirm</strong>：转正预留资源（冻结→实扣）<br><strong>Cancel</strong>：释放预留资源（解冻）</td>
+<td><strong>Compensate</strong>：执行逆向操作（如退款/加库存）<br>▪ <strong>补偿必须幂等</strong><br>▪ <strong>反向覆盖已提交状态</strong></td>
+</tr>
+<tr>
+<td><strong>隔离性</strong></td>
+<td>✅ <strong>强隔离</strong><br>▪ <strong>隐藏中间态</strong>：冻结值对用户不可见<br>▪ <strong>业务锁</strong>：Try阶段拒绝冲突操作<br>▪ <strong>原子校验</strong>：资源充足才占用</td>
+<td>❌ <strong>弱隔离</strong><br>▪ <strong>暴露中间态</strong>：扣减后数据立即可读<br>▪ <strong>无互斥锁</strong>：依赖数据库行锁<br>▪ <strong>时间窗风险</strong>：校验与提交分离</td>
+</tr>
+<tr>
+<td><strong>隔离实现机制</strong></td>
+<td><strong>业务层资源封锁</strong>：<br>▪ 冻结库存 → 前端仍显示原库存<br>▪ 冻结金额 → 余额查询不变<br>▪ 冲突请求直接拒绝</td>
+<td><strong>无中间态保护</strong>：<br>▪ 扣减库存 → 前端立即显示减少<br>▪ 支付扣款 → 余额实时变化<br>▪ 可能读到&quot;已扣未发&quot;态</td>
+</tr>
+<tr>
+<td><strong>锁机制</strong></td>
+<td><strong>短时业务锁</strong>：<br>▪ 仅在Try阶段持有<br>▪ 锁定粒度=业务资源</td>
+<td><strong>无预留锁</strong>：<br>▪ 直接提交无锁定<br>▪ 依赖数据库行锁（可能死锁）</td>
+</tr>
+<tr>
+<td><strong>适用场景</strong></td>
+<td>▪ 高并发强隔离场景（支付/秒杀）<br>▪ 短流程（秒级事务）<br>▪ 需防脏读的业务（如钱包/库存）</td>
+<td>▪ 长流程事务（旅行订票/订单链）<br>▪ 旧系统集成（无法改造接口）<br>▪ 容忍中间态场景（如积分变更）</td>
+</tr>
+<tr>
+<td><strong>实现复杂度</strong></td>
+<td><strong>高</strong><br>▪ 需实现Try/Confirm/Cancel三接口<br>▪ 处理空回滚/防悬挂</td>
+<td><strong>中</strong><br>▪ 需正向操作+补偿接口<br>▪ 保证补偿幂等性<br>▪ 设计事务状态追踪</td>
+</tr>
+<tr>
+<td><strong>改造成本</strong></td>
+<td><strong>高</strong>：需拆分业务逻辑为三阶段</td>
+<td><strong>低</strong>：兼容现有提交逻辑，只需追加补偿</td>
+</tr>
+<tr>
+<td><strong>典型框架</strong></td>
+<td>Seata TCC、ByteTCC</td>
+<td>Temporal、Cadence、AWS Step Functions</td>
+</tr>
+</tbody>
+</table>
+<h2 id="阿里的-seata-模型衍生的数据库中间件跨库事务">阿里的 Seata 模型衍生的数据库中间件跨库事务</h2>
+<p>首先要把物理 sql 的改写逻辑抽象化，然后在这里实现一个具体的<br>
+<img src="%E7%89%A9%E7%90%86-sql-%E4%BA%8B%E5%8A%A1%E5%8C%96.jpg" alt="物理-sql-事务化.jpg"></p>
+<p>然后要在事务的前后加上 WAL：</p>
+<p><img src="%E7%94%9F%E6%88%90%E4%BA%8B%E5%8A%A1%E5%8C%96%E7%9A%84wal.jpg" alt="生成事务化的wal.jpg"></p>
+<p>然后就可以实现跨库事务了：</p>
+<p><img src="%E8%B7%A8%E5%BA%93%E4%BA%8B%E5%8A%A1.jpg" alt="跨库事务.jpg"></p>
+<p>但跨库事务需要保证本地事务有写隔离，类似全局意向锁：</p>
+<p><img src="%E6%9C%AC%E5%9C%B0%E4%BA%8B%E5%8A%A1%E7%9A%84%E5%86%99%E9%9A%94%E7%A6%BB.jpg" alt="本地事务的写隔离.jpg"></p>
+<p>局部的意向锁实现：</p>
+<p><img src="seata%E7%9A%84%E5%85%A8%E5%B1%80%E9%94%81.jpg" alt="seata的全局锁.jpg"></p>
+<p><a target="_blank" rel="noopener" href="https://github.com/seata/seata/issues/1246">使用seata的公司</a>。</p>
+<h2 id="seata-与-swan">seata 与 swan</h2>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>技术原理</th>
+<th>适用场景</th>
+<th>侵入性</th>
+<th>框架支持</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>AT (Auto Transaction)</strong></td>
+<td>- 基于 SQL 解析生成回滚日志（UNDO_LOG）<br>- 一阶段提交，二阶段异步回滚</td>
+<td>- 高并发读多写少场景（如商品查询、配置更新）<br>- <strong>无需业务改造</strong></td>
+<td>低（无代码侵入）</td>
+<td>Seata ✅<br>Swan ✅</td>
+</tr>
+<tr>
+<td><strong>TCC (Try-Confirm-Cancel)</strong></td>
+<td>- Try: 资源预留<br>- Confirm/Cancel: 提交/回滚</td>
+<td>- 强一致性要求（如支付、库存）<br>- 需<strong>精确控制事务边界</strong></td>
+<td>高（需实现三接口）</td>
+<td>Seata ✅<br>Swan ✅</td>
+</tr>
+<tr>
+<td><strong>SAGA</strong></td>
+<td>- 长事务拆分为多个本地事务<br>- 失败时触发逆向补偿</td>
+<td>- 跨服务长流程（如订单→支付→物流）<br>- 旧系统集成（无事务接口）</td>
+<td>中（需定义状态机）</td>
+<td>Seata ✅<br>Swan ✅</td>
+</tr>
+<tr>
+<td><strong>XA</strong></td>
+<td>- 基于数据库 XA 协议<br>- TM 协调全局事务</td>
+<td>- 传统数据库强一致场景（如银行转账）<br>- <strong>兼容已有 XA 数据库</strong></td>
+<td>低（数据库驱动层）</td>
+<td>Seata ✅<br>Swan ✅</td>
+</tr>
+</tbody>
+</table>
+<h2 id="带事务消息中间件-kafka-的方案-消息事务">带事务消息中间件（Kafka 的方案）-消息事务</h2>
+<ol>
+<li>
+<p><strong>Producer → Broker 段</strong><br>
+需有 ack 机制。消息需自带唯一标识（如业务ID或序列号）。Broker 用 ack 确认，Producer 超时重试（借鉴 TCP）。<br>
+<strong>优化补充</strong>：Kafka 通过 <strong>PID（Producer ID）+ 序列号</strong>机制在存储层直接去重（无需外部数据库），实现<strong>发送侧的 Exactly-Once</strong>。</p>
+</li>
+<li>
+<p><strong>Broker → Consumer 段</strong><br>
+需 Consumer 主动 commit 偏移量。核心在于 <strong>Consumer 本地事务与 commit 的原子性</strong>：</p>
+<ul>
+<li>若无法原子化（如本地事务成功但 commit 前崩溃），则需本地维护消息去重表（如 <code>processed_msg_ids</code>）。</li>
+<li><strong>关键设计</strong>：本地事务需<strong>原子性更新业务状态+记录消息ID</strong>，commit 失败后重试时，利用去重表拒绝重复处理。</li>
+</ul>
+</li>
+<li>
+<p><strong>事务本质与性能</strong><br>
+Exactly-Once 的完整实现<strong>通常需事务型数据库配合</strong>（如本地消息表模式），但得益于：</p>
+<ul>
+<li>Producer-Broker 是<strong>局部事务</strong>（Kafka 事务协议）</li>
+<li>Consumer-业务库是<strong>另一局部事务</strong>（数据库事务）<br>
+两者通过消息解耦，<strong>性能远高于 2PC/3PC</strong>，仅牺牲部分时效性。</li>
+</ul>
+</li>
+<li>
+<p><strong>流处理的 Exactly-Once</strong><br>
+Exactly-Once 在流处理中历来是难题：</p>
+<ul>
+<li><strong>Kafka Streams</strong> 通过<strong>内置事务</strong>实现端到端精确一次（读写原子捆绑）。</li>
+<li><strong>非 Stream 方案</strong>（如独立 Consumer）需客户端自行处理（即第 2 点机制）。</li>
+</ul>
+<blockquote>
+<p><strong>注</strong>：Flink 等框架通过分布式快照也实现了流处理精确一次，但机制不同。</p>
+</blockquote>
+</li>
+</ol>
+<h2 id="基于本地事件表系统的-scan-and-send-机制">基于本地事件表系统的 scan and send 机制</h2>
+<p><img src="outbox-table.png" alt="alibaba-outbox-table"></p>
+<p>本质上还是把本地事务和事件在同一个事务里面写入本地数据库，然后写一个单独的服务来 scan 这个 event 表。对业务侵入性很大。</p>
+<h2 id="基于外部事件表系统的-prepared-and-send-机制">基于外部事件表系统的 prepared and send 机制</h2>
+<p><img src="transflow-rocketmq.png" alt="transflow-rocketmq"></p>
+<p>大致上就是：</p>
+<ol>
+<li>把消息 enqueue 给broker，让消息进入 prepared 发射状态。</li>
+<li>在本地事务执行完成或者失败了以后，发送 confirm 或者 cancel消息给 broker。这一步是可能失败的。</li>
+<li>broker 自己也定时扫描 enqueued 的 message，如果超时，按照既定配置来使用消息（通常是准备一个 fallback 接口，在接口里决定硬是发射消息或者取消发射）。如果有可能得到一个确切结果，而不是 fallback的话，就需要 broker 反查数据库表，这样又会要求数据库表至少携带事务信息-甚至是任务信息，这又让这个设计不能完全舍弃“事件表”的痕迹。</li>
+<li>这其实是 broker 不提供 ack 机制的时候的一种折中。先 prepare 再 confirm，其实是一种变相的小分布式事务，主事务是本地的数据库事务，辅事务是 broker 事务，辅事务预先分配锁定资源，由主事务激发释放。</li>
+<li>RocketMQ 的分布式事务也是采取这种外部事件表的形式。早期是基于文件系统来实现的，后期是基于数据库来实现的。</li>
+<li>这种外部事件表把侵入性放到 mq 身上。如果不像阿里之类的公司有办法自研消息中间件，则需要围绕原始的 mq 队列实现，无法改造 mq 的生命周期接口，实现各种反查逻辑，就无法实现，要回到本地事件表的方案上。</li>
+</ol>
+<h1>我在 bridgemq 问题下的评论</h1>
+<p>以下评论是错的<br>
+~~感觉上这个问题在消息发送方的地方被做得复杂化了。<br>
+根据我个人浅薄的理解，这里 bridgemq 的存在，<strong>是把这种（事务加 MQ）的解决思路，做成了一个单独的服务</strong>，即很多人所说的外部事件表或者外部消息表。<br>
+在这个架构里面，本地事务 +  bridgemq，其实就是 jta 里面的所谓的预扣资源 + 确认的模式：</p>
+<ol>
+<li>bridgemq 预扣资源。</li>
+<li>本地事务预扣资源。</li>
+<li>本地事务提交或失败。</li>
+<li>bridgemq 提交或失败。<br>
+只不过这里的设计是一个只有两个服务的小 JTA，所以事务的颗粒度更小，而 bridgemq 作为辅助事务，其生命周期完全是由本地事务这个主事务决定的，所以主事务的：</li>
+<li>性能更更好，2 被 bridgemq 耦合造成的改造更小。<br>
+而且这个 bridgemq 的设计，本身只解决了发送方 exactly-once 的问题，正如下面评论所说的，consumer 的 exactly-once 还是要靠业务方自己解决–实际上还是做消息的幂等要求设计或者准备本地事务去重。<br>
+实际上，Kafka 当前版本（1.0以后的版本），有了一个全局 exactly-once 的解决方案。据他们估计，可以在  Kafka Stream 里面做到 exactly-once（<a target="_blank" rel="noopener" href="https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/%EF%BC%89%E3%80%82%E5%8D%B3%E4%BD%BF%E6%98%AF%E5%9C%A8%E9%9D%9E">https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/）。即使是在非</a> Stream 的场景里面，他们的 Producer API 也是支持 exactly once 的。具体地说,新版本的 Producer实际上给每个消息准备了一个序号（sequence no），producer 大部分情况下通过 ack 机制来保证 at-least-once，重复消息，就像 tcp 协议一样通过序号在 broker 这端去重（TCP 是在内存里去重的，Kafka 还支持 leader replica 在分布式场景下用文件系统去重）。这样就达到了 producer 端的 exactly-once 语义，保证了只要通信是可达的，producer 总能正确地发送消息到 broker。<br>
+那么套用到这篇文章的场景里面，这个问题就非常简单了，不需要 bridgeMQ 的帮助，只要：</li>
+<li>本地事务先执行成功。否则中断流程。</li>
+<li>在 producer 端使用 exactly-once 语义发送消息。<br>
+发送端的事务性就达到了。</li>
+</ol>
+<h1>在事务里调 rpc 的铁律</h1>
+<ol>
+<li>无论如何，不依靠补偿和反查，不可能保证事务和网络 io 原子性成功或者失败。而且这两者不可偏废，要引入一个终态管理机制，调度补偿和反查。</li>
+<li>尽量让所有的 rpc 分成两段，前半段在事务之前，后半段在事务之后执行，在后半段上加上补偿，是最简单的方法。</li>
+<li>如果无法做到第二条，则把求锁类 rpc 放在事务之前，解锁类 rpc 放在事务之内，把初始化任务类事务放在 rpc 之前，把更新结果类事务放在 rpc 之后。</li>
+<li>在事务里实现 rpc，只有实现 at-least-once 的语义时有用。很多时候不加任务进行局部重试，或者上游全局重试的话事务太大-或者事务要幂等问题，勉强可以使用这种 at-least-once 语义。</li>
+</ol>
+<h1>分布式 xa</h1>
+<p>java7 xa</p>
+<h1>在 SOA 场景下再谈分布式事务调度的意义</h1>
+<p>一个好的分布式框架应该提供一个分布式服务，提供 TCC、SAGA、BestEffort、跨库事务。</p>
+<h2 id="概念分类">概念分类</h2>
+<ul>
+<li>事务（Transaction）：事务是指作为单个逻辑工作单元执行的一系列操作，要么完全执行，要么完全不执行。</li>
+<li>分布式事务 （Distributed Transaction）：事务的发起者、资源及资源管理器和事务协调者分别位于不同的分布式系统的不同节点之上。</li>
+<li>柔性事务：传统数据库事务中的事务遵循 ACID 特性，但是在分布式场景下 CAP 三者不可能完全达到，而 P 是分布式场景下必然会出现的，因此分布式事务主要在可用性和一致性间进行部分妥协，因此诞生柔性事务，它保证的是 “基本可用，最终一致” ，本质遵循 BASE 理论，保证数据的最终一致性。</li>
+<li>全局事务 （Global Transaction）：全局事务是一个逻辑上的概念，他并不是具体执行的某段逻辑。一个全局事务包含了多个具体的分支事务，发起方通过修改全局事务的状态，控制分支事物的提交/回滚。</li>
+<li>分支事务 （Branch Transaction）：分支事务是一个逻辑上的概念，一个分布式事务可能包含多个数据库本地事务，在分布式事务框架下，分支事务可能是一个分库上执行的 SQL 语句，或是一个自定义模式服务的调用。</li>
+<li>发起方（Launcher）：分布式事务的发起方负责启动分布式事务，通过调用参与者的服务，将参与者纳入到分布式事务当中，并决定整个分布式事务是提交还是回滚。一个分布式事务有且只能有一个发起方。</li>
+<li>参与者（Participant）：参与者提供分支事务服务。当一个参与者被发起方调用，则被纳入到该发起方启动的分布式事务中，成为该分布式事务的一个分支事务。一个分布式事务可以有多个参与者。</li>
+<li>事务管理器（Transaction Manager）：事务管理器是一个独立的服务，用于控制分布式事务的生命周期，包括创建主事务记录、分支事务记录，并根据分布式事务的状态，调用参与者提交或回滚方法。</li>
+<li>事务协调器 （Transaction Coordinator）：事务协调器是一个独立的模块，用来控制事务的提交和回滚操作。事务协调器可嵌入在客户端中独立运行，也可部署在Server端作为独立服务。</li>
+<li>资源管理器（Resource Manager）：一个事务管理器下存在若干个资源管理器，用于管理事务所需要协调的资源。**能够把资源抽象出来，才可以对资源进行调度。这也是种操作系统设计解决方案的思路。**资源和事务应该单独抽象。</li>
+<li>异常事务（Error Transaction）：对于某个分布式事务设定了最大重试次数和事务超时两种熔断策略，如果达到熔断条件，事务就会归类为异常事务，然后告警，不再继续重试。</li>
+<li>事务域（Domain）：概念上表示事务域，即一个 TCC 参与方的确定边界，由三个方法组成。功能上相当于分布式事务概念中的资源管理器，使用时可以理解为一套事务参与方的实现。</li>
+</ul>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant TM as TM (事务管理器)
+    participant TC as TC (事务协调器)
+    participant RM1 as RM (资源管理器1)
+    participant RM2 as RM (资源管理器2)
+
+    Note over TM: 业务方法开始
+    TM-&gt;&gt;TC: 1. 开启全局事务
+    TC--&gt;&gt;TM: 返回全局事务ID(XID)
+
+    Note over TM, RM1: 业务操作
+    TM-&gt;&gt;RM1: 2. 执行分支事务(携带XID)
+    RM1-&gt;&gt;TC: 3. 注册分支事务
+    RM1--&gt;&gt;TM: 执行成功
+
+    TM-&gt;&gt;RM2: 4. 执行分支事务(携带XID)
+    RM2-&gt;&gt;TC: 5. 注册分支事务
+    RM2--&gt;&gt;TM: 执行成功
+
+    Note over TM: 根据业务结果决策
+    TM-&gt;&gt;TC: 6. 提交/回滚全局事务
+
+    TC-&gt;&gt;RM1: 7. 提交/回滚分支事务
+    TC-&gt;&gt;RM2: 8. 提交/回滚分支事务
+    RM1--&gt;&gt;TC: 完成
+    RM2--&gt;&gt;TC: 完成</code></pre>
+<p>本文重点参考了：</p>
+<ol>
+<li><a target="_blank" rel="noopener" href="https://mp.weixin.qq.com/s?__biz=MzIwMzg1ODcwMw==&amp;mid=2247486427&amp;idx=1&amp;sn=459386dd3461285c50e6d70378541ec6&amp;source=41#wechat_redirect">《分布式事务：不过是在一致性、吞吐量和复杂度之间，做一个选择》</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/">《Exactly-once Semantics are Possible: Here’s How Kafka Does it》</a></li>
+<li><a target="_blank" rel="noopener" href="http://www.cnblogs.com/xybaby/p/7465816.html?hmsr=toutiao.io&amp;utm_medium=toutiao.io&amp;utm_source=toutiao.io">《从银行转账失败到分布式事务：总结与思考</a>。</li>
+<li><a target="_blank" rel="noopener" href="http://blog.jobbole.com/95632/">除了Paxos，没有真正的分布式一致算法</a>。</li>
+<li><a target="_blank" rel="noopener" href="https://www.ibm.com/developerworks/cn/java/j-lo-jta/">《JTA 深度历险》</a>。</li>
+<li><a target="_blank" rel="noopener" href="https://coolshell.cn/articles/10910.html">《分布式系统的事务处理》</a></li>
+</ol>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2025/09/13/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/">https://magicliang.github.io/2025/09/13/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></div><div class="post-share"><div class="social-share" data-image="/2025/09/13/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/3pc.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2018/01/30/%E5%87%A0%E7%A7%8D%E5%85%B1%E8%AF%86%E7%AE%97%E6%B3%95/" title="几种共识算法"><img class="cover" src="/img/wall-paper-99.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2018-01-30</div><div class="info-item-2">几种共识算法</div></div><div class="info-2"><div class="info-item-1">达成共识的英文原文是 come to consensus。达成共识以后，也未必代表数据是完全一致的（Raft 算法中 leader 发出 append log 的 commit 命令即算达成共识？但如果中途数据丢失，则还是会有子节点数据不一致）。 在分布式环境下，多个系统协同工作的效率，受制于系统交叉点的性能。在需要达成分布式共识的场景下，分布式共识算法在保证系统安全性的同时，限制了全系统横向扩展的性能提升。 根据环境的不同，可以应用不同的共识算法。 在完全互信的环境下-私有链、私有的分布式数据库，节点之间可以使用 Paxos 或者 Raft 这种 leader 相对固定的算法。 在有限互信的环境下-联盟链，可以使用 PBFT。PBFT 算法是依据确定性的投票（可能是漫长的投票，也可能进入死循环）达到确定性一致的算法。 在没有互信的情况下-公有链，可以使用 POW/POS/DPOS/POA。这类算法是基于概率得到正确的最终一致性，性能比 PBFT 要稍微好点。 最好的共识算法应该模块化，例如 Corda 中的 notary，Hyperledger fabric 中的 solo/k...</div></div></div></a><a class="pagination-related" href="/2018/04/02/%E4%B8%80%E4%B8%AA%E6%BB%9A%E5%8A%A8%E9%87%8D%E5%90%AF%E7%9A%84%E7%8A%B6%E6%80%81%E4%BF%9D%E5%AD%98%E9%97%AE%E9%A2%98/" title="一个滚动重启的状态保存问题"><img class="cover" src="/img/wall-paper-143.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2018-04-02</div><div class="info-item-2">一个滚动重启的状态保存问题</div></div><div class="info-2"><div class="info-item-1">很多时候滚动重启，都会导致状态丢失。比较好的设计方法是把服务本身设计成无状态的，然后在上游的服务上做好 failover，然后增加 standby server，让 sticky 数据 transmit 到 standby 机器上，让 request 失败以后可以自己由上游重传到 standby server。然后就可以滚动重启了。 这大部分场景下还要考虑幂等的问题。 这就看得出热配置热替换的重要性了。在大多数情况下，除了发布新的 feature 升级以外，都应该尽量用热配置来避免重启。 </div></div></div></a><a class="pagination-related" href="/2018/11/28/%E6%AD%A3%E4%BA%A4%E6%80%A7/" title="正交性"><img class="cover" src="/img/wall-paper-33.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2018-11-28</div><div class="info-item-2">正交性</div></div><div class="info-2"><div class="info-item-1">所谓正交性（orthogonal 意为正交的），就是设计的维度与其他维度完全隔离，一个正交的设计/值域设计，其变化绝不会受其他正交维度影响，也不会影响其他正交维度。 我们可以把 API 设计成正交的。这样 API 有独立变化的空间的。 我们可以把问题域切分清楚。问题域之间完全不相互干涉（注意跨问题域问题）。 我们可以把变量、字段、列设计成正交的。这样不同业务场景下，列之间的赋值不会相互覆盖。 </div></div></div></a><a class="pagination-related" href="/2019/08/30/%E3%80%8A%E9%AB%98%E5%8F%AF%E7%94%A8%E6%81%A2%E5%A4%8D%E6%80%9D%E8%B7%AF%E3%80%8B%E7%AC%94%E8%AE%B0/" title="《高可用恢复思路》笔记"><img class="cover" src="/img/wall-paper-67.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2019-08-30</div><div class="info-item-2">《高可用恢复思路》笔记</div></div><div class="info-2"><div class="info-item-1">遇到线上问题，经常陷入一个误区：一定要找到问题的根因（root cause）。但实际上对线上应用而言，最重要的是恢复可用性，所以在开发设计环境除了完成功能性需求以外，还需要加入非功能性设计的需求：  限流保护。抵挡来自突发流量冲垮整个集群。 降级保护，对调用的服务接口保持警惕，其各种因素导致不可用，可以对齐降级，从而确保核心功能可用。 削峰填谷（traffic shaping），不因突发数据来袭，造成任务消费陡增，造成调用系统的连串抖动。  这些基本的系统保护，是应对未来的各种突发不确定事件的高可用思考。 以上描述的是问题的应对机制设计，问题的发现机制，也需要结构化地考虑，体系化地建设：  发现机制，是我们的眼睛，也是基础。 监控主指标，需要找对业务的主要指标，常见的主指标一般是：RT（响应时间）、总量、成功量、失败量、成功率。 主指标有异常，还要有细分维度（即结果还可以内部 group by aggregation）。 快速恢复 根据监控快速寻找问题发生的方向和位置。 找对恢复的人、恢复的预案。 倾向于选择成本低的恢复手段。---- 并不是所有的恢复都用大招（熔断、限流），大招...</div></div></div></a><a class="pagination-related" href="/2019/09/26/%E6%9E%B6%E6%9E%84%E6%95%B4%E6%B4%81%E4%B9%8B%E9%81%93%E7%AC%94%E8%AE%B0/" title="架构整洁之道笔记"><img class="cover" src="/img/wall-paper-98.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2019-09-26</div><div class="info-item-2">架构整洁之道笔记</div></div><div class="info-2"><div class="info-item-1">最早的《The Clean Architecture》诞生于 2012年，这个问题很早就被讨论清楚了。 思维导图：   注意，所有的接口都是在高层声明的：UseCase Input Port 和 UseCase Output port，所以高层可以实现高层的接口，低层也可以实现高层的接口。 注意，sofa的分层就是在一个横向的模块里声明了业务用例的接口和 core-model 的接口，这样源代码级的依赖都集中在抽象上：   Use Case Interactor 和 Presenter 应该是可测试的，而 Data Access Interface、View、ORM 应该是 humble object。所以一个应用的低层（外层）应该是被排除掉不做测试的。 附件下载： xmind 关于源代码中的依赖关系的一些澄清：  “使用”并不意味着“定义”，而只是引用  dashed outline 代表虚线框，也代表抽象。           </div></div></div></a><a class="pagination-related" href="/2019/09/05/%E3%80%8A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%84%E4%B9%8B%E9%81%93%E3%80%8B%E7%AC%94%E8%AE%B0/" title="《应用架构之道》笔记"><img class="cover" src="/img/wall-paper-177.jpeg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2019-09-05</div><div class="info-item-2">《应用架构之道》笔记</div></div><div class="info-2"><div class="info-item-1">架构师的职责 化繁为简。架构师是职责就是把复杂的问题简单化，使得其他人能够更好地在架构里工作。 架构师要努力训练自己的思维，用它去理解复杂的系统，通过合理的分解和抽象，做出合理的设计。 软件架构 软件架构是一个系统的草图。软件架构描述的对象是直接构成系统的抽象组件。各个组件的链接则明确和相对细致地描述组件之间的通信。  软件架构为软件系统提供了结构、行为和属性的高级抽象。，由构件的描述、构件的相互作用、指导构件集成的模式以及这些模式的约束组成。软件架构不仅显示了软件需求和软件结构之间的对应关系，而且指定了整个软件系统的组织和拓扑结构，提供了一些设计决策的基本原理。 软件架构的核心价值应该只围绕一个核心命题：控制复杂性。  软件架构分类  业务架构：由业务架构师负责，也可以称为业务领域专家、行业专家。业务架构属于顶层设计，其对业务的定义和划分会影响组织结构和技术架构。 应用架构：由应用架构师负责，他需要根据业务场景的需要，设计应用的层次结构，制定应用规范、定义接口和数据交互协议等。并尽量将应用的复杂度控制在一个可以接受的水平，从而在快速的支撑业务发展的同时，在保证系统的可用性和可维...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">问题定义</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#cap-%E5%AE%9A%E4%B9%89"><span class="toc-number">1.1.</span> <span class="toc-text">CAP 定义</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">1.1.1.</span> <span class="toc-text">常见误解</span></a><ol class="toc-child"><li class="toc-item toc-level-4"><a class="toc-link" href="#%E4%B8%89%E9%80%89%E4%BA%8C%E7%B3%BB%E7%BB%9F%E7%9A%84%E6%B6%8C%E7%8E%B0"><span class="toc-number">1.1.1.1.</span> <span class="toc-text">三选二系统的涌现</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E5%90%8C%E6%97%B6%E4%B8%A2%E5%A4%B1%E6%89%80%E6%9C%89%E7%89%B9%E6%80%A7"><span class="toc-number">1.1.1.2.</span> <span class="toc-text">同时丢失所有特性</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E7%AE%A1%E7%90%86%E5%88%86%E5%8C%BA"><span class="toc-number">1.1.1.3.</span> <span class="toc-text">管理分区</span></a><ol class="toc-child"><li class="toc-item toc-level-5"><a class="toc-link" href="#%E5%93%AA%E4%BA%9B%E6%93%8D%E4%BD%9C%E5%8F%AF%E4%BB%A5%E7%BB%A7%E7%BB%AD%EF%BC%9F"><span class="toc-number">1.1.1.3.1.</span> <span class="toc-text">哪些操作可以继续？</span></a></li></ol></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E5%88%86%E5%8C%BA%E6%81%A2%E5%A4%8D"><span class="toc-number">1.1.1.4.</span> <span class="toc-text">分区恢复</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E9%94%99%E8%AF%AF%E8%A1%A5%E5%81%BF"><span class="toc-number">1.1.1.5.</span> <span class="toc-text">错误补偿</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E7%BB%93%E8%AF%AD"><span class="toc-number">1.1.1.6.</span> <span class="toc-text">结语</span></a></li></ol></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#cap-%E5%B7%A5%E7%A8%8B%E6%B5%81%E7%A8%8B%E9%80%9F%E6%9F%A5%E8%A1%A8"><span class="toc-number">1.2.</span> <span class="toc-text">CAP 工程流程速查表</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-%E6%8A%8A-%E5%88%86%E5%8C%BA-%E5%BD%93%E6%88%90%E9%99%90%E6%97%B6%E9%80%9A%E4%BF%A1%E9%97%AE%E9%A2%98-%E8%80%8C%E9%9D%9E%E6%96%AD%E7%BD%91"><span class="toc-number">1.2.1.</span> <span class="toc-text">1. 把“分区”当成限时通信问题，而非断网</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-%E8%BF%9B%E5%85%A5%E5%88%86%E5%8C%BA%E6%A8%A1%E5%BC%8F%E5%90%8E-%E6%98%BE%E5%BC%8F%E9%99%90%E5%88%B6%E6%93%8D%E4%BD%9C-%E8%80%8C%E9%9D%9E%E7%9B%B4%E6%8E%A5%E9%99%8D%E7%BB%B4"><span class="toc-number">1.2.2.</span> <span class="toc-text">2. 进入分区模式后，显式限制操作（而非直接降维）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-%E5%88%86%E5%8C%BA%E6%9C%9F%E9%97%B4%E4%B8%A4%E4%BE%A7%E9%83%BD%E8%B7%91%E5%8E%9F%E5%AD%90%E6%93%8D%E4%BD%9C-%E4%BD%86%E4%B8%8D%E8%B7%91%E5%85%A8%E5%B1%80%E4%BA%8B%E5%8A%A1"><span class="toc-number">1.2.3.</span> <span class="toc-text">3. 分区期间两侧都跑原子操作，但不跑全局事务</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-%E7%94%A8%E7%89%88%E6%9C%AC%E5%90%91%E9%87%8F%E6%88%96-crdt-%E8%AE%B0%E5%BD%95%E5%9B%A0%E6%9E%9C-%E8%AE%A9%E7%8A%B6%E6%80%81%E8%87%AA%E5%8A%A8%E6%94%B6%E6%95%9B"><span class="toc-number">1.2.4.</span> <span class="toc-text">4. 用版本向量或 CRDT 记录因果，让状态自动收敛</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-%E6%81%A2%E5%A4%8D%E9%98%B6%E6%AE%B5%E4%B8%A4%E6%AD%A5%E8%B5%B0%EF%BC%9A%E5%85%88%E5%90%88%E5%B9%B6%E7%8A%B6%E6%80%81-%E5%86%8D%E8%A1%A5%E5%81%BF%E9%94%99%E8%AF%AF"><span class="toc-number">1.2.5.</span> <span class="toc-text">5. 恢复阶段两步走：先合并状态，再补偿错误</span></a><ol class="toc-child"><li class="toc-item toc-level-4"><a class="toc-link" href="#%E2%91%A0-%E5%90%88%E5%B9%B6%E7%8A%B6%E6%80%81"><span class="toc-number">1.2.5.1.</span> <span class="toc-text">① 合并状态</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E2%91%A1-%E8%A1%A5%E5%81%BF%E9%94%99%E8%AF%AF"><span class="toc-number">1.2.5.2.</span> <span class="toc-text">② 补偿错误</span></a></li></ol></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%80%E5%8F%A5%E8%AF%9D%E5%B8%A6%E8%B5%B0"><span class="toc-number">1.2.6.</span> <span class="toc-text">一句话带走</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#base-%E5%AE%9A%E4%B9%89"><span class="toc-number">1.3.</span> <span class="toc-text">BASE 定义</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%BC%BA%E4%B8%80%E8%87%B4%E6%80%A7-%E9%9B%B6%E7%AA%97%E5%8F%A3%EF%BC%9B%E5%AE%9E%E7%8E%B0%EF%BC%9A%E5%85%B1%E8%AF%86%E7%AE%97%E6%B3%95-%E5%A4%8D%E5%88%B6%E7%8A%B6%E6%80%81%E6%9C%BA-2pc"><span class="toc-number">1.3.1.</span> <span class="toc-text">强一致性（零窗口；实现：共识算法 + 复制状态机 &#x2F; 2PC）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%BC%B1%E4%B8%80%E8%87%B4%E6%80%A7-%E6%97%A0%E9%99%90%E7%AA%97%E5%8F%A3"><span class="toc-number">1.3.2.</span> <span class="toc-text">弱一致性（无限窗口）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%9C%80%E7%BB%88%E4%B8%80%E8%87%B4%E6%80%A7-%E6%9C%89%E9%99%90%E7%AA%97%E5%8F%A3%EF%BC%9Bliveness-safety"><span class="toc-number">1.3.3.</span> <span class="toc-text">最终一致性（有限窗口；liveness + safety）</span></a></li></ol></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">事务模型</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#2pc"><span class="toc-number">2.1.</span> <span class="toc-text">2PC</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#xa-%E4%BA%8B%E5%8A%A1%E7%AE%80%E8%BF%B0"><span class="toc-number">2.1.1.</span> <span class="toc-text">XA 事务简述</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2pc-%E7%9A%84-failover"><span class="toc-number">2.1.2.</span> <span class="toc-text">2PC 的 Failover</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%80%E4%B8%AA%E5%85%B8%E5%9E%8B%E7%9A%84-2pc-%E7%9A%84%E4%BE%8B%E5%AD%90"><span class="toc-number">2.1.3.</span> <span class="toc-text">一个典型的 2PC 的例子</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%AD%E5%BF%83%E5%8C%96%E5%92%8C%E5%8E%BB%E4%B8%AD%E5%BF%83%E5%8C%96%E7%9A%84-2pc"><span class="toc-number">2.1.4.</span> <span class="toc-text">中心化和去中心化的 2PC</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">2.1.5.</span> <span class="toc-text">总结</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#3pc"><span class="toc-number">2.2.</span> <span class="toc-text">3PC</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#3pc-%E5%AE%8C%E6%95%B4%E6%97%B6%E5%BA%8F%E4%B8%8E%E8%B6%85%E6%97%B6%E8%A1%8C%E4%B8%BA"><span class="toc-number">2.3.</span> <span class="toc-text">3PC 完整时序与超时行为</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#tcc"><span class="toc-number">2.4.</span> <span class="toc-text">TCC</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#tcc-%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1%E8%AF%A6%E8%A7%A3"><span class="toc-number">2.4.1.</span> <span class="toc-text">TCC 分布式事务详解</span></a><ol class="toc-child"><li class="toc-item toc-level-4"><a class="toc-link" href="#%E8%A7%92%E8%89%B2"><span class="toc-number">2.4.1.1.</span> <span class="toc-text">角色</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E5%8D%8F%E8%B0%83%E5%99%A8%E8%B0%83%E7%94%A8%E6%A8%A1%E5%BC%8F%E7%9A%84%E7%81%B5%E6%B4%BB%E6%80%A7"><span class="toc-number">2.4.1.2.</span> <span class="toc-text">协调器调用模式的灵活性</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E5%8F%82%E4%B8%8E%E8%80%85%E6%8E%A5%E5%8F%A3%E8%A6%81%E6%B1%82"><span class="toc-number">2.4.1.3.</span> <span class="toc-text">参与者接口要求</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E4%B8%89%E9%98%B6%E6%AE%B5%E8%AF%AD%E4%B9%89"><span class="toc-number">2.4.1.4.</span> <span class="toc-text">三阶段语义</span></a><ol class="toc-child"><li class="toc-item toc-level-5"><a class="toc-link" href="#1-try-%E9%98%B6%E6%AE%B5-1-%E4%B8%9A%E5%8A%A1%E5%B1%82-prepare"><span class="toc-number">2.4.1.4.1.</span> <span class="toc-text">1. Try（阶段 1 → 业务层 “prepare”）</span></a></li><li class="toc-item toc-level-5"><a class="toc-link" href="#2-confirm-%E9%98%B6%E6%AE%B5-2-%E6%8F%90%E4%BA%A4"><span class="toc-number">2.4.1.4.2.</span> <span class="toc-text">2. Confirm（阶段 2 → 提交）</span></a></li><li class="toc-item toc-level-5"><a class="toc-link" href="#3-cancel-%E9%98%B6%E6%AE%B5-2-%E5%9B%9E%E6%BB%9A"><span class="toc-number">2.4.1.4.3.</span> <span class="toc-text">3. Cancel（阶段 2 → 回滚）</span></a></li></ol></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E4%B8%8E-2pc-%E7%9A%84%E5%85%B3%E7%B3%BB"><span class="toc-number">2.4.1.5.</span> <span class="toc-text">与 2PC 的关系</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E6%A0%B8%E5%BF%83%E8%AE%BE%E8%AE%A1%E5%8E%9F%E5%88%99"><span class="toc-number">2.4.1.6.</span> <span class="toc-text">核心设计原则</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E4%BA%8B%E5%8A%A1%E6%B5%81%E7%A8%8B"><span class="toc-number">2.4.1.7.</span> <span class="toc-text">事务流程</span></a></li></ol></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%9C%AC%E5%9C%B0%E6%A8%A1%E5%BC%8F"><span class="toc-number">2.4.2.</span> <span class="toc-text">本地模式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#try-%E5%92%8C-catch-%E7%9A%84%E4%BD%BF%E7%94%A8%E6%96%B9%E6%B3%95"><span class="toc-number">2.4.3.</span> <span class="toc-text">try 和 catch 的使用方法</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%A9%BA%E5%9B%9E%E6%BB%9A%E5%92%8C%E4%BA%8B%E5%8A%A1%E6%82%AC%E6%8C%82"><span class="toc-number">2.4.4.</span> <span class="toc-text">空回滚和事务悬挂</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%80%82%E7%94%A8-tcc-%E7%9A%84%E4%B8%9A%E5%8A%A1%E5%9C%BA%E6%99%AF"><span class="toc-number">2.4.5.</span> <span class="toc-text">适用 TCC 的业务场景</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#saga-%E6%A8%A1%E5%9E%8B"><span class="toc-number">2.5.</span> <span class="toc-text">Saga 模型</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#saga-%E7%9A%84%E4%B8%AD%E5%BF%83%E5%8C%96%E5%AE%9E%E7%8E%B0"><span class="toc-number">2.5.1.</span> <span class="toc-text">saga 的中心化实现</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#saga-%E7%9A%84%E4%B8%A4%E7%A7%8D%E6%81%A2%E5%A4%8D%E7%AD%96%E7%95%A5"><span class="toc-number">2.5.2.</span> <span class="toc-text">saga 的两种恢复策略</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#saga-%E7%9A%84%E9%80%82%E7%94%A8%E5%9C%BA%E6%99%AF"><span class="toc-number">2.5.3.</span> <span class="toc-text">saga 的适用场景</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AF%B9%E6%AF%94%E6%89%80%E6%9C%89%E7%9A%84%E5%9F%BA%E4%BA%8E%E6%B6%88%E6%81%AF%E7%9A%84%E6%96%B9%E6%A1%88"><span class="toc-number">2.6.</span> <span class="toc-text">对比所有的基于消息的方案</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#tcc-%E5%92%8C-saga-%E7%9A%84%E6%AF%94%E8%BE%83"><span class="toc-number">2.7.</span> <span class="toc-text">TCC 和 saga 的比较</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%98%BF%E9%87%8C%E7%9A%84-seata-%E6%A8%A1%E5%9E%8B%E8%A1%8D%E7%94%9F%E7%9A%84%E6%95%B0%E6%8D%AE%E5%BA%93%E4%B8%AD%E9%97%B4%E4%BB%B6%E8%B7%A8%E5%BA%93%E4%BA%8B%E5%8A%A1"><span class="toc-number">2.8.</span> <span class="toc-text">阿里的 Seata 模型衍生的数据库中间件跨库事务</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#seata-%E4%B8%8E-swan"><span class="toc-number">2.9.</span> <span class="toc-text">seata 与 swan</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%A6%E4%BA%8B%E5%8A%A1%E6%B6%88%E6%81%AF%E4%B8%AD%E9%97%B4%E4%BB%B6-kafka-%E7%9A%84%E6%96%B9%E6%A1%88-%E6%B6%88%E6%81%AF%E4%BA%8B%E5%8A%A1"><span class="toc-number">2.10.</span> <span class="toc-text">带事务消息中间件（Kafka 的方案）-消息事务</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9F%BA%E4%BA%8E%E6%9C%AC%E5%9C%B0%E4%BA%8B%E4%BB%B6%E8%A1%A8%E7%B3%BB%E7%BB%9F%E7%9A%84-scan-and-send-%E6%9C%BA%E5%88%B6"><span class="toc-number">2.11.</span> <span class="toc-text">基于本地事件表系统的 scan and send 机制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9F%BA%E4%BA%8E%E5%A4%96%E9%83%A8%E4%BA%8B%E4%BB%B6%E8%A1%A8%E7%B3%BB%E7%BB%9F%E7%9A%84-prepared-and-send-%E6%9C%BA%E5%88%B6"><span class="toc-number">2.12.</span> <span class="toc-text">基于外部事件表系统的 prepared and send 机制</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">我在 bridgemq 问题下的评论</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">在事务里调 rpc 的铁律</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">分布式 xa</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">在 SOA 场景下再谈分布式事务调度的意义</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A6%82%E5%BF%B5%E5%88%86%E7%B1%BB"><span class="toc-number">6.1.</span> <span class="toc-text">概念分类</span></a></li></ol></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.1</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.2</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.2"></script><script src="/js/main.js?v=5.5.2"></script><script src="/js/tw_cn.js?v=5.5.2"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+      }
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="ribbon" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-ribbon.min.js" size="150" alpha="0.6" zIndex="-1" mobile="false" data-click="true"></script><script id="canvas_nest" defer="defer" color="0,0,255" opacity="0.7" zIndex="-1" count="99" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-nest.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = true;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script id="click-heart" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/click-heart.min.js" async="async" mobile="false"></script><script async data-pjax src="/"></script></div></body></html>
