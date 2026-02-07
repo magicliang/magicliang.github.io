@@ -1,0 +1,748 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>缓存系统设计——从穿透到雪崩的完整攻略 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="缓存是提升系统性能的第一利器，但也是引发故障的第一杀手。缓存穿透、缓存击穿、缓存雪崩——这三大问题几乎是每个后端工程师都会遇到的挑战。本文将系统性地剖析缓存系统的设计原则、经典问题及其解决方案，从单机缓存到分布式缓存，从理论到生产实践。  Part 1: 缓存的基本原理 为什么需要缓存    存储介质 访问延迟 吞吐量 成本     CPU L1 Cache ~1 ns — 极高   CPU L3">
+<meta property="og:type" content="article">
+<meta property="og:title" content="缓存系统设计——从穿透到雪崩的完整攻略">
+<meta property="og:url" content="https://magicliang.github.io/2025/07/29/%E7%BC%93%E5%AD%98%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="缓存是提升系统性能的第一利器，但也是引发故障的第一杀手。缓存穿透、缓存击穿、缓存雪崩——这三大问题几乎是每个后端工程师都会遇到的挑战。本文将系统性地剖析缓存系统的设计原则、经典问题及其解决方案，从单机缓存到分布式缓存，从理论到生产实践。  Part 1: 缓存的基本原理 为什么需要缓存    存储介质 访问延迟 吞吐量 成本     CPU L1 Cache ~1 ns — 极高   CPU L3">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-84.jpg">
+<meta property="article:published_time" content="2025-07-29T07:05:34.000Z">
+<meta property="article:modified_time" content="2026-02-07T05:56:26.648Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="系统设计">
+<meta property="article:tag" content="缓存">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-84.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "缓存系统设计——从穿透到雪崩的完整攻略",
+  "url": "https://magicliang.github.io/2025/07/29/%E7%BC%93%E5%AD%98%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/",
+  "image": "https://magicliang.github.io/img/wall-paper-84.jpg",
+  "datePublished": "2025-07-29T07:05:34.000Z",
+  "dateModified": "2026-02-07T05:56:26.648Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2025/07/29/%E7%BC%93%E5%AD%98%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.2"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.1.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.12.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '缓存系统设计——从穿透到雪崩的完整攻略',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.1"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (false) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-84.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">缓存系统设计——从穿透到雪崩的完整攻略</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"></div></nav><div id="post-info"><h1 class="post-title">缓存系统设计——从穿透到雪崩的完整攻略</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2025-07-29T07:05:34.000Z" title="Created 2025-07-29 15:05:34">2025-07-29</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-02-07T05:56:26.648Z" title="Updated 2026-02-07 13:56:26">2026-02-07</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>16mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><p>缓存是提升系统性能的<strong>第一利器</strong>，但也是引发故障的<strong>第一杀手</strong>。缓存穿透、缓存击穿、缓存雪崩——这三大问题几乎是每个后端工程师都会遇到的挑战。本文将系统性地剖析缓存系统的设计原则、经典问题及其解决方案，从单机缓存到分布式缓存，从理论到生产实践。</p>
+<hr>
+<h2 id="part-1-缓存的基本原理">Part 1: 缓存的基本原理</h2>
+<h3 id="为什么需要缓存">为什么需要缓存</h3>
+<table>
+<thead>
+<tr>
+<th>存储介质</th>
+<th>访问延迟</th>
+<th>吞吐量</th>
+<th>成本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>CPU L1 Cache</strong></td>
+<td>~1 ns</td>
+<td>—</td>
+<td>极高</td>
+</tr>
+<tr>
+<td><strong>CPU L3 Cache</strong></td>
+<td>~10 ns</td>
+<td>—</td>
+<td>高</td>
+</tr>
+<tr>
+<td><strong>内存（RAM）</strong></td>
+<td>~100 ns</td>
+<td>~10 GB/s</td>
+<td>中</td>
+</tr>
+<tr>
+<td><strong>SSD</strong></td>
+<td>~100 μs</td>
+<td>~500 MB/s</td>
+<td>低</td>
+</tr>
+<tr>
+<td><strong>HDD</strong></td>
+<td>~10 ms</td>
+<td>~100 MB/s</td>
+<td>极低</td>
+</tr>
+<tr>
+<td><strong>网络（同机房）</strong></td>
+<td>~500 μs</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>网络（跨机房）</strong></td>
+<td>~50 ms</td>
+<td>—</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>内存访问比 SSD 快 <strong>1000 倍</strong>，比 HDD 快 <strong>100,000 倍</strong>。缓存的本质就是用<strong>更快的存储介质</strong>保存<strong>热点数据</strong>的副本。</p>
+<h3 id="缓存的命中率">缓存的命中率</h3>
+<p><strong>命中率 = 命中次数 / (命中次数 + 未命中次数)</strong></p>
+<table>
+<thead>
+<tr>
+<th>命中率</th>
+<th>效果</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&lt; 50%</td>
+<td>差</td>
+<td>缓存几乎没有意义</td>
+</tr>
+<tr>
+<td>50-80%</td>
+<td>一般</td>
+<td>有一定效果</td>
+</tr>
+<tr>
+<td>80-95%</td>
+<td>好</td>
+<td>显著减轻数据库压力</td>
+</tr>
+<tr>
+<td>&gt; 95%</td>
+<td>优秀</td>
+<td>数据库几乎无压力</td>
+</tr>
+</tbody>
+</table>
+<h3 id="缓存的分类">缓存的分类</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>位置</th>
+<th>代表</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>客户端缓存</strong></td>
+<td>浏览器/App</td>
+<td>HTTP Cache、LocalStorage</td>
+<td>静态资源</td>
+</tr>
+<tr>
+<td><strong>CDN 缓存</strong></td>
+<td>边缘节点</td>
+<td>CloudFlare、阿里云 CDN</td>
+<td>静态文件、图片</td>
+</tr>
+<tr>
+<td><strong>反向代理缓存</strong></td>
+<td>Nginx</td>
+<td>proxy_cache</td>
+<td>页面缓存</td>
+</tr>
+<tr>
+<td><strong>本地缓存</strong></td>
+<td>应用进程内</td>
+<td>Caffeine、Guava Cache</td>
+<td>热点数据、配置</td>
+</tr>
+<tr>
+<td><strong>分布式缓存</strong></td>
+<td>独立集群</td>
+<td>Redis、Memcached</td>
+<td>共享数据、Session</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="part-2-缓存读写策略">Part 2: 缓存读写策略</h2>
+<h3 id="cache-aside-旁路缓存">Cache-Aside（旁路缓存）</h3>
+<p><strong>最常用</strong>的缓存策略：</p>
+<figure class="highlight markdown"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs markdown">读取流程：<br><span class="hljs-bullet">1.</span> 先查缓存<br><span class="hljs-bullet">2.</span> 缓存命中 → 直接返回<br><span class="hljs-bullet">3.</span> 缓存未命中 → 查数据库 → 写入缓存 → 返回<br><br>写入流程：<br><span class="hljs-bullet">1.</span> 更新数据库<br><span class="hljs-bullet">2.</span> 删除缓存（而非更新缓存）<br></code></pre></td></tr></table></figure>
+<p><strong>为什么是&quot;删除缓存&quot;而非&quot;更新缓存&quot;？</strong></p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>更新缓存</strong></td>
+<td>并发写入时可能导致缓存与数据库不一致（后写入数据库的先更新了缓存）</td>
+</tr>
+<tr>
+<td><strong>删除缓存</strong></td>
+<td>下次读取时重新加载，保证最终一致性</td>
+</tr>
+</tbody>
+</table>
+<p><strong>为什么是&quot;先更新数据库，再删除缓存&quot;？</strong></p>
+<table>
+<thead>
+<tr>
+<th>顺序</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>先删缓存，再更新数据库</td>
+<td>删除缓存后、更新数据库前，另一个请求读到旧数据并写入缓存</td>
+</tr>
+<tr>
+<td>先更新数据库，再删缓存</td>
+<td>更新数据库后、删除缓存前，短暂的不一致（可接受）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="read-through-write-through">Read-Through / Write-Through</h3>
+<p>缓存层作为数据库的代理，应用只与缓存交互：</p>
+<figure class="highlight mathematica"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs mathematica"><span class="hljs-built_in">Read</span><span class="hljs-operator">-</span><span class="hljs-built_in">Through</span>：<br>应用 → 缓存（未命中时自动从数据库加载）<br><br><span class="hljs-built_in">Write</span><span class="hljs-operator">-</span><span class="hljs-built_in">Through</span>：<br>应用 → 缓存 → 数据库（同步写入）<br></code></pre></td></tr></table></figure>
+<p>优势：应用代码简单，缓存逻辑封装在缓存层。<br>
+劣势：写入延迟高（同步写数据库）。</p>
+<h3 id="write-behind-异步写回">Write-Behind（异步写回）</h3>
+<figure class="highlight"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs">应用 → 缓存（立即返回）→ 异步批量写入数据库<br></code></pre></td></tr></table></figure>
+<p>优势：写入延迟极低，可以合并多次写入。<br>
+劣势：数据可能丢失（缓存故障时未持久化的数据）。</p>
+<p>适用场景：计数器、浏览量、点赞数等允许少量丢失的场景。</p>
+<h3 id="refresh-ahead-预刷新">Refresh-Ahead（预刷新）</h3>
+<p>在缓存过期<strong>之前</strong>，异步刷新缓存：</p>
+<figure class="highlight abnf"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs abnf">缓存 TTL <span class="hljs-operator">=</span> <span class="hljs-number">60</span> 秒<br>刷新窗口 <span class="hljs-operator">=</span> TTL × <span class="hljs-number">0.8</span> <span class="hljs-operator">=</span> <span class="hljs-number">48</span> 秒<br><br>当缓存存活时间 &gt; <span class="hljs-number">48</span> 秒时，异步刷新缓存<br>用户始终读到缓存数据，不会触发缓存未命中<br></code></pre></td></tr></table></figure>
+<p>优势：避免缓存过期瞬间的请求穿透。<br>
+劣势：实现复杂，可能刷新不再被访问的数据。</p>
+<hr>
+<h2 id="part-3-缓存穿透">Part 3: 缓存穿透</h2>
+<h3 id="问题描述">问题描述</h3>
+<p><strong>缓存穿透</strong>：查询一个<strong>不存在的数据</strong>，缓存中没有，数据库中也没有。每次请求都会穿透缓存直达数据库。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs bash">攻击者请求 <span class="hljs-built_in">id</span> = -1 的用户<br>→ 缓存未命中<br>→ 数据库查询：SELECT * FROM <span class="hljs-built_in">users</span> WHERE <span class="hljs-built_in">id</span> = -1 → 空结果<br>→ 不缓存空结果<br>→ 下次请求仍然穿透<br></code></pre></td></tr></table></figure>
+<h3 id="解决方案一：缓存空值">解决方案一：缓存空值</h3>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">public</span> User <span class="hljs-title function_">getUser</span><span class="hljs-params">(<span class="hljs-type">long</span> userId)</span> &#123;<br>    <span class="hljs-type">String</span> <span class="hljs-variable">cacheKey</span> <span class="hljs-operator">=</span> <span class="hljs-string">&quot;user:&quot;</span> + userId;<br>    <span class="hljs-type">String</span> <span class="hljs-variable">cached</span> <span class="hljs-operator">=</span> redis.get(cacheKey);<br><br>    <span class="hljs-keyword">if</span> (cached != <span class="hljs-literal">null</span>) &#123;<br>        <span class="hljs-keyword">if</span> (<span class="hljs-string">&quot;NULL&quot;</span>.equals(cached)) &#123;<br>            <span class="hljs-keyword">return</span> <span class="hljs-literal">null</span>;  <span class="hljs-comment">// 缓存的空值</span><br>        &#125;<br>        <span class="hljs-keyword">return</span> deserialize(cached);<br>    &#125;<br><br>    <span class="hljs-type">User</span> <span class="hljs-variable">user</span> <span class="hljs-operator">=</span> userDao.findById(userId);<br>    <span class="hljs-keyword">if</span> (user != <span class="hljs-literal">null</span>) &#123;<br>        redis.setex(cacheKey, <span class="hljs-number">3600</span>, serialize(user));  <span class="hljs-comment">// 正常数据缓存 1 小时</span><br>    &#125; <span class="hljs-keyword">else</span> &#123;<br>        redis.setex(cacheKey, <span class="hljs-number">300</span>, <span class="hljs-string">&quot;NULL&quot;</span>);  <span class="hljs-comment">// 空值缓存 5 分钟（短 TTL）</span><br>    &#125;<br>    <span class="hljs-keyword">return</span> user;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p><strong>注意</strong>：空值的 TTL 应该较短（如 5 分钟），避免数据创建后长时间无法查到。</p>
+<h3 id="解决方案二：布隆过滤器">解决方案二：布隆过滤器</h3>
+<p>在缓存之前加一层布隆过滤器，快速判断数据是否存在：</p>
+<figure class="highlight 1c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs 1c">请求 → 布隆过滤器 → 不存在？直接返回 <span class="hljs-literal">null</span><br>                   → 可能存在？查缓存 → 查数据库<br></code></pre></td></tr></table></figure>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">public</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">UserService</span> &#123;<br>    <span class="hljs-keyword">private</span> <span class="hljs-keyword">final</span> BloomFilter&lt;Long&gt; userIdBloomFilter;<br><br>    <span class="hljs-keyword">public</span> <span class="hljs-title function_">UserService</span><span class="hljs-params">()</span> &#123;<br>        <span class="hljs-comment">// 初始化时加载所有用户 ID 到布隆过滤器</span><br>        <span class="hljs-built_in">this</span>.userIdBloomFilter = BloomFilter.create(<br>            Funnels.longFunnel(),<br>            <span class="hljs-number">10_000_000</span>,  <span class="hljs-comment">// 预期元素数量</span><br>            <span class="hljs-number">0.01</span>         <span class="hljs-comment">// 误判率 1%</span><br>        );<br>        userDao.findAllIds().forEach(userIdBloomFilter::put);<br>    &#125;<br><br>    <span class="hljs-keyword">public</span> User <span class="hljs-title function_">getUser</span><span class="hljs-params">(<span class="hljs-type">long</span> userId)</span> &#123;<br>        <span class="hljs-comment">// 布隆过滤器判断</span><br>        <span class="hljs-keyword">if</span> (!userIdBloomFilter.mightContain(userId)) &#123;<br>            <span class="hljs-keyword">return</span> <span class="hljs-literal">null</span>;  <span class="hljs-comment">// 一定不存在</span><br>        &#125;<br><br>        <span class="hljs-comment">// 正常的缓存查询流程</span><br>        <span class="hljs-keyword">return</span> getFromCacheOrDb(userId);<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<h3 id="解决方案三：参数校验">解决方案三：参数校验</h3>
+<p>在入口处进行参数校验，拦截明显非法的请求：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">public</span> User <span class="hljs-title function_">getUser</span><span class="hljs-params">(<span class="hljs-type">long</span> userId)</span> &#123;<br>    <span class="hljs-keyword">if</span> (userId &lt;= <span class="hljs-number">0</span>) &#123;<br>        <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">IllegalArgumentException</span>(<span class="hljs-string">&quot;Invalid user ID: &quot;</span> + userId);<br>    &#125;<br>    <span class="hljs-keyword">return</span> getFromCacheOrDb(userId);<br>&#125;<br></code></pre></td></tr></table></figure>
+<h3 id="三种方案对比">三种方案对比</h3>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>优势</th>
+<th>劣势</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>缓存空值</strong></td>
+<td>实现简单</td>
+<td>占用缓存空间</td>
+<td>空值数量有限</td>
+</tr>
+<tr>
+<td><strong>布隆过滤器</strong></td>
+<td>空间效率高</td>
+<td>有误判率，需要维护</td>
+<td>数据集较大</td>
+</tr>
+<tr>
+<td><strong>参数校验</strong></td>
+<td>零成本</td>
+<td>只能拦截明显非法请求</td>
+<td>所有场景（基础防线）</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="part-4-缓存击穿">Part 4: 缓存击穿</h2>
+<h3 id="问题描述">问题描述</h3>
+<p><strong>缓存击穿</strong>：一个<strong>热点 Key</strong> 在缓存过期的瞬间，大量并发请求同时穿透到数据库。</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs yaml"><span class="hljs-string">时间线：</span><br><span class="hljs-attr">T0:</span> <span class="hljs-string">热点</span> <span class="hljs-string">Key</span> <span class="hljs-string">过期</span><br><span class="hljs-attr">T1:</span> <span class="hljs-number">1000</span> <span class="hljs-string">个并发请求同时发现缓存未命中</span><br><span class="hljs-attr">T2:</span> <span class="hljs-number">1000</span> <span class="hljs-string">个请求同时查询数据库</span><br><span class="hljs-attr">T3:</span> <span class="hljs-string">数据库被打垮</span><br></code></pre></td></tr></table></figure>
+<h3 id="解决方案一：互斥锁-mutex-lock">解决方案一：互斥锁（Mutex Lock）</h3>
+<p>只允许一个请求去加载数据，其他请求等待：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">public</span> User <span class="hljs-title function_">getUser</span><span class="hljs-params">(<span class="hljs-type">long</span> userId)</span> &#123;<br>    <span class="hljs-type">String</span> <span class="hljs-variable">cacheKey</span> <span class="hljs-operator">=</span> <span class="hljs-string">&quot;user:&quot;</span> + userId;<br>    <span class="hljs-type">String</span> <span class="hljs-variable">cached</span> <span class="hljs-operator">=</span> redis.get(cacheKey);<br>    <span class="hljs-keyword">if</span> (cached != <span class="hljs-literal">null</span>) &#123;<br>        <span class="hljs-keyword">return</span> deserialize(cached);<br>    &#125;<br><br>    <span class="hljs-comment">// 尝试获取分布式锁</span><br>    <span class="hljs-type">String</span> <span class="hljs-variable">lockKey</span> <span class="hljs-operator">=</span> <span class="hljs-string">&quot;lock:user:&quot;</span> + userId;<br>    <span class="hljs-type">boolean</span> <span class="hljs-variable">locked</span> <span class="hljs-operator">=</span> redis.setnx(lockKey, <span class="hljs-string">&quot;1&quot;</span>, <span class="hljs-number">10</span>, TimeUnit.SECONDS);<br><br>    <span class="hljs-keyword">if</span> (locked) &#123;<br>        <span class="hljs-keyword">try</span> &#123;<br>            <span class="hljs-comment">// 双重检查：获取锁后再次检查缓存</span><br>            cached = redis.get(cacheKey);<br>            <span class="hljs-keyword">if</span> (cached != <span class="hljs-literal">null</span>) &#123;<br>                <span class="hljs-keyword">return</span> deserialize(cached);<br>            &#125;<br><br>            <span class="hljs-comment">// 查询数据库并更新缓存</span><br>            <span class="hljs-type">User</span> <span class="hljs-variable">user</span> <span class="hljs-operator">=</span> userDao.findById(userId);<br>            redis.setex(cacheKey, <span class="hljs-number">3600</span>, serialize(user));<br>            <span class="hljs-keyword">return</span> user;<br>        &#125; <span class="hljs-keyword">finally</span> &#123;<br>            redis.del(lockKey);<br>        &#125;<br>    &#125; <span class="hljs-keyword">else</span> &#123;<br>        <span class="hljs-comment">// 未获取到锁，等待后重试</span><br>        Thread.sleep(<span class="hljs-number">50</span>);<br>        <span class="hljs-keyword">return</span> getUser(userId);  <span class="hljs-comment">// 递归重试</span><br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<h3 id="解决方案二：逻辑过期">解决方案二：逻辑过期</h3>
+<p>缓存永不过期，但在值中存储一个<strong>逻辑过期时间</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">public</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">CacheValue</span>&lt;T&gt; &#123;<br>    <span class="hljs-keyword">private</span> T data;<br>    <span class="hljs-keyword">private</span> <span class="hljs-type">long</span> expireTime;  <span class="hljs-comment">// 逻辑过期时间</span><br><br>    <span class="hljs-keyword">public</span> <span class="hljs-type">boolean</span> <span class="hljs-title function_">isExpired</span><span class="hljs-params">()</span> &#123;<br>        <span class="hljs-keyword">return</span> System.currentTimeMillis() &gt; expireTime;<br>    &#125;<br>&#125;<br><br><span class="hljs-keyword">public</span> User <span class="hljs-title function_">getUser</span><span class="hljs-params">(<span class="hljs-type">long</span> userId)</span> &#123;<br>    <span class="hljs-type">String</span> <span class="hljs-variable">cacheKey</span> <span class="hljs-operator">=</span> <span class="hljs-string">&quot;user:&quot;</span> + userId;<br>    CacheValue&lt;User&gt; cacheValue = redis.get(cacheKey);<br><br>    <span class="hljs-keyword">if</span> (cacheValue == <span class="hljs-literal">null</span>) &#123;<br>        <span class="hljs-comment">// 缓存不存在，同步加载</span><br>        <span class="hljs-keyword">return</span> loadAndCache(userId);<br>    &#125;<br><br>    <span class="hljs-keyword">if</span> (!cacheValue.isExpired()) &#123;<br>        <span class="hljs-keyword">return</span> cacheValue.getData();  <span class="hljs-comment">// 未过期，直接返回</span><br>    &#125;<br><br>    <span class="hljs-comment">// 逻辑过期，异步刷新</span><br>    <span class="hljs-type">String</span> <span class="hljs-variable">lockKey</span> <span class="hljs-operator">=</span> <span class="hljs-string">&quot;lock:refresh:&quot;</span> + userId;<br>    <span class="hljs-keyword">if</span> (redis.setnx(lockKey, <span class="hljs-string">&quot;1&quot;</span>, <span class="hljs-number">10</span>, TimeUnit.SECONDS)) &#123;<br>        <span class="hljs-comment">// 获取到锁，异步刷新缓存</span><br>        executor.submit(() -&gt; &#123;<br>            <span class="hljs-keyword">try</span> &#123;<br>                loadAndCache(userId);<br>            &#125; <span class="hljs-keyword">finally</span> &#123;<br>                redis.del(lockKey);<br>            &#125;<br>        &#125;);<br>    &#125;<br><br>    <span class="hljs-comment">// 返回旧数据（不等待刷新完成）</span><br>    <span class="hljs-keyword">return</span> cacheValue.getData();<br>&#125;<br></code></pre></td></tr></table></figure>
+<h3 id="解决方案三：热点-key-永不过期">解决方案三：热点 Key 永不过期</h3>
+<p>对于已知的热点 Key，设置永不过期，通过后台任务定期刷新：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-meta">@Scheduled(fixedRate = 30000)</span>  <span class="hljs-comment">// 每 30 秒刷新一次</span><br><span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title function_">refreshHotKeys</span><span class="hljs-params">()</span> &#123;<br>    List&lt;String&gt; hotKeys = getHotKeyList();<br>    <span class="hljs-keyword">for</span> (String key : hotKeys) &#123;<br>        <span class="hljs-type">Object</span> <span class="hljs-variable">data</span> <span class="hljs-operator">=</span> loadFromDb(key);<br>        redis.set(key, serialize(data));  <span class="hljs-comment">// 不设置 TTL</span><br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<h3 id="三种方案对比">三种方案对比</h3>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>一致性</th>
+<th>可用性</th>
+<th>复杂度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>互斥锁</strong></td>
+<td>强一致</td>
+<td>可能阻塞</td>
+<td>中</td>
+</tr>
+<tr>
+<td><strong>逻辑过期</strong></td>
+<td>最终一致（短暂返回旧数据）</td>
+<td>高（不阻塞）</td>
+<td>高</td>
+</tr>
+<tr>
+<td><strong>永不过期</strong></td>
+<td>最终一致</td>
+<td>最高</td>
+<td>低</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="part-5-缓存雪崩">Part 5: 缓存雪崩</h2>
+<h3 id="问题描述">问题描述</h3>
+<p><strong>缓存雪崩</strong>：大量缓存 Key <strong>同时过期</strong>，或者缓存服务<strong>整体宕机</strong>，导致所有请求直达数据库。</p>
+<figure class="highlight nestedtext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs nestedtext"><span class="hljs-attribute">场景一：大量 Key 同时过期</span><br><span class="hljs-attribute">T0</span><span class="hljs-punctuation">:</span> <span class="hljs-string">系统启动时批量加载缓存，TTL 都设为 1 小时</span><br><span class="hljs-attribute">T0 + 1h</span><span class="hljs-punctuation">:</span> <span class="hljs-string">所有缓存同时过期，数据库瞬间承受全部流量</span><br><br><span class="hljs-attribute">场景二：Redis 宕机</span><br><span class="hljs-attribute">T0</span><span class="hljs-punctuation">:</span> <span class="hljs-string">Redis 集群故障</span><br><span class="hljs-attribute">T1</span><span class="hljs-punctuation">:</span> <span class="hljs-string">所有请求直达数据库</span><br><span class="hljs-attribute">T2</span><span class="hljs-punctuation">:</span> <span class="hljs-string">数据库被打垮，整个系统不可用</span><br></code></pre></td></tr></table></figure>
+<h3 id="解决方案一：随机-ttl">解决方案一：随机 TTL</h3>
+<p>给 TTL 加上随机偏移，避免同时过期：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title function_">setWithRandomTtl</span><span class="hljs-params">(String key, String value, <span class="hljs-type">int</span> baseTtlSeconds)</span> &#123;<br>    <span class="hljs-comment">// 基础 TTL + 随机偏移（0 到 baseTtl 的 20%）</span><br>    <span class="hljs-type">int</span> <span class="hljs-variable">randomOffset</span> <span class="hljs-operator">=</span> ThreadLocalRandom.current().nextInt(baseTtlSeconds / <span class="hljs-number">5</span>);<br>    <span class="hljs-type">int</span> <span class="hljs-variable">actualTtl</span> <span class="hljs-operator">=</span> baseTtlSeconds + randomOffset;<br>    redis.setex(key, actualTtl, value);<br>&#125;<br><br><span class="hljs-comment">// 使用</span><br>setWithRandomTtl(<span class="hljs-string">&quot;user:1001&quot;</span>, userData, <span class="hljs-number">3600</span>);<br><span class="hljs-comment">// 实际 TTL 在 3600 ~ 4320 秒之间随机</span><br></code></pre></td></tr></table></figure>
+<h3 id="解决方案二：多级缓存">解决方案二：多级缓存</h3>
+<figure class="highlight"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs">请求 → L1 本地缓存（Caffeine）→ L2 分布式缓存（Redis）→ 数据库<br></code></pre></td></tr></table></figure>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">public</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">MultiLevelCache</span> &#123;<br>    <span class="hljs-keyword">private</span> <span class="hljs-keyword">final</span> Cache&lt;String, Object&gt; localCache;  <span class="hljs-comment">// L1: Caffeine</span><br>    <span class="hljs-keyword">private</span> <span class="hljs-keyword">final</span> RedisTemplate&lt;String, Object&gt; redis;  <span class="hljs-comment">// L2: Redis</span><br><br>    <span class="hljs-keyword">public</span> <span class="hljs-title function_">MultiLevelCache</span><span class="hljs-params">()</span> &#123;<br>        <span class="hljs-built_in">this</span>.localCache = Caffeine.newBuilder()<br>            .maximumSize(<span class="hljs-number">10_000</span>)<br>            .expireAfterWrite(<span class="hljs-number">5</span>, TimeUnit.MINUTES)  <span class="hljs-comment">// 本地缓存 5 分钟</span><br>            .build();<br>    &#125;<br><br>    <span class="hljs-keyword">public</span> Object <span class="hljs-title function_">get</span><span class="hljs-params">(String key)</span> &#123;<br>        <span class="hljs-comment">// L1: 本地缓存</span><br>        <span class="hljs-type">Object</span> <span class="hljs-variable">value</span> <span class="hljs-operator">=</span> localCache.getIfPresent(key);<br>        <span class="hljs-keyword">if</span> (value != <span class="hljs-literal">null</span>) <span class="hljs-keyword">return</span> value;<br><br>        <span class="hljs-comment">// L2: Redis</span><br>        value = redis.opsForValue().get(key);<br>        <span class="hljs-keyword">if</span> (value != <span class="hljs-literal">null</span>) &#123;<br>            localCache.put(key, value);  <span class="hljs-comment">// 回填 L1</span><br>            <span class="hljs-keyword">return</span> value;<br>        &#125;<br><br>        <span class="hljs-comment">// L3: 数据库</span><br>        value = loadFromDb(key);<br>        <span class="hljs-keyword">if</span> (value != <span class="hljs-literal">null</span>) &#123;<br>            redis.opsForValue().set(key, value, <span class="hljs-number">1</span>, TimeUnit.HOURS);  <span class="hljs-comment">// 写入 L2</span><br>            localCache.put(key, value);  <span class="hljs-comment">// 写入 L1</span><br>        &#125;<br>        <span class="hljs-keyword">return</span> value;<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p><strong>多级缓存的一致性问题</strong>：</p>
+<p>当数据更新时，需要同时失效 L1 和 L2：</p>
+<ul>
+<li>L2（Redis）：直接 DEL</li>
+<li>L1（本地缓存）：通过 Redis Pub/Sub 或消息队列通知所有应用实例</li>
+</ul>
+<h3 id="解决方案三：熔断降级">解决方案三：熔断降级</h3>
+<p>当数据库压力过大时，启动熔断保护：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-meta">@HystrixCommand(</span><br><span class="hljs-meta">    fallbackMethod = &quot;getUserFallback&quot;,</span><br><span class="hljs-meta">    commandProperties = &#123;</span><br><span class="hljs-meta">        @HystrixProperty(name = &quot;circuitBreaker.requestVolumeThreshold&quot;, value = &quot;20&quot;),</span><br><span class="hljs-meta">        @HystrixProperty(name = &quot;circuitBreaker.errorThresholdPercentage&quot;, value = &quot;50&quot;),</span><br><span class="hljs-meta">        @HystrixProperty(name = &quot;circuitBreaker.sleepWindowInMilliseconds&quot;, value = &quot;5000&quot;)</span><br><span class="hljs-meta">    &#125;</span><br><span class="hljs-meta">)</span><br><span class="hljs-keyword">public</span> User <span class="hljs-title function_">getUser</span><span class="hljs-params">(<span class="hljs-type">long</span> userId)</span> &#123;<br>    <span class="hljs-keyword">return</span> userDao.findById(userId);<br>&#125;<br><br><span class="hljs-keyword">public</span> User <span class="hljs-title function_">getUserFallback</span><span class="hljs-params">(<span class="hljs-type">long</span> userId)</span> &#123;<br>    <span class="hljs-comment">// 降级策略：返回默认值或缓存的旧数据</span><br>    <span class="hljs-keyword">return</span> User.defaultUser();<br>&#125;<br></code></pre></td></tr></table></figure>
+<h3 id="解决方案四：redis-高可用">解决方案四：Redis 高可用</h3>
+<table>
+<thead>
+<tr>
+<th>部署模式</th>
+<th>说明</th>
+<th>可用性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>主从复制</strong></td>
+<td>一主多从，读写分离</td>
+<td>中</td>
+</tr>
+<tr>
+<td><strong>Sentinel</strong></td>
+<td>自动故障转移</td>
+<td>高</td>
+</tr>
+<tr>
+<td><strong>Cluster</strong></td>
+<td>分片 + 副本</td>
+<td>最高</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="part-6-缓存一致性">Part 6: 缓存一致性</h2>
+<h3 id="最终一致性方案：延迟双删">最终一致性方案：延迟双删</h3>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title function_">updateUser</span><span class="hljs-params">(User user)</span> &#123;<br>    <span class="hljs-comment">// 1. 删除缓存</span><br>    redis.del(<span class="hljs-string">&quot;user:&quot;</span> + user.getId());<br><br>    <span class="hljs-comment">// 2. 更新数据库</span><br>    userDao.update(user);<br><br>    <span class="hljs-comment">// 3. 延迟再次删除缓存（防止并发读写导致的不一致）</span><br>    scheduler.schedule(() -&gt; &#123;<br>        redis.del(<span class="hljs-string">&quot;user:&quot;</span> + user.getId());<br>    &#125;, <span class="hljs-number">500</span>, TimeUnit.MILLISECONDS);<br>&#125;<br></code></pre></td></tr></table></figure>
+<p><strong>为什么需要延迟双删？</strong></p>
+<figure class="highlight avrasm"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><code class="hljs avrasm">时间线（不使用延迟双删时的问题）：<br><span class="hljs-symbol">T1:</span> 线程 A 删除缓存<br><span class="hljs-symbol">T2:</span> 线程 B 读取缓存（未命中），从数据库读取旧值<br><span class="hljs-symbol">T3:</span> 线程 A 更新数据库<br><span class="hljs-symbol">T4:</span> 线程 B 将旧值写入缓存<br>→ 缓存中是旧值，数据库中是新值，不一致！<br><br>使用延迟双删：<br><span class="hljs-symbol">T1:</span> 线程 A 删除缓存<br><span class="hljs-symbol">T2:</span> 线程 B 读取旧值并写入缓存<br><span class="hljs-symbol">T3:</span> 线程 A 更新数据库<br><span class="hljs-symbol">T4:</span> 线程 A 延迟 <span class="hljs-number">500</span>ms 后再次删除缓存<br>→ 缓存被清除，下次读取会加载新值<br></code></pre></td></tr></table></figure>
+<h3 id="强一致性方案：分布式锁">强一致性方案：分布式锁</h3>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">public</span> User <span class="hljs-title function_">getUser</span><span class="hljs-params">(<span class="hljs-type">long</span> userId)</span> &#123;<br>    <span class="hljs-type">String</span> <span class="hljs-variable">lockKey</span> <span class="hljs-operator">=</span> <span class="hljs-string">&quot;lock:user:&quot;</span> + userId;<br>    <span class="hljs-type">RLock</span> <span class="hljs-variable">lock</span> <span class="hljs-operator">=</span> redisson.getLock(lockKey);<br>    lock.lock();<br>    <span class="hljs-keyword">try</span> &#123;<br>        <span class="hljs-comment">// 在锁内读取缓存或数据库</span><br>        <span class="hljs-type">String</span> <span class="hljs-variable">cached</span> <span class="hljs-operator">=</span> redis.get(<span class="hljs-string">&quot;user:&quot;</span> + userId);<br>        <span class="hljs-keyword">if</span> (cached != <span class="hljs-literal">null</span>) <span class="hljs-keyword">return</span> deserialize(cached);<br><br>        <span class="hljs-type">User</span> <span class="hljs-variable">user</span> <span class="hljs-operator">=</span> userDao.findById(userId);<br>        redis.setex(<span class="hljs-string">&quot;user:&quot;</span> + userId, <span class="hljs-number">3600</span>, serialize(user));<br>        <span class="hljs-keyword">return</span> user;<br>    &#125; <span class="hljs-keyword">finally</span> &#123;<br>        lock.unlock();<br>    &#125;<br>&#125;<br><br><span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title function_">updateUser</span><span class="hljs-params">(User user)</span> &#123;<br>    <span class="hljs-type">String</span> <span class="hljs-variable">lockKey</span> <span class="hljs-operator">=</span> <span class="hljs-string">&quot;lock:user:&quot;</span> + user.getId();<br>    <span class="hljs-type">RLock</span> <span class="hljs-variable">lock</span> <span class="hljs-operator">=</span> redisson.getLock(lockKey);<br>    lock.lock();<br>    <span class="hljs-keyword">try</span> &#123;<br>        userDao.update(user);<br>        redis.del(<span class="hljs-string">&quot;user:&quot;</span> + user.getId());<br>    &#125; <span class="hljs-keyword">finally</span> &#123;<br>        lock.unlock();<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p><strong>代价</strong>：性能下降（所有读写都需要获取锁）。只适用于对一致性要求极高的场景。</p>
+<h3 id="基于-binlog-的异步同步">基于 Binlog 的异步同步</h3>
+<figure class="highlight nix"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs nix">应用 → 数据库（写入）<br>                ↓<br>         Binlog（变更日志）<br>                ↓<br>         Canal <span class="hljs-symbol">/</span> Debezium（监听 Binlog）<br>                ↓<br>         消息队列（Kafka）<br>                ↓<br>         缓存更新服务 → Redis（更新<span class="hljs-operator">/</span>删除缓存）<br></code></pre></td></tr></table></figure>
+<p>优势：</p>
+<ul>
+<li>应用代码无侵入</li>
+<li>保证最终一致性</li>
+<li>解耦缓存更新逻辑</li>
+</ul>
+<p>劣势：</p>
+<ul>
+<li>架构复杂度高</li>
+<li>有一定延迟（通常 &lt; 1 秒）</li>
+</ul>
+<hr>
+<h2 id="part-7-分布式锁">Part 7: 分布式锁</h2>
+<h3 id="redis-分布式锁的实现">Redis 分布式锁的实现</h3>
+<p><strong>基本实现</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-comment">// 加锁</span><br><span class="hljs-keyword">public</span> <span class="hljs-type">boolean</span> <span class="hljs-title function_">tryLock</span><span class="hljs-params">(String lockKey, String requestId, <span class="hljs-type">int</span> expireSeconds)</span> &#123;<br>    <span class="hljs-type">String</span> <span class="hljs-variable">result</span> <span class="hljs-operator">=</span> redis.set(lockKey, requestId, <span class="hljs-string">&quot;NX&quot;</span>, <span class="hljs-string">&quot;EX&quot;</span>, expireSeconds);<br>    <span class="hljs-keyword">return</span> <span class="hljs-string">&quot;OK&quot;</span>.equals(result);<br>&#125;<br><br><span class="hljs-comment">// 解锁（Lua 脚本保证原子性）</span><br><span class="hljs-keyword">public</span> <span class="hljs-type">boolean</span> <span class="hljs-title function_">unlock</span><span class="hljs-params">(String lockKey, String requestId)</span> &#123;<br>    <span class="hljs-type">String</span> <span class="hljs-variable">luaScript</span> <span class="hljs-operator">=</span><br>        <span class="hljs-string">&quot;if redis.call(&#x27;get&#x27;, KEYS[1]) == ARGV[1] then &quot;</span> +<br>        <span class="hljs-string">&quot;    return redis.call(&#x27;del&#x27;, KEYS[1]) &quot;</span> +<br>        <span class="hljs-string">&quot;else &quot;</span> +<br>        <span class="hljs-string">&quot;    return 0 &quot;</span> +<br>        <span class="hljs-string">&quot;end&quot;</span>;<br>    <span class="hljs-type">Long</span> <span class="hljs-variable">result</span> <span class="hljs-operator">=</span> redis.eval(luaScript, Collections.singletonList(lockKey),<br>                             Collections.singletonList(requestId));<br>    <span class="hljs-keyword">return</span> result == <span class="hljs-number">1L</span>;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p><strong>为什么解锁需要 Lua 脚本？</strong></p>
+<p>如果用 <code>GET + DEL</code> 两步操作，在 GET 和 DEL 之间锁可能已经过期并被其他线程获取，DEL 会错误地删除别人的锁。Lua 脚本在 Redis 中是原子执行的。</p>
+<h3 id="锁续期-watchdog">锁续期（Watchdog）</h3>
+<p>如果业务执行时间超过锁的过期时间，锁会自动释放，导致并发问题。Redisson 的 Watchdog 机制：</p>
+<figure class="highlight markdown"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs markdown"><span class="hljs-bullet">1.</span> 加锁时设置 TTL = 30 秒<br><span class="hljs-bullet">2.</span> 启动一个后台线程（Watchdog），每 10 秒检查一次<br><span class="hljs-bullet">3.</span> 如果锁仍然被持有，续期到 30 秒<br><span class="hljs-bullet">4.</span> 如果持有锁的线程崩溃，Watchdog 也会停止，锁自然过期<br></code></pre></td></tr></table></figure>
+<h3 id="redlock-算法">RedLock 算法</h3>
+<p>单 Redis 实例的分布式锁在 Redis 故障时不可靠。RedLock 使用多个独立的 Redis 实例：</p>
+<figure class="highlight markdown"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs markdown"><span class="hljs-bullet">1.</span> 获取当前时间 T1<br><span class="hljs-bullet">2.</span> 依次向 N 个 Redis 实例尝试加锁（超时时间很短）<br><span class="hljs-bullet">3.</span> 如果在超过 N/2 + 1 个实例上加锁成功，且总耗时 &lt; 锁的 TTL<br><span class="hljs-bullet">4.</span> 则认为加锁成功，锁的有效时间 = TTL - 加锁耗时<br><span class="hljs-bullet">5.</span> 否则，向所有实例发送解锁请求<br></code></pre></td></tr></table></figure>
+<p><strong>争议</strong>：Martin Kleppmann 指出 RedLock 在某些故障场景下仍然不安全（如时钟跳变）。对于强一致性需求，应使用 ZooKeeper 或 etcd。</p>
+<hr>
+<h2 id="part-8-热点-key-问题">Part 8: 热点 Key 问题</h2>
+<h3 id="问题描述">问题描述</h3>
+<p>某个 Key 被大量请求访问（如微博热搜、秒杀商品），单个 Redis 节点承受不住。</p>
+<h3 id="解决方案一：本地缓存">解决方案一：本地缓存</h3>
+<p>将热点 Key 缓存在应用本地，减少对 Redis 的访问：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">private</span> <span class="hljs-keyword">final</span> Cache&lt;String, Object&gt; hotKeyCache = Caffeine.newBuilder()<br>    .maximumSize(<span class="hljs-number">1000</span>)<br>    .expireAfterWrite(<span class="hljs-number">1</span>, TimeUnit.SECONDS)  <span class="hljs-comment">// 极短 TTL</span><br>    .build();<br><br><span class="hljs-keyword">public</span> Object <span class="hljs-title function_">getHotKey</span><span class="hljs-params">(String key)</span> &#123;<br>    <span class="hljs-keyword">return</span> hotKeyCache.get(key, k -&gt; redis.get(k));<br>&#125;<br></code></pre></td></tr></table></figure>
+<h3 id="解决方案二：key-分片">解决方案二：Key 分片</h3>
+<p>将一个热点 Key 拆分为多个 Key，分散到不同的 Redis 节点：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">public</span> Object <span class="hljs-title function_">getHotKey</span><span class="hljs-params">(String key)</span> &#123;<br>    <span class="hljs-comment">// 将 key 分散到 10 个分片</span><br>    <span class="hljs-type">int</span> <span class="hljs-variable">shard</span> <span class="hljs-operator">=</span> ThreadLocalRandom.current().nextInt(<span class="hljs-number">10</span>);<br>    <span class="hljs-type">String</span> <span class="hljs-variable">shardKey</span> <span class="hljs-operator">=</span> key + <span class="hljs-string">&quot;:shard:&quot;</span> + shard;<br><br>    <span class="hljs-type">Object</span> <span class="hljs-variable">value</span> <span class="hljs-operator">=</span> redis.get(shardKey);<br>    <span class="hljs-keyword">if</span> (value != <span class="hljs-literal">null</span>) <span class="hljs-keyword">return</span> value;<br><br>    <span class="hljs-comment">// 未命中时从数据库加载，并写入所有分片</span><br>    value = loadFromDb(key);<br>    <span class="hljs-keyword">for</span> (<span class="hljs-type">int</span> <span class="hljs-variable">i</span> <span class="hljs-operator">=</span> <span class="hljs-number">0</span>; i &lt; <span class="hljs-number">10</span>; i++) &#123;<br>        redis.setex(key + <span class="hljs-string">&quot;:shard:&quot;</span> + i, <span class="hljs-number">3600</span>, serialize(value));<br>    &#125;<br>    <span class="hljs-keyword">return</span> value;<br>&#125;<br></code></pre></td></tr></table></figure>
+<h3 id="解决方案三：热点-key-发现">解决方案三：热点 Key 发现</h3>
+<p>自动发现热点 Key 并进行特殊处理：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>实现</th>
+<th>优势</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>客户端统计</strong></td>
+<td>在应用中统计 Key 的访问频率</td>
+<td>实时性好</td>
+</tr>
+<tr>
+<td><strong>Redis 监控</strong></td>
+<td><code>redis-cli --hotkeys</code>（基于 LFU）</td>
+<td>无侵入</td>
+</tr>
+<tr>
+<td><strong>代理层统计</strong></td>
+<td>在 Redis 代理（如 Twemproxy）中统计</td>
+<td>全局视角</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="part-9-缓存预热与更新策略">Part 9: 缓存预热与更新策略</h2>
+<h3 id="缓存预热">缓存预热</h3>
+<p>系统启动时，主动加载热点数据到缓存：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-meta">@Component</span><br><span class="hljs-keyword">public</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">CacheWarmer</span> <span class="hljs-keyword">implements</span> <span class="hljs-title class_">ApplicationRunner</span> &#123;<br><br>    <span class="hljs-meta">@Override</span><br>    <span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title function_">run</span><span class="hljs-params">(ApplicationArguments args)</span> &#123;<br>        <span class="hljs-comment">// 预热 Top 1000 热门商品</span><br>        List&lt;Long&gt; hotProductIds = productDao.findTopHotIds(<span class="hljs-number">1000</span>);<br>        <span class="hljs-keyword">for</span> (Long productId : hotProductIds) &#123;<br>            <span class="hljs-type">Product</span> <span class="hljs-variable">product</span> <span class="hljs-operator">=</span> productDao.findById(productId);<br>            redis.setex(<span class="hljs-string">&quot;product:&quot;</span> + productId, <span class="hljs-number">3600</span>, serialize(product));<br>        &#125;<br><br>        <span class="hljs-comment">// 预热用户配置</span><br>        List&lt;Config&gt; configs = configDao.findAll();<br>        <span class="hljs-keyword">for</span> (Config config : configs) &#123;<br>            redis.set(<span class="hljs-string">&quot;config:&quot;</span> + config.getKey(), serialize(config));<br>        &#125;<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<h3 id="缓存更新的最佳实践">缓存更新的最佳实践</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>读多写少</strong></td>
+<td>Cache-Aside + 延迟双删</td>
+</tr>
+<tr>
+<td><strong>读多写多</strong></td>
+<td>Write-Through + 短 TTL</td>
+</tr>
+<tr>
+<td><strong>写多读少</strong></td>
+<td>Write-Behind（异步写回）</td>
+</tr>
+<tr>
+<td><strong>强一致性</strong></td>
+<td>分布式锁 或 Binlog 同步</td>
+</tr>
+<tr>
+<td><strong>热点数据</strong></td>
+<td>本地缓存 + Key 分片</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="总结">总结</h2>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>原因</th>
+<th>核心解决方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>缓存穿透</strong></td>
+<td>查询不存在的数据</td>
+<td>缓存空值 + 布隆过滤器</td>
+</tr>
+<tr>
+<td><strong>缓存击穿</strong></td>
+<td>热点 Key 过期</td>
+<td>互斥锁 + 逻辑过期</td>
+</tr>
+<tr>
+<td><strong>缓存雪崩</strong></td>
+<td>大量 Key 同时过期 / Redis 宕机</td>
+<td>随机 TTL + 多级缓存 + 熔断</td>
+</tr>
+<tr>
+<td><strong>缓存一致性</strong></td>
+<td>缓存与数据库数据不同步</td>
+<td>延迟双删 + Binlog 同步</td>
+</tr>
+<tr>
+<td><strong>热点 Key</strong></td>
+<td>单 Key 访问量过大</td>
+<td>本地缓存 + Key 分片</td>
+</tr>
+</tbody>
+</table>
+<p><strong>核心设计原则</strong>：</p>
+<ol>
+<li><strong>缓存是加速手段，不是数据源</strong>——数据库才是 Source of Truth</li>
+<li><strong>接受最终一致性</strong>——追求强一致性的代价通常过高</li>
+<li><strong>防御性设计</strong>——假设缓存随时可能失效，系统仍能工作</li>
+<li><strong>监控先行</strong>——命中率、延迟、内存使用是核心指标</li>
+</ol>
+<h2 id="参考资料">参考资料</h2>
+<blockquote>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://redis.io/docs/">Redis 官方文档</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/ben-manes/caffeine">Caffeine Cache</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/alibaba/canal">Canal - 阿里巴巴 MySQL Binlog 增量订阅</a></li>
+<li><a target="_blank" rel="noopener" href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Martin Kleppmann - How to do distributed locking</a></li>
+<li><a target="_blank" rel="noopener" href="https://dataintensive.net/">Designing Data-Intensive Applications - Martin Kleppmann</a></li>
+</ul>
+</blockquote>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2025/07/29/%E7%BC%93%E5%AD%98%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">https://magicliang.github.io/2025/07/29/%E7%BC%93%E5%AD%98%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Redis/">Redis</a><a class="post-meta__tags" href="/tags/%E7%BC%93%E5%AD%98/">缓存</a><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-84.jpg" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2025/07/28/Redis-%E7%9A%84%E7%A5%9E%E5%A5%87%E7%94%A8%E4%BE%8B/" title="Redis 经典用例全解：从数据结构到系统设计"><img class="cover" src="/img/wall-paper-168.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-07-28</div><div class="info-item-2">Redis 经典用例全解：从数据结构到系统设计</div></div><div class="info-2"><div class="info-item-1">Redis 不只是缓存。它是一把瑞士军刀——凭借五种基础数据结构和若干扩展模块，Redis 能解决从分布式锁到社交网络、从排行榜到消息队列的几乎所有高频系统设计问题。 本文的目标是：建立一套从业务问题到 Redis 数据结构的映射思维。对于每个用例，我们都会回答三个问题：  业务问题是什么？ 需求的本质是什么操作？ 为什么选 Redis？ 相比 MySQL、MQ 等方案，Redis 的优势和代价是什么？ 怎么设计？ 用哪种数据结构，Key 怎么命名，核心命令是什么？  mindmap   root((Redis 用例全景))     基础存储       缓存策略         Cache-Aside         穿透/击穿/雪崩       分布式会话         Session 共享         验证码/短链接       分布式 ID         INCR 自增         日期分段     并发控制       分布式锁         SET NX         Redlock         看门狗续期       计数器与限流        ...</div></div></div></a><a class="pagination-related" href="/2019/11/09/Redis-%E7%AC%94%E8%AE%B0%E4%B9%8B%E5%8D%81%E4%B8%80-%E9%9B%86%E7%BE%A4-Cluster/" title="Redis 笔记之十一-集群 Cluster"><img class="cover" src="/img/wall-paper-47.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2019-11-09</div><div class="info-item-2">Redis 笔记之十一-集群 Cluster</div></div><div class="info-2"><div class="info-item-1">背景 在 Redis Cluster 方案诞生以前，在 Redis 集群遇到单机资源和流量瓶颈时，有两种常见分布式解决方案：  客户端方案：需要自己处理分区逻辑、路由、故障转移（有时候 Routing、LB 和 Failover是同一个问题，都需要通过 routing 技术来切换流量的 endpoint）。 代理方案：减轻了客户端的职责和压力，架构上的负担过重。  Redis Cluster 的出现，极大地降低了架构师的负担，解放了生产力。 数据分布 数据分布理论 |分区方式|特点|代表产品|取舍逻辑| |:–:|:–:|:–:| |哈希分区| 离散度好 数据分布业务无关 无法顺序访问| KV型 Redis Cluster Cassandra Dynamo Elastic Search|如果需要平衡地存储大量数据而只有随机访问其中的若干条，则可以使用简单的哈希分区| |顺序分区|离散度易倾斜 数据分布业务相关 可顺序访问| 表型 Bigtable HBase Hypertable|如果需要存储大量数据且需要支持区间查找，则也需要使用简单的顺序分区，如果要解决负载均衡的问题可能需要...</div></div></div></a><a class="pagination-related" href="/2019/10/30/Redis-%E7%AC%94%E8%AE%B0%E4%B9%8B%E5%8D%81-%E5%93%A8%E5%85%B5-Sentinel/" title="Redis 笔记之十-哨兵 Sentinel"><img class="cover" src="/img/wall-paper-100.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2019-10-30</div><div class="info-item-2">Redis 笔记之十-哨兵 Sentinel</div></div><div class="info-2"><div class="info-item-1">Redis 有若干套高可用实现方案。2.8 开始提供哨兵功能（不要使用更低版本的哨兵，可能有 bug）。 基本概念  主从复制模式的问题 Redis 天然就带有主从复制的功能，但主从复制有若干缺点：  需要手工干预，缺乏自动 FO 机制-分布式高可用问题。 单机的写能力有限-分布式容量问题。 单机的存储能力有限-分布式容量问题。  一个经典的高可用场景 当一个主从集群的 主节点 失效的时候，经典的恢复步骤如下：  主节点失效。 选出新的从节点，slaveof no one。 先更新应用方的连接。 再让其他从节点换主。 再把恢复好的主节点作为新的从节点复制新的主节点。  3 和 4 的步骤可以互换。这种需要手工介入的运行机制不能被当作高可用的。而 sentinel 的作用是把这些经典步骤从手工实现为自动。 Sentinel 的高可用性 Sentinel 方案是在原生的 Master-Slave 集群之外加上一个 Sentinel 集群。 每个 Sentinel 节点会监控其他 Sentinel 节点和所有 Redis 节点。任何一个不可达的节点，它都会将其做下线标识。 如果标识的是...</div></div></div></a><a class="pagination-related" href="/2022/01/13/Redis-%E7%AC%94%E8%AE%B0%E4%B9%8B%EF%BC%9A%E5%86%85%E5%AD%98%E8%B0%83%E4%BC%98/" title="Redis 笔记之：内存调优"><img class="cover" src="/img/wall-paper-122.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2022-01-13</div><div class="info-item-2">Redis 笔记之：内存调优</div></div><div class="info-2"><div class="info-item-1">Redis 的 memory info Redis 的内存使用状况可以使用info memory来获取。 需要重点关注的值是 used_memory_rss（用于存储消耗的物理内存），used_memory（用于存储消耗的内存= 物理内存 + 硬盘），以及他们的比值mem_fragmentation_ratio（used_memory_rss/used_memory）。 used_memory_rss或者used_memory很高时，意味着当前的 Redis 实例正在蚕食系统中的内存/硬盘资源。 当这个mem_fragmentation_ratio大于 1 的时候，意味着用于存储消耗的物理内存超过了 Redis 自己掌控的内存值，也就意味着当前有些未能回收的内存泄漏或者碎片。 当这个mem_fragmentation_ratio小于 1 的时候，这意味着有一部分用于存储的内存，实际上是在使用虚拟内存中的 swap 空间，此时 Redis 的性能会非常差。 Redis 的内存轮廓 memory_used = 进程自身消耗的内存 + 存储对象的内存（大头） + buffer 内存 m...</div></div></div></a><a class="pagination-related" href="/2024/11/04/Redis-%E5%BC%80%E5%8F%91%E4%B8%8E%E8%BF%90%E7%BB%B4/" title="Redis 开发与运维"><img class="cover" src="/2024/11/04/Redis-%E5%BC%80%E5%8F%91%E4%B8%8E%E8%BF%90%E7%BB%B4/cover.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2024-11-04</div><div class="info-item-2">Redis 开发与运维</div></div><div class="info-2"><div class="info-item-1">Redis 特性 Redis 高性能的原因 Redis 的读写性能达到 10w/s，主要基于以下原因：  数据主要放在内存中。 Redis 使用距离 OS “层次更近”的 C 语言实现。 Redis 使用单线程架构，没有很高的 lock contention。 IO 多路复用技术 Redis 的代码实现得优雅而兼顾性能  Redis 的数据结构 Redis 本身是 Remote Dictionary Server 的简称，其中，老的、常见的数据结构有：  字符串 哈希 列表 set（集合） zset（有序集合）  但后来追加了几种新颖的数据机构，包括：bitmap、hyperloglog，更后来更添加了 GEO 地理信息相关的工具。 基于这些数据结构，我们可以实现一些常见的功能：  键过期，可以用来实现缓存，进而实现分布式锁。 发布订阅功能，进而实现消息系统（TODO）。 Lua 脚本功能，可以实现自定义的 Redis 命令（TODO）。 实现简单的事务功能，能在一定程度上实现事务特性。 提供流水线功能，能够让客户端一次性把一批命令一次性上传到 Redis 里，能够合并 IO 并...</div></div></div></a><a class="pagination-related" href="/2020/03/23/%E7%BC%93%E5%AD%98%E7%9A%84%E5%A5%97%E8%B7%AF/" title="缓存的套路"><img class="cover" src="/img/wall-paper-53.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2020-03-23</div><div class="info-item-2">缓存的套路</div></div><div class="info-2"><div class="info-item-1">什么时候应该使用缓存？ 所有高耗时，需要吞吐量，而不太严格依赖强一致性的场景-不管是计算密集型还是 io 密集型，都可以使用缓存加速。 多级缓存问题 大多数情况下不要使用多级缓存。 多级缓存要严格设计差异化的冷热数据分离策略，还要考虑分布式的缓存失效+更新的问题，很复杂。 勉强可用的多级缓存应该是远端一级缓存，近端二级缓存。 本地多级缓存非常容易出一致性问题-慎用 MyBatis 和 Hibernate 的二级缓存。 外部缓存设计思路 外部缓存通常指的是分布式缓存组件或者中间件。 内文直接参考《缓存更新的套路》 缓存更新的设计模式.xmind  Redis 内部缓存的用法 内部缓存通常指的是进程内缓存，in-memory-cache。 Spring Cache 依靠一个 CacheManager SPI 机制，来跟不同的 cache 实现打交道。大多数时候我们应该用 CacheManager 封装好的 wrapper api 来跟缓存打交道，极少数情况下我们应该 getNativeCache 来使用专有 API。  Guava Cache 就是给 ConcurrentHashMa...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#part-1-%E7%BC%93%E5%AD%98%E7%9A%84%E5%9F%BA%E6%9C%AC%E5%8E%9F%E7%90%86"><span class="toc-number">1.</span> <span class="toc-text">Part 1: 缓存的基本原理</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9C%80%E8%A6%81%E7%BC%93%E5%AD%98"><span class="toc-number">1.1.</span> <span class="toc-text">为什么需要缓存</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%BC%93%E5%AD%98%E7%9A%84%E5%91%BD%E4%B8%AD%E7%8E%87"><span class="toc-number">1.2.</span> <span class="toc-text">缓存的命中率</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%BC%93%E5%AD%98%E7%9A%84%E5%88%86%E7%B1%BB"><span class="toc-number">1.3.</span> <span class="toc-text">缓存的分类</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-2-%E7%BC%93%E5%AD%98%E8%AF%BB%E5%86%99%E7%AD%96%E7%95%A5"><span class="toc-number">2.</span> <span class="toc-text">Part 2: 缓存读写策略</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#cache-aside-%E6%97%81%E8%B7%AF%E7%BC%93%E5%AD%98"><span class="toc-number">2.1.</span> <span class="toc-text">Cache-Aside（旁路缓存）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#read-through-write-through"><span class="toc-number">2.2.</span> <span class="toc-text">Read-Through &#x2F; Write-Through</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#write-behind-%E5%BC%82%E6%AD%A5%E5%86%99%E5%9B%9E"><span class="toc-number">2.3.</span> <span class="toc-text">Write-Behind（异步写回）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#refresh-ahead-%E9%A2%84%E5%88%B7%E6%96%B0"><span class="toc-number">2.4.</span> <span class="toc-text">Refresh-Ahead（预刷新）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-3-%E7%BC%93%E5%AD%98%E7%A9%BF%E9%80%8F"><span class="toc-number">3.</span> <span class="toc-text">Part 3: 缓存穿透</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%97%AE%E9%A2%98%E6%8F%8F%E8%BF%B0"><span class="toc-number">3.1.</span> <span class="toc-text">问题描述</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9A%E7%BC%93%E5%AD%98%E7%A9%BA%E5%80%BC"><span class="toc-number">3.2.</span> <span class="toc-text">解决方案一：缓存空值</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9A%E5%B8%83%E9%9A%86%E8%BF%87%E6%BB%A4%E5%99%A8"><span class="toc-number">3.3.</span> <span class="toc-text">解决方案二：布隆过滤器</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%B8%89%EF%BC%9A%E5%8F%82%E6%95%B0%E6%A0%A1%E9%AA%8C"><span class="toc-number">3.4.</span> <span class="toc-text">解决方案三：参数校验</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%89%E7%A7%8D%E6%96%B9%E6%A1%88%E5%AF%B9%E6%AF%94"><span class="toc-number">3.5.</span> <span class="toc-text">三种方案对比</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-4-%E7%BC%93%E5%AD%98%E5%87%BB%E7%A9%BF"><span class="toc-number">4.</span> <span class="toc-text">Part 4: 缓存击穿</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%97%AE%E9%A2%98%E6%8F%8F%E8%BF%B0"><span class="toc-number">4.1.</span> <span class="toc-text">问题描述</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9A%E4%BA%92%E6%96%A5%E9%94%81-mutex-lock"><span class="toc-number">4.2.</span> <span class="toc-text">解决方案一：互斥锁（Mutex Lock）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9A%E9%80%BB%E8%BE%91%E8%BF%87%E6%9C%9F"><span class="toc-number">4.3.</span> <span class="toc-text">解决方案二：逻辑过期</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%B8%89%EF%BC%9A%E7%83%AD%E7%82%B9-key-%E6%B0%B8%E4%B8%8D%E8%BF%87%E6%9C%9F"><span class="toc-number">4.4.</span> <span class="toc-text">解决方案三：热点 Key 永不过期</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%89%E7%A7%8D%E6%96%B9%E6%A1%88%E5%AF%B9%E6%AF%94"><span class="toc-number">4.5.</span> <span class="toc-text">三种方案对比</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-5-%E7%BC%93%E5%AD%98%E9%9B%AA%E5%B4%A9"><span class="toc-number">5.</span> <span class="toc-text">Part 5: 缓存雪崩</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%97%AE%E9%A2%98%E6%8F%8F%E8%BF%B0"><span class="toc-number">5.1.</span> <span class="toc-text">问题描述</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9A%E9%9A%8F%E6%9C%BA-ttl"><span class="toc-number">5.2.</span> <span class="toc-text">解决方案一：随机 TTL</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9A%E5%A4%9A%E7%BA%A7%E7%BC%93%E5%AD%98"><span class="toc-number">5.3.</span> <span class="toc-text">解决方案二：多级缓存</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%B8%89%EF%BC%9A%E7%86%94%E6%96%AD%E9%99%8D%E7%BA%A7"><span class="toc-number">5.4.</span> <span class="toc-text">解决方案三：熔断降级</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E5%9B%9B%EF%BC%9Aredis-%E9%AB%98%E5%8F%AF%E7%94%A8"><span class="toc-number">5.5.</span> <span class="toc-text">解决方案四：Redis 高可用</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-6-%E7%BC%93%E5%AD%98%E4%B8%80%E8%87%B4%E6%80%A7"><span class="toc-number">6.</span> <span class="toc-text">Part 6: 缓存一致性</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%9C%80%E7%BB%88%E4%B8%80%E8%87%B4%E6%80%A7%E6%96%B9%E6%A1%88%EF%BC%9A%E5%BB%B6%E8%BF%9F%E5%8F%8C%E5%88%A0"><span class="toc-number">6.1.</span> <span class="toc-text">最终一致性方案：延迟双删</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%BC%BA%E4%B8%80%E8%87%B4%E6%80%A7%E6%96%B9%E6%A1%88%EF%BC%9A%E5%88%86%E5%B8%83%E5%BC%8F%E9%94%81"><span class="toc-number">6.2.</span> <span class="toc-text">强一致性方案：分布式锁</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9F%BA%E4%BA%8E-binlog-%E7%9A%84%E5%BC%82%E6%AD%A5%E5%90%8C%E6%AD%A5"><span class="toc-number">6.3.</span> <span class="toc-text">基于 Binlog 的异步同步</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-7-%E5%88%86%E5%B8%83%E5%BC%8F%E9%94%81"><span class="toc-number">7.</span> <span class="toc-text">Part 7: 分布式锁</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#redis-%E5%88%86%E5%B8%83%E5%BC%8F%E9%94%81%E7%9A%84%E5%AE%9E%E7%8E%B0"><span class="toc-number">7.1.</span> <span class="toc-text">Redis 分布式锁的实现</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%94%81%E7%BB%AD%E6%9C%9F-watchdog"><span class="toc-number">7.2.</span> <span class="toc-text">锁续期（Watchdog）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#redlock-%E7%AE%97%E6%B3%95"><span class="toc-number">7.3.</span> <span class="toc-text">RedLock 算法</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-8-%E7%83%AD%E7%82%B9-key-%E9%97%AE%E9%A2%98"><span class="toc-number">8.</span> <span class="toc-text">Part 8: 热点 Key 问题</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%97%AE%E9%A2%98%E6%8F%8F%E8%BF%B0"><span class="toc-number">8.1.</span> <span class="toc-text">问题描述</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9A%E6%9C%AC%E5%9C%B0%E7%BC%93%E5%AD%98"><span class="toc-number">8.2.</span> <span class="toc-text">解决方案一：本地缓存</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9Akey-%E5%88%86%E7%89%87"><span class="toc-number">8.3.</span> <span class="toc-text">解决方案二：Key 分片</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%B8%89%EF%BC%9A%E7%83%AD%E7%82%B9-key-%E5%8F%91%E7%8E%B0"><span class="toc-number">8.4.</span> <span class="toc-text">解决方案三：热点 Key 发现</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-9-%E7%BC%93%E5%AD%98%E9%A2%84%E7%83%AD%E4%B8%8E%E6%9B%B4%E6%96%B0%E7%AD%96%E7%95%A5"><span class="toc-number">9.</span> <span class="toc-text">Part 9: 缓存预热与更新策略</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%BC%93%E5%AD%98%E9%A2%84%E7%83%AD"><span class="toc-number">9.1.</span> <span class="toc-text">缓存预热</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%BC%93%E5%AD%98%E6%9B%B4%E6%96%B0%E7%9A%84%E6%9C%80%E4%BD%B3%E5%AE%9E%E8%B7%B5"><span class="toc-number">9.2.</span> <span class="toc-text">缓存更新的最佳实践</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">10.</span> <span class="toc-text">总结</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">11.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.1</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.2</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.2"></script><script src="/js/main.js?v=5.5.2"></script><script src="/js/tw_cn.js?v=5.5.2"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+      }
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="ribbon" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-ribbon.min.js" size="150" alpha="0.6" zIndex="-1" mobile="false" data-click="true"></script><script id="canvas_nest" defer="defer" color="0,0,255" opacity="0.7" zIndex="-1" count="99" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-nest.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = true;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script id="click-heart" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/click-heart.min.js" async="async" mobile="false"></script><script async data-pjax src="/"></script></div></body></html>

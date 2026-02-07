@@ -1,0 +1,890 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>数据库写入的潜规则——合并树与 MPP 架构深度剖析 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="“为什么我的数据库不建议高频写入？” 这是一个让许多开发者困惑的问题，尤其是在使用 ClickHouse、HBase、Elasticsearch 等现代数据系统时。人们常常将其归因于&quot;列式存储&quot;，但这其实是一个误解。 真正的答案深藏在数据库的存储引擎架构中。今天，我们将深入剖析四大主流架构——LSM-Tree、ClickHouse MergeTree、MPP 和 B-Tree—">
+<meta property="og:type" content="article">
+<meta property="og:title" content="数据库写入的潜规则——合并树与 MPP 架构深度剖析">
+<meta property="og:url" content="https://magicliang.github.io/2025/07/29/%E6%95%B0%E6%8D%AE%E5%BA%93%E5%86%99%E5%85%A5%E7%9A%84%E6%BD%9C%E8%A7%84%E5%88%99/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="“为什么我的数据库不建议高频写入？” 这是一个让许多开发者困惑的问题，尤其是在使用 ClickHouse、HBase、Elasticsearch 等现代数据系统时。人们常常将其归因于&quot;列式存储&quot;，但这其实是一个误解。 真正的答案深藏在数据库的存储引擎架构中。今天，我们将深入剖析四大主流架构——LSM-Tree、ClickHouse MergeTree、MPP 和 B-Tree—">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-168.jpg">
+<meta property="article:published_time" content="2025-07-29T07:05:34.000Z">
+<meta property="article:modified_time" content="2026-02-07T05:36:16.313Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="存储引擎">
+<meta property="article:tag" content="数据库">
+<meta property="article:tag" content="系统设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-168.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "数据库写入的潜规则——合并树与 MPP 架构深度剖析",
+  "url": "https://magicliang.github.io/2025/07/29/%E6%95%B0%E6%8D%AE%E5%BA%93%E5%86%99%E5%85%A5%E7%9A%84%E6%BD%9C%E8%A7%84%E5%88%99/",
+  "image": "https://magicliang.github.io/img/wall-paper-168.jpg",
+  "datePublished": "2025-07-29T07:05:34.000Z",
+  "dateModified": "2026-02-07T05:36:16.313Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2025/07/29/%E6%95%B0%E6%8D%AE%E5%BA%93%E5%86%99%E5%85%A5%E7%9A%84%E6%BD%9C%E8%A7%84%E5%88%99/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.2"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.1.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.12.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '数据库写入的潜规则——合并树与 MPP 架构深度剖析',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.1"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (false) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-168.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">数据库写入的潜规则——合并树与 MPP 架构深度剖析</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"></div></nav><div id="post-info"><h1 class="post-title">数据库写入的潜规则——合并树与 MPP 架构深度剖析</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2025-07-29T07:05:34.000Z" title="Created 2025-07-29 15:05:34">2025-07-29</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-02-07T05:36:16.313Z" title="Updated 2026-02-07 13:36:16">2026-02-07</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>14mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><p>“为什么我的数据库不建议高频写入？”</p>
+<p>这是一个让许多开发者困惑的问题，尤其是在使用 ClickHouse、HBase、Elasticsearch 等现代数据系统时。人们常常将其归因于&quot;列式存储&quot;，但这其实是一个误解。</p>
+<p>真正的答案深藏在数据库的<strong>存储引擎架构</strong>中。今天，我们将深入剖析四大主流架构——<strong>LSM-Tree</strong>、<strong>ClickHouse MergeTree</strong>、<strong>MPP</strong> 和 <strong>B-Tree</strong>——揭示它们各自的写入机制、性能权衡，以及为什么它们都&quot;偏爱&quot;批量写入。</p>
+<hr>
+<h2 id="part-1-磁盘-i-o-基础-理解一切的前提">Part 1: 磁盘 I/O 基础——理解一切的前提</h2>
+<p>在深入存储引擎之前，我们必须先理解磁盘 I/O 的基本特性，因为所有存储引擎的设计都是围绕磁盘特性做出的权衡。</p>
+<h3 id="随机写-vs-顺序写">随机写 vs 顺序写</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>HDD（机械硬盘）</th>
+<th>SSD（固态硬盘）</th>
+<th>内存（DRAM）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>随机写 IOPS</strong></td>
+<td>~100-200</td>
+<td>10K-100K</td>
+<td>~10M</td>
+</tr>
+<tr>
+<td><strong>顺序写吞吐</strong></td>
+<td>~100-200 MB/s</td>
+<td>500 MB/s - 3 GB/s</td>
+<td>~10 GB/s</td>
+</tr>
+<tr>
+<td><strong>随机写延迟</strong></td>
+<td>~10ms（寻道时间）</td>
+<td>~100μs</td>
+<td>~100ns</td>
+</tr>
+<tr>
+<td><strong>顺序写延迟</strong></td>
+<td>~1ms</td>
+<td>~10μs</td>
+<td>~100ns</td>
+</tr>
+</tbody>
+</table>
+<p><strong>为什么顺序写比随机写快 100-1000 倍？</strong></p>
+<ul>
+<li><strong>HDD</strong>：机械硬盘需要物理移动磁头（寻道）和等待盘片旋转到目标位置。随机写意味着频繁的寻道，而顺序写可以连续写入相邻扇区，几乎不需要寻道。</li>
+<li><strong>SSD</strong>：虽然没有机械部件，但 SSD 的写入单位是<strong>页（Page，通常 4KB-16KB）</strong>，而擦除单位是<strong>块（Block，通常 256KB-4MB）</strong>。随机小写入会导致<strong>写放大（Write Amplification）<strong>和频繁的</strong>垃圾回收（Garbage Collection）</strong>，严重影响性能和寿命。</li>
+</ul>
+<h3 id="page-cache-与-fsync">Page Cache 与 fsync</h3>
+<p>操作系统在应用程序和磁盘之间维护了一层<strong>Page Cache（页缓存）</strong>：</p>
+<figure class="highlight scss"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs scss">应用程序 <span class="hljs-built_in">write</span>() → <span class="hljs-attribute">Page</span> Cache（内存） → <span class="hljs-selector-attr">[异步刷盘]</span> → 磁盘<br>                                        ↑<br>                                    <span class="hljs-built_in">fsync</span>() 强制刷盘<br></code></pre></td></tr></table></figure>
+<ul>
+<li><strong>write()</strong> 系统调用通常只是将数据写入 Page Cache，立即返回。这使得写入看起来很快。</li>
+<li><strong>fsync()</strong> 强制将 Page Cache 中的脏页刷写到磁盘，确保数据持久化。这是一个昂贵的操作。</li>
+<li>数据库通常需要在关键时刻调用 fsync() 来保证<strong>持久性（Durability）</strong>，这是性能的主要瓶颈之一。</li>
+</ul>
+<h3 id="wal：write-ahead-log">WAL：Write-Ahead Log</h3>
+<p>几乎所有数据库都使用 <strong>WAL（预写日志）</strong> 来保证崩溃恢复能力：</p>
+<ol>
+<li>先将修改操作<strong>顺序追加</strong>到 WAL 文件</li>
+<li>然后再修改实际的数据文件</li>
+<li>崩溃恢复时，通过重放 WAL 恢复未完成的操作</li>
+</ol>
+<p>WAL 之所以高效，正是因为它是<strong>顺序写入</strong>的——利用了磁盘顺序写的高吞吐特性。</p>
+<h3 id="direct-i-o-vs-buffered-i-o">Direct I/O vs Buffered I/O</h3>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>特点</th>
+<th>使用者</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Buffered I/O</strong></td>
+<td>经过 Page Cache，操作系统管理缓存</td>
+<td>大多数数据库默认模式</td>
+</tr>
+<tr>
+<td><strong>Direct I/O</strong></td>
+<td>绕过 Page Cache，直接读写磁盘</td>
+<td>InnoDB、RocksDB（可选）</td>
+</tr>
+</tbody>
+</table>
+<p>Direct I/O 的优势在于：数据库可以自己管理缓存策略（如 InnoDB 的 Buffer Pool），避免与操作系统的 Page Cache 产生**双重缓存（Double Buffering）**问题。</p>
+<hr>
+<h2 id="part-2-经典-lsm-tree-为高频更新而生的缓冲合并">Part 2: 经典 LSM-Tree——为高频更新而生的缓冲合并</h2>
+<h3 id="发明背景">发明背景</h3>
+<p>LSM-Tree（Log-Structured Merge-Tree）由 Patrick O’Neil 等人在 1996 年的论文中提出。其核心动机是：<strong>将随机写入转换为顺序写入</strong>，从而在机械硬盘时代获得极高的写入吞吐量。</p>
+<h3 id="三部曲：memtable-flush-compaction">三部曲：MemTable → Flush → Compaction</h3>
+<p>LSM-Tree 的写入流程可以概括为三个阶段：</p>
+<figure class="highlight css"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs css">写入请求 → MemTable（内存） → <span class="hljs-selector-attr">[Flush]</span> → SSTable（磁盘） → <span class="hljs-selector-attr">[Compaction]</span> → 合并后的 SSTable<br>              ↓<br>           WAL（磁盘，顺序写）<br></code></pre></td></tr></table></figure>
+<h4 id="阶段一：写入-memtable">阶段一：写入 MemTable</h4>
+<p>数据首先写入内存中的有序数据结构——<strong>MemTable</strong>。同时，为了防止崩溃丢失数据，写入操作也会被追加到 WAL。</p>
+<p>MemTable 的数据结构选择：</p>
+<table>
+<thead>
+<tr>
+<th>数据结构</th>
+<th>使用者</th>
+<th>优势</th>
+<th>劣势</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>跳表（SkipList）</strong></td>
+<td>RocksDB、LevelDB</td>
+<td>支持并发写入（无锁或细粒度锁）</td>
+<td>内存碎片较多</td>
+</tr>
+<tr>
+<td><strong>红黑树</strong></td>
+<td>HBase（早期）</td>
+<td>严格平衡，查找性能稳定</td>
+<td>并发写入需要加锁</td>
+</tr>
+<tr>
+<td><strong>B+ 树变体</strong></td>
+<td>WiredTiger（MongoDB）</td>
+<td>缓存友好</td>
+<td>实现复杂</td>
+</tr>
+</tbody>
+</table>
+<h4 id="阶段二：flush-到磁盘">阶段二：Flush 到磁盘</h4>
+<p>当 MemTable 达到阈值（通常 64MB-256MB）时，它会被冻结（变为不可变的 Immutable MemTable），然后作为一个整体的、有序的 <strong>SSTable（Sorted String Table）</strong> 文件<strong>顺序写入</strong>磁盘。</p>
+<p>SSTable 的内部结构：</p>
+<figure class="highlight fortran"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><code class="hljs fortran">┌─────────────────────────────────────┐<br>│         <span class="hljs-keyword">Data</span> Blocks                 │  ← 实际的 key-<span class="hljs-keyword">value</span> 数据，按 key 排序<br>│  ┌─────────┬─────────┬─────────┐   │<br>│  │ <span class="hljs-keyword">Block</span> <span class="hljs-number">1</span> │ <span class="hljs-keyword">Block</span> <span class="hljs-number">2</span> │ <span class="hljs-keyword">Block</span> N │   │<br>│  └─────────┴─────────┴─────────┘   │<br>├─────────────────────────────────────┤<br>│         <span class="hljs-built_in">Index</span> <span class="hljs-keyword">Block</span>                 │  ← 每个 <span class="hljs-keyword">Data</span> <span class="hljs-keyword">Block</span> 的起始 key 和偏移量<br>├─────────────────────────────────────┤<br>│         Bloom Filter <span class="hljs-keyword">Block</span>          │  ← 快速判断某个 key 是否可能存在<br>├─────────────────────────────────────┤<br>│         Meta <span class="hljs-keyword">Block</span>                  │  ← 统计信息、压缩类型等元数据<br>├─────────────────────────────────────┤<br>│         Footer                      │  ← 指向 <span class="hljs-built_in">Index</span> <span class="hljs-keyword">Block</span> 和 Meta <span class="hljs-keyword">Block</span> 的偏移量<br>└─────────────────────────────────────┘<br></code></pre></td></tr></table></figure>
+<h4 id="阶段三：后台-compaction">阶段三：后台 Compaction</h4>
+<p>随着 Flush 不断产生新的 SSTable 文件，磁盘上会积累大量小文件。后台的 <strong>Compaction（合并）</strong> 任务负责将多个小 SSTable 合并成更大的 SSTable，同时：</p>
+<ul>
+<li>删除过期的数据（tombstone 标记的删除）</li>
+<li>合并同一个 key 的多个版本</li>
+<li>减少文件数量，提升读取性能</li>
+</ul>
+<h3 id="compaction-策略详解">Compaction 策略详解</h3>
+<p>不同的 Compaction 策略适用于不同的工作负载：</p>
+<h4 id="size-tiered-compaction-stcs">Size-Tiered Compaction（STCS）</h4>
+<figure class="highlight inform7"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs inform7">Level 0: <span class="hljs-comment">[SST1]</span> <span class="hljs-comment">[SST2]</span> <span class="hljs-comment">[SST3]</span> <span class="hljs-comment">[SST4]</span>  ← 大小相近的文件分为一组<br>                    ↓ 合并<br>Level 1: <span class="hljs-comment">[    SST_merged_1    ]</span><br></code></pre></td></tr></table></figure>
+<ul>
+<li><strong>原理</strong>：将大小相近的 SSTable 分组，当同一组的文件数量达到阈值时，合并为一个更大的文件</li>
+<li><strong>优势</strong>：写入放大低，适合<strong>写多读少</strong>的场景</li>
+<li><strong>劣势</strong>：空间放大高（合并期间需要同时保留新旧文件），读取时可能需要查询多个文件</li>
+<li><strong>使用者</strong>：Cassandra（默认）、ScyllaDB</li>
+</ul>
+<h4 id="leveled-compaction-lcs">Leveled Compaction（LCS）</h4>
+<figure class="highlight inform7"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs inform7">Level 0: <span class="hljs-comment">[SST1]</span> <span class="hljs-comment">[SST2]</span>                ← 从 MemTable flush 的文件<br>Level 1: <span class="hljs-comment">[A-D]</span> <span class="hljs-comment">[E-H]</span> <span class="hljs-comment">[I-L]</span> <span class="hljs-comment">[M-P]</span>     ← 每层文件 key 范围不重叠<br>Level 2: <span class="hljs-comment">[A-B]</span> <span class="hljs-comment">[C-D]</span> <span class="hljs-comment">[E-F]</span> ... <span class="hljs-comment">[O-P]</span>  ← 每层容量是上一层的 10 倍<br></code></pre></td></tr></table></figure>
+<ul>
+<li><strong>原理</strong>：将 SSTable 组织成多个层级，每层的文件 key 范围不重叠。Level 0 的文件与 Level 1 合并时，选择 key 范围有重叠的文件进行合并</li>
+<li><strong>优势</strong>：空间放大低，读取性能好（每层最多查一个文件）</li>
+<li><strong>劣势</strong>：写入放大高（一条数据可能被合并多次）</li>
+<li><strong>使用者</strong>：RocksDB（默认）、LevelDB</li>
+</ul>
+<h4 id="fifo-compaction">FIFO Compaction</h4>
+<ul>
+<li><strong>原理</strong>：按时间顺序淘汰最老的 SSTable，不做合并</li>
+<li><strong>适用场景</strong>：时序数据，只需要最近的数据</li>
+</ul>
+<h4 id="universal-compaction">Universal Compaction</h4>
+<ul>
+<li><strong>原理</strong>：RocksDB 提供的混合策略，根据文件大小比例动态选择合并方式</li>
+<li><strong>适用场景</strong>：需要在写入放大和空间放大之间灵活权衡</li>
+</ul>
+<h3 id="三种放大问题">三种放大问题</h3>
+<p>LSM-Tree 的核心权衡可以用三种&quot;放大&quot;来量化：</p>
+<table>
+<thead>
+<tr>
+<th>放大类型</th>
+<th>定义</th>
+<th>影响</th>
+<th>量化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>写放大（Write Amplification）</strong></td>
+<td>实际写入磁盘的数据量 / 用户写入的数据量</td>
+<td>磁盘寿命（SSD）、写入带宽</td>
+<td>STCS: 2-5x, LCS: 10-30x</td>
+</tr>
+<tr>
+<td><strong>读放大（Read Amplification）</strong></td>
+<td>读取一条数据需要查询的 SSTable 数量</td>
+<td>读取延迟</td>
+<td>STCS: 高, LCS: 低</td>
+</tr>
+<tr>
+<td><strong>空间放大（Space Amplification）</strong></td>
+<td>实际占用磁盘空间 / 有效数据大小</td>
+<td>存储成本</td>
+<td>STCS: 高, LCS: 低</td>
+</tr>
+</tbody>
+</table>
+<h3 id="代表系统">代表系统</h3>
+<table>
+<thead>
+<tr>
+<th>系统</th>
+<th>MemTable</th>
+<th>Compaction 默认策略</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>LevelDB</strong></td>
+<td>SkipList</td>
+<td>Leveled</td>
+<td>Google 开发，单线程 Compaction</td>
+</tr>
+<tr>
+<td><strong>RocksDB</strong></td>
+<td>SkipList</td>
+<td>Leveled</td>
+<td>Facebook 基于 LevelDB 优化，多线程 Compaction</td>
+</tr>
+<tr>
+<td><strong>HBase</strong></td>
+<td>ConcurrentSkipListMap</td>
+<td>Size-Tiered</td>
+<td>Hadoop 生态，分布式</td>
+</tr>
+<tr>
+<td><strong>Cassandra</strong></td>
+<td>ConcurrentSkipListMap</td>
+<td>Size-Tiered</td>
+<td>无主架构，高可用</td>
+</tr>
+<tr>
+<td><strong>ScyllaDB</strong></td>
+<td>自定义</td>
+<td>Size-Tiered</td>
+<td>C++ 重写 Cassandra，性能更高</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="part-3-clickhouse-mergetree-为极致分析而生的直接合并">Part 3: ClickHouse MergeTree——为极致分析而生的直接合并</h2>
+<h3 id="与经典-lsm-tree-的关键区别">与经典 LSM-Tree 的关键区别</h3>
+<p>ClickHouse 的 MergeTree 引擎虽然也依赖&quot;合并&quot;，但它走了一条更直接、更极致的道路：</p>
+<blockquote>
+<p><strong>MergeTree 不是一个标准的 LSM-Tree，因为它没有 MemTable！</strong></p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>经典 LSM-Tree</th>
+<th>ClickHouse MergeTree</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>写入缓冲</strong></td>
+<td>MemTable（内存）</td>
+<td>无（直接写磁盘）</td>
+</tr>
+<tr>
+<td><strong>写入单位</strong></td>
+<td>单条/小批量 → MemTable</td>
+<td>每个 INSERT → 一个 Part</td>
+</tr>
+<tr>
+<td><strong>合并触发</strong></td>
+<td>MemTable 满 → Flush + Compaction</td>
+<td>后台定期合并 Parts</td>
+</tr>
+<tr>
+<td><strong>攒批责任</strong></td>
+<td>数据库内部（MemTable）</td>
+<td>用户/客户端</td>
+</tr>
+</tbody>
+</table>
+<h3 id="每个-insert-直接生成-part">每个 INSERT 直接生成 Part</h3>
+<p>每一个 <code>INSERT INTO ... VALUES (...)</code> 语句，无论大小，都会被 ClickHouse 直接在文件系统上组织成一个或多个新的、不可变的<strong>数据部件（Part）</strong>。</p>
+<p>Part 的内部结构（列式存储）：</p>
+<figure class="highlight python"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs python">part_directory/<br>├── primary.idx          ← 主键索引（稀疏索引，每 <span class="hljs-number">8192</span> 行一个标记）<br>├── column1.<span class="hljs-built_in">bin</span>          ← 列数据文件（压缩存储）<br>├── column1.mrk2         ← 标记文件（将主键索引映射到 .<span class="hljs-built_in">bin</span> 文件的偏移量）<br>├── column2.<span class="hljs-built_in">bin</span><br>├── column2.mrk2<br>├── ...<br>├── count.txt            ← 行数<br>├── columns.txt          ← 列信息<br>├── checksums.txt        ← 校验和<br>└── partition.dat        ← 分区键信息<br></code></pre></td></tr></table></figure>
+<h3 id="后台-merge-的触发与策略">后台 Merge 的触发与策略</h3>
+<p>ClickHouse 的后台合并线程会持续地将小 Part 合并成更大的 Part：</p>
+<ul>
+<li><strong>触发条件</strong>：当同一分区内的 Part 数量超过阈值时触发</li>
+<li><strong>合并策略</strong>：选择大小相近的 Part 进行合并（类似 Size-Tiered）</li>
+<li><strong>合并过程</strong>：读取多个 Part 的数据，按主键排序后写入新的 Part，删除旧 Part</li>
+</ul>
+<h3 id="为什么-mergetree-对-批量性-要求更高">为什么 MergeTree 对&quot;批量性&quot;要求更高</h3>
+<p>由于没有 MemTable 作为缓冲，每个 INSERT 都直接产生磁盘文件：</p>
+<ul>
+<li><strong>1000 次单条 INSERT</strong> = 1000 个小 Part = 1000 个目录 = 海量小文件</li>
+<li><strong>1 次 1000 条 INSERT</strong> = 1 个 Part = 1 个目录</li>
+</ul>
+<p>海量小文件会导致：</p>
+<ol>
+<li>文件系统 inode 耗尽</li>
+<li>后台合并压力剧增</li>
+<li>查询性能急剧下降（需要打开和读取大量小文件）</li>
+<li>ClickHouse 可能直接报错：<code>Too many parts</code></li>
+</ol>
+<p><strong>生产建议</strong>：每批至少 1000 行，每秒不超过 1 次 INSERT。</p>
+<h3 id="async-insert：clickhouse-的-外部-memtable">async_insert：ClickHouse 的&quot;外部 MemTable&quot;</h3>
+<p>ClickHouse 21.11 引入了 <code>async_insert</code> 功能，本质上是在服务端实现了类似 MemTable 的攒批机制：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-comment">-- 启用异步插入</span><br><span class="hljs-keyword">SET</span> async_insert <span class="hljs-operator">=</span> <span class="hljs-number">1</span>;<br><span class="hljs-keyword">SET</span> wait_for_async_insert <span class="hljs-operator">=</span> <span class="hljs-number">1</span>;<br><span class="hljs-keyword">SET</span> async_insert_max_data_size <span class="hljs-operator">=</span> <span class="hljs-number">10000000</span>;  <span class="hljs-comment">-- 攒到 10MB 才写入</span><br><span class="hljs-keyword">SET</span> async_insert_busy_timeout_ms <span class="hljs-operator">=</span> <span class="hljs-number">200</span>;      <span class="hljs-comment">-- 或者等待 200ms</span><br></code></pre></td></tr></table></figure>
+<p>工作原理：</p>
+<ol>
+<li>客户端发送 INSERT 请求</li>
+<li>ClickHouse 将数据暂存在内存缓冲区</li>
+<li>当缓冲区达到大小阈值或超时时，将缓冲区中的数据合并为一个 Part 写入磁盘</li>
+</ol>
+<h3 id="mergetree-变体">MergeTree 变体</h3>
+<table>
+<thead>
+<tr>
+<th>变体</th>
+<th>用途</th>
+<th>合并时的特殊行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>ReplacingMergeTree</strong></td>
+<td>去重</td>
+<td>保留同一主键的最新版本</td>
+</tr>
+<tr>
+<td><strong>AggregatingMergeTree</strong></td>
+<td>预聚合</td>
+<td>合并时执行聚合函数</td>
+</tr>
+<tr>
+<td><strong>CollapsingMergeTree</strong></td>
+<td>状态变更</td>
+<td>通过 +1/-1 标记实现&quot;撤销&quot;</td>
+</tr>
+<tr>
+<td><strong>VersionedCollapsingMergeTree</strong></td>
+<td>带版本的状态变更</td>
+<td>支持乱序插入的 Collapsing</td>
+</tr>
+<tr>
+<td><strong>SummingMergeTree</strong></td>
+<td>求和聚合</td>
+<td>合并时对数值列求和</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="part-4-mpp-架构的另一种权衡-aws-redshift">Part 4: MPP 架构的另一种权衡——AWS Redshift</h2>
+<h3 id="架构概述">架构概述</h3>
+<p>Redshift 是一个典型的 <strong>MPP（Massively Parallel Processing，大规模并行处理）</strong> 架构的列式数据库。</p>
+<figure class="highlight tap"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs tap">            ┌─────────────────┐<br>            │   Leader Node   │  ← 接收查询、优化、分发<br>            └────────┬────────┘<br>                     │<br>      ┌──────────────┼──────────────┐<br>      │              │              │<br>┌─────┴─────┐ ┌─────┴─────┐ ┌─────┴─────┐<br>│ Compute<span class="hljs-number"> 1 </span>│ │ Compute<span class="hljs-number"> 2 </span>│ │ Compute N │  ← 并行执行<br>│  Slice<span class="hljs-number"> 1 </span> │ │  Slice<span class="hljs-number"> 1 </span> │ │  Slice<span class="hljs-number"> 1 </span> │<br>│  Slice<span class="hljs-number"> 2 </span> │ │  Slice<span class="hljs-number"> 2 </span> │ │  Slice<span class="hljs-number"> 2 </span> │<br>└───────────┘ └───────────┘ └───────────┘<br></code></pre></td></tr></table></figure>
+<ul>
+<li><strong>Leader Node</strong>：接收查询、解析 SQL、生成执行计划、分发任务、汇总结果</li>
+<li><strong>Compute Nodes</strong>：存储数据并执行计算。每个节点被划分为多个 <strong>Slice</strong>，每个 Slice 独立处理一部分数据</li>
+</ul>
+<h3 id="数据分布策略">数据分布策略</h3>
+<p>数据如何分布到各个 Compute Node 上，直接影响查询和写入性能：</p>
+<table>
+<thead>
+<tr>
+<th>分布策略</th>
+<th>说明</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>KEY</strong></td>
+<td>按指定列的哈希值分布</td>
+<td>经常 JOIN 的大表，选择 JOIN 键作为分布键</td>
+</tr>
+<tr>
+<td><strong>EVEN</strong></td>
+<td>轮询均匀分布</td>
+<td>没有明显 JOIN 模式的表</td>
+</tr>
+<tr>
+<td><strong>ALL</strong></td>
+<td>每个节点存储完整副本</td>
+<td>小的维度表（&lt; 几百万行）</td>
+</tr>
+<tr>
+<td><strong>AUTO</strong></td>
+<td>Redshift 自动选择</td>
+<td>不确定最佳策略时</td>
+</tr>
+</tbody>
+</table>
+<h3 id="copy-命令：最高效的写入方式">COPY 命令：最高效的写入方式</h3>
+<p>Redshift 最高效的写入方式是使用 <code>COPY</code> 命令从 S3 并行加载数据：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">COPY</span> sales<br><span class="hljs-keyword">FROM</span> <span class="hljs-string">&#x27;s3://mybucket/sales/data_&#x27;</span><br>IAM_ROLE <span class="hljs-string">&#x27;arn:aws:iam::123456789012:role/MyRedshiftRole&#x27;</span><br>FORMAT <span class="hljs-keyword">AS</span> PARQUET;<br></code></pre></td></tr></table></figure>
+<p>此时，每个 Compute Node 会<strong>独立、并行</strong>地从 S3 拉取属于自己的那部分数据，效率极高。</p>
+<p>最佳实践：</p>
+<ul>
+<li>将数据文件拆分为与 Slice 数量相同（或倍数）的文件</li>
+<li>使用压缩格式（GZIP、LZO、ZSTD）</li>
+<li>使用列式格式（Parquet、ORC）</li>
+</ul>
+<h3 id="单条-insert-的分布式事务开销">单条 INSERT 的分布式事务开销</h3>
+<p>当你执行一条 <code>INSERT INTO ... VALUES (...)</code> 语句时：</p>
+<ol>
+<li>请求到达 Leader Node</li>
+<li>Leader Node 解析 SQL，确定数据应该分布到哪个 Compute Node</li>
+<li>Leader Node 启动<strong>分布式事务</strong></li>
+<li>数据被发送到目标 Compute Node</li>
+<li>Compute Node 写入数据</li>
+<li>分布式事务提交（涉及跨节点的 2PC 协调）</li>
+</ol>
+<p>为一条小小的记录，去启动整个集群的分布式事务流程，其开销是巨大的。这就好比为了运送一箱矿泉水，却启动了一整列高铁。</p>
+<h3 id="sort-key-与-distribution-key">Sort Key 与 Distribution Key</h3>
+<table>
+<thead>
+<tr>
+<th>键类型</th>
+<th>作用</th>
+<th>对写入的影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Sort Key</strong></td>
+<td>数据在磁盘上的物理排序</td>
+<td>写入后需要 VACUUM SORT 重新排序</td>
+</tr>
+<tr>
+<td><strong>Distribution Key</strong></td>
+<td>数据在节点间的分布</td>
+<td>影响数据倾斜和 JOIN 性能</td>
+</tr>
+</tbody>
+</table>
+<h3 id="vacuum-和-analyze">VACUUM 和 ANALYZE</h3>
+<p>Redshift 的写入和删除不会立即物理删除数据，而是标记为&quot;已删除&quot;。需要定期执行：</p>
+<ul>
+<li><strong>VACUUM DELETE</strong>：回收已删除行的空间</li>
+<li><strong>VACUUM SORT</strong>：重新按 Sort Key 排序</li>
+<li><strong>ANALYZE</strong>：更新统计信息，优化查询计划</li>
+</ul>
+<h3 id="与其他-mpp-系统的对比">与其他 MPP 系统的对比</h3>
+<table>
+<thead>
+<tr>
+<th>系统</th>
+<th>架构特点</th>
+<th>写入方式</th>
+<th>存算分离</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Redshift</strong></td>
+<td>传统 MPP</td>
+<td>COPY 命令</td>
+<td>Redshift Serverless 支持</td>
+</tr>
+<tr>
+<td><strong>Greenplum</strong></td>
+<td>基于 PostgreSQL 的 MPP</td>
+<td>外部表/COPY</td>
+<td>否</td>
+</tr>
+<tr>
+<td><strong>Snowflake</strong></td>
+<td>云原生存算分离</td>
+<td>COPY/Snowpipe</td>
+<td>是（S3 存储）</td>
+</tr>
+<tr>
+<td><strong>BigQuery</strong></td>
+<td>Serverless</td>
+<td>流式插入/批量加载</td>
+<td>是（Colossus 存储）</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="part-5-b-tree-存储引擎-传统-oltp-的写入机制">Part 5: B-Tree 存储引擎——传统 OLTP 的写入机制</h2>
+<h3 id="原地更新策略">原地更新策略</h3>
+<p>B-Tree（及其变体 B+ Tree）是传统 OLTP 数据库（MySQL InnoDB、PostgreSQL）的核心存储结构。与 LSM-Tree 的&quot;追加写入&quot;不同，B-Tree 采用**原地更新（In-Place Update）**策略：</p>
+<figure class="highlight markdown"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs markdown">更新操作：<br><span class="hljs-bullet">1.</span> 通过 B-Tree 索引定位到目标页（Page）<br><span class="hljs-bullet">2.</span> 将页读入内存（如果不在 Buffer Pool 中）<br><span class="hljs-bullet">3.</span> 在内存中修改数据<br><span class="hljs-bullet">4.</span> 将修改后的页写回磁盘（可能是随机写）<br></code></pre></td></tr></table></figure>
+<h3 id="页分裂的开销">页分裂的开销</h3>
+<p>当一个 B-Tree 节点（页）已满，插入新数据时会触发<strong>页分裂（Page Split）</strong>：</p>
+<ol>
+<li>分配一个新页</li>
+<li>将原页的一半数据移动到新页</li>
+<li>更新父节点的指针</li>
+<li>如果父节点也满了，递归分裂</li>
+</ol>
+<p>页分裂涉及多个页的读写和指针更新，是一个昂贵的操作。在高频写入场景下，频繁的页分裂会严重影响性能。</p>
+<h3 id="innodb-的-change-buffer-优化">InnoDB 的 Change Buffer 优化</h3>
+<p>InnoDB 针对<strong>非唯一二级索引</strong>的写入做了优化——<strong>Change Buffer</strong>：</p>
+<figure class="highlight arcade"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs arcade">写入非唯一二级索引：<br><span class="hljs-number">1.</span> 如果索引页在 <span class="hljs-built_in">Buffer</span> Pool 中 → 直接更新<br><span class="hljs-number">2.</span> 如果索引页不在 <span class="hljs-built_in">Buffer</span> Pool 中 → 将修改记录到 Change <span class="hljs-built_in">Buffer</span><br><span class="hljs-number">3.</span> 后续读取该索引页时 → 将 Change <span class="hljs-built_in">Buffer</span> 中的修改合并到页中（Merge）<br></code></pre></td></tr></table></figure>
+<p>Change Buffer 的本质是<strong>延迟写入</strong>：避免为了更新一个不在内存中的索引页而产生随机 I/O。</p>
+<h3 id="postgresql-的-hot-更新">PostgreSQL 的 HOT 更新</h3>
+<p>PostgreSQL 的 MVCC 实现中，UPDATE 操作实际上是<strong>插入一个新版本</strong>。HOT（Heap-Only Tuple）优化允许在同一个页内更新，避免更新索引：</p>
+<ul>
+<li><strong>条件</strong>：更新的列不包含任何索引列，且同一页有足够空间</li>
+<li><strong>效果</strong>：避免了索引更新的开销</li>
+</ul>
+<h3 id="b-tree-vs-lsm-tree-经典对比">B-Tree vs LSM-Tree 经典对比</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>B-Tree</th>
+<th>LSM-Tree</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>写入模式</strong></td>
+<td>原地更新（随机写）</td>
+<td>追加写入（顺序写）</td>
+</tr>
+<tr>
+<td><strong>写入性能</strong></td>
+<td>中等</td>
+<td>高</td>
+</tr>
+<tr>
+<td><strong>读取性能</strong></td>
+<td>高（一次 B-Tree 查找）</td>
+<td>中等（可能查多个 SSTable）</td>
+</tr>
+<tr>
+<td><strong>空间利用率</strong></td>
+<td>高（原地更新）</td>
+<td>中等（多版本共存）</td>
+</tr>
+<tr>
+<td><strong>写放大</strong></td>
+<td>低（1-2x）</td>
+<td>高（10-30x）</td>
+</tr>
+<tr>
+<td><strong>适用场景</strong></td>
+<td>OLTP（读多写少）</td>
+<td>写密集型工作负载</td>
+</tr>
+<tr>
+<td><strong>代表系统</strong></td>
+<td>MySQL InnoDB、PostgreSQL</td>
+<td>RocksDB、HBase、Cassandra</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="结论：殊途同归的-批量写入">结论：殊途同归的&quot;批量写入&quot;</h2>
+<h3 id="完整对比">完整对比</h3>
+<table>
+<thead>
+<tr>
+<th>架构</th>
+<th>代表系统</th>
+<th>写入瓶颈根源</th>
+<th>瓶颈类型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>经典 LSM-Tree</strong></td>
+<td>HBase, Cassandra, RocksDB</td>
+<td>后台 Compaction 跟不上 MemTable Flush 产生的小文件速度</td>
+<td>写后维护成本</td>
+</tr>
+<tr>
+<td><strong>ClickHouse MergeTree</strong></td>
+<td>ClickHouse</td>
+<td>后台 Merge 跟不上直接 INSERT 产生的小 Part 速度</td>
+<td>写后维护成本</td>
+</tr>
+<tr>
+<td><strong>MPP</strong></td>
+<td>Redshift, Greenplum</td>
+<td>分布式事务和数据分发对单条写入开销过大</td>
+<td>写入时协调成本</td>
+</tr>
+<tr>
+<td><strong>B-Tree</strong></td>
+<td>MySQL InnoDB, PostgreSQL</td>
+<td>随机 I/O 和页分裂的开销</td>
+<td>原地更新成本</td>
+</tr>
+</tbody>
+</table>
+<h3 id="技术选型指南">技术选型指南</h3>
+<table>
+<thead>
+<tr>
+<th>业务场景</th>
+<th>推荐架构</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>高频 OLTP（订单、支付）</strong></td>
+<td>B-Tree（MySQL/PostgreSQL）</td>
+<td>低延迟读写，事务支持</td>
+</tr>
+<tr>
+<td><strong>高频写入 + 实时查询</strong></td>
+<td>LSM-Tree（RocksDB/Cassandra）</td>
+<td>高写入吞吐，可接受的读取延迟</td>
+</tr>
+<tr>
+<td><strong>批量分析（BI 报表）</strong></td>
+<td>ClickHouse MergeTree</td>
+<td>极致的分析查询性能</td>
+</tr>
+<tr>
+<td><strong>数据仓库（ETL 后分析）</strong></td>
+<td>MPP（Redshift/Snowflake）</td>
+<td>大规模并行查询，SQL 兼容性好</td>
+</tr>
+<tr>
+<td><strong>时序数据（监控、IoT）</strong></td>
+<td>LSM-Tree 变体（InfluxDB/TimescaleDB）</td>
+<td>高写入吞吐，时间范围查询优化</td>
+</tr>
+</tbody>
+</table>
+<p>无论是哪种架构，它们都通过各自的方式，最终指向了同一个最佳实践——<strong>&quot;批量、低频次&quot;地写入数据</strong>。</p>
+<p>作为开发者和架构师，理解这个&quot;为什么&quot;至关重要。它不仅能帮助我们正确地使用这些强大的工具，避免性能陷阱，更能在技术选型时，根据业务的真实写入模式做出最精准的决策。</p>
+<h2 id="参考资料">参考资料</h2>
+<blockquote>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://www.cs.umb.edu/~poneil/lsmtree.pdf">The Log-Structured Merge-Tree (LSM-Tree) - O’Neil et al., 1996</a></li>
+<li><a target="_blank" rel="noopener" href="https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree">ClickHouse MergeTree 官方文档</a></li>
+<li><a target="_blank" rel="noopener" href="https://docs.aws.amazon.com/redshift/latest/dg/c_loading-data-best-practices.html">AWS Redshift 最佳实践</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/facebook/rocksdb/wiki/Compaction">RocksDB Wiki - Compaction</a></li>
+<li><a target="_blank" rel="noopener" href="https://dataintensive.net/">Designing Data-Intensive Applications - Martin Kleppmann</a></li>
+</ul>
+</blockquote>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2025/07/29/%E6%95%B0%E6%8D%AE%E5%BA%93%E5%86%99%E5%85%A5%E7%9A%84%E6%BD%9C%E8%A7%84%E5%88%99/">https://magicliang.github.io/2025/07/29/%E6%95%B0%E6%8D%AE%E5%BA%93%E5%86%99%E5%85%A5%E7%9A%84%E6%BD%9C%E8%A7%84%E5%88%99/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E5%AD%98%E5%82%A8%E5%BC%95%E6%93%8E/">存储引擎</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-168.jpg" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2017/11/15/MariaDB-%E8%B0%83%E4%BC%98%E7%9B%B8%E5%85%B3/" title="MariaDB 调优相关"><img class="cover" src="/img/wall-paper-85.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2017-11-15</div><div class="info-item-2">MariaDB 调优相关</div></div><div class="info-2"><div class="info-item-1">本文主要摘译自这里。 MySQL 曾经有独立的公司。但那间公司后来被 Sun 微系统公司获取了。 Sun 微系统公司又被 Oracle 获取了。原 MySQL 开发者担心 MySQL 成为闭源软件，因此成立了一家SkySQL 公司维护开源的 MySQL 分支–MariaDB。 MariaDB 支持的存储引擎包括：  InnoDB/XtraDB 后者是前者的加强版，属于事务性存储引擎，也叫  ACID-compliant（ACID 遵从的）。XtraDB 是 Percona 开发的存储引擎，整体向下兼容。使用普通的 mysqldump 会耗尽 cpu（因为要把数据库转化成正经的 SQL 语句）。而 xtrabackup 在大库上的备份、还原、冗余都表现得更好（因为像 Oracle 一样是二进制备份吗？）。 TokuDB。另一个事务性存储引擎。以高压缩率著称（最高25倍压缩）。适合小空间存储大数据。 MyISAM。MySQL 上最古老的存储引擎。非事务性存储引擎，只支持表级锁，不支持 MVCC。 SphinxSE。非事务性存储引擎。这名字和古希腊猜谜语的怪兽，斯芬克斯一样。本以上是用...</div></div></div></a><a class="pagination-related" href="/2018/05/29/JPA-%E7%9A%84-id-%E7%94%9F%E6%88%90%E7%AD%96%E7%95%A5/" title="JPA 的 id 生成策略"><img class="cover" src="/img/wall-paper-144.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2018-05-29</div><div class="info-item-2">JPA 的 id 生成策略</div></div><div class="info-2"><div class="info-item-1">JPA 有一个@GeneratedValue注解，有一个strategy attribute，如 @GeneratedValue(strategy = GenerationType.IDENTITY)。 常见的可选策略主要有IDENTITY和SEQUENCE。 GenerationType.IDENTITY 要求底层有一个 integer 或者 bigint 类型的自增列（ auto-incremented column)。自增列的赋值必须在插入操作之后发生，因为这个原因，Hibernate 无法进行各种优化（特别是 JDBC 的 batch 处理，一次 flush 操作会产生很多条insert 语句，分别执行）。如果事务回滚，自增列的值就会被丢弃。数据库在这个自增操作上有个高度优化的轻量级锁机制，性能非常棒。 MySQL 支持这种 id 生成策略， 使用 MySQL 应该尽量使用这个策略，即使它无法优化。 JPA 用它生成 id，会一条一条地插入新的 entity。 GenerationType.SEQUENCE 数据库有一个所谓的 sequence 对象，可以通过 selec...</div></div></div></a><a class="pagination-related" href="/2020/09/14/MySQL-%E7%9A%84%E9%85%8D%E7%BD%AE/" title="MySQL 的配置"><img class="cover" src="/img/wall-paper-2.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2020-09-14</div><div class="info-item-2">MySQL 的配置</div></div><div class="info-2"><div class="info-item-1">123456789101112131415161718-- 查看自动提交SELECT @@autocommit-- 查看全局隔离级别和会话隔离级别SELECT @@global.tx_isolation, @@tx_isolation;-- 查看引擎的事务状态，这里可以看出死锁日志，但需要  PROCESS privilege(s)show engine innodb status# 查看表详情show table status like &#x27;dept_emp&#x27;#  查看当前存储引擎默认的行格式SHOW VARIABLES LIKE &#x27;%innodb_default_row_format%&#x27;# 查看全部 binlog 文件show binary logs;# 查看最新的binlog，带有 positionshow master status; # 查看某个 binlog 的内容show binlog events in &#x27;binlog.000156&#x27;; </div></div></div></a><a class="pagination-related" href="/2021/03/01/HATP-%E9%97%AE%E9%A2%98/" title="HATP 问题"><img class="cover" src="/img/wall-paper-76.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-03-01</div><div class="info-item-2">HATP 问题</div></div><div class="info-2"><div class="info-item-1">问题定义 AP 的出现 在互联网浪潮出现之前，企业的数据量普遍不大。通常一个单机的数据库就可以保存核心的业务数据。那时候的存储并不需要复杂的架构，所有的线上请求(OLTP, Online Transactional Processing) 和后台分析 (OLAP, Online Analytical Processing) 都跑在同一个数据库实例上。后来业务越来越复杂，数据量越来越大，产生了一个显著问题：单机数据库支持线上的 TP 请求已经非常吃力，没办法再跑比较重的 AP 分析型任务，在这样的大背景下，于是AP开始从TP系统分离，某种程度上，AP是TP的一个分支。 这等于是在存储层做 CQRS 架构设计-另一种方案是在应用层也设计读写分离的架构。 AP的玩法 在这样的背景下，以 Hadoop 为代表的大数据技术开始蓬勃发展，它用许多相对廉价的 x86 机器构建了一个数据分析平台，用并行的能力破解大数据集的计算问题。 TP和AP的联系 虽然 TP 和 AP 开始往独立的方向演进，但是他们的核心都是需要处理数据，所以需要将数据打通。业内普遍玩法将 TP 数据通过 ETL 工具抽取出...</div></div></div></a><a class="pagination-related" href="/2021/03/10/%E7%A7%92%E6%9D%80%E9%80%9A%E7%94%A8%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88/" title="秒杀通用解决方案"><img class="cover" src="/img/wall-paper-174.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-03-10</div><div class="info-item-2">秒杀通用解决方案</div></div><div class="info-2"><div class="info-item-1">秒杀的实质 秒杀的实质，是围绕库存管理展开的并发读写 如果架构设计里面包含商品系统，包含库存，秒杀就要解决库存热点行高并发读写问题。 秒杀的底线是：不能超卖。qty库存 ≥ qty卖出 &amp;&amp; qty库存 - qty卖出 ≈ 0。 秒杀能够容忍的一些思路：渐进趋于一致，允许漏卖。 秒杀架构的特性   高性能：秒杀架构要承载的访问流量比平时高出许多倍，涉及大量的并发读和并发写，因此支持高并发访问非常关键。   一致性：秒杀活动中有限数量的商品在同一时刻被很多倍的请求同时扣减库存，在大并发更新的过程中要保证数据准确，不能发生超卖的问题（超卖，本来应该卖完下架的商品，在前台展示依然有库存，依然不停的被卖出），即库存是多少，理应卖出多少（qty库存 ≥ qty卖出 &amp;&amp; qty库存 - qty卖出 ≈ 0）。   高可用：秒杀架构虽经多次打磨优化，但现实中总难免出现一些考虑不到的情况，要保证系统的高可用，还要设计一个兜底预案，以便在最坏的情况发生时仍能从容应对。   秒杀技术难点  在有限的资源下，秒杀链路承载合理的最大流量。 大并发下扣减库存准确，“一致性...</div></div></div></a><a class="pagination-related" href="/2021/03/11/MySQL-%E7%9A%84-MGR/" title="MySQL 的 MGR"><img class="cover" src="/img/wall-paper-8.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-03-11</div><div class="info-item-2">MySQL 的 MGR</div></div><div class="info-2"><div class="info-item-1">MySQL 高可用架构的历史 MySQL 自带的主从复制机制，本身并不能实现自动高可用。 早期使用开源组件来搭 MySQL 集群的方案，使用 MMHA。当代 MySQL 官方自己主推的方案是 MySQL cluster。这些老的方案，优先保证MySQL服务的持续可用，在异常切换情况下，可能出现主机上部分数据未能及时同步到从库，造成主从切换后数据丢失。但是包括金融支付在内的一些业务，对于数据库服务既要求持续可用、也要求数据强一致（可以在性能上做出一些让步）。 因此，当代的 MySQL 官方提供了组复制（MySQL Group Replication）的方案，构建了新一代的 MySQL 高可用强一致服务。 Master-Slave（MS）架构高可用概述 MS架构高可用基础 高可用MySQL是依赖复制（Replication）技术实现的，复制解决的基本问题就是，让一台数据库服务器的数据同步到其它服务器上。MySQL数据库的复制有如下三个步骤。   在主库上把数据更改记录到二进制日志（Binary Log）中（这些记录被称为二进制日志事件）。   备库将主库上的日志复制到自己的中继日志（...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#part-1-%E7%A3%81%E7%9B%98-i-o-%E5%9F%BA%E7%A1%80-%E7%90%86%E8%A7%A3%E4%B8%80%E5%88%87%E7%9A%84%E5%89%8D%E6%8F%90"><span class="toc-number">1.</span> <span class="toc-text">Part 1: 磁盘 I&#x2F;O 基础——理解一切的前提</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%9A%8F%E6%9C%BA%E5%86%99-vs-%E9%A1%BA%E5%BA%8F%E5%86%99"><span class="toc-number">1.1.</span> <span class="toc-text">随机写 vs 顺序写</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#page-cache-%E4%B8%8E-fsync"><span class="toc-number">1.2.</span> <span class="toc-text">Page Cache 与 fsync</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#wal%EF%BC%9Awrite-ahead-log"><span class="toc-number">1.3.</span> <span class="toc-text">WAL：Write-Ahead Log</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#direct-i-o-vs-buffered-i-o"><span class="toc-number">1.4.</span> <span class="toc-text">Direct I&#x2F;O vs Buffered I&#x2F;O</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-2-%E7%BB%8F%E5%85%B8-lsm-tree-%E4%B8%BA%E9%AB%98%E9%A2%91%E6%9B%B4%E6%96%B0%E8%80%8C%E7%94%9F%E7%9A%84%E7%BC%93%E5%86%B2%E5%90%88%E5%B9%B6"><span class="toc-number">2.</span> <span class="toc-text">Part 2: 经典 LSM-Tree——为高频更新而生的缓冲合并</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%8F%91%E6%98%8E%E8%83%8C%E6%99%AF"><span class="toc-number">2.1.</span> <span class="toc-text">发明背景</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%89%E9%83%A8%E6%9B%B2%EF%BC%9Amemtable-flush-compaction"><span class="toc-number">2.2.</span> <span class="toc-text">三部曲：MemTable → Flush → Compaction</span></a><ol class="toc-child"><li class="toc-item toc-level-4"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5%E4%B8%80%EF%BC%9A%E5%86%99%E5%85%A5-memtable"><span class="toc-number">2.2.1.</span> <span class="toc-text">阶段一：写入 MemTable</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5%E4%BA%8C%EF%BC%9Aflush-%E5%88%B0%E7%A3%81%E7%9B%98"><span class="toc-number">2.2.2.</span> <span class="toc-text">阶段二：Flush 到磁盘</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5%E4%B8%89%EF%BC%9A%E5%90%8E%E5%8F%B0-compaction"><span class="toc-number">2.2.3.</span> <span class="toc-text">阶段三：后台 Compaction</span></a></li></ol></li><li class="toc-item toc-level-3"><a class="toc-link" href="#compaction-%E7%AD%96%E7%95%A5%E8%AF%A6%E8%A7%A3"><span class="toc-number">2.3.</span> <span class="toc-text">Compaction 策略详解</span></a><ol class="toc-child"><li class="toc-item toc-level-4"><a class="toc-link" href="#size-tiered-compaction-stcs"><span class="toc-number">2.3.1.</span> <span class="toc-text">Size-Tiered Compaction（STCS）</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#leveled-compaction-lcs"><span class="toc-number">2.3.2.</span> <span class="toc-text">Leveled Compaction（LCS）</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#fifo-compaction"><span class="toc-number">2.3.3.</span> <span class="toc-text">FIFO Compaction</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#universal-compaction"><span class="toc-number">2.3.4.</span> <span class="toc-text">Universal Compaction</span></a></li></ol></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%89%E7%A7%8D%E6%94%BE%E5%A4%A7%E9%97%AE%E9%A2%98"><span class="toc-number">2.4.</span> <span class="toc-text">三种放大问题</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%BB%A3%E8%A1%A8%E7%B3%BB%E7%BB%9F"><span class="toc-number">2.5.</span> <span class="toc-text">代表系统</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-3-clickhouse-mergetree-%E4%B8%BA%E6%9E%81%E8%87%B4%E5%88%86%E6%9E%90%E8%80%8C%E7%94%9F%E7%9A%84%E7%9B%B4%E6%8E%A5%E5%90%88%E5%B9%B6"><span class="toc-number">3.</span> <span class="toc-text">Part 3: ClickHouse MergeTree——为极致分析而生的直接合并</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%8E%E7%BB%8F%E5%85%B8-lsm-tree-%E7%9A%84%E5%85%B3%E9%94%AE%E5%8C%BA%E5%88%AB"><span class="toc-number">3.1.</span> <span class="toc-text">与经典 LSM-Tree 的关键区别</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%AF%8F%E4%B8%AA-insert-%E7%9B%B4%E6%8E%A5%E7%94%9F%E6%88%90-part"><span class="toc-number">3.2.</span> <span class="toc-text">每个 INSERT 直接生成 Part</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%90%8E%E5%8F%B0-merge-%E7%9A%84%E8%A7%A6%E5%8F%91%E4%B8%8E%E7%AD%96%E7%95%A5"><span class="toc-number">3.3.</span> <span class="toc-text">后台 Merge 的触发与策略</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%BA%E4%BB%80%E4%B9%88-mergetree-%E5%AF%B9-%E6%89%B9%E9%87%8F%E6%80%A7-%E8%A6%81%E6%B1%82%E6%9B%B4%E9%AB%98"><span class="toc-number">3.4.</span> <span class="toc-text">为什么 MergeTree 对&quot;批量性&quot;要求更高</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#async-insert%EF%BC%9Aclickhouse-%E7%9A%84-%E5%A4%96%E9%83%A8-memtable"><span class="toc-number">3.5.</span> <span class="toc-text">async_insert：ClickHouse 的&quot;外部 MemTable&quot;</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#mergetree-%E5%8F%98%E4%BD%93"><span class="toc-number">3.6.</span> <span class="toc-text">MergeTree 变体</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-4-mpp-%E6%9E%B6%E6%9E%84%E7%9A%84%E5%8F%A6%E4%B8%80%E7%A7%8D%E6%9D%83%E8%A1%A1-aws-redshift"><span class="toc-number">4.</span> <span class="toc-text">Part 4: MPP 架构的另一种权衡——AWS Redshift</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%9E%B6%E6%9E%84%E6%A6%82%E8%BF%B0"><span class="toc-number">4.1.</span> <span class="toc-text">架构概述</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%95%B0%E6%8D%AE%E5%88%86%E5%B8%83%E7%AD%96%E7%95%A5"><span class="toc-number">4.2.</span> <span class="toc-text">数据分布策略</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#copy-%E5%91%BD%E4%BB%A4%EF%BC%9A%E6%9C%80%E9%AB%98%E6%95%88%E7%9A%84%E5%86%99%E5%85%A5%E6%96%B9%E5%BC%8F"><span class="toc-number">4.3.</span> <span class="toc-text">COPY 命令：最高效的写入方式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%8D%95%E6%9D%A1-insert-%E7%9A%84%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1%E5%BC%80%E9%94%80"><span class="toc-number">4.4.</span> <span class="toc-text">单条 INSERT 的分布式事务开销</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#sort-key-%E4%B8%8E-distribution-key"><span class="toc-number">4.5.</span> <span class="toc-text">Sort Key 与 Distribution Key</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#vacuum-%E5%92%8C-analyze"><span class="toc-number">4.6.</span> <span class="toc-text">VACUUM 和 ANALYZE</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%8E%E5%85%B6%E4%BB%96-mpp-%E7%B3%BB%E7%BB%9F%E7%9A%84%E5%AF%B9%E6%AF%94"><span class="toc-number">4.7.</span> <span class="toc-text">与其他 MPP 系统的对比</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#part-5-b-tree-%E5%AD%98%E5%82%A8%E5%BC%95%E6%93%8E-%E4%BC%A0%E7%BB%9F-oltp-%E7%9A%84%E5%86%99%E5%85%A5%E6%9C%BA%E5%88%B6"><span class="toc-number">5.</span> <span class="toc-text">Part 5: B-Tree 存储引擎——传统 OLTP 的写入机制</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%8E%9F%E5%9C%B0%E6%9B%B4%E6%96%B0%E7%AD%96%E7%95%A5"><span class="toc-number">5.1.</span> <span class="toc-text">原地更新策略</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%A1%B5%E5%88%86%E8%A3%82%E7%9A%84%E5%BC%80%E9%94%80"><span class="toc-number">5.2.</span> <span class="toc-text">页分裂的开销</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#innodb-%E7%9A%84-change-buffer-%E4%BC%98%E5%8C%96"><span class="toc-number">5.3.</span> <span class="toc-text">InnoDB 的 Change Buffer 优化</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#postgresql-%E7%9A%84-hot-%E6%9B%B4%E6%96%B0"><span class="toc-number">5.4.</span> <span class="toc-text">PostgreSQL 的 HOT 更新</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#b-tree-vs-lsm-tree-%E7%BB%8F%E5%85%B8%E5%AF%B9%E6%AF%94"><span class="toc-number">5.5.</span> <span class="toc-text">B-Tree vs LSM-Tree 经典对比</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%93%E8%AE%BA%EF%BC%9A%E6%AE%8A%E9%80%94%E5%90%8C%E5%BD%92%E7%9A%84-%E6%89%B9%E9%87%8F%E5%86%99%E5%85%A5"><span class="toc-number">6.</span> <span class="toc-text">结论：殊途同归的&quot;批量写入&quot;</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%AE%8C%E6%95%B4%E5%AF%B9%E6%AF%94"><span class="toc-number">6.1.</span> <span class="toc-text">完整对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%8A%80%E6%9C%AF%E9%80%89%E5%9E%8B%E6%8C%87%E5%8D%97"><span class="toc-number">6.2.</span> <span class="toc-text">技术选型指南</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">7.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.1</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.2</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.2"></script><script src="/js/main.js?v=5.5.2"></script><script src="/js/tw_cn.js?v=5.5.2"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+      }
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="ribbon" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-ribbon.min.js" size="150" alpha="0.6" zIndex="-1" mobile="false" data-click="true"></script><script id="canvas_nest" defer="defer" color="0,0,255" opacity="0.7" zIndex="-1" count="99" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-nest.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = true;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script id="click-heart" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/click-heart.min.js" async="async" mobile="false"></script><script async data-pjax src="/"></script></div></body></html>
