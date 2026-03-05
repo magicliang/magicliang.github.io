@@ -61,11 +61,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const { highlightCopy, highlightLang, highlightHeightLimit, highlightFullpage, highlightMacStyle, plugin } = highLight
     const isHighlightShrink = GLOBAL_CONFIG_SITE.isHighlightShrink
     const isShowTool = highlightCopy || highlightLang || isHighlightShrink !== undefined || highlightFullpage || highlightMacStyle
-    const $figureHighlight = plugin === 'highlight.js' ? document.querySelectorAll('figure.highlight') : document.querySelectorAll('pre[class*="language-"]')
+    const isNotHighlightJs = plugin !== 'highlight.js'
+    const isPrismjs = plugin === 'prismjs'
+    const $figureHighlight = isNotHighlightJs
+      ? Array.from(document.querySelectorAll('code[class*="language-"]')).map(code => code.parentElement)
+      : document.querySelectorAll('figure.highlight')
 
     if (!((isShowTool || highlightHeightLimit) && $figureHighlight.length)) return
 
-    const isPrismjs = plugin === 'prismjs'
     const highlightShrinkClass = isHighlightShrink === true ? 'closed' : ''
     const highlightShrinkEle = isHighlightShrink !== undefined ? '<i class="fas fa-angle-down expand"></i>' : ''
     const highlightCopyEle = highlightCopy ? '<i class="fas fa-paste copy-button"></i>' : ''
@@ -84,10 +87,17 @@ document.addEventListener('DOMContentLoaded', () => {
         const buttonRect = ele.getBoundingClientRect()
         const scrollTop = window.pageYOffset || document.documentElement.scrollTop
         const scrollLeft = window.pageXOffset || document.documentElement.scrollLeft
-        const finalTop = buttonRect.top + scrollTop - 40
-        const finalLeft = buttonRect.left + scrollLeft + buttonRect.width / 2
 
-        const topValue = ele.closest('figure.highlight').classList.contains('code-fullpage') ? finalTop + 60 : finalTop
+        // X-axis boundary check
+        const halfWidth = newEle.offsetWidth / 2
+        const centerLeft = buttonRect.left + scrollLeft + buttonRect.width / 2
+        const finalLeft = Math.max(halfWidth + 10, Math.min(window.innerWidth - halfWidth - 10, centerLeft))
+
+        // Show tooltip below button if too close to top
+        const normalTop = buttonRect.top + scrollTop - 40
+        const shouldShowBelow = buttonRect.top < 60 || normalTop < 10
+
+        const topValue = shouldShowBelow ? buttonRect.top + scrollTop + buttonRect.height + 10 : normalTop
 
         newEle.style.cssText = `
       top: ${topValue + 10}px;
@@ -111,6 +121,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }, 800)
       }
     }
+
     const copy = async (text, ctx) => {
       try {
         await navigator.clipboard.writeText(text)
@@ -125,7 +136,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const highlightCopyFn = (ele, clickEle) => {
       const $buttonParent = ele.parentNode
       $buttonParent.classList.add('copy-true')
-      const preCodeSelector = isPrismjs ? 'pre code' : 'table .code pre'
+      const preCodeSelector = isNotHighlightJs ? 'pre code' : 'table .code pre'
       const codeElement = $buttonParent.querySelector(preCodeSelector)
       if (!codeElement) return
       copy(codeElement.innerText, clickEle)
@@ -155,6 +166,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // 獲取隱藏狀態下元素的真實高度
     const getActualHeight = item => {
+      if (item.offsetHeight > 0) return item.offsetHeight
       const hiddenElements = new Map()
 
       const fix = () => {
@@ -204,20 +216,23 @@ document.addEventListener('DOMContentLoaded', () => {
         fragment.appendChild(ele)
       }
 
-      isPrismjs ? item.parentNode.insertBefore(fragment, item) : item.insertBefore(fragment, item.firstChild)
+      isNotHighlightJs ? item.parentNode.insertBefore(fragment, item) : item.insertBefore(fragment, item.firstChild)
     }
 
     $figureHighlight.forEach(item => {
       let langName = ''
-      if (isPrismjs) btf.wrap(item, 'figure', { class: 'highlight' })
+      if (isNotHighlightJs) {
+        const newClassName = isPrismjs ? 'prismjs' : 'default'
+        btf.wrap(item, 'figure', { class: `highlight ${newClassName}` })
+      }
 
       if (!highlightLang) {
         createEle('', item)
         return
       }
 
-      if (isPrismjs) {
-        langName = item.getAttribute('data-language') || 'Code'
+      if (isNotHighlightJs) {
+        langName = isPrismjs ? item.getAttribute('data-language') || 'Code' : item.querySelector('code').getAttribute('class').replace('language-', '')
       } else {
         langName = item.getAttribute('class').split(' ')[1]
         if (langName === 'plain' || langName === undefined) langName = 'Code'
@@ -541,17 +556,29 @@ document.addEventListener('DOMContentLoaded', () => {
     const $articleList = $article.querySelectorAll('h1,h2,h3,h4,h5,h6')
     let detectItem = ''
 
+    // Optimization: Cache header positions
+    let headerList = []
+    const updateHeaderPositions = () => {
+      headerList = Array.from($articleList).map(ele => ({
+        ele,
+        top: btf.getEleTop(ele),
+        id: ele.id
+      }))
+    }
+
+    updateHeaderPositions()
+    btf.addEventListenerPjax(window, 'resize', btf.throttle(updateHeaderPositions, 200))
+
     const findHeadPosition = top => {
       if (top === 0) return false
 
       let currentId = ''
       let currentIndex = ''
 
-      for (let i = 0; i < $articleList.length; i++) {
-        const ele = $articleList[i]
-        if (top > btf.getEleTop(ele) - 80) {
-          const id = ele.id
-          currentId = id ? '#' + encodeURI(id) : ''
+      for (let i = 0; i < headerList.length; i++) {
+        const item = headerList[i]
+        if (top > item.top - 80) {
+          currentId = item.id ? '#' + encodeURI(item.id) : ''
           currentIndex = i
         } else {
           break
@@ -629,7 +656,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
       $body.classList.add('read-mode')
       newEle.type = 'button'
-      newEle.className = 'fas fa-sign-out-alt exit-readmode'
+      newEle.className = 'exit-readmode'
+      newEle.innerHTML = '<i class="fas fa-sign-out-alt"></i>'
       newEle.addEventListener('click', exitReadMode)
       $body.appendChild(newEle)
     },
