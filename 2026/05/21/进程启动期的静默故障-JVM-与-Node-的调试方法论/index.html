@@ -1,0 +1,792 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>进程启动期的静默故障：JVM 与 Node.js 的调试方法论 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="很多人都遇到过这种场景：一个 JVM 进程因为 -Xmx 写错了一个字符，启动起来就死掉，控制台一行日志都没有；一个 Node.js CLI 比如 opencode 在前台 hang 住，光标不闪，也不退出；一个 Spring Boot 服务被 systemd 拉起来，systemctl status 显示 running，但端口永远不开。stderr 看不到、源码也没有，只能反复重启。 这类问题">
+<meta property="og:type" content="article">
+<meta property="og:title" content="进程启动期的静默故障：JVM 与 Node.js 的调试方法论">
+<meta property="og:url" content="https://magicliang.github.io/2026/05/21/%E8%BF%9B%E7%A8%8B%E5%90%AF%E5%8A%A8%E6%9C%9F%E7%9A%84%E9%9D%99%E9%BB%98%E6%95%85%E9%9A%9C-JVM-%E4%B8%8E-Node-%E7%9A%84%E8%B0%83%E8%AF%95%E6%96%B9%E6%B3%95%E8%AE%BA/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="很多人都遇到过这种场景：一个 JVM 进程因为 -Xmx 写错了一个字符，启动起来就死掉，控制台一行日志都没有；一个 Node.js CLI 比如 opencode 在前台 hang 住，光标不闪，也不退出；一个 Spring Boot 服务被 systemd 拉起来，systemctl status 显示 running，但端口永远不开。stderr 看不到、源码也没有，只能反复重启。 这类问题">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-169.jpg">
+<meta property="article:published_time" content="2026-05-20T16:00:00.000Z">
+<meta property="article:modified_time" content="2026-05-20T16:48:27.328Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="JVM">
+<meta property="article:tag" content="Node.js">
+<meta property="article:tag" content="可观察性">
+<meta property="article:tag" content="系统编程">
+<meta property="article:tag" content="调试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-169.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "进程启动期的静默故障：JVM 与 Node.js 的调试方法论",
+  "url": "https://magicliang.github.io/2026/05/21/%E8%BF%9B%E7%A8%8B%E5%90%AF%E5%8A%A8%E6%9C%9F%E7%9A%84%E9%9D%99%E9%BB%98%E6%95%85%E9%9A%9C-JVM-%E4%B8%8E-Node-%E7%9A%84%E8%B0%83%E8%AF%95%E6%96%B9%E6%B3%95%E8%AE%BA/",
+  "image": "https://magicliang.github.io/img/wall-paper-169.jpg",
+  "datePublished": "2026-05-20T16:00:00.000Z",
+  "dateModified": "2026-05-20T16:48:27.328Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/05/21/%E8%BF%9B%E7%A8%8B%E5%90%AF%E5%8A%A8%E6%9C%9F%E7%9A%84%E9%9D%99%E9%BB%98%E6%95%85%E9%9A%9C-JVM-%E4%B8%8E-Node-%E7%9A%84%E8%B0%83%E8%AF%95%E6%96%B9%E6%B3%95%E8%AE%BA/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.4"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.1.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '进程启动期的静默故障：JVM 与 Node.js 的调试方法论',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.1"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (false) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">442</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">484</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">31</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-169.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">进程启动期的静默故障：JVM 与 Node.js 的调试方法论</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">进程启动期的静默故障：JVM 与 Node.js 的调试方法论</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-05-20T16:00:00.000Z" title="Created 2026-05-21 00:00:00">2026-05-21</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-05-20T16:48:27.328Z" title="Updated 2026-05-21 00:48:27">2026-05-21</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.5k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>16mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><p>很多人都遇到过这种场景：一个 JVM 进程因为 <code>-Xmx</code> 写错了一个字符，启动起来就死掉，控制台一行日志都没有；一个 Node.js CLI 比如 opencode 在前台 hang 住，光标不闪，也不退出；一个 Spring Boot 服务被 systemd 拉起来，<code>systemctl status</code> 显示 running，但端口永远不开。stderr 看不到、源码也没有，只能反复重启。</p>
+<p>这类问题的共同点不是程序&quot;出 bug&quot;，而是<strong>进程在&quot;出第一行日志&quot;之前就已经失败或卡住</strong>。常规的&quot;看日志找异常&quot;那一套这时候没东西可看。需要的是另一类方法论：把进程当黑盒，从外部撬开它的状态。</p>
+<p>下面把这套方法论拆成四步，先给通用框架，再给 JVM 与 Node.js 两个语言专题，最后用 opencode hang 这个具体例子推演一遍。</p>
+<span id="more"></span>
+<h2 id="一-先把-看不到日志-分成四种情况">一、先把&quot;看不到日志&quot;分成四种情况</h2>
+<p>把&quot;启动期黑盒&quot;展开来看，至少是四种性质完全不同的故障。混在一起调，方向就错了。</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>特征</th>
+<th>进程状态</th>
+<th>主要工具方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A. crash 静默</td>
+<td>进程已经退出，但没看到任何 stderr</td>
+<td>不存在</td>
+<td>找输出去向；看 OS / runtime 留下的尸检文件</td>
+</tr>
+<tr>
+<td>B. 系统调用阻塞</td>
+<td>进程还在，CPU 接近 0，卡在某个 syscall</td>
+<td>sleeping</td>
+<td>内核态栈 / strace / dtruss</td>
+</tr>
+<tr>
+<td>C. 用户态死循环</td>
+<td>进程还在，CPU 接近 100%，没产出</td>
+<td>running</td>
+<td>profiler / thread dump / inspector</td>
+</tr>
+<tr>
+<td>D. 到不了 main</td>
+<td>进程在，但还在 pre-main 阶段（agent / classloader / native init）</td>
+<td>视语言而定</td>
+<td>runtime 自带的 verbose 启动开关</td>
+</tr>
+</tbody>
+</table>
+<p>A 和 D 最容易被搞混。两者外在表现都是&quot;启动起来什么都没说&quot;，但 A 已经退出而 D 还在跑。看一眼 PID 是否还在就能分清。B 和 C 也容易搞混，看 CPU 占用即可——<code>top -p PID</code> 上接近 0 就是阻塞，接近 100% 就是死循环。</p>
+<p>这四类对应不同的下一步。所有调试动作的第一件事，就是先确定自己面对的是哪一类。</p>
+<h3 id="模式提炼：先做分类-再选工具">模式提炼：先做分类，再选工具</h3>
+<blockquote>
+<p><code>症状 → 分类 → 工具</code></p>
+</blockquote>
+<p>这条原则之所以重要，是因为常见的踩坑是&quot;看见控制台没输出，就开始猜测代码 bug&quot;。猜代码是工具栈最末端的事。在确定进程到底是 crash 了还是 hang 住、CPU 是 0 还是 100% 之前，做的所有假设都可能踩空。</p>
+<h2 id="二-第一步：找输出">二、第一步：找输出</h2>
+<p>“我没看到日志&quot;在工程现实里通常不是&quot;程序没产生输出”，而是&quot;输出被某层吞掉了&quot;。可能的去向至少有这几个：</p>
+<ol>
+<li><strong>stderr 被重定向</strong>。<code>nohup cmd &gt; out.log</code> 这种写法会把 stderr 也吞进 <code>nohup.out</code>；<code>cmd 2&gt;/dev/null</code> 直接丢弃；docker 容器只会显示 PID 1 的 stdout/stderr，子进程要靠自己把日志写出来。</li>
+<li><strong>stdout 全缓冲</strong>。当 stdout 不连接到 tty 时，glibc 默认是块缓冲（一般 4KB 或 8KB），程序 crash 时缓冲区里的内容会随进程一起消失。这就是为什么&quot;在终端里能看到日志，重定向到管道就看不到&quot;。</li>
+<li><strong>日志框架自身没起来</strong>。log4j2 配置错误时，业务日志不会出，但 log4j 自己有一个 status logger 用来报告&quot;我配错了&quot;——默认级别是 ERROR，且独立写到 stderr。如果连 stderr 也被吞了，连&quot;配错了&quot;这件事都看不到。</li>
+<li><strong>runtime 的尸检文件没在你看的目录</strong>。HotSpot crash 会写 <code>hs_err_pid&lt;PID&gt;.log</code>，默认放在当前工作目录或 <code>/tmp</code>，不在控制台，不在 stdout。</li>
+</ol>
+<p>对应的反制手段：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 强制行缓冲</span><br><span class="hljs-built_in">stdbuf</span> -oL -eL ./your-program<br><br><span class="hljs-comment"># 在 systemd 下查输出</span><br>journalctl -u your.service -f<br><br><span class="hljs-comment"># 看进程的标准输出/错误真实指向哪里</span><br><span class="hljs-built_in">ls</span> -l /proc/$(pidof your-prog)/fd/&#123;1,2&#125;<br><br><span class="hljs-comment"># 用 script(1) 把整个会话录下来（含 tty 行为）</span><br>script -f /tmp/session.log -c <span class="hljs-string">&quot;./your-program&quot;</span><br><br><span class="hljs-comment"># 把已经在跑的进程的 stderr 拉过来看</span><br>strace -p PID -e trace=write -e write=2 -s 4096<br></code></pre></td></tr></table></figure>
+<p>最后一条 <code>strace -e write=2 -s 4096</code> 是个被低估的招——即使一个进程已经在跑、stderr 早就被挂到 <code>/dev/null</code>，这条命令仍然能把它正在写 fd 2 的内容拉出来打印到当前终端。前提是 Linux，且有调试权限（<code>ptrace_scope</code> 或 root）。</p>
+<h3 id="模式提炼：永远先验证-fd-0-1-2-指向哪里">模式提炼：永远先验证 fd 0/1/2 指向哪里</h3>
+<blockquote>
+<p><code>/proc/PID/fd/{0,1,2}</code> 是进程对外说话的喉舌。一切&quot;找输出&quot;问题都从这里看起。</p>
+</blockquote>
+<p>很多看起来诡异的&quot;日志去哪了&quot;的问题，本质都是 fd 1 或 fd 2 被 wrapper 脚本、systemd unit、容器 entrypoint 重定向到了一个&quot;调试时谁也想不到的地方&quot;。</p>
+<h2 id="三-第二步：定位卡点">三、第二步：定位卡点</h2>
+<p>如果是 B（系统调用阻塞）或 C（用户态死循环），下一步是搞清楚&quot;进程现在在哪一行&quot;。</p>
+<p>OS 层的工具按平台分：</p>
+<table>
+<thead>
+<tr>
+<th>用途</th>
+<th>Linux</th>
+<th>macOS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>跟踪 syscall</td>
+<td><code>strace -fp PID</code></td>
+<td><code>dtruss -p PID</code>（需关 SIP）</td>
+</tr>
+<tr>
+<td>当前内核栈</td>
+<td><code>cat /proc/PID/stack</code></td>
+<td><code>sample PID 5</code>（用户态栈）</td>
+</tr>
+<tr>
+<td>当前 syscall</td>
+<td><code>cat /proc/PID/syscall</code> + <code>wchan</code></td>
+<td><code>sample</code> 或 lldb attach</td>
+</tr>
+<tr>
+<td>抓现场（CPU profiling）</td>
+<td><code>perf top -p PID</code> / <code>async-profiler</code></td>
+<td><code>Instruments</code> / <code>sample</code></td>
+</tr>
+<tr>
+<td>通用 attach</td>
+<td><code>gdb -p PID</code></td>
+<td><code>lldb -p PID</code></td>
+</tr>
+</tbody>
+</table>
+<p>判断卡点的几个常见线索：</p>
+<ul>
+<li>卡在 <code>futex</code> → 锁等待，下一步抓 thread dump 看是谁拿着锁。</li>
+<li>卡在 <code>read</code> / <code>recvfrom</code> / <code>epoll_wait</code> → 在等 IO 或事件，下一步看是哪条连接、对端是谁。</li>
+<li>卡在 <code>connect</code> / <code>poll</code> 配合一个外部地址 → 网络等待，常见是 DNS 反解、TLS 握手、对端不通。</li>
+<li>卡在 <code>nanosleep</code> / <code>clock_nanosleep</code> → 程序自己在 sleep，是逻辑问题不是阻塞。</li>
+</ul>
+<p>对 Linux 来说，<code>/proc/PID/wchan</code> 直接给出一个 kernel symbol，比如 <code>futex_wait_queue_me</code> 或 <code>inet_csk_accept</code>，哪怕不读 strace 也能粗略判断。</p>
+<h3 id="模式提炼：syscall-是黑盒进程的-自白">模式提炼：syscall 是黑盒进程的&quot;自白&quot;</h3>
+<blockquote>
+<p>用户态代码看不到没关系，syscall 是必经之路。卡在哪个 syscall，等价于告诉你&quot;它在等什么&quot;。</p>
+</blockquote>
+<p>当一个 Java 或 Node 进程闭源、没日志、还 hang 住时，往往不需要懂业务逻辑，只看 syscall 序列就能猜出大致原因。比如 strace 只输出 <code>recvfrom(7, ...) = ?</code> 一直不返回，PID 7 用 <code>lsof -p PID</code> 查到对应一个远端 IP，而那个远端正好是公司被墙的服务，问题就清楚了。</p>
+<h2 id="四-第三步：到不了-main-的情况">四、第三步：到不了 main 的情况</h2>
+<p>A 和 D 这两类问题都属于&quot;在程序员能写日志的代码之前就已经失败&quot;。这里就要换语言专题。</p>
+<h3 id="jvm-启动期诊断">JVM 启动期诊断</h3>
+<p>JVM 的启动流程比看上去复杂得多：加载 <code>libjvm.so</code> → 解析参数 → 加载基础类 → 启动 JVMTI agent → 调用 <code>main</code>。任何一步失败都可能导致&quot;我什么都没看到，但 java 进程没了&quot;。</p>
+<p>几个最有用的入口：</p>
+<p><strong>hs_err_pid 文件</strong>。HotSpot 在遇到 fatal error（含参数解析错误、内部 assert、SIGSEGV）时会写一份 dump，文件名形如 <code>hs_err_pid&lt;PID&gt;.log</code>。默认目录是当前工作目录，写不进去时会退到 <code>/tmp</code>。可用 <code>-XX:ErrorFile=/var/log/jvm/hs_err_%p.log</code> 强制指定。这个文件几乎是 JVM crash 后唯一可靠的现场。</p>
+<p><strong>JAVA_TOOL_OPTIONS 环境变量</strong>。JVMTI 规范定义的环境变量，每个 HotSpot JVM 启动都会读它，把里面的内容拼到命令行参数前面。这个机制特别适合&quot;我改不了启动命令&quot;的场景：CI 脚本、容器 ENTRYPOINT、systemd unit、IDE Run 配置。设一个 <code>JAVA_TOOL_OPTIONS=-Dlog4j2.debug -verbose:class -Xlog:all=info</code>，下次启动就能看到全部参数解析、类加载、log4j 状态。</p>
+<p><strong>统一 JVM 日志</strong>（JDK 9+）。<code>-Xlog:all=info</code> 一次性把 GC、类加载、JIT 编译、JNI 等子系统的诊断输出都打开。早期版本要分别开 <code>-verbose:class -verbose:gc -verbose:jni -XX:+TraceClassLoading</code>。</p>
+<p><strong>诊断选项解锁</strong>。有些参数（如 <code>-XX:+PrintFlagsFinal</code>、<code>-XX:+PrintConcurrentLocks</code>）需要先 <code>-XX:+UnlockDiagnosticVMOptions</code> 才能用。<code>PrintFlagsFinal</code> 把当前 JVM 实际使用的所有 flag 值打出来，包括默认值，比 GC 调优指南有用得多——它告诉你&quot;实际生效的是什么&quot;。</p>
+<p><strong>log4j2 自身的诊断开关</strong>。当 log4j2 配置错误时，它的默认行为是退化到 fallback configuration（通常只在 console 输出 ERROR），并把&quot;我退化了&quot;通过 status logger 报告出来。<code>-Dlog4j2.debug</code> 把 status logger 拉到 DEBUG 级别，能看到它读了哪个配置文件、为什么解析失败。配置文件根元素的 <code>&lt;Configuration status=&quot;WARN&quot;&gt;</code> 属性也是同一个 status logger 的级别。</p>
+<p><strong>已经在跑的 JVM 怎么戳</strong>。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 触发 thread dump（输出到进程的 stderr）</span><br><span class="hljs-built_in">kill</span> -3 PID            <span class="hljs-comment"># 等价于 jstack PID</span><br><br><span class="hljs-comment"># jcmd 是 JVM 通用诊断入口，比 jstack/jmap 更现代</span><br>jcmd PID Thread.<span class="hljs-built_in">print</span><br>jcmd PID VM.flags<br>jcmd PID VM.system_properties<br>jcmd PID GC.heap_info<br><br><span class="hljs-comment"># 已经 hang 住的 JVM，可以用 jhsdb attach 走 SA 通道</span><br>jhsdb jstack --pid PID<br></code></pre></td></tr></table></figure>
+<p><code>kill -3 PID</code> 这条值得单独提：HotSpot 把 SIGQUIT 当作 thread dump 触发器，输出落到进程的 stderr。这意味着如果进程 stderr 已经被重定向到一个文件，你 <code>kill -3</code> 之后就要去那个文件里捞 dump，而不是当前终端。</p>
+<h3 id="node-js-启动期诊断">Node.js 启动期诊断</h3>
+<p>Node 的启动期也并不简单：加载 V8 → 加载 <code>node</code> 自己的 builtin 模块 → 执行入口脚本（其中包含一棵 require 树）→ 进入事件循环。</p>
+<p>几个常用入口：</p>
+<p><strong>NODE_OPTIONS 环境变量</strong>。和 JAVA_TOOL_OPTIONS 同样的思路，可以在不改启动命令的情况下注入 node 命令行参数。<code>NODE_OPTIONS=&quot;--inspect=0.0.0.0:9229 --trace-warnings --trace-uncaught&quot;</code> 就把 inspector 端口、警告栈、未捕获异常栈都打开了。</p>
+<p><strong>NODE_DEBUG 与 DEBUG</strong>。两个不同的机制，经常被搞混：</p>
+<ul>
+<li><code>NODE_DEBUG=*</code> 控制 node core 模块的内置 debug 输出（比如 <code>http</code>、<code>net</code>、<code>tls</code>、<code>fs</code>），底层是 <code>util.debuglog</code>。</li>
+<li><code>DEBUG=*</code> 是 npm 上 <code>debug</code> 包的约定，几乎所有第三方库（Express、Mongoose、puppeteer…）都遵守它。</li>
+</ul>
+<p>两个一起开通常是必要的：<code>NODE_DEBUG=* DEBUG=* node app.js</code>。</p>
+<p><strong>–inspect-brk</strong>。让 node 在执行第一行前暂停，等待调试器连接。比 <code>--inspect</code> 严格，避免&quot;我还没 attach 上业务逻辑就跑过去了&quot;。</p>
+<p><strong>SIGUSR1 信号</strong>。这是 node 的一个隐藏特性：给一个已经在跑的 node 进程发 <code>SIGUSR1</code>，它会原地启动 inspector 端口（默认 9229）。对前面那个 hang 住的 opencode 来说尤其有用——不需要重启，直接 <code>kill -SIGUSR1 PID</code>，然后 <code>chrome://inspect</code> 附加上去看 stack trace。</p>
+<p><strong>未捕获异常</strong>。<code>--abort-on-uncaught-exception</code> 让 node 在抛 uncaught exception 时直接 abort 并产生 core dump，可以用 <code>lldb</code> 或 <code>gdb</code> 离线分析。<code>--trace-uncaught</code> 输出栈而不退出。</p>
+<p><strong>深度跟踪</strong>。<code>--prof</code> 写 V8 tick log（<code>isolate-*.log</code>），用 <code>node --prof-process</code> 解析，能看出启动期热点函数。<code>--cpu-prof</code> 直接生成 .cpuprofile，可以扔进 Chrome DevTools。</p>
+<h3 id="模式提炼：runtime-都有-无侵入注入-的环境变量">模式提炼：runtime 都有&quot;无侵入注入&quot;的环境变量</h3>
+<blockquote>
+<p>JVM 是 <code>JAVA_TOOL_OPTIONS</code>，Node 是 <code>NODE_OPTIONS</code>，Python 是 <code>PYTHONSTARTUP</code> / <code>PYTHONFAULTHANDLER</code>。在改不了启动命令的场景下，这些都是一类语义。</p>
+</blockquote>
+<p>这条模式的价值在调试容器、CI、桌面应用时极高。docker run 不能改，但可以加 <code>-e JAVA_TOOL_OPTIONS=...</code>；systemd unit 不能改，但可以加一行 <code>Environment=NODE_OPTIONS=...</code>；IDE 不让传参，但 OS 全局环境变量它躲不开。</p>
+<h2 id="五-把不能修改启动命令的进程也盯住">五、把不能修改启动命令的进程也盯住</h2>
+<p>很多调试场景的根本困难不是&quot;工具不够&quot;，而是&quot;我没有命令行控制权&quot;。比如：</p>
+<ul>
+<li>容器 ENTRYPOINT 写死，要重新打镜像才能改。</li>
+<li>systemd unit 在 <code>/etc/systemd/system/</code> 下，重启需要权限。</li>
+<li>客户机器上的桌面应用，源码在远端，本地只有二进制。</li>
+<li>IDE Run/Debug 配置里 stderr 是被吞的。</li>
+</ul>
+<p>四种通用注入点：</p>
+<table>
+<thead>
+<tr>
+<th>注入点</th>
+<th>JVM</th>
+<th>Node.js</th>
+<th>通用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>命令行参数</td>
+<td>改不了</td>
+<td>改不了</td>
+<td>改不了</td>
+</tr>
+<tr>
+<td>环境变量</td>
+<td><code>JAVA_TOOL_OPTIONS</code></td>
+<td><code>NODE_OPTIONS</code></td>
+<td><code>LD_PRELOAD</code>（Linux）/ <code>DYLD_INSERT_LIBRARIES</code>（macOS）</td>
+</tr>
+<tr>
+<td>配置文件</td>
+<td><code>log4j2.xml</code> 的 <code>status</code> 属性、<code>logging.properties</code></td>
+<td><code>NODE_DEBUG</code> 配合 <code>package.json</code></td>
+<td><code>~/.bashrc</code>、shell wrapper</td>
+</tr>
+<tr>
+<td>信号</td>
+<td><code>SIGQUIT</code>（thread dump）</td>
+<td><code>SIGUSR1</code>（inspector）</td>
+<td><code>SIGINFO</code>（部分 OS）</td>
+</tr>
+</tbody>
+</table>
+<p>实战里这四种经常组合用。比如要观察一个 docker 化的 Spring Boot，最常见的是在 Compose 里加一个 <code>JAVA_TOOL_OPTIONS=-Dlog4j2.debug -XX:+UnlockDiagnosticVMOptions -Xlog:all=info,gc*=debug:file=/tmp/jvm.log</code>，然后用 <code>docker exec</code> 进容器看 <code>/tmp/jvm.log</code>。</p>
+<h2 id="六-用-opencode-hang-这个例子推演一遍">六、用 opencode hang 这个例子推演一遍</h2>
+<p>opencode 是基于 Node.js 的终端 CLI（TUI 模式）。即使没有源码，按上面这套方法也能盯。</p>
+<p><strong>第一步：分类</strong>。先用 <code>top -p PID</code> 看 CPU 占用，区分 B 和 C；再 <code>ps PID</code> 看进程是否还在，区分 A。如果 CPU ≈ 0 且进程还在，是典型的 B（在等什么 syscall）。</p>
+<p><strong>第二步：让它说话</strong>。下次启动加全套环境变量：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">DEBUG=* NODE_DEBUG=* NODE_OPTIONS=<span class="hljs-string">&quot;--inspect=127.0.0.1:9229 --trace-warnings --trace-uncaught&quot;</span> opencode<br></code></pre></td></tr></table></figure>
+<p>如果 opencode 自己有 verbose flag（CLI 一般会有 <code>-v</code> 或 <code>--debug</code>），优先用它的，因为业务层日志比 node core 日志更具体。</p>
+<p><strong>第三步：附加到当前 hang 住的进程</strong>。如果不想重启：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 找到 PID</span><br>pgrep -f opencode<br><br><span class="hljs-comment"># 触发 inspector</span><br><span class="hljs-built_in">kill</span> -SIGUSR1 &lt;PID&gt;<br><br><span class="hljs-comment"># 同时看它卡在哪个 syscall</span><br><span class="hljs-comment"># Linux:</span><br><span class="hljs-built_in">sudo</span> strace -fp &lt;PID&gt;<br><span class="hljs-built_in">sudo</span> <span class="hljs-built_in">cat</span> /proc/&lt;PID&gt;/stack<br><span class="hljs-comment"># macOS:</span><br>sample &lt;PID&gt; 5<br><span class="hljs-built_in">sudo</span> dtruss -p &lt;PID&gt;<br></code></pre></td></tr></table></figure>
+<p>然后浏览器打开 <code>chrome://inspect</code>，点 “Open dedicated DevTools for Node”，应该能看到 V8 的 call stack。Node TUI 类应用 hang 住的常见根因有几类：</p>
+<ul>
+<li>网络请求没设超时（<code>fetch</code> / <code>axios</code> 默认就是无限等）。</li>
+<li>TLS 握手慢（公司网络代理、自签证书校验）。</li>
+<li>DNS 阻塞（<code>/etc/resolv.conf</code> 配错或 IPv6 走通了 IPv4 没回来）。</li>
+<li>TUI 渲染锁住事件循环（同步阻塞 stdin 读，或者一个无限的 <code>setImmediate</code> 链）。</li>
+<li>某个 plugin / extension 在初始化时 await 了一个永远不会 resolve 的 Promise。</li>
+</ul>
+<p>通过 strace 看到 <code>connect</code> / <code>recvfrom</code> 卡在某个 IP，多半是网络类；通过 inspector 看到栈停在 <code>tls.js</code> 或 <code>dns.js</code>，多半是 TLS / DNS 类；如果完全空闲、栈停在 <code>epoll_wait</code>，又没新事件，那就是 Promise 永远不 resolve。</p>
+<p><strong>第四步：缩小重现</strong>。一旦定位了大致方向，把环境变量限定到最少的开关上重启，确认每一步推理。这一步看起来累赘，但能避免&quot;我以为是网络其实是 plugin&quot;的方向性错误。</p>
+<h2 id="七-模式速查表">七、模式速查表</h2>
+<p>横轴是故障类型，纵轴是 runtime。每格给出&quot;第一时间该敲什么&quot;。</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>A. 静默 crash</th>
+<th>B. syscall 阻塞</th>
+<th>C. 用户态死循环</th>
+<th>D. 到不了 main</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>JVM</strong></td>
+<td>找 <code>hs_err_pid*.log</code>；<code>JAVA_TOOL_OPTIONS=-verbose:class -Xlog:all=info</code> 重跑</td>
+<td><code>kill -3 PID</code> 看 thread dump；<code>jstack</code> / <code>jhsdb jstack</code></td>
+<td><code>async-profiler -d 30 -f flame.html PID</code>；<code>jcmd PID Thread.print</code> 多次采样</td>
+<td><code>JAVA_TOOL_OPTIONS=-Dlog4j2.debug</code> + <code>-Xlog:class+load=debug</code>；查 javaagent 加载顺序</td>
+</tr>
+<tr>
+<td><strong>Node.js</strong></td>
+<td><code>--abort-on-uncaught-exception</code> 产 core dump + lldb；查 wrapper 是否吞 stderr</td>
+<td><code>kill -SIGUSR1 PID</code> 起 inspector；strace 看 syscall</td>
+<td><code>--cpu-prof</code> 或 inspector 的 Profiler</td>
+<td><code>NODE_OPTIONS=&quot;--inspect-brk --trace-warnings&quot;</code> 重跑；<code>NODE_DEBUG=module</code> 看 require 链</td>
+</tr>
+<tr>
+<td><strong>通用 OS</strong></td>
+<td>看 <code>/proc/PID/fd/{1,2}</code> 之前的最后写入；<code>dmesg</code> 看 OOM kill；core file</td>
+<td><code>cat /proc/PID/stack</code> + <code>cat /proc/PID/wchan</code></td>
+<td><code>perf top -p PID</code>；按 CPU 时间排序</td>
+<td>strace 整个 exec 链；查 <code>LD_PRELOAD</code> / <code>DYLD_*</code> 是否有人埋了 hook</td>
+</tr>
+</tbody>
+</table>
+<h2 id="八-几个反复踩到的反模式">八、几个反复踩到的反模式</h2>
+<ul>
+<li><strong>nohup 把 stderr 也搞丢了</strong>。<code>nohup cmd &gt; out.log</code> 不会重定向 stderr，但 <code>nohup cmd &gt; out.log 2&gt;&amp;1</code> 才是想要的。最常见的是写 <code>nohup cmd &amp;</code> 然后困惑为什么没日志——其实它默认写到 <code>nohup.out</code>。</li>
+<li><strong>IDE Run 配置吞启动错</strong>。IntelliJ / VS Code 的 Run 面板对 stderr 的处理因 runner 不同而不同；同样的程序在 Terminal 里跑能看到错，在 Run 面板里看不到。出怪问题时用 Terminal 重跑一次。</li>
+<li><strong>PID 1 不传信号</strong>。容器里如果 entrypoint 是 shell 脚本而不是 <code>exec</code> 替换，子进程不是 PID 1，外部 <code>docker kill -s SIGUSR1</code> 信号可能根本到不了 node。dockerfile 里的 <code>CMD [&quot;node&quot;, &quot;app.js&quot;]</code> 是 PID 1，<code>CMD node app.js</code> 不是。</li>
+<li><strong>启动期 DNS 反解阻塞</strong>。<code>/etc/resolv.conf</code> 里第一个 nameserver 不通时，glibc 默认会试到超时。一台新机器、VPN 切换、容器 networkmode 错了，都会触发。表现就是&quot;程序 hang 住几十秒到几分钟，然后突然继续&quot;。strace 上是反复 <code>connect</code> 到 53/UDP。</li>
+<li><strong>macOS 上的工具受 SIP 限制</strong>。<code>dtruss</code>、<code>dtrace</code> 默认不能 attach 到 Apple 签名的二进制上；<code>lldb</code> 也需要 codesign 或关 SIP。如果命令直接说 “operation not permitted”，多半是这个原因。</li>
+<li><strong>log4j2 自己配错，连&quot;配错&quot;都不打印</strong>。这是最阴险的一类。<code>log4j2.xml</code> 没在 classpath、命名不对（必须是 <code>log4j2.xml</code> 不是 <code>log4j.xml</code>）、或 XML 语法错，log4j2 会退化到默认 console + ERROR 级别，业务日志全没了，但 status logger 不出错就不会主动报告。<strong>记住打 <code>-Dlog4j2.debug</code> 是诊断这一类的钥匙</strong>。</li>
+<li><strong>把 JIT 编译当成 hang</strong>。冷启动的 JVM 在第一次跑热点路径时，可能在 C2 编译器里花几秒到几十秒，看起来像 hang。<code>-XX:+PrintCompilation</code> 或 <code>-Xlog:jit+compilation</code> 可以确认是不是这个。</li>
+</ul>
+<h2 id="九-收尾">九、收尾</h2>
+<p>这套方法论的核心其实只有一句话：<strong>没有看见输出 ≠ 没有产生输出</strong>。剩下的工作是按 OS / runtime / 框架 三层倒推，把&quot;输出去哪了&quot;、“卡在哪一步”、&quot;什么时候开始失败的&quot;分别定位清楚。</p>
+<p>工具的具体名字会随版本变（jstack 被 jcmd 替代，strace 在 macOS 不存在），但分类和原则不会变：</p>
+<ol>
+<li>先按 A/B/C/D 把症状归类，避免方向错。</li>
+<li>找输出永远是第一步——<code>/proc/PID/fd</code> 或等价物先看一眼。</li>
+<li>卡点定位用 syscall，因为它是用户态代码绕不开的接口。</li>
+<li>pre-main 失败用 runtime 自带的 verbose 开关，靠不到代码就靠不到日志。</li>
+<li>改不了启动命令时，环境变量 / 信号 / 配置文件三选一注入。</li>
+</ol>
+<p>最后一个建议：把这五步沉淀成自己的 cheat sheet，下次遇到 opencode 这类&quot;启动黑盒&quot;，第一反应就不会是&quot;重装一遍试试&quot;。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/05/21/%E8%BF%9B%E7%A8%8B%E5%90%AF%E5%8A%A8%E6%9C%9F%E7%9A%84%E9%9D%99%E9%BB%98%E6%95%85%E9%9A%9C-JVM-%E4%B8%8E-Node-%E7%9A%84%E8%B0%83%E8%AF%95%E6%96%B9%E6%B3%95%E8%AE%BA/">https://magicliang.github.io/2026/05/21/%E8%BF%9B%E7%A8%8B%E5%90%AF%E5%8A%A8%E6%9C%9F%E7%9A%84%E9%9D%99%E9%BB%98%E6%95%85%E9%9A%9C-JVM-%E4%B8%8E-Node-%E7%9A%84%E8%B0%83%E8%AF%95%E6%96%B9%E6%B3%95%E8%AE%BA/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/JVM/">JVM</a><a class="post-meta__tags" href="/tags/%E8%B0%83%E8%AF%95/">调试</a><a class="post-meta__tags" href="/tags/Node-js/">Node.js</a><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E7%BC%96%E7%A8%8B/">系统编程</a><a class="post-meta__tags" href="/tags/%E5%8F%AF%E8%A7%82%E5%AF%9F%E6%80%A7/">可观察性</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-169.jpg" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2017/10/27/%E5%9F%BA%E4%BA%8E%E6%A0%88%E7%9A%84%E8%99%9A%E6%8B%9F%E6%9C%BA/" title="基于栈的虚拟机"><img class="cover" src="/img/cover-programming-language.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2017-10-27</div><div class="info-item-2">基于栈的虚拟机</div></div><div class="info-2"><div class="info-item-1">基于栈的虚拟机 全景导图 mindmap   root((基于栈的虚拟机))     核心架构       操作数栈       局部变量表       栈帧     执行机制       字节码指令       基于栈的运算       指令集简洁性     设计优势       可移植性       代码紧凑       实现简单     典型应用       JVM       Python虚拟机       .NET CLR 模式总览    # 模式名称 一句话口诀 覆盖场景     1 栈式计算 数据流与控制流分离，操作数隐式传递 JVM字节码执行、表达式求值、递归调用   2 栈帧隔离 每个方法调用独立的执行上下文 方法调用、异常处理、线程隔离   3 指令紧凑 操作数位置编码在指令中，减少指令长度 字节码压缩、跨平台分发    问题定义 为什么选择基于栈的虚拟机架构，而非基于寄存器的架构？这种设计如何影响字节码的生成、执行效率以及跨平台可移植性？ 核心概念 虚拟机架构分类 虚拟机按照指令集架构主要分为两类：  基于栈的虚拟机：指令不指定操作数的位置，操作数从栈顶弹出...</div></div></div></a><a class="pagination-related" href="/2026/01/12/Java-%E5%B9%B6%E5%8F%91%E7%BC%96%E7%A8%8B%E7%AC%94%E8%AE%B0/" title="Java 并发编程笔记"><img class="cover" src="/2026/01/12/Java-%E5%B9%B6%E5%8F%91%E7%BC%96%E7%A8%8B%E7%AC%94%E8%AE%B0/%E9%9D%9E%E5%85%AC%E5%B9%B3%E9%94%81%E6%B5%81%E7%A8%8B1.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-01-12</div><div class="info-item-2">Java 并发编程笔记</div></div><div class="info-2"><div class="info-item-1">本文思维导图总览：  下载思维导图源文件 写在前面的话 并发编程最早的实践都在操作系统里。高层语言的并发模型都要基于底层系统对硬件抽象和并发的设计来设计和实现，不能超出操作系统允许的范围。所谓的高级抽象总体上是简化对 OS 底层机制的复杂调用。 并发与异步 本文聚焦并发（Concurrency），即多任务在同一时间段内的交替或并行执行，核心问题是资源共享、线程同步与协作。 **异步（Asynchronous）**是另一维度：调用方发起操作后不等结果返回即继续执行，通过回调、Future或事件机制获取结果。异步可通过单线程事件循环实现，也可依托多线程并发实现。 二者关系：并发关注&quot;多任务如何执行与协调&quot;，异步关注&quot;调用是否阻塞等待&quot;。并发编程常涉及异步，但本文不展开异步编程模式（如响应式流、协程），相关内容请参阅《Java 线程池笔记》。 管程 理论和实践之间是有鸿沟的，要弥合这种鸿沟，通常需要我们去学习别人的实践。比如并发的标准设计思想来自于操作系统里的管程（monitor），我们应当学习管程，进而了解标准的并发模型-管理共享变量和线程（并...</div></div></div></a><a class="pagination-related" href="/2017/10/23/%E6%98%82%E8%B4%B5%E7%9A%84%E5%BC%82%E5%B8%B8/" title="昂贵的异常"><img class="cover" src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2017-10-23</div><div class="info-item-2">昂贵的异常</div></div><div class="info-2"><div class="info-item-1">抛出问题 Joshua Bloch 在《Effective Java》的 Item 57 里明确地提到过，不要试图用 Exception 的跳转来代替正常的程序控制流。他列举了很多原因，但特别提到了抛出异常会使得整个程序运行变慢。抛出异常远比普通的 return、break 等操作对控制流、数据流的性能影响要大，它就只适合拿来作异常分支的控制语句，而不能拿来编写正常的逻辑。  Throwing exception is expensive.  这句话在 Java 的程序员世界里面已经成为老生常谈，却很少有人谈及到底抛出异常比正常的程序跳转返回慢在哪里，有多慢。&quot;不要滥用异常&quot;好像一个猴子定律，人们知道不能这么做，却不明白为什么不能这么做。 此前读了一位同事写的好文《Java虚拟机是如何处理异常的》，深入地分析了 JVM 对异常跳转的处理过程：JVM 会通过异常表的机制，优化异常抛出和正常返回之间的性能差异。仅从程序计数器的移动上来讲，抛出一个异常对栈帧的弹栈并不比直接返回更昂贵。写在前头的结论是：&quot;try-catch 语句块几乎不会影响程序运行性能！...</div></div></div></a><a class="pagination-related" href="/2020/03/08/JMX-%E6%B7%B1%E5%BA%A6%E5%8E%86%E9%99%A9/" title="JMX 深度历险"><img class="cover" src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2020-03-08</div><div class="info-item-2">JMX 深度历险</div></div><div class="info-2"><div class="info-item-1">JMX 常见指标 JVM 指标 系统指标    System 相关指标 描述     system.load.average 系统load，如果是docker，此指标收集的物理机的load   cpu.system.load.percent 系统所有进程占用cpu的百分比   cpu.jvm.load.percent jvm占用cpu的百分比   system.process.used.phyical.memory 系统使用的物理内存   system.process.used.swap.size 系统使用的swap内存    JVM 内存指标    JVM相关指标 描述     jvm.gc.count GC的次数   jvm.gc.time GC的时间，单位毫秒   jvm.younggc.count 年轻代GC的次数 ，包括的GC算法（Copy，ParNew，PS Scavenge，G1 Young Generation）   jvm.younggc.time 年轻代GC的时间，单位毫秒   jvm.fullgc.count 年老代GC的次数，包括的GC算法   jvm.f...</div></div></div></a><a class="pagination-related" href="/2026/04/19/Java%E6%A0%88%E5%B8%A7%E7%9C%81%E7%95%A5%E6%9C%BA%E5%88%B6%E8%AF%A6%E8%A7%A3/" title="Java栈帧省略机制详解：为什么异常堆栈会消失？"><img class="cover" src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-04-19</div><div class="info-item-2">Java栈帧省略机制详解：为什么异常堆栈会消失？</div></div><div class="info-2"><div class="info-item-1">引言：诡异的异常堆栈消失现象 线上服务报错时，你打开日志准备排查问题，却发现异常堆栈信息神秘消失了： 1java.lang.NullPointerException 只有短短一行异常类名，没有完整的堆栈跟踪。你可能会怀疑：是日志框架出问题了？还是被什么拦截器截断了？ 其实，这是 JVM 的一个性能优化机制，叫做 OmitStackTraceInFastThrow（快速抛出时省略堆栈跟踪）。从 JDK 5 开始引入，默认启用。 本文将深入剖析这个机制的设计动机、工作原理、触发条件，以及如何正确应对。  一、问题场景：异常堆栈去哪了？ 1.1 复现现象 用一段简单的代码就能复现： 123456789101112public class ExceptionOmitDemo &#123;    public static void main(String[] args) &#123;        String msg = null;        for (int i = 0; i &lt; 500000; i++) &#123;            try &#123;      ...</div></div></div></a><a class="pagination-related" href="/2017/12/24/client-%E4%B8%8E-server/" title="client 与 server"><img class="cover" src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2017-12-24</div><div class="info-item-2">client 与 server</div></div><div class="info-2"><div class="info-item-1">client 模式 默认的jit编译器，c1。 默认的gc：serial-serial old。 需要更短的启动时间和初始堆大小，能做更保守的优化。 默认-Xms是1M，-Xmx是64M。 适合 GUI 程序。 server 模式 默认的jit编译器，c2。 默认的gc：ps-serial old即 PS MarkSweep（可以启用parallel old）。 需要更长的启动时间和更大的堆大小，能够做更有深度的优化。 默认-Xms是128M，-Xmx是1024M。 适合长时间运转的程序。 64 位JVM# 在64位 JVM 上有个 -d64 的模式，实际上就是禁止client模式单独启动，只允许server模式或者混合编译模式启动的模式。 </div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80-%E5%85%88%E6%8A%8A-%E7%9C%8B%E4%B8%8D%E5%88%B0%E6%97%A5%E5%BF%97-%E5%88%86%E6%88%90%E5%9B%9B%E7%A7%8D%E6%83%85%E5%86%B5"><span class="toc-number">1.</span> <span class="toc-text">一、先把&quot;看不到日志&quot;分成四种情况</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9A%E5%85%88%E5%81%9A%E5%88%86%E7%B1%BB-%E5%86%8D%E9%80%89%E5%B7%A5%E5%85%B7"><span class="toc-number">1.1.</span> <span class="toc-text">模式提炼：先做分类，再选工具</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C-%E7%AC%AC%E4%B8%80%E6%AD%A5%EF%BC%9A%E6%89%BE%E8%BE%93%E5%87%BA"><span class="toc-number">2.</span> <span class="toc-text">二、第一步：找输出</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9A%E6%B0%B8%E8%BF%9C%E5%85%88%E9%AA%8C%E8%AF%81-fd-0-1-2-%E6%8C%87%E5%90%91%E5%93%AA%E9%87%8C"><span class="toc-number">2.1.</span> <span class="toc-text">模式提炼：永远先验证 fd 0&#x2F;1&#x2F;2 指向哪里</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89-%E7%AC%AC%E4%BA%8C%E6%AD%A5%EF%BC%9A%E5%AE%9A%E4%BD%8D%E5%8D%A1%E7%82%B9"><span class="toc-number">3.</span> <span class="toc-text">三、第二步：定位卡点</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9Asyscall-%E6%98%AF%E9%BB%91%E7%9B%92%E8%BF%9B%E7%A8%8B%E7%9A%84-%E8%87%AA%E7%99%BD"><span class="toc-number">3.1.</span> <span class="toc-text">模式提炼：syscall 是黑盒进程的&quot;自白&quot;</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B-%E7%AC%AC%E4%B8%89%E6%AD%A5%EF%BC%9A%E5%88%B0%E4%B8%8D%E4%BA%86-main-%E7%9A%84%E6%83%85%E5%86%B5"><span class="toc-number">4.</span> <span class="toc-text">四、第三步：到不了 main 的情况</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#jvm-%E5%90%AF%E5%8A%A8%E6%9C%9F%E8%AF%8A%E6%96%AD"><span class="toc-number">4.1.</span> <span class="toc-text">JVM 启动期诊断</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#node-js-%E5%90%AF%E5%8A%A8%E6%9C%9F%E8%AF%8A%E6%96%AD"><span class="toc-number">4.2.</span> <span class="toc-text">Node.js 启动期诊断</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9Aruntime-%E9%83%BD%E6%9C%89-%E6%97%A0%E4%BE%B5%E5%85%A5%E6%B3%A8%E5%85%A5-%E7%9A%84%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F"><span class="toc-number">4.3.</span> <span class="toc-text">模式提炼：runtime 都有&quot;无侵入注入&quot;的环境变量</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94-%E6%8A%8A%E4%B8%8D%E8%83%BD%E4%BF%AE%E6%94%B9%E5%90%AF%E5%8A%A8%E5%91%BD%E4%BB%A4%E7%9A%84%E8%BF%9B%E7%A8%8B%E4%B9%9F%E7%9B%AF%E4%BD%8F"><span class="toc-number">5.</span> <span class="toc-text">五、把不能修改启动命令的进程也盯住</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD-%E7%94%A8-opencode-hang-%E8%BF%99%E4%B8%AA%E4%BE%8B%E5%AD%90%E6%8E%A8%E6%BC%94%E4%B8%80%E9%81%8D"><span class="toc-number">6.</span> <span class="toc-text">六、用 opencode hang 这个例子推演一遍</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83-%E6%A8%A1%E5%BC%8F%E9%80%9F%E6%9F%A5%E8%A1%A8"><span class="toc-number">7.</span> <span class="toc-text">七、模式速查表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB-%E5%87%A0%E4%B8%AA%E5%8F%8D%E5%A4%8D%E8%B8%A9%E5%88%B0%E7%9A%84%E5%8F%8D%E6%A8%A1%E5%BC%8F"><span class="toc-number">8.</span> <span class="toc-text">八、几个反复踩到的反模式</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D-%E6%94%B6%E5%B0%BE"><span class="toc-number">9.</span> <span class="toc-text">九、收尾</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.1</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.4</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.4"></script><script src="/js/main.js?v=5.5.4"></script><script src="/js/tw_cn.js?v=5.5.4"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.12.2/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="ribbon" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-ribbon.min.js" size="150" alpha="0.6" zIndex="-1" mobile="false" data-click="true"></script><script id="canvas_nest" defer="defer" color="0,0,255" opacity="0.7" zIndex="-1" count="99" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-nest.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = true;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script id="click-heart" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/click-heart.min.js" async="async" mobile="false"></script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

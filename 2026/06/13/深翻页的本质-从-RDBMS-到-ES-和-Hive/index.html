@@ -1,0 +1,982 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深翻页的本质：从 RDBMS 到 ES 和 Hive | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="博客里原来有两处深分页材料：一篇《一次大表翻页实验》，以及《MySQL 基本功》里的两个深分页片段。它们都说到了同一件事：大 OFFSET 慢，先查窄索引再回表会快很多，连续翻页可以记录上一页的最后一个 id。 这几个判断是对的，但还不够完整。深翻页并不是一个单纯的 SQL 写法问题。它同时牵涉四件事：访问路径是否够窄、排序是否稳定、产品是否允许只连续向后翻、底层系统是不是分布式合并结果。RDBM">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深翻页的本质：从 RDBMS 到 ES 和 Hive">
+<meta property="og:url" content="https://magicliang.github.io/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="博客里原来有两处深分页材料：一篇《一次大表翻页实验》，以及《MySQL 基本功》里的两个深分页片段。它们都说到了同一件事：大 OFFSET 慢，先查窄索引再回表会快很多，连续翻页可以记录上一页的最后一个 id。 这几个判断是对的，但还不够完整。深翻页并不是一个单纯的 SQL 写法问题。它同时牵涉四件事：访问路径是否够窄、排序是否稳定、产品是否允许只连续向后翻、底层系统是不是分布式合并结果。RDBM">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/cover.svg">
+<meta property="article:published_time" content="2026-06-13T02:00:00.000Z">
+<meta property="article:modified_time" content="2026-06-12T16:22:51.394Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Elasticsearch">
+<meta property="article:tag" content="Hive">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="分布式系统">
+<meta property="article:tag" content="数据库">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深翻页的本质：从 RDBMS 到 ES 和 Hive",
+  "url": "https://magicliang.github.io/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/",
+  "image": "https://magicliang.github.io/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/cover.svg",
+  "datePublished": "2026-06-13T02:00:00.000Z",
+  "dateModified": "2026-06-12T16:22:51.394Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.4"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.1.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深翻页的本质：从 RDBMS 到 ES 和 Hive',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.1"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (false) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">442</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">484</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">31</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深翻页的本质：从 RDBMS 到 ES 和 Hive</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深翻页的本质：从 RDBMS 到 ES 和 Hive</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-06-13T02:00:00.000Z" title="Created 2026-06-13 10:00:00">2026-06-13</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-06-12T16:22:51.394Z" title="Updated 2026-06-13 00:22:51">2026-06-13</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.8k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>16mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><p>博客里原来有两处深分页材料：一篇《一次大表翻页实验》，以及《MySQL 基本功》里的两个深分页片段。它们都说到了同一件事：大 <code>OFFSET</code> 慢，先查窄索引再回表会快很多，连续翻页可以记录上一页的最后一个 <code>id</code>。</p>
+<p>这几个判断是对的，但还不够完整。深翻页并不是一个单纯的 SQL 写法问题。它同时牵涉四件事：访问路径是否够窄、排序是否稳定、产品是否允许只连续向后翻、底层系统是不是分布式合并结果。RDBMS、Elasticsearch、Hive 的症状不同，底层问题却很像：系统被要求在一个有序结果集上跳过很长的前缀。</p>
+<p>核心判断很简单：</p>
+<blockquote>
+<p>深翻页的成本来自“计算前缀再丢弃前缀”。优化要么把前缀变窄，要么把“第 N 页”改成“从某个锚点继续”，要么提前把结果集物化成可跳转目录。</p>
+</blockquote>
+<span id="more"></span>
+<h1>旧实验给出的信号</h1>
+<p>旧文里的实验表大约有 1000 万行，按 <code>status</code> 过滤后命中约 100 万行。测试环境是本地硬盘，慢查询阈值按 100ms 估算。几条查询的结果很有代表性：</p>
+<table>
+<thead>
+<tr>
+<th>查询形态</th>
+<th>典型 SQL</th>
+<th style="text-align:right">耗时</th>
+<th>主要现象</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>直接深翻页</td>
+<td><code>where status = '1' limit 990000, 1000</code></td>
+<td style="text-align:right">3.563s</td>
+<td>命中 <code>idx_status</code>，但要跳过 99 万行</td>
+</tr>
+<tr>
+<td>加 <code>id</code> 范围</td>
+<td><code>where status = '1' and id &gt;= 9000000 limit 990000, 1000</code></td>
+<td style="text-align:right">1.572s</td>
+<td>访问范围变窄，但仍在深跳过</td>
+</tr>
+<tr>
+<td>只取 <code>id</code></td>
+<td><code>select id ... limit 990000, 1000</code></td>
+<td style="text-align:right">0.194s</td>
+<td>覆盖索引，行变窄</td>
+</tr>
+<tr>
+<td>先取 <code>id</code> 再回表</td>
+<td><code>id in (select id ... limit 990000, 1000)</code></td>
+<td style="text-align:right">0.199s</td>
+<td>比直接查全列快很多，但仍超过 100ms</td>
+</tr>
+</tbody>
+</table>
+<p>这个实验最重要的结论是：跳过同样多的逻辑行时，跳过窄索引比跳过整行便宜。旧文把这个叫作 <code>Using index</code> 带来的性能差异；换成更一般的说法，就是先沿着窄结构走到目标窗口，再用目标窗口里的主键回表。</p>
+<p>这也是《MySQL 基本功》里“延迟关联 / 覆盖索引 / 游标分页”几种写法的共同前提。三种写法分处不同层次：</p>
+<table>
+<thead>
+<tr>
+<th>技巧</th>
+<th>减掉的成本</th>
+<th>没有减掉的成本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>覆盖索引</td>
+<td>回表与大字段读取</td>
+<td>仍要跳过前面的索引项</td>
+</tr>
+<tr>
+<td>延迟关联</td>
+<td>深页阶段只处理窄键</td>
+<td>仍要按偏移计算目标窗口</td>
+</tr>
+<tr>
+<td>游标分页</td>
+<td>不再按偏移跳过</td>
+<td>只能自然连续翻页</td>
+</tr>
+</tbody>
+</table>
+<h1><code>OFFSET</code> 慢在哪里</h1>
+<p>SQL 里的 <code>LIMIT/OFFSET</code> 语义很朴素：先得到查询结果的一段有序序列，再跳过前 <code>OFFSET</code> 行，返回后面的 <code>LIMIT</code> 行。PostgreSQL 官方文档写得很直白：被 <code>OFFSET</code> 跳过的行仍然要在服务端计算出来，大 <code>OFFSET</code> 可能低效。这个说法足够解释绝大多数 RDBMS 深分页问题。</p>
+<p>MySQL 的 <code>LIMIT</code> 优化文档也给了两个关键提醒。第一，<code>LIMIT row_count</code> 可以让优化器在某些场景更早停止，例如 <code>ORDER BY + LIMIT</code> 在找到足够多的有序结果后可以停止。第二，如果 <code>ORDER BY</code> 列不唯一，带不带 <code>LIMIT</code> 可能得到不同的行内顺序；要获得稳定分页，必须在排序列后补一个唯一的 tie-breaker，例如 <code>id</code>。</p>
+<p>因此，一个看似普通的分页 SQL 至少有三层成本：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">SELECT</span> <span class="hljs-operator">*</span><br><span class="hljs-keyword">FROM</span> orders<br><span class="hljs-keyword">WHERE</span> status <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;PAID&#x27;</span><br><span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> paid_at <span class="hljs-keyword">DESC</span>, id <span class="hljs-keyword">DESC</span><br>LIMIT <span class="hljs-number">990000</span>, <span class="hljs-number">1000</span>;<br></code></pre></td></tr></table></figure>
+<p>第一层是过滤成本。<code>status = 'PAID'</code> 能不能走到选择性足够好的索引，决定候选集有多大。</p>
+<p>第二层是排序成本。<code>ORDER BY paid_at DESC, id DESC</code> 能不能沿索引天然输出，决定是否需要额外排序。</p>
+<p>第三层是跳过成本。哪怕前两层都命中索引，数据库仍要沿着有序结果走过 99 万个位置，才能返回后面的 1000 行。</p>
+<p>深分页优化的基本动作，就是分别处理这三层成本。</p>
+<h1>模式一：先翻窄索引，再回表</h1>
+<p>“延迟关联”适合保留页码语义，又希望把大偏移的伤害降下来。它让内层子查询只扫描覆盖索引，拿到目标窗口的主键后，外层再回表取完整行：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">SELECT</span> o.<span class="hljs-operator">*</span><br><span class="hljs-keyword">FROM</span> orders o<br><span class="hljs-keyword">JOIN</span> (<br>    <span class="hljs-keyword">SELECT</span> id<br>    <span class="hljs-keyword">FROM</span> orders<br>    <span class="hljs-keyword">WHERE</span> status <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;PAID&#x27;</span><br>    <span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> paid_at <span class="hljs-keyword">DESC</span>, id <span class="hljs-keyword">DESC</span><br>    LIMIT <span class="hljs-number">990000</span>, <span class="hljs-number">1000</span><br>) page <span class="hljs-keyword">ON</span> page.id <span class="hljs-operator">=</span> o.id<br><span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> o.paid_at <span class="hljs-keyword">DESC</span>, o.id <span class="hljs-keyword">DESC</span>;<br></code></pre></td></tr></table></figure>
+<p>对应的索引应该贴合过滤与排序：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">CREATE</span> INDEX idx_orders_paid_page<br><span class="hljs-keyword">ON</span> orders (status, paid_at <span class="hljs-keyword">DESC</span>, id <span class="hljs-keyword">DESC</span>);<br></code></pre></td></tr></table></figure>
+<p>这个方案的价值在于把“跳过 99 万行完整记录”变成“跳过 99 万个索引项”。索引项包含的列少，页更紧凑，缓存命中率更高，回表只发生在最后 1000 个目标行上。</p>
+<p>边界也很清楚。偏移本身没有消失，只是被压到更便宜的结构上。如果业务要求 100ms 内返回第 1000 页，旧实验里 0.19s 的结果已经说明：延迟关联可以把 3 秒级查询拉回亚秒级，但不保证进入高并发接口的 SLA。</p>
+<p>可迁移模式是“瘦身后定位”：目标窗口很深时，先用只包含过滤列、排序列和主键的窄结构定位窗口，再把窗口里的键扩展成完整对象。</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>窄结构</th>
+<th>扩展动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MySQL 深页</td>
+<td>覆盖索引 <code>(where, order, id)</code></td>
+<td>按主键回表</td>
+</tr>
+<tr>
+<td>ES 搜索页</td>
+<td>每个 shard 的 top docs</td>
+<td>coordinator 合并后取 <code>_source</code></td>
+</tr>
+<tr>
+<td>Hive 离线页</td>
+<td>物化出的行号表</td>
+<td>查询行号范围后读宽表</td>
+</tr>
+</tbody>
+</table>
+<h1>模式二：用锚点替代偏移</h1>
+<p>如果产品只需要连续向后翻页，<code>OFFSET</code> 可以完全消失。上一页最后一条记录就是下一页的锚点：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">SELECT</span> <span class="hljs-operator">*</span><br><span class="hljs-keyword">FROM</span> orders<br><span class="hljs-keyword">WHERE</span> status <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;PAID&#x27;</span><br>  <span class="hljs-keyword">AND</span> (<br>      paid_at <span class="hljs-operator">&lt;</span> :last_paid_at<br>      <span class="hljs-keyword">OR</span> (paid_at <span class="hljs-operator">=</span> :last_paid_at <span class="hljs-keyword">AND</span> id <span class="hljs-operator">&lt;</span> :last_id)<br>  )<br><span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> paid_at <span class="hljs-keyword">DESC</span>, id <span class="hljs-keyword">DESC</span><br>LIMIT <span class="hljs-number">1000</span>;<br></code></pre></td></tr></table></figure>
+<p>这类写法常被叫作 keyset pagination、seek pagination 或 cursor pagination。核心动作是使用完整排序键，而不只是使用 <code>id</code>。如果列表按 <code>paid_at DESC, id DESC</code> 排序，游标里就必须带 <code>paid_at</code> 和 <code>id</code>。只带 <code>id</code> 等于假设 <code>id</code> 与排序完全一致；这个假设在按发布时间、热度、最后回复时间排序的业务里通常不成立。</p>
+<p>游标建议做成不透明 token，而不是把 <code>id</code> 裸露在 URL 里：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs json"><span class="hljs-punctuation">&#123;</span><br>  <span class="hljs-attr">&quot;query_hash&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;paid-orders:v3:status=PAID&quot;</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;sort&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">[</span><span class="hljs-string">&quot;2026-06-13T09:30:12.123Z&quot;</span><span class="hljs-punctuation">,</span> <span class="hljs-number">918273645</span><span class="hljs-punctuation">]</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;direction&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;next&quot;</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;page_size&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-number">1000</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;snapshot&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;optional-snapshot-or-pit-id&quot;</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;expires_at&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;2026-06-13T10:30:12Z&quot;</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;signature&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;hmac...&quot;</span><br><span class="hljs-punctuation">&#125;</span><br></code></pre></td></tr></table></figure>
+<p><code>query_hash</code> 防止拿 A 查询的游标翻 B 查询。<code>sort</code> 存排序锚点。<code>snapshot</code> 用来绑定一致性视图。<code>signature</code> 防止客户端篡改游标内容。</p>
+<p>这个模式的读法是“锚点续走”：听到“无限滚动”“下一页”“消息流”“时间线”这类需求，优先考虑基于排序键的 seek，而不是页码。</p>
+<h1><code>id</code> 稀疏包含三个不同问题</h1>
+<p>用户开头里提到“<code>id</code> 稀疏，查询结果的 <code>id</code> 看起来很难理解为 1000 条记录”。这句话要拆开看。</p>
+<p>如果 SQL 写成：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">WHERE</span> id <span class="hljs-operator">&gt;</span> :last_id<br><span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> id<br>LIMIT <span class="hljs-number">1000</span><br></code></pre></td></tr></table></figure>
+<p><code>id</code> 中间缺号并不会影响返回 1000 条记录。数据库会沿 B+Tree 继续向后扫描，直到收集到 1000 条存在的记录或结果集耗尽。<code>id</code> 从 1000 跳到 9000000 并不表示中间必须返回 8999000 行。</p>
+<p>麻烦来自三处。</p>
+<p>第一，<code>id</code> 不一定是业务排序。论坛按 <code>last_reply_at</code> 排，商品按销量或相关性排，订单后台按 <code>paid_at</code> 排。此时 <code>id &gt; last_id</code> 不是“下一页”，只是“主键更大的另一批行”。</p>
+<p>第二，<code>id</code> 与过滤条件可能不对齐。如果 <code>status = 'PAID'</code> 的数据在主键空间里很稀疏，<code>id &gt; last_id</code> 之后可能要扫很远才能凑够一页。更好的修正方向是让索引以过滤列和排序列开头，例如 <code>(status, paid_at, id)</code>。</p>
+<p>第三，<code>id</code> 对用户没有解释力。用户看见第 13 页的 <code>id</code> 从 1000 跳到 9000000，会误以为漏了大量数据。接口不应该把游标解释成“页码”。游标是机器用的锚点，不是人的位置编号。</p>
+<h1>跨页和乱翻页需要目录</h1>
+<p>keyset pagination 最擅长连续翻页。它天然不擅长三个需求：</p>
+<table>
+<thead>
+<tr>
+<th>需求</th>
+<th>keyset 的困难</th>
+<th>更合适的方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>跳到第 100 页</td>
+<td>没有第 100 页的锚点</td>
+<td>锚点目录或物化结果</td>
+</tr>
+<tr>
+<td>一次取第 100 到 120 页</td>
+<td>需要顺序走 99 次</td>
+<td>后台任务生成结果集</td>
+</tr>
+<tr>
+<td>前后乱翻</td>
+<td>需要保存双向锚点</td>
+<td>游标栈、PIT、锚点目录</td>
+</tr>
+</tbody>
+</table>
+<p>双向翻页可以通过“前后两个锚点”解决。当前页有第一条和最后一条记录，向后翻用最后一条，向前翻用第一条并反向排序：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-comment">-- 当前页之前的一页</span><br><span class="hljs-keyword">SELECT</span> <span class="hljs-operator">*</span><br><span class="hljs-keyword">FROM</span> orders<br><span class="hljs-keyword">WHERE</span> status <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;PAID&#x27;</span><br>  <span class="hljs-keyword">AND</span> (<br>      paid_at <span class="hljs-operator">&gt;</span> :first_paid_at<br>      <span class="hljs-keyword">OR</span> (paid_at <span class="hljs-operator">=</span> :first_paid_at <span class="hljs-keyword">AND</span> id <span class="hljs-operator">&gt;</span> :first_id)<br>  )<br><span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> paid_at <span class="hljs-keyword">ASC</span>, id <span class="hljs-keyword">ASC</span><br>LIMIT <span class="hljs-number">1000</span>;<br></code></pre></td></tr></table></figure>
+<p>客户端拿到结果后再反转成 <code>DESC</code> 展示。这个方案适合“上一页 / 下一页”，不适合任意页码跳转。</p>
+<p>任意跳转要引入目录。目录可以每隔固定行数保存一个锚点：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">query_hash | snapshot_id | page_no | anchor_paid_at | anchor_id<br>-----------+-------------+---------+----------------+----------<br>Q1         | S1          | 1       | 2026-06-13 ... | 9981<br>Q1         | S1          | 10      | 2026-06-12 ... | 7162<br>Q1         | S1          | 20      | 2026-06-10 ... | 4319<br></code></pre></td></tr></table></figure>
+<p>跳到第 23 页时，先找到第 20 页锚点，再顺序 seek 3 页。目录越密，跳转越快，维护成本越高。目录越稀，存储更省，跳转时要补走更多页。</p>
+<p>更重的做法是物化整个结果集：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">CREATE TABLE</span> export_orders_page_result <span class="hljs-keyword">AS</span><br><span class="hljs-keyword">SELECT</span><br>    <span class="hljs-built_in">row_number</span>() <span class="hljs-keyword">OVER</span> (<span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> paid_at <span class="hljs-keyword">DESC</span>, id <span class="hljs-keyword">DESC</span>) <span class="hljs-keyword">AS</span> rn,<br>    id<br><span class="hljs-keyword">FROM</span> orders<br><span class="hljs-keyword">WHERE</span> status <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;PAID&#x27;</span><br>  <span class="hljs-keyword">AND</span> paid_at <span class="hljs-operator">&gt;=</span> <span class="hljs-string">&#x27;2026-01-01&#x27;</span>;<br></code></pre></td></tr></table></figure>
+<p>这种方案适合后台报表、审计导出、运营后台复杂筛选，不适合普通用户每次打开列表都即时生成。</p>
+<p>可迁移模式是“目录化跳页”：当产品坚持页码、跳页、跨页批量操作时，单靠游标不够，需要把“页号到锚点”的映射显式存下来。</p>
+<h1>产品语义先于技术方案</h1>
+<p>分页接口最常见的失败，是把所有交互都压成 <code>page_no + page_size</code>。不同交互要的是不同语义：</p>
+<table>
+<thead>
+<tr>
+<th>产品交互</th>
+<th>用户真正需要</th>
+<th>推荐实现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>首页和前几页</td>
+<td>快速看到最新结果</td>
+<td><code>OFFSET</code> 或浅层 <code>from/size</code></td>
+</tr>
+<tr>
+<td>无限滚动</td>
+<td>从当前看到的位置继续</td>
+<td>keyset / <code>search_after</code></td>
+</tr>
+<tr>
+<td>论坛上一页下一页</td>
+<td>稳定地前后移动</td>
+<td>双向 cursor + 稳定排序键</td>
+</tr>
+<tr>
+<td>跳到第 N 页</td>
+<td>页号有可解释含义</td>
+<td>锚点目录或物化结果</td>
+</tr>
+<tr>
+<td>导出全部结果</td>
+<td>完整遍历，不是交互翻页</td>
+<td>批处理游标、scroll、离线任务</td>
+</tr>
+<tr>
+<td>运营后台复杂筛选</td>
+<td>可重复、可审计</td>
+<td>固定快照 + 物化结果</td>
+</tr>
+</tbody>
+</table>
+<p>如果产品说“必须跳到第 1000 页”，技术方案不应该强行套游标。更合理的问题是：第 1000 页是否真的有业务意义；如果有，页码目录由谁维护；如果没有，交互是否可以改成时间范围、筛选条件或导出任务。</p>
+<h1>Elasticsearch 的深分页</h1>
+<p>Elasticsearch 把 RDBMS 的问题放大到了分布式环境里。官方分页文档直接提醒：不要用 <code>from</code> 和 <code>size</code> 翻得太深。搜索请求通常跨多个 shard，每个 shard 都要把本 shard 的当前页和之前页命中加载到内存里；深页会显著增加内存和 CPU，甚至导致节点故障。默认情况下，<code>from + size</code> 不能超过 10000，这个限制来自 <code>index.max_result_window</code>。</p>
+<p>一个五分片索引执行：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs json"><span class="hljs-punctuation">&#123;</span><br>  <span class="hljs-attr">&quot;from&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-number">990000</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;size&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-number">1000</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;sort&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">[</span><br>    <span class="hljs-punctuation">&#123;</span> <span class="hljs-attr">&quot;created_at&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;desc&quot;</span> <span class="hljs-punctuation">&#125;</span><span class="hljs-punctuation">,</span><br>    <span class="hljs-punctuation">&#123;</span> <span class="hljs-attr">&quot;tie_breaker_id&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;desc&quot;</span> <span class="hljs-punctuation">&#125;</span><br>  <span class="hljs-punctuation">]</span><br><span class="hljs-punctuation">&#125;</span><br></code></pre></td></tr></table></figure>
+<p>直觉上只要 1000 条结果。实际每个 shard 都可能需要拿出接近 <code>from + size</code> 的候选，再交给协调节点做全局归并。RDBMS 是“单机跳过长前缀”，ES 是“每个 shard 都跳过长前缀，再集中归并”。</p>
+<p>ES 的交互式深翻页方案是 <code>search_after</code>：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs json"><span class="hljs-punctuation">&#123;</span><br>  <span class="hljs-attr">&quot;size&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-number">1000</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;query&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">&#123;</span><br>    <span class="hljs-attr">&quot;term&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">&#123;</span> <span class="hljs-attr">&quot;status&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;published&quot;</span> <span class="hljs-punctuation">&#125;</span><br>  <span class="hljs-punctuation">&#125;</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;sort&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">[</span><br>    <span class="hljs-punctuation">&#123;</span> <span class="hljs-attr">&quot;created_at&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;desc&quot;</span> <span class="hljs-punctuation">&#125;</span><span class="hljs-punctuation">,</span><br>    <span class="hljs-punctuation">&#123;</span> <span class="hljs-attr">&quot;tie_breaker_id&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;desc&quot;</span> <span class="hljs-punctuation">&#125;</span><br>  <span class="hljs-punctuation">]</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;search_after&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">[</span><span class="hljs-string">&quot;2026-06-13T08:00:00.000Z&quot;</span><span class="hljs-punctuation">,</span> <span class="hljs-string">&quot;post_918273&quot;</span><span class="hljs-punctuation">]</span><br><span class="hljs-punctuation">&#125;</span><br></code></pre></td></tr></table></figure>
+<p>它和 RDBMS keyset pagination 是同一个模式：用上一页最后一条命中的 <code>sort</code> 值作为下一页锚点。官方文档还建议在需要稳定索引视图时配合 PIT（point in time）。使用 PIT 时，ES 会在排序中提供一个 <code>_shard_doc</code> tie-breaker；继续翻页时要使用上一页返回的最新 PIT ID 和最后一条命中的 sort values。</p>
+<p><code>scroll</code> 不是交互深分页的现代答案。ES 的 scroll API 文档已经明确提示：scroll 不再推荐用于深分页；如果要在 10000 条之后继续翻，并且需要保留索引状态，应该使用 <code>search_after</code> + PIT。scroll 更适合批量遍历和重建索引一类任务。</p>
+<p>ES 侧的模式表可以这样记：</p>
+<table>
+<thead>
+<tr>
+<th>需求</th>
+<th>ES 方案</th>
+<th>边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>前几页搜索结果</td>
+<td><code>from + size</code></td>
+<td>不要突破 <code>max_result_window</code> 当作常规方案</td>
+</tr>
+<tr>
+<td>连续深翻页</td>
+<td><code>search_after + sort</code></td>
+<td>查询和排序必须保持不变</td>
+</tr>
+<tr>
+<td>稳定视图</td>
+<td><code>PIT + search_after</code></td>
+<td>PIT 有保留时间和资源成本</td>
+</tr>
+<tr>
+<td>全量导出</td>
+<td>scroll 或异步任务</td>
+<td>不用于实时用户翻页</td>
+</tr>
+<tr>
+<td>聚合桶分页</td>
+<td>composite aggregation</td>
+<td>解决的是桶分页，不是文档列表分页</td>
+</tr>
+</tbody>
+</table>
+<h1>Hive 的深分页</h1>
+<p>Hive 也支持 <code>LIMIT [offset,] rows</code>。官方 Select 手册说明，两个参数时第一个是 offset，第二个是最大返回行数。语法看起来像 MySQL，但执行语义完全不同。</p>
+<p>Hive 面向批处理和大规模分析，不是面向毫秒级交互查询。深分页在 Hive 里通常意味着三个重成本叠在一起：</p>
+<ol>
+<li>扫描大量文件，除非分区裁剪能提前排除数据。</li>
+<li>构造全局顺序，尤其是 <code>ORDER BY</code>。</li>
+<li>丢弃 offset 前面的结果。</li>
+</ol>
+<p><code>ORDER BY</code> 与 <code>SORT BY</code> 的区别尤其重要。Hive 官方文档说明，<code>ORDER BY</code> 保证全局有序；<code>SORT BY</code> 只保证每个 reducer 内部有序，多 reducer 时最终结果只是局部有序。换言之，要得到“第 N 页”这种全局位置，<code>SORT BY</code> 不够，必须付出全局排序或物化结果的代价。</p>
+<p>Hive 里通常应该改变问题形态，不适合把在线深翻页当成默认路径：</p>
+<table>
+<thead>
+<tr>
+<th>目标</th>
+<th>更合适的做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>看样例</td>
+<td>分区过滤 + 小 <code>LIMIT</code>，不承诺页码</td>
+</tr>
+<tr>
+<td>查某个时间段</td>
+<td>用分区列和排序键缩小范围</td>
+</tr>
+<tr>
+<td>多次跳页分析</td>
+<td>CTAS 物化结果集，加 <code>row_number()</code></td>
+</tr>
+<tr>
+<td>导出明细</td>
+<td>后台任务写入文件或下游表</td>
+</tr>
+<tr>
+<td>Dashboard</td>
+<td>预聚合、预排序、物化视图</td>
+</tr>
+</tbody>
+</table>
+<p>一个典型离线物化方案是：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">CREATE TABLE</span> paid_order_result_20260613 <span class="hljs-keyword">AS</span><br><span class="hljs-keyword">SELECT</span><br>    <span class="hljs-built_in">row_number</span>() <span class="hljs-keyword">OVER</span> (<span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> paid_at <span class="hljs-keyword">DESC</span>, id <span class="hljs-keyword">DESC</span>) <span class="hljs-keyword">AS</span> rn,<br>    id,<br>    paid_at,<br>    amount<br><span class="hljs-keyword">FROM</span> dwd_order<br><span class="hljs-keyword">WHERE</span> ds <span class="hljs-keyword">BETWEEN</span> <span class="hljs-string">&#x27;2026-06-01&#x27;</span> <span class="hljs-keyword">AND</span> <span class="hljs-string">&#x27;2026-06-13&#x27;</span><br>  <span class="hljs-keyword">AND</span> status <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;PAID&#x27;</span>;<br><br><span class="hljs-keyword">SELECT</span> <span class="hljs-operator">*</span><br><span class="hljs-keyword">FROM</span> paid_order_result_20260613<br><span class="hljs-keyword">WHERE</span> rn <span class="hljs-keyword">BETWEEN</span> <span class="hljs-number">990001</span> <span class="hljs-keyword">AND</span> <span class="hljs-number">991000</span>;<br></code></pre></td></tr></table></figure>
+<p>这个方案不神奇。第一次生成 <code>rn</code> 仍然要扫描和排序。它的价值在于把一次昂贵的全局排序，换成后续多次可复用的稳定结果集。对于 Hive，这通常比每次交互都即时翻深页更符合系统定位。</p>
+<h1>一致性：页不能只谈性能</h1>
+<p>分页结果不稳定时，用户会看到重复、漏行、上一页消失、下一页跳动。性能优化不能绕过一致性语义。</p>
+<p>稳定分页至少需要三个条件：</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>稳定排序</td>
+<td><code>ORDER BY</code> 后补唯一 tie-breaker，例如 <code>(created_at, id)</code></td>
+</tr>
+<tr>
+<td>稳定过滤</td>
+<td>翻页期间查询条件不能被客户端悄悄改变</td>
+</tr>
+<tr>
+<td>稳定视图</td>
+<td>翻页期间新增、删除、更新是否可见，要有明确策略</td>
+</tr>
+</tbody>
+</table>
+<p>常见策略有三种。</p>
+<p>实时列表允许漂移。社交信息流、论坛最新回复、监控告警列表可以接受新数据插入导致列表变化。此时 cursor 只保证“从刚才的位置继续”，不承诺全局快照。</p>
+<p>固定快照保证一致。审计、对账、导出、复杂后台筛选更适合固定一个 snapshot。RDBMS 可以用事务一致性视图或物化结果；ES 可以用 PIT；Hive 通常直接物化一张结果表。</p>
+<p>短期缓存折中。对普通后台列表，可以把某次查询的 cursor 链或锚点目录缓存几分钟。过期后要求重新搜索。这个方案减少资源占用，也避免长事务或长 PIT 压住系统。</p>
+<h1>工程落地清单</h1>
+<p>设计分页接口时，可以按以下顺序收敛方案。</p>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>如果答案是“是”</th>
+<th>方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>只访问前几页吗</td>
+<td>是</td>
+<td><code>OFFSET/LIMIT</code> 或 <code>from/size</code> 足够</td>
+</tr>
+<tr>
+<td>只需要连续向后翻吗</td>
+<td>是</td>
+<td>keyset / <code>search_after</code></td>
+</tr>
+<tr>
+<td>需要上一页吗</td>
+<td>是</td>
+<td>保存当前页首尾锚点，做双向 cursor</td>
+</tr>
+<tr>
+<td>需要任意页码跳转吗</td>
+<td>是</td>
+<td>锚点目录或物化结果集</td>
+</tr>
+<tr>
+<td>需要跨页批量处理吗</td>
+<td>是</td>
+<td>后台任务，不要走实时分页接口</td>
+</tr>
+<tr>
+<td>需要强一致结果吗</td>
+<td>是</td>
+<td>snapshot / PIT / 物化表</td>
+</tr>
+<tr>
+<td>排序字段可能重复吗</td>
+<td>是</td>
+<td>补唯一 tie-breaker</td>
+</tr>
+<tr>
+<td>查询条件变化频繁吗</td>
+<td>是</td>
+<td>cursor 绑定 query hash</td>
+</tr>
+</tbody>
+</table>
+<p>索引设计也有一条简单规则：把“过滤列、排序列、唯一键”合成同一条访问路径。比如订单后台常见查询：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">WHERE</span> tenant_id <span class="hljs-operator">=</span> ?<br>  <span class="hljs-keyword">AND</span> status <span class="hljs-operator">=</span> ?<br><span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> paid_at <span class="hljs-keyword">DESC</span>, id <span class="hljs-keyword">DESC</span><br></code></pre></td></tr></table></figure>
+<p>索引优先考虑：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">CREATE</span> INDEX idx_order_page<br><span class="hljs-keyword">ON</span> orders (tenant_id, status, paid_at <span class="hljs-keyword">DESC</span>, id <span class="hljs-keyword">DESC</span>);<br></code></pre></td></tr></table></figure>
+<p>如果查询还有范围条件，例如 <code>paid_at &gt;= ?</code>，需要评估范围列之后的排序列还能不能有效利用索引。索引设计不能照着 SQL 字段全部塞进去；目标是让数据库沿一条尽量窄、尽量有序的路径拿到目标窗口。</p>
+<h1>模式速查表</h1>
+<table>
+<thead>
+<tr>
+<th>听到的需求关键词</th>
+<th>对应模式</th>
+<th>典型方案</th>
+<th>主要代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>大 offset 慢</td>
+<td>瘦身后定位</td>
+<td>覆盖索引 + 延迟关联</td>
+<td>仍要跳过前缀</td>
+</tr>
+<tr>
+<td>无限滚动</td>
+<td>锚点续走</td>
+<td>keyset / <code>search_after</code></td>
+<td>不支持任意跳页</td>
+</tr>
+<tr>
+<td>上一页下一页</td>
+<td>双向锚点</td>
+<td>保存 first/last sort values</td>
+<td>游标状态更复杂</td>
+</tr>
+<tr>
+<td>跳到第 N 页</td>
+<td>目录化跳页</td>
+<td>每隔 K 页保存锚点</td>
+<td>维护目录</td>
+</tr>
+<tr>
+<td>复杂筛选后反复查看</td>
+<td>结果集物化</td>
+<td>snapshot table / PIT / cache</td>
+<td>资源占用和过期策略</td>
+</tr>
+<tr>
+<td>ES 超过 10000</td>
+<td>分布式锚点</td>
+<td><code>search_after + PIT</code></td>
+<td>查询、排序、PIT 必须稳定</td>
+</tr>
+<tr>
+<td>Hive 明细翻页</td>
+<td>离线物化</td>
+<td>CTAS + <code>row_number()</code></td>
+<td>首次生成昂贵</td>
+</tr>
+</tbody>
+</table>
+<p>深翻页没有免费的通用解法。<code>OFFSET</code> 保留了页码语义，却把长前缀成本留给数据库；keyset 消灭了长前缀，却牺牲了随机跳页；物化结果支持跳页和一致性，却把成本提前支付到存储和后台任务里。工程上能做的，是先把产品语义说清楚，再选择愿意支付哪一种成本。</p>
+<h1>参考资料</h1>
+<blockquote>
+<ul>
+<li>迁移来源：旧文《一次大表翻页实验》（2020-02-19，已撤稿），实验数据已合并到上文“旧实验给出的信号”。</li>
+<li>迁移来源：<a href="/2020/02/19/MySQL-%E5%9F%BA%E6%9C%AC%E5%8A%9F/">《MySQL 基本功》</a> 中“深分页问题 / 分页查询优化”相关小节。</li>
+<li><a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/current/queries-limit.html">PostgreSQL Documentation: LIMIT and OFFSET</a></li>
+<li><a target="_blank" rel="noopener" href="https://dev.mysql.com/doc/refman/8.4/en/limit-optimization.html">MySQL 8.4 Reference Manual: LIMIT Query Optimization</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.elastic.co/docs/reference/elasticsearch/rest-apis/paginate-search-results">Elasticsearch Reference: Paginate search results</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-scroll">Elasticsearch API documentation: Run a scrolling search</a></li>
+<li><a target="_blank" rel="noopener" href="https://cwiki.apache.org/confluence/display/Hive/LanguageManual+Select">Apache Hive LanguageManual Select: LIMIT Clause</a></li>
+<li><a target="_blank" rel="noopener" href="https://cwiki.apache.org/confluence/display/Hive/LanguageManual+SortBy">Apache Hive LanguageManual SortBy: Difference between Sort By and Order By</a></li>
+</ul>
+</blockquote>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/">https://magicliang.github.io/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/Elasticsearch/">Elasticsearch</a><a class="post-meta__tags" href="/tags/Hive/">Hive</a></div><div class="post-share"><div class="social-share" data-image="/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/cover.svg" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2021/03/11/MySQL-%E7%9A%84-MGR/" title="MySQL 的 MGR"><img class="cover" src="/2021/03/11/MySQL-%E7%9A%84-MGR/%E7%BB%84%E5%A4%8D%E5%88%B6%E6%8F%92%E4%BB%B6%E6%9E%B6%E6%9E%84.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-03-11</div><div class="info-item-2">MySQL 的 MGR</div></div><div class="info-2"><div class="info-item-1">MySQL 高可用架构的历史 MySQL 自带的主从复制机制，本身并不能实现自动高可用。 早期使用开源组件来搭 MySQL 集群的方案，使用 MMHA。当代 MySQL 官方自己主推的方案是 MySQL cluster。这些老的方案，优先保证MySQL服务的持续可用，在异常切换情况下，可能出现主机上部分数据未能及时同步到从库，造成主从切换后数据丢失。但是包括金融支付在内的一些业务，对于数据库服务既要求持续可用、也要求数据强一致（可以在性能上做出一些让步）。 因此，当代的 MySQL 官方提供了组复制（MySQL Group Replication）的方案，构建了新一代的 MySQL 高可用强一致服务。 Master-Slave（MS）架构高可用概述 MS架构高可用基础 高可用MySQL是依赖复制（Replication）技术实现的，复制解决的基本问题就是，让一台数据库服务器的数据同步到其它服务器上。MySQL数据库的复制有如下三个步骤。   在主库上把数据更改记录到二进制日志（Binary Log）中（这些记录被称为二进制日志事件）。   备库将主库上的日志复制到自己的中继日志（...</div></div></div></a><a class="pagination-related" href="/2021/03/18/MySQL-pitfalls-%E4%B8%8E%E9%85%8D%E7%BD%AE%E6%9C%AD%E8%AE%B0/" title="MySQL pitfalls 与配置札记（2018-2021 札记整合）"><img class="cover" src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-03-18</div><div class="info-item-2">MySQL pitfalls 与配置札记（2018-2021 札记整合）</div></div><div class="info-2"><div class="info-item-1">一、SQL 语义陷阱 引号的方言差异 标准的 SQL 中只允许用单引号表达字符串类型。有些 SQL 方言允许使用双引号包裹字符串，如 MySQL，有些则不允许，如 Oracle。 反引号是专门用来表达 identifier 的。 字符串与数字的隐式转换 pitfall Data truncation: Truncated incorrect 不要小看 MySQL，它出 warning 就一定有错误。 不要滥用 MySQL 字符串到decimal，和 decimal 到 string 的转换。这样有时候 MySQL 不只是 warning。 二、存储引擎对比 参考：https://www.zhihu.com/question/20596402 MyISAM 与 InnoDB 的区别   InnoDB 支持事务，MyISAM 不支持事务。这是 MySQL 将默认存储引擎从 MyISAM 变成 InnoDB 的重要原因之一；   InnoDB 支持外键，而 MyISAM 不支持。对一个包含外键的 InnoDB 表转为 MYISAM 会失败；   InnoDB 是聚集索引，MyISAM ...</div></div></div></a><a class="pagination-related" href="/2017/11/15/MariaDB-%E8%B0%83%E4%BC%98%E7%9B%B8%E5%85%B3/" title="MariaDB 调优相关"><img class="cover" src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2017-11-15</div><div class="info-item-2">MariaDB 调优相关</div></div><div class="info-2"><div class="info-item-1">本文主要摘译自这里。 MySQL 曾经有独立的公司。但那间公司后来被 Sun 微系统公司获取了。 Sun 微系统公司又被 Oracle 获取了。原 MySQL 开发者担心 MySQL 成为闭源软件，因此成立了一家SkySQL 公司维护开源的 MySQL 分支–MariaDB。 MariaDB 支持的存储引擎包括：  InnoDB/XtraDB 后者是前者的加强版，属于事务性存储引擎，也叫  ACID-compliant（ACID 遵从的）。XtraDB 是 Percona 开发的存储引擎，整体向下兼容。使用普通的 mysqldump 会耗尽 cpu（因为要把数据库转化成正经的 SQL 语句）。而 xtrabackup 在大库上的备份、还原、冗余都表现得更好（因为像 Oracle 一样是二进制备份吗？）。 TokuDB。另一个事务性存储引擎。以高压缩率著称（最高25倍压缩）。适合小空间存储大数据。 MyISAM。MySQL 上最古老的存储引擎。非事务性存储引擎，只支持表级锁，不支持 MVCC。 SphinxSE。非事务性存储引擎。这名字和古希腊猜谜语的怪兽，斯芬克斯一样。本以上是用...</div></div></div></a><a class="pagination-related" href="/2026/06/01/%E6%95%B0%E6%8D%AE%E5%BA%93-Resharding-%E7%9A%84%E5%9C%A8%E7%BA%BF%E5%88%87%E6%8D%A2%E4%B8%8E%E5%9B%9E%E6%BB%9A/" title="数据库 Resharding 的在线切换与回滚"><img class="cover" src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-01</div><div class="info-item-2">数据库 Resharding 的在线切换与回滚</div></div><div class="info-2"><div class="info-item-1">Resharding 是分库分表架构绕不过去的难题。系统上线时用 uid % 2 把数据分到两个库，跑了两年发现容量不够，要扩成四个库——uid % 4。这个 % 号一变，大约 75% 的数据需要重新搬家。搬数据本身不难，难的是三件事同时做到：在线搬、搬完瞬间切、切坏了能回滚。 下面从最朴素的双写到 Vitess 的 VReplication，逐一拆解业界主流的 resharding 在线切换方案。核心问题只有三个：数据怎么不丢，流量怎么瞬间切，故障怎么秒级回。 问题的本质：hash mod 变化引发的数据海啸 hash 取模是最常见的分片路由策略。uid % N 的 N 一旦改变，绝大部分数据的归属分片都会变。 以 2 库扩 4 库为例：原先 uid % 2 = 0 的数据全在 A 库，扩容后 uid % 4 把这批数据拆成了 uid % 4 = 0（留 A 库）和 uid % 4 = 2（搬到新 C 库）。B 库的情况类似，一半数据要搬去新 D 库。 12345678910111213扩容前（uid % 2）          扩容后（uid % 4）┌─────────┐ ...</div></div></div></a><a class="pagination-related" href="/2021/03/28/MySQL-%E5%AD%98%E5%82%A8%E5%BC%95%E6%93%8E-InnoDB-%E6%8A%80%E6%9C%AF%E5%86%85%E5%B9%95/" title="MySQL 存储引擎 InnoDB 技术内幕"><img class="cover" src="/2021/03/28/MySQL-%E5%AD%98%E5%82%A8%E5%BC%95%E6%93%8E-InnoDB-%E6%8A%80%E6%9C%AF%E5%86%85%E5%B9%95/InnoDBStructure.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-03-28</div><div class="info-item-2">MySQL 存储引擎 InnoDB 技术内幕</div></div><div class="info-2"><div class="info-item-1">这本书的电子版的一个博客。 InnoDB.xmind  前言 MySQL 是处理海量数据（尤其 是OLTP 写入）时仍能获得最佳性能的最佳选择之一，它的 CPU 效率可能其他任何基于磁盘的关系型数据库所不能匹敌的-但它应该能够匹敌 Redis。 Think Different 而不是 Think Differently，这意味着要思考不同的东西，而不只是思考不同的方式。 不要相信网上的传言，去做测试，根据自己的实践做决定。很多伟大的作者写的伟大的书里面，关于性能的说法都来源于他们个人的随身电脑的直观测试。 change buffer 是 inert buffer 的升级版本。 MySQL 体系结构和存储引擎 定义数据库和实例  数据库：物理操作系统文件或其他形式文件类型的集合。 实例：操作系统后台进程（线程和一堆共享内存）。 存储引擎：基于表而不是基于库的，所以一个库可以有不同的表使用不同的存储引擎。  InnoDB 将数据存储在逻辑的表空间中，这个表空间就像黑盒一样。 存储引擎不一定需要事务。比如没有 ETL 的操作，单纯的查询操作不需要考虑并发控制问题，不需要产生一致性视图。...</div></div></div></a><a class="pagination-related" href="/2018/06/06/log-%E7%9A%84%E5%8E%86%E5%8F%B2/" title="log 的历史"><img class="cover" src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2018-06-06</div><div class="info-item-2">log 的历史</div></div><div class="info-2"><div class="info-item-1">Log：一种被低估的计算机科学基础抽象 在计算机科学中，log（日志）远不止是&quot;打印调试信息&quot;那么简单。从数据库的 WAL 到分布式系统的共识协议，从版本控制系统到区块链，log 作为一种 append-only 的有序记录序列，是贯穿整个计算机科学发展史的核心抽象之一。 LinkedIn 的前首席工程师 Jay Kreps 在其著名文章 “The Log: What every software engineer should know about real-time data’s unifying abstraction” 中指出：log 是一种比消息队列、数据库、文件系统更基础的抽象——后者都可以建立在 log 之上。 本文尝试梳理 log 这一抽象在不同技术领域中的演化脉络。 数据库中的 Log：WAL 与 Binlog WAL（Write-Ahead Logging） WAL 是数据库实现 ACID 特性的基石。其核心思想是：在修改数据页之前，先将修改操作写入日志。 WAL 的工作流程：  事务开始时，将修改操作（redo log entry）追加写...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">旧实验给出的信号</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">OFFSET 慢在哪里</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">模式一：先翻窄索引，再回表</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">模式二：用锚点替代偏移</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">id 稀疏包含三个不同问题</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">跨页和乱翻页需要目录</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">产品语义先于技术方案</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">Elasticsearch 的深分页</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">9.</span> <span class="toc-text">Hive 的深分页</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">10.</span> <span class="toc-text">一致性：页不能只谈性能</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">11.</span> <span class="toc-text">工程落地清单</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">12.</span> <span class="toc-text">模式速查表</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">13.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.1</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.4</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.4"></script><script src="/js/main.js?v=5.5.4"></script><script src="/js/tw_cn.js?v=5.5.4"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.12.2/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="ribbon" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-ribbon.min.js" size="150" alpha="0.6" zIndex="-1" mobile="false" data-click="true"></script><script id="canvas_nest" defer="defer" color="0,0,255" opacity="0.7" zIndex="-1" count="99" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-nest.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = true;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script id="click-heart" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/click-heart.min.js" async="async" mobile="false"></script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

@@ -1,0 +1,777 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>数据库 Resharding 的在线切换与回滚 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="Resharding 是分库分表架构绕不过去的难题。系统上线时用 uid % 2 把数据分到两个库，跑了两年发现容量不够，要扩成四个库——uid % 4。这个 % 号一变，大约 75% 的数据需要重新搬家。搬数据本身不难，难的是三件事同时做到：在线搬、搬完瞬间切、切坏了能回滚。 下面从最朴素的双写到 Vitess 的 VReplication，逐一拆解业界主流的 resharding 在线切换方案">
+<meta property="og:type" content="article">
+<meta property="og:title" content="数据库 Resharding 的在线切换与回滚">
+<meta property="og:url" content="https://magicliang.github.io/2026/06/01/%E6%95%B0%E6%8D%AE%E5%BA%93-Resharding-%E7%9A%84%E5%9C%A8%E7%BA%BF%E5%88%87%E6%8D%A2%E4%B8%8E%E5%9B%9E%E6%BB%9A/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="Resharding 是分库分表架构绕不过去的难题。系统上线时用 uid % 2 把数据分到两个库，跑了两年发现容量不够，要扩成四个库——uid % 4。这个 % 号一变，大约 75% 的数据需要重新搬家。搬数据本身不难，难的是三件事同时做到：在线搬、搬完瞬间切、切坏了能回滚。 下面从最朴素的双写到 Vitess 的 VReplication，逐一拆解业界主流的 resharding 在线切换方案">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-database.svg">
+<meta property="article:published_time" content="2026-06-01T07:00:00.000Z">
+<meta property="article:modified_time" content="2026-06-01T08:53:17.788Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="分布式系统">
+<meta property="article:tag" content="数据库">
+<meta property="article:tag" content="架构">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-database.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "数据库 Resharding 的在线切换与回滚",
+  "url": "https://magicliang.github.io/2026/06/01/%E6%95%B0%E6%8D%AE%E5%BA%93-Resharding-%E7%9A%84%E5%9C%A8%E7%BA%BF%E5%88%87%E6%8D%A2%E4%B8%8E%E5%9B%9E%E6%BB%9A/",
+  "image": "https://magicliang.github.io/img/cover-database.svg",
+  "datePublished": "2026-06-01T07:00:00.000Z",
+  "dateModified": "2026-06-01T08:53:17.788Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/06/01/%E6%95%B0%E6%8D%AE%E5%BA%93-Resharding-%E7%9A%84%E5%9C%A8%E7%BA%BF%E5%88%87%E6%8D%A2%E4%B8%8E%E5%9B%9E%E6%BB%9A/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.4"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.1.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '数据库 Resharding 的在线切换与回滚',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.1"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (false) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">442</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">484</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">31</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-database.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">数据库 Resharding 的在线切换与回滚</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">数据库 Resharding 的在线切换与回滚</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-06-01T07:00:00.000Z" title="Created 2026-06-01 15:00:00">2026-06-01</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-06-01T08:53:17.788Z" title="Updated 2026-06-01 16:53:17">2026-06-01</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.9k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>16mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><p>Resharding 是分库分表架构绕不过去的难题。系统上线时用 uid % 2 把数据分到两个库，跑了两年发现容量不够，要扩成四个库——uid % 4。这个 % 号一变，大约 75% 的数据需要重新搬家。搬数据本身不难，难的是三件事同时做到：在线搬、搬完瞬间切、切坏了能回滚。</p>
+<p>下面从最朴素的双写到 Vitess 的 VReplication，逐一拆解业界主流的 resharding 在线切换方案。核心问题只有三个：数据怎么不丢，流量怎么瞬间切，故障怎么秒级回。</p>
+<h1>问题的本质：hash mod 变化引发的数据海啸</h1>
+<p>hash 取模是最常见的分片路由策略。uid % N 的 N 一旦改变，绝大部分数据的归属分片都会变。</p>
+<p>以 2 库扩 4 库为例：原先 uid % 2 = 0 的数据全在 A 库，扩容后 uid % 4 把这批数据拆成了 uid % 4 = 0（留 A 库）和 uid % 4 = 2（搬到新 C 库）。B 库的情况类似，一半数据要搬去新 D 库。</p>
+<figure class="highlight routeros"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><code class="hljs routeros">扩容前（uid % 2）          扩容后（uid % 4）<br>┌─────────┐               ┌─────────┐<br>│  A 库   │  uid%<span class="hljs-attribute">2</span>=0      │  A 库   │  uid%<span class="hljs-attribute">4</span>=0<br>└─────────┘               └─────────┘<br>                          ┌─────────┐<br>                          │  C 库   │  uid%<span class="hljs-attribute">4</span>=2  ← 从 A 搬来<br>                          └─────────┘<br>┌─────────┐               ┌─────────┐<br>│  B 库   │  uid%<span class="hljs-attribute">2</span>=1      │  B 库   │  uid%<span class="hljs-attribute">4</span>=1<br>└─────────┘               └─────────┘<br>                          ┌─────────┐<br>                          │  D 库   │  uid%<span class="hljs-attribute">4</span>=3  ← 从 B 搬来<br>                          └─────────┘<br></code></pre></td></tr></table></figure>
+<p>如果 N 不是倍数关系（比如 3 扩 5），情况更糟——几乎所有数据都要重新分配。所以业界有一条经验法则：分片数永远按 2 的幂次规划（2→4→8→16），每次扩容只需搬约 50% 的数据。</p>
+<p>不过即使只搬 50%，对一个日均千万级写入的在线系统来说，&quot;边跑边搬&quot;的挑战仍然巨大。</p>
+<h1>停机迁移——简单但代价最大</h1>
+<p>最直觉的做法：停服务 → 导数据 → 改路由 → 启服务。</p>
+<p>整个过程的数据一致性由&quot;没有新写入&quot;来保证。停机窗口取决于数据量，千万级别的表通常需要数小时。对于 7×24 的互联网系统，这个代价往往不可接受。银行核心和社保基金偶尔还会用这种方案，但更多是出于合规和风控考量而非技术限制。</p>
+<p>停机迁移的回滚很简单：切换前保留旧库快照，发现问题就回退路由、恢复快照。</p>
+<h1>双写迁移——五阶段渐进切换</h1>
+<p>双写迁移是业界使用最广泛的在线扩容方案。核心思路是让新旧两套分片拓扑在一段时间内共存，通过五个阶段渐进切换。</p>
+<h2 id="阶段一：同步">阶段一：同步</h2>
+<p>先把存量数据从旧库搬到新库。常见做法是用 Canal 或 Debezium 订阅旧库的 binlog，按新的分片规则写入新库。这一步只需要&quot;追&quot;，不需要改应用代码。</p>
+<p>搬运期间旧库仍在接收写入。新写入的数据通过 binlog 实时同步到新库，因此新库的数据会逐步逼近旧库。</p>
+<h2 id="阶段二：双写">阶段二：双写</h2>
+<p>当新库的数据与旧库基本追平后，在应用层开启双写：每次写操作同时写旧库和新库。此时可以关闭 binlog 同步程序，由应用层的双写逻辑接管增量同步。</p>
+<p>双写的一致性策略通常是&quot;以旧库为准&quot;：旧库写成功即返回业务成功，新库写失败则记日志后异步补偿。整个迁移期间旧库始终是 source of truth，任何时刻都可以安全回滚。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant App as 应用层
+    participant Old as 旧库（2 分片）
+    participant New as 新库（4 分片）
+    App-&gt;&gt;Old: 写入 uid=123
+    Old--&gt;&gt;App: 成功
+    App-&gt;&gt;New: 异步写入 uid=123（按新分片规则路由）
+    alt 新库写入失败
+        New--&gt;&gt;App: 失败
+        Note over App: 记日志，异步补偿
+    end</code></pre>
+<h2 id="阶段三：校验">阶段三：校验</h2>
+<p>双写稳定运行后，启动数据校验程序，对旧库和新库的数据做全量对比，发现不一致就以旧库为准修复新库。</p>
+<p>校验通常按批次进行：每次取一批 ID 范围的数据，逐行比对字段值和更新时间。如果不一致率在万分之一以下且持续数天无新增差异，进入下一阶段。</p>
+<h2 id="阶段四：切读">阶段四：切读</h2>
+<p>把读流量从旧库切到新库。这一步风险相对可控——读操作不影响数据完整性，发现异常可以秒级切回旧库。</p>
+<p>灰度切换是常见做法：先把 1% 的读流量导向新库，观察响应时间和错误率，逐步放大到 100%。</p>
+<h2 id="阶段五：切写">阶段五：切写</h2>
+<p>这是整个迁移过程中风险最高的一步：停掉旧库的写入，让新库成为唯一的写入目标。</p>
+<p>切写的关键动作是一个很短的&quot;停写窗口&quot;：</p>
+<ol>
+<li>暂停所有写请求（通常在 Proxy 层拦截，返回重试或排队等待）</li>
+<li>等待新库追平旧库的最后一批双写数据（通常只需几秒）</li>
+<li>切换路由规则，让写请求指向新库</li>
+<li>恢复写请求</li>
+</ol>
+<p>这个停写窗口就是用户能感知到的&quot;瞬间切换&quot;，实际持续时间从几百毫秒到几秒不等。</p>
+<pre><code class="hljs mermaid">graph LR
+    A[&quot;阶段一：同步&quot;] --&gt; B[&quot;阶段二：双写&quot;]
+    B --&gt; C[&quot;阶段三：校验&quot;]
+    C --&gt; D[&quot;阶段四：切读&quot;]
+    D --&gt; E[&quot;阶段五：切写&quot;]
+    E -.-&gt;|回滚| D
+    D -.-&gt;|回滚| C
+    C -.-&gt;|回滚| B
+    B -.-&gt;|回滚| A</code></pre>
+<p>双写迁移的回滚能力来自一个关键设计：在切写完成之前，旧库始终是 source of truth。任何阶段发现异常，只需关闭双写、切回旧库路由即可。切写完成之后，回滚需要额外手段——下文的&quot;反向复制&quot;就是为此而设。</p>
+<h1>CDC/Binlog 增量追平——对应用零侵入</h1>
+<p>双写方案的最大缺点是需要修改应用代码。CDC（Change Data Capture）方案通过数据库底层的 binlog 机制实现同步，对应用层完全透明。</p>
+<h2 id="工作原理">工作原理</h2>
+<p>CDC 工具（Canal、Debezium、Maxwell）伪装成 MySQL 从库，实时解析 binlog 中的行变更事件，按新的分片规则写入目标库。</p>
+<p>整个流程分两步。</p>
+<p>全量复制：对旧库做一致性快照（如 <code>mysqldump --single-transaction</code>），按新分片规则导入新库。记录快照时刻的 binlog position。</p>
+<p>增量追平：从快照的 binlog position 开始，持续解析增量变更并应用到新库。当延迟降到秒级以内时，执行切换。</p>
+<figure class="highlight crmsh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs crmsh">┌──────────┐    binlog     ┌──────────┐    路由分发    ┌──────────┐<br>│  旧库    │──────────────►│  Canal   │──────────────►│  新库    │<br>│ (<span class="hljs-literal">master</span>) │               │ /Debezium│               │ (<span class="hljs-number">4</span> 分片) │<br>└──────────┘               └──────────┘               └──────────┘<br>      │                                                    ▲<br>      │          全量快照 (mysqldump)                       │<br>      └────────────────────────────────────────────────────┘<br></code></pre></td></tr></table></figure>
+<h2 id="切换与回滚">切换与回滚</h2>
+<p>切换时刻的处理与双写方案类似：短暂停写 → 等 CDC 追平最后一批变更 → 切路由 → 恢复写入。</p>
+<p>回滚策略：在切换后一段时间内保持旧库在线，同时反向配置 CDC（从新库同步回旧库），确保旧库数据持续更新。一旦需要回滚，切回旧库路由即可。</p>
+<p>CDC 方案的优势是零代码侵入，劣势是依赖 binlog 格式（必须是 ROW 模式）和 CDC 工具的稳定性。对于写入量特别大的系统，CDC 工具可能成为瓶颈。</p>
+<h1>升级从库——不搬数据的 2^n 倍扩</h1>
+<p>这个方案利用 MySQL 主从复制的特性，堪称最优雅的扩容手段。</p>
+<h2 id="前提条件">前提条件</h2>
+<p>系统已经配置了主从复制，每个主库有一个或多个从库。分片数按 2 的幂次规划。</p>
+<h2 id="操作步骤">操作步骤</h2>
+<p>以 2 库扩 4 库为例：</p>
+<figure class="highlight routeros"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><code class="hljs routeros">扩容前                      扩容后<br>┌──────────┐               ┌──────────┐<br>│ A (主库) │               │ A (主库) │  uid%<span class="hljs-attribute">4</span>=0<br>│ 全量数据 │               │ 删 uid%<span class="hljs-attribute">4</span>=2│<br>├──────────┤               └──────────┘<br>│ A0(从库) │               ┌──────────┐<br>│ 全量副本 │──── 升级 ────►│ A0(主库) │  uid%<span class="hljs-attribute">4</span>=2<br>└──────────┘               │ 删 uid%4≠2│<br>                           └──────────┘<br>┌──────────┐               ┌──────────┐<br>│ B (主库) │               │ B (主库) │  uid%<span class="hljs-attribute">4</span>=1<br>│ 全量数据 │               │ 删 uid%<span class="hljs-attribute">4</span>=3│<br>├──────────┤               └──────────┘<br>│ B0(从库) │               ┌──────────┐<br>│ 全量副本 │──── 升级 ────►│ B0(主库) │  uid%<span class="hljs-attribute">4</span>=3<br>└──────────┘               │ 删 uid%4≠3│<br>                           └──────────┘<br></code></pre></td></tr></table></figure>
+<p>操作序列：</p>
+<ol>
+<li>将从库 A0、B0 升级为独立主库</li>
+<li>修改路由规则：uid % 2 改为 uid % 4</li>
+<li>在 A 库中删除 uid % 4 = 2 的数据（这些数据已经在 A0 中）</li>
+<li>在 A0 库中删除 uid % 4 ≠ 2 的数据</li>
+<li>B 和 B0 做同样处理</li>
+</ol>
+<p>由于从库通过主从复制天然持有主库的完整数据副本，升级为主库后只需要删除不属于自己分片的数据即可。整个过程不需要跨网络搬运数据。</p>
+<h2 id="切换与回滚">切换与回滚</h2>
+<p>切换动作就是：断开主从复制 + 修改路由规则，两步可以在秒级完成。</p>
+<p>回滚相对麻烦：需要把已升级的从库重新接回主库恢复主从关系。如果升级后已经删除了冗余数据，回滚就需要重新全量同步。因此实践中通常不急着删冗余数据，等确认稳定后再清理。</p>
+<h2 id="局限性">局限性</h2>
+<p>只支持 2 倍扩容（2→4→8→16），不能 3→5 或 2→3。如果初始分片数规划不当（比如分了 3 个库），后续扩容会很痛苦。</p>
+<h1>一致性哈希与虚拟分片——从源头减少数据迁移</h1>
+<p>前面几种方案有一个共同前提：hash mod 变化导致大量数据需要重新分配。一致性哈希从根本上缓解这个问题。</p>
+<h2 id="一致性哈希">一致性哈希</h2>
+<p>把哈希空间组织成一个环（0 ~ 2^32-1），数据和节点都映射到环上的某个位置。每条数据归属于顺时针方向遇到的第一个节点。</p>
+<p>新增或移除节点时，只有相邻区间的数据需要迁移，其余数据不动。N 个节点新增 1 个节点时只需迁移 1/N 的数据，远优于 hash mod 的&quot;几乎全部重分配&quot;。</p>
+<p>但一致性哈希有一个缺陷：节点在环上的分布不均匀，导致数据倾斜。虚拟节点技术为每个物理节点在环上创建多个映射点（通常 100~200 个），大幅改善数据分布的均匀性。</p>
+<figure class="highlight smali"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><code class="hljs smali">            一致性哈希环<br>          ┌────────────┐<br>       N_A_v1        N_B_v1<br>      ╱                    ╲<br>   N_C_v3                  N_C_v1<br>    │     hash 空间 0~2³²    │<br>   N_A_v2                  N_B_v3<br>      ╲                    ╱<br>       N_B_v2        N_A_v3<br>          └────────────┘<br><br>新增 Node_D 时，只从相邻虚拟节点迁移少量数据<br></code></pre></td></tr></table></figure>
+<h2 id="虚拟分片">虚拟分片</h2>
+<p>虚拟分片是一致性哈希思想在分库分表场景下的工程化应用。在逻辑层预先划分大量虚拟分片（如 1024 个），物理部署时将多个虚拟分片映射到同一台物理机。扩容时只需调整映射关系，把部分虚拟分片迁移到新机器。</p>
+<figure class="highlight jboss-cli"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><code class="hljs jboss-cli">初始部署（4 台物理机，1024 个虚拟分片）<br><br>物理机 A:  VS_0,   VS_1,   <span class="hljs-string">...</span>, VS_255<br>物理机 B:  VS_256, VS_257, <span class="hljs-string">...</span>, VS_511<br>物理机 C:  VS_512, VS_513, <span class="hljs-string">...</span>, VS_767<br>物理机 D:  VS_768, VS_769, <span class="hljs-string">...</span>, VS_1023<br><br>扩容到 8 台物理机：只搬映射，不改路由规则<br><br>物理机 A:  VS_0,   VS_1,   <span class="hljs-string">...</span>, VS_127<br>物理机 E:  VS_128, VS_129, <span class="hljs-string">...</span>, VS_255   ← 从 A 搬来<br>物理机 B:  VS_256, VS_257, <span class="hljs-string">...</span>, VS_383<br>物理机 F:  VS_384, VS_385, <span class="hljs-string">...</span>, VS_511   ← 从 B 搬来<br>……以此类推<br></code></pre></td></tr></table></figure>
+<p>虚拟分片方案的切换和回滚非常灵活：路由表是一个&quot;虚拟分片 → 物理机&quot;的映射配置，原子更新这张映射表就完成了切换。回滚只需还原映射配置。</p>
+<p>ShardingSphere 的弹性扩容就采用了这种思路：预设大量逻辑分片，物理部署时按需聚合，扩容时只需调整逻辑到物理的映射。</p>
+<h1>切换的&quot;瞬间&quot;到底怎么实现</h1>
+<p>不管采用哪种迁移方案，最终都要回答一个问题：新旧拓扑的流量切换如何做到&quot;原子性&quot;？</p>
+<p>数据库层面没有跨实例的原子切换机制。所谓的&quot;瞬间切换&quot;发生在数据库之上的路由层。</p>
+<h2 id="proxy-层路由切换">Proxy 层路由切换</h2>
+<p>ShardingSphere、MyCat、ProxySQL 等数据库中间件维护着一张路由表，定义了分片键到物理库表的映射关系。切换时更新这张路由表，所有后续请求立即按新规则路由。</p>
+<p>更新路由表的操作本身是原子的（单次配置推送），但需要处理&quot;正在执行的请求&quot;。常见策略是：</p>
+<ol>
+<li>等待所有进行中的事务完成（drain）</li>
+<li>短暂拒绝新请求（&lt; 1 秒）</li>
+<li>推送新路由配置</li>
+<li>恢复接受请求</li>
+</ol>
+<p>这个短暂的拒绝窗口就是业务层感知到的&quot;抖动&quot;。</p>
+<h2 id="gh-ost-的原子-rename">gh-ost 的原子 RENAME</h2>
+<p>gh-ost（GitHub Online Schema Tool）在单表级别实现了一种精妙的原子切换。虽然 gh-ost 主要用于在线 DDL 而非 resharding，但其切换思路对 resharding 有直接借鉴价值。</p>
+<p>gh-ost 的 cut-over 流程：</p>
+<ol>
+<li>创建一张与原表结构相同的影子表（ghost table）</li>
+<li>通过 binlog 持续同步原表的变更到影子表</li>
+<li>切换时刻：对原表加锁 → RENAME 原表和影子表互换 → 释放锁</li>
+</ol>
+<p>MySQL 的 RENAME TABLE 是元数据操作，不涉及数据拷贝，执行时间在毫秒级。通过 RENAME 实现表名互换，应用层完全无感知。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-comment">-- gh-ost 切换的核心操作（简化）</span><br>LOCK TABLES original WRITE, _original_ghost WRITE;<br>RENAME <span class="hljs-keyword">TABLE</span> original <span class="hljs-keyword">TO</span> _original_old,<br>             _original_ghost <span class="hljs-keyword">TO</span> original;<br>UNLOCK TABLES;<br></code></pre></td></tr></table></figure>
+<h2 id="vitess-的-switchtraffic-reversetraffic">Vitess 的 SwitchTraffic / ReverseTraffic</h2>
+<p>Vitess 是 YouTube 开源的 MySQL 分片中间件，在 resharding 的切换和回滚设计上最为完整。</p>
+<p>Vitess 的 resharding 基于 VReplication——一套内建的 binlog 复制引擎。切换流程：</p>
+<ol>
+<li>启动 VReplication，将源分片的数据持续复制到目标分片</li>
+<li>SwitchTraffic：先切读流量，再切写流量；切写时 Vitess 暂停源分片写入，等 VReplication 追平，然后原子切换路由</li>
+<li>切换完成后，Vitess 自动建立反向 VReplication：从新分片向旧分片同步数据</li>
+</ol>
+<p>反向复制是 Vitess 回滚能力的核心。调用 ReverseTraffic 即可把流量切回旧分片，因为旧分片通过反向复制一直保持着最新数据。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant C as 客户端
+    participant V as VTGate（路由层）
+    participant S as 源分片（2 片）
+    participant D as 目标分片（4 片）
+    Note over S,D: VReplication 持续同步
+    S-&gt;&gt;D: binlog 复制
+    Note over V: SwitchTraffic — 切读
+    C-&gt;&gt;V: SELECT
+    V-&gt;&gt;D: 路由到新分片
+    Note over V: SwitchTraffic — 切写
+    V-&gt;&gt;S: 暂停写入
+    S-&gt;&gt;D: 追平最后一批变更
+    V-&gt;&gt;V: 原子切换路由
+    V-&gt;&gt;D: 恢复写入
+    Note over S,D: 自动建立反向复制
+    D-&gt;&gt;S: 反向 binlog 同步
+    Note over V: 如需回滚：ReverseTraffic
+    V-&gt;&gt;V: 切回源分片路由</code></pre>
+<h1>回滚：切不回去才是最大的恐惧</h1>
+<p>resharding 的回滚能力取决于一个核心问题：旧拓扑的数据还是不是最新的？</p>
+<h2 id="三种回滚策略">三种回滚策略</h2>
+<p>保持旧库在线：切换后不急着下线旧库。新库出问题时直接把路由切回旧库。这种方式最简单，但要求切换期间旧库没有落后。适用于双写方案——双写阶段旧库始终在接收写入。</p>
+<p>反向复制：切换后从新库向旧库建立反向数据同步（CDC 或 binlog 复制）。旧库持续更新，随时可以接管。Vitess 的 ReverseTraffic 就基于这个原理。</p>
+<p>快照加重放：切换前对旧库做快照，回滚时恢复快照再重放切换期间的 binlog。恢复时间最长但最可靠，适用于对数据一致性要求极高的金融场景。</p>
+<h2 id="回滚的时间窗口">回滚的时间窗口</h2>
+<p>回滚能力不是永久的。随着新拓扑运行时间增长，回滚成本越来越高：</p>
+<ul>
+<li>切换后数小时内：直接切路由，秒级回滚</li>
+<li>切换后数天内：反向复制保持旧库更新，分钟级回滚</li>
+<li>切换后数周：旧库可能已下线，回滚需要重建环境，小时级甚至更长</li>
+</ul>
+<p>业界通常规定一个&quot;观察期&quot;（如一至两周），观察期内保持旧库和反向复制在线，确认无异常后才正式下线旧库。</p>
+<pre><code class="hljs mermaid">graph TD
+    A[&quot;切换完成&quot;] --&gt; B&#123;&quot;观察期内？&quot;&#125;
+    B --&gt;|是| C[&quot;旧库在线 + 反向复制运行中&quot;]
+    C --&gt; D&#123;&quot;发现异常？&quot;&#125;
+    D --&gt;|是| E[&quot;切回旧库路由（秒级）&quot;]
+    D --&gt;|否| F[&quot;继续观察&quot;]
+    B --&gt;|否| G[&quot;下线旧库 + 停止反向复制&quot;]
+    G --&gt; H[&quot;回滚需重建环境（小时级）&quot;]</code></pre>
+<h1>业界工程实践对比</h1>
+<h2 id="大规模电商的虚拟分片实践">大规模电商的虚拟分片实践</h2>
+<p>一种在大厂广泛使用的做法以 32×32 = 1024 张表为例，初始部署在 8 台物理机上（每台 4 个库实例，每库 32 张表）。扩容时不改路由规则，只把部分库实例从旧物理机搬到新物理机——本质上就是虚拟分片：1024 张表是 1024 个虚拟分片，物理搬运不涉及数据重分配。</p>
+<p>路由规则始终是 uid 后四位 % 32 定库、uid 后四位 / 32 % 32 定表，从头到尾不变。DBA 只需把数据库实例从一台机器迁移到另一台。</p>
+<h2 id="vitess">Vitess</h2>
+<p>Vitess 的 Reshard 工作流是目前开源方案中最完整的：内建 VReplication 引擎不依赖外部 CDC 工具；SwitchTraffic 支持先切读后切写的灰度策略；自动建立反向复制，ReverseTraffic 一键回滚；支持任意分片规则变更，不限于 2^n 倍扩。</p>
+<h2 id="shardingsphere-弹性扩容">ShardingSphere 弹性扩容</h2>
+<p>Apache ShardingSphere 的弹性扩容采用四阶段模型：资源准备（创建新库实例，初始化元数据）→ 全量迁移（一致性快照复制）→ 增量同步（基于 binlog 的 CDC）→ 流量切换（原子更新路由配置）。ShardingSphere 作为 Proxy 层中间件，切换路由配置本身就是原子操作，对应用层透明。</p>
+<h2 id="stripe-四阶段迁移">Stripe 四阶段迁移</h2>
+<p>Stripe 的在线数据迁移模式虽然不完全是 resharding 场景，但思路通用：</p>
+<ol>
+<li>Dual-write：同时写新旧存储</li>
+<li>Backfill：迁移历史数据</li>
+<li>Dark-read：同时从新旧存储读取并对比结果，但只返回旧存储的结果</li>
+<li>Cutover：确认一致后切到新存储，下线旧存储</li>
+</ol>
+<p>Dark-read 阶段是这套方案的亮点：在不影响生产流量的前提下验证新存储的正确性。每个阶段结束后系统都处于一个可安全回退到上一阶段的状态。</p>
+<h1>方案选型</h1>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>停机时间</th>
+<th>代码侵入</th>
+<th>回滚能力</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>停机迁移</td>
+<td>小时级</td>
+<td>无</td>
+<td>快照恢复</td>
+<td>非 7×24 系统、合规驱动</td>
+</tr>
+<tr>
+<td>双写迁移</td>
+<td>秒级停写窗口</td>
+<td>高（改 DAO 层）</td>
+<td>任意阶段可回滚</td>
+<td>通用在线系统</td>
+</tr>
+<tr>
+<td>CDC/Binlog</td>
+<td>秒级</td>
+<td>无</td>
+<td>反向 CDC</td>
+<td>binlog ROW 模式、不想改代码</td>
+</tr>
+<tr>
+<td>升级从库</td>
+<td>秒级</td>
+<td>低（改路由配置）</td>
+<td>需重建主从</td>
+<td>已有主从、2^n 倍扩</td>
+</tr>
+<tr>
+<td>虚拟分片</td>
+<td>秒级</td>
+<td>低</td>
+<td>还原映射表</td>
+<td>需要灵活扩缩容</td>
+</tr>
+<tr>
+<td>Vitess</td>
+<td>秒级</td>
+<td>无</td>
+<td>ReverseTraffic 一键</td>
+<td>MySQL 生态、需完整工具链</td>
+</tr>
+</tbody>
+</table>
+<p>实际工程中这些方案经常混合使用：用虚拟分片降低数据迁移量，用 CDC 做增量同步，用 Proxy 层做原子切换，用反向复制保障回滚能力。最终选择取决于数据规模、团队技术栈、以及对停机时间的容忍度。</p>
+<h1>参考资料</h1>
+<ul>
+<li>Vitess 官方文档：Resharding 工作流 <a target="_blank" rel="noopener" href="https://vitess.io/docs/user-guides/migration/">https://vitess.io/docs/user-guides/migration/</a></li>
+<li>Apache ShardingSphere 弹性扩容文档 <a target="_blank" rel="noopener" href="https://shardingsphere.apache.org/">https://shardingsphere.apache.org/</a></li>
+<li>gh-ost：GitHub Online Schema Tool <a target="_blank" rel="noopener" href="https://github.com/github/gh-ost">https://github.com/github/gh-ost</a></li>
+<li>Canal：阿里巴巴 MySQL binlog 增量订阅组件 <a target="_blank" rel="noopener" href="https://github.com/alibaba/canal">https://github.com/alibaba/canal</a></li>
+<li>Debezium：开源 CDC 平台 <a target="_blank" rel="noopener" href="https://debezium.io/">https://debezium.io/</a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/06/01/%E6%95%B0%E6%8D%AE%E5%BA%93-Resharding-%E7%9A%84%E5%9C%A8%E7%BA%BF%E5%88%87%E6%8D%A2%E4%B8%8E%E5%9B%9E%E6%BB%9A/">https://magicliang.github.io/2026/06/01/%E6%95%B0%E6%8D%AE%E5%BA%93-Resharding-%E7%9A%84%E5%9C%A8%E7%BA%BF%E5%88%87%E6%8D%A2%E4%B8%8E%E5%9B%9E%E6%BB%9A/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a><a class="post-meta__tags" href="/tags/%E6%9E%B6%E6%9E%84/">架构</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-database.svg" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2018/06/06/log-%E7%9A%84%E5%8E%86%E5%8F%B2/" title="log 的历史"><img class="cover" src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2018-06-06</div><div class="info-item-2">log 的历史</div></div><div class="info-2"><div class="info-item-1">Log：一种被低估的计算机科学基础抽象 在计算机科学中，log（日志）远不止是&quot;打印调试信息&quot;那么简单。从数据库的 WAL 到分布式系统的共识协议，从版本控制系统到区块链，log 作为一种 append-only 的有序记录序列，是贯穿整个计算机科学发展史的核心抽象之一。 LinkedIn 的前首席工程师 Jay Kreps 在其著名文章 “The Log: What every software engineer should know about real-time data’s unifying abstraction” 中指出：log 是一种比消息队列、数据库、文件系统更基础的抽象——后者都可以建立在 log 之上。 本文尝试梳理 log 这一抽象在不同技术领域中的演化脉络。 数据库中的 Log：WAL 与 Binlog WAL（Write-Ahead Logging） WAL 是数据库实现 ACID 特性的基石。其核心思想是：在修改数据页之前，先将修改操作写入日志。 WAL 的工作流程：  事务开始时，将修改操作（redo log entry）追加写...</div></div></div></a><a class="pagination-related" href="/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/" title="深翻页的本质：从 RDBMS 到 ES 和 Hive"><img class="cover" src="/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">深翻页的本质：从 RDBMS 到 ES 和 Hive</div></div><div class="info-2"><div class="info-item-1">博客里原来有两处深分页材料：一篇《一次大表翻页实验》，以及《MySQL 基本功》里的两个深分页片段。它们都说到了同一件事：大 OFFSET 慢，先查窄索引再回表会快很多，连续翻页可以记录上一页的最后一个 id。 这几个判断是对的，但还不够完整。深翻页并不是一个单纯的 SQL 写法问题。它同时牵涉四件事：访问路径是否够窄、排序是否稳定、产品是否允许只连续向后翻、底层系统是不是分布式合并结果。RDBMS、Elasticsearch、Hive 的症状不同，底层问题却很像：系统被要求在一个有序结果集上跳过很长的前缀。 核心判断很简单：  深翻页的成本来自“计算前缀再丢弃前缀”。优化要么把前缀变窄，要么把“第 N 页”改成“从某个锚点继续”，要么提前把结果集物化成可跳转目录。   旧实验给出的信号 旧文里的实验表大约有 1000 万行，按 status 过滤后命中约 100 万行。测试环境是本地硬盘，慢查询阈值按 100ms 估算。几条查询的结果很有代表性：    查询形态 典型 SQL 耗时 主要现象     直接深翻页 where status = '1' limit 990000, ...</div></div></div></a><a class="pagination-related" href="/2026/05/20/MyBatis-%E5%86%85%E9%83%A8%E6%9E%B6%E6%9E%84%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90/" title="MyBatis 内部架构深度解析：从 Mapper 方法到 JDBC 执行链"><img class="cover" src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-20</div><div class="info-item-2">MyBatis 内部架构深度解析：从 Mapper 方法到 JDBC 执行链</div></div><div class="info-2"><div class="info-item-1">MyBatis 的内部结构并不复杂，但很容易被看散：SqlSession、MapperProxy、MappedStatement、Executor、StatementHandler、TypeHandler、一级缓存、二级缓存、插件链分别出现在不同包里，单看任何一个类都像是局部技巧。把它们放回完整调用链之后，MyBatis 的设计会变得很清楚：  MyBatis 的核心不是“把对象自动映射成表”，而是“把 Java 方法稳定地映射到一条可执行的 SQL 描述，再把执行过程拆成可替换的流水线组件”。  本文以 MyBatis 3.5.19 的官方文档与源码 XRef 为基准，重点讨论 MyBatis 运行时内部架构，不展开 MyBatis-Spring 的事务同步、Spring Boot 自动装配，也不讨论 MyBatis-Plus 等增强框架。  总体架构 MyBatis 可以分成两条主线：构建期主线和执行期主线。 构建期负责把 XML、注解、类型别名、类型处理器、插件、缓存配置等材料编译成一个 Configuration 对象。执行期从 SqlSessionFactory 打开 ...</div></div></div></a><a class="pagination-related" href="/2021/03/24/%E6%95%B0%E6%8D%AE%E5%BA%93%E5%AE%B9%E7%81%BE%E4%BD%93%E7%B3%BB%E7%9A%84%E6%BC%94%E5%8F%98/" title="数据库容灾体系的演变"><img class="cover" src="/2021/03/24/%E6%95%B0%E6%8D%AE%E5%BA%93%E5%AE%B9%E7%81%BE%E4%BD%93%E7%B3%BB%E7%9A%84%E6%BC%94%E5%8F%98/Transaction-Across-DataCenter.jpeg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-03-24</div><div class="info-item-2">数据库容灾体系的演变</div></div><div class="info-2"><div class="info-item-1">什么是容灾  备份的分类    备份方式 说明     逻辑备份 数据库对象级备份，备份内容是表、索引、存储过程等数据库对象，如MySQL mysqldump、Oracle exp/imp。   物理备份 数据库文件级备份，备份内容是操作系统上数据库文件，如MySQL XtraBackup、Oracle RMAN。   快照备份 基于快照技术获取指定数据集合的一个完全可用拷贝，随后可以选择仅在本机上维护快照，或者对快照进行数据跨机备份，如文件系统Veritas File System，卷管理器Linux LVM，存储子系统NetApp NAS。    规划 要结合业务，产生多维立体的解决方案。 </div></div></div></a><a class="pagination-related" href="/2026/02/07/%E9%87%8D%E8%AF%BB-Eric-Evans-%E7%9A%84-DDD-%E8%93%9D%E7%9A%AE%E4%B9%A6/" title="重读 Eric Evans 的 DDD 蓝皮书"><img class="cover" src="/img/cover-architecture.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-02-07</div><div class="info-item-2">重读 Eric Evans 的 DDD 蓝皮书</div></div><div class="info-2"><div class="info-item-1">引言 软件系统的复杂性往往被误解为技术问题。在多年的开发实践中，我们习惯了用各种设计模式、架构框架、技术栈来应对复杂性，却忽略了一个根本事实：软件的核心复杂性在于领域本身，而非技术实现。Eric Evans 在《领域驱动设计》一书中提出了这一深刻见解，并给出了一套系统化的方法论——领域驱动设计。 DDD 不是一套必须严格遵守的规范，也不是一个可以简单套用的框架，它是一种思维方式，一种通过深入理解业务领域来构建高质量软件的方法论。重读这本经典著作，让我们重新审视这些核心理念。 通用语言 通用语言是 DDD 的基石。开发团队与领域专家共享同一套语言，这套语言不仅用于沟通，也体现在代码中。代码即文档，文档即代码。 在传统开发模式中，业务专家使用业务术语，技术人员使用技术术语，两者之间存在天然的语言鸿沟。业务需求被翻译成技术文档，技术文档又被翻译成代码，每个翻译环节都会产生信息丢失和误解。通用语言的提出，就是为了消除这种鸿沟。 通用语言应该由开发和业务专家共同构建，在持续的交流中不断完善。它体现在所有方面：需求讨论、文档、代码、测试。当领域专家能够阅读代码并理解其含义时，当开发人员能够直...</div></div></div></a><a class="pagination-related" href="/2025/07/29/%E5%89%AF%E6%9C%AC%E5%A4%8D%E5%88%B6%E7%AE%97%E6%B3%95%E4%B8%8E%E6%9E%B6%E6%9E%84/" title="副本复制算法与架构——PacificA、Elasticsearch、Kafka、Pulsar 全面对比"><img class="cover" src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-07-29</div><div class="info-item-2">副本复制算法与架构——PacificA、Elasticsearch、Kafka、Pulsar 全面对比</div></div><div class="info-2"><div class="info-item-1">本文将深入剖析 PacificA、Elasticsearch、Kafka、Pulsar 四大分布式系统的副本复制机制，揭示它们在一致性、可用性和性能之间的精妙权衡。这些系统虽然都通过副本复制来保证数据可靠性和高可用性，但在具体的实现策略上各有特色，反映了不同的设计哲学和适用场景。  引言：为什么需要副本复制 数据可靠性与高可用性 在分布式系统中，硬件故障是常态而非例外。Google 的统计数据显示，一个拥有 10,000 台服务器的数据中心，每天平均会有 2-3 台服务器发生故障。如果数据只存储在一台机器上，那么这台机器的故障就意味着数据的永久丢失。 副本复制（Replication） 是解决这个问题的核心手段：将数据复制到多台机器上，即使部分机器故障，数据仍然可用。 CAP 定理的实际影响 CAP 定理告诉我们，在网络分区（Partition）发生时，分布式系统只能在**一致性（Consistency）和可用性（Availability）**之间二选一：    选择 含义 代表系统     CP 网络分区时拒绝服务，保证一致性 ZooKeeper、etcd、HBase   AP...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">问题的本质：hash mod 变化引发的数据海啸</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">停机迁移——简单但代价最大</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">双写迁移——五阶段渐进切换</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5%E4%B8%80%EF%BC%9A%E5%90%8C%E6%AD%A5"><span class="toc-number">3.1.</span> <span class="toc-text">阶段一：同步</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5%E4%BA%8C%EF%BC%9A%E5%8F%8C%E5%86%99"><span class="toc-number">3.2.</span> <span class="toc-text">阶段二：双写</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5%E4%B8%89%EF%BC%9A%E6%A0%A1%E9%AA%8C"><span class="toc-number">3.3.</span> <span class="toc-text">阶段三：校验</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5%E5%9B%9B%EF%BC%9A%E5%88%87%E8%AF%BB"><span class="toc-number">3.4.</span> <span class="toc-text">阶段四：切读</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5%E4%BA%94%EF%BC%9A%E5%88%87%E5%86%99"><span class="toc-number">3.5.</span> <span class="toc-text">阶段五：切写</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">CDC&#x2F;Binlog 增量追平——对应用零侵入</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E4%BD%9C%E5%8E%9F%E7%90%86"><span class="toc-number">4.1.</span> <span class="toc-text">工作原理</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%88%87%E6%8D%A2%E4%B8%8E%E5%9B%9E%E6%BB%9A"><span class="toc-number">4.2.</span> <span class="toc-text">切换与回滚</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">升级从库——不搬数据的 2^n 倍扩</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E6%8F%90%E6%9D%A1%E4%BB%B6"><span class="toc-number">5.1.</span> <span class="toc-text">前提条件</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%93%8D%E4%BD%9C%E6%AD%A5%E9%AA%A4"><span class="toc-number">5.2.</span> <span class="toc-text">操作步骤</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%88%87%E6%8D%A2%E4%B8%8E%E5%9B%9E%E6%BB%9A"><span class="toc-number">5.3.</span> <span class="toc-text">切换与回滚</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B1%80%E9%99%90%E6%80%A7"><span class="toc-number">5.4.</span> <span class="toc-text">局限性</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">一致性哈希与虚拟分片——从源头减少数据迁移</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E8%87%B4%E6%80%A7%E5%93%88%E5%B8%8C"><span class="toc-number">6.1.</span> <span class="toc-text">一致性哈希</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%99%9A%E6%8B%9F%E5%88%86%E7%89%87"><span class="toc-number">6.2.</span> <span class="toc-text">虚拟分片</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">切换的&quot;瞬间&quot;到底怎么实现</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#proxy-%E5%B1%82%E8%B7%AF%E7%94%B1%E5%88%87%E6%8D%A2"><span class="toc-number">7.1.</span> <span class="toc-text">Proxy 层路由切换</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#gh-ost-%E7%9A%84%E5%8E%9F%E5%AD%90-rename"><span class="toc-number">7.2.</span> <span class="toc-text">gh-ost 的原子 RENAME</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#vitess-%E7%9A%84-switchtraffic-reversetraffic"><span class="toc-number">7.3.</span> <span class="toc-text">Vitess 的 SwitchTraffic &#x2F; ReverseTraffic</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">回滚：切不回去才是最大的恐惧</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E7%A7%8D%E5%9B%9E%E6%BB%9A%E7%AD%96%E7%95%A5"><span class="toc-number">8.1.</span> <span class="toc-text">三种回滚策略</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9E%E6%BB%9A%E7%9A%84%E6%97%B6%E9%97%B4%E7%AA%97%E5%8F%A3"><span class="toc-number">8.2.</span> <span class="toc-text">回滚的时间窗口</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">9.</span> <span class="toc-text">业界工程实践对比</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%A7%E8%A7%84%E6%A8%A1%E7%94%B5%E5%95%86%E7%9A%84%E8%99%9A%E6%8B%9F%E5%88%86%E7%89%87%E5%AE%9E%E8%B7%B5"><span class="toc-number">9.1.</span> <span class="toc-text">大规模电商的虚拟分片实践</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#vitess"><span class="toc-number">9.2.</span> <span class="toc-text">Vitess</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#shardingsphere-%E5%BC%B9%E6%80%A7%E6%89%A9%E5%AE%B9"><span class="toc-number">9.3.</span> <span class="toc-text">ShardingSphere 弹性扩容</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#stripe-%E5%9B%9B%E9%98%B6%E6%AE%B5%E8%BF%81%E7%A7%BB"><span class="toc-number">9.4.</span> <span class="toc-text">Stripe 四阶段迁移</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">10.</span> <span class="toc-text">方案选型</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">11.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.1</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.4</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.4"></script><script src="/js/main.js?v=5.5.4"></script><script src="/js/tw_cn.js?v=5.5.4"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.12.2/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="ribbon" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-ribbon.min.js" size="150" alpha="0.6" zIndex="-1" mobile="false" data-click="true"></script><script id="canvas_nest" defer="defer" color="0,0,255" opacity="0.7" zIndex="-1" count="99" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-nest.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = true;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script id="click-heart" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/click-heart.min.js" async="async" mobile="false"></script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

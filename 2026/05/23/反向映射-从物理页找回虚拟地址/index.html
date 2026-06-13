@@ -1,0 +1,781 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>反向映射：从物理页找回虚拟地址 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇把 folio 作为缓存与回收的管理单位。一旦讨论“回收”，立刻冒出一个问题：内核拿到一个准备回收的 folio，怎么知道哪些进程的页表还指着它？正向页表只能从虚拟地址走到物理页，反过来走不通。反向映射就是为这件事存在的。 核心问题可以压成一句话：  正向页表回答“这个地址翻译到哪一页”，反向映射回答“这一页被哪些地址空间映射”。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="反向映射：从物理页找回虚拟地址">
+<meta property="og:url" content="https://magicliang.github.io/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇把 folio 作为缓存与回收的管理单位。一旦讨论“回收”，立刻冒出一个问题：内核拿到一个准备回收的 folio，怎么知道哪些进程的页表还指着它？正向页表只能从虚拟地址走到物理页，反过来走不通。反向映射就是为这件事存在的。 核心问题可以压成一句话：  正向页表回答“这个地址翻译到哪一页”，反向映射回答“这一页被哪些地址空间映射”。">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/cover.svg">
+<meta property="article:published_time" content="2026-05-23T13:42:09.000Z">
+<meta property="article:modified_time" content="2026-05-23T17:04:28.980Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Linux">
+<meta property="article:tag" content="内核">
+<meta property="article:tag" content="操作系统">
+<meta property="article:tag" content="数据结构">
+<meta property="article:tag" content="虚拟内存">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "反向映射：从物理页找回虚拟地址",
+  "url": "https://magicliang.github.io/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/",
+  "image": "https://magicliang.github.io/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/cover.svg",
+  "datePublished": "2026-05-23T13:42:09.000Z",
+  "dateModified": "2026-05-23T17:04:28.980Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.4"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.1.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '反向映射：从物理页找回虚拟地址',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.1"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (false) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">442</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">484</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">31</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">反向映射：从物理页找回虚拟地址</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">反向映射：从物理页找回虚拟地址</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-05-23T13:42:09.000Z" title="Created 2026-05-23 21:42:09">2026-05-23</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-05-23T17:04:28.980Z" title="Updated 2026-05-24 01:04:28">2026-05-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.5k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>12mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><p>上一篇把 folio 作为缓存与回收的管理单位。一旦讨论“回收”，立刻冒出一个问题：内核拿到一个准备回收的 folio，怎么知道哪些进程的页表还指着它？正向页表只能从虚拟地址走到物理页，反过来走不通。反向映射就是为这件事存在的。</p>
+<p>核心问题可以压成一句话：</p>
+<blockquote>
+<p>正向页表回答“这个地址翻译到哪一页”，反向映射回答“这一页被哪些地址空间映射”。</p>
+</blockquote>
+<span id="more"></span>
+<h2 id="问题从哪里来">问题从哪里来</h2>
+<p>页表只解决一个方向：拿到一个虚拟地址，按 PGD→P4D→PUD→PMD→PTE 走下去，最终得到 PFN。这是 MMU 在用户态访问路径上需要的。</p>
+<p>但内核在很多场景需要反方向：拿到一个物理页（或 folio），找到所有当前映射它的虚拟页和对应 PTE。典型场景包括：</p>
+<ul>
+<li>回收一个 folio。释放前必须撤销所有指向它的 PTE，否则用户态访问会拿到已释放的物理页。</li>
+<li>迁移一个 folio。把内容搬到新物理页之后，所有原指针都要改写到新 PFN。</li>
+<li>COW 写入触发时。即使是 <code>do_wp_page</code> 的判断，也要确认有没有其他映射方共享同一物理页。</li>
+<li>在大页拆分、NUMA balancing、kernel same-page merging（KSM）等路径上，都要把同一物理页的所有映射当作一个整体处理。</li>
+</ul>
+<p>仅靠正向页表做这件事的开销是不可接受的。它意味着每次回收都要遍历所有进程的页表，找哪个 PTE 的 PFN 字段等于目标。物理内存上有几十万到数百万个物理页，进程也可能成百上千，这条路走不通。</p>
+<p>反向映射的本质是一组反向索引：让“物理页 → 映射方”这条查询有 O(映射数量) 的复杂度，而不是 O(全系统 PTE 数量)。</p>
+<h2 id="最小模型">最小模型</h2>
+<p>正向与反向的对照：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">forward (page table):<br>  virtual address -&gt; PGD/P4D/PUD/PMD/PTE -&gt; PFN<br><br>reverse (rmap):<br>  folio -&gt; anon_vma rb tree or address_space i_mmap interval tree<br>         -&gt; set of VMAs<br>         -&gt; for each VMA: locate the PTE pointing to this folio<br></code></pre></td></tr></table></figure>
+<p>正向路径由 MMU 在访问时走。反向路径由内核在维护时走，典型入口是 <code>rmap_walk</code>、<code>try_to_unmap</code>、<code>folio_referenced</code>、<code>page_mkclean</code> 等。</p>
+<p>反向映射在 Linux 里按页的来源分成两类：</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>容器</th>
+<th>数据结构</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>匿名页</td>
+<td><code>struct anon_vma</code> 链</td>
+<td>red-black tree（per anon_vma）</td>
+</tr>
+<tr>
+<td>文件页</td>
+<td><code>struct address_space-&gt;i_mmap</code></td>
+<td>interval tree（按 pgoff 区间）</td>
+</tr>
+</tbody>
+</table>
+<p>官方文档把这两类合称为反向映射，并且把保护它们的锁称为 rmap locks：</p>
+<blockquote>
+<p>When trying to access VMAs through the reverse mapping via a <code>struct address_space</code> or <code>struct anon_vma</code> object …<br>
+We refer to these locks as the reverse mapping locks, or “rmap locks” for brevity.</p>
+</blockquote>
+<p>两类访问路径走的也是不同的锁：</p>
+<blockquote>
+<p>VMAs must be stabilised via <code>anon_vma_[try]lock_read()</code> or <code>anon_vma_[try]lock_write()</code> for anonymous memory.<br>
+<code>i_mmap_[try]lock_read()</code> or <code>i_mmap_[try]lock_write()</code> for file-backed memory.</p>
+</blockquote>
+<p>锁的细节后面回收篇会再用到。这里只需要记住：反向访问从来不是 cheap 的随便走，每次都要先稳定相应的 rmap 结构。</p>
+<h2 id="anon-vma-与-i-mmap-为什么不同">anon_vma 与 i_mmap 为什么不同</h2>
+<p>匿名页和文件页在“可能被谁映射”这个问题上有结构差异。</p>
+<p>文件页的映射关系天生集中。所有用 <code>mmap</code> 把同一文件的同一段映射进自己地址空间的进程，对应的 VMA 都挂在该文件的 <code>address_space-&gt;i_mmap</code> 上。一棵 interval tree 索引按文件偏移区间组织，查询“pgoff X 被哪些 VMA 覆盖”是高效的。这棵树天然按文件偏移管理，能直接服务于回收和写回。</p>
+<p>匿名页没有文件可以挂。它们的“归属”是某个进程在某次 <code>mmap(MAP_ANONYMOUS)</code> 时建立的 VMA。问题在于 <code>fork</code> 之后子进程会复制 VMA，原 VMA 的匿名页可能同时被父子两个进程映射；如果子进程再 fork，关系还会扩张。</p>
+<p><code>anon_vma</code> 系统解决的就是这个扩张。每个匿名 VMA 关联一个 <code>anon_vma</code> 对象，每个匿名页（folio）通过 <code>mapping</code> 字段反向指到属于自己的 <code>anon_vma</code>。<code>anon_vma</code> 内部维护一棵 red-black tree，记录所有当前可能映射其页面的 VMA。fork 时不复制页面，但要把子进程的新 VMA 接入这棵树，使得后续从原页反查仍能找到子进程那一份 VMA。</p>
+<p>官方文档对匿名 VMA 与 <code>anon_vma</code> 的关系给了简短描述：</p>
+<blockquote>
+<p><code>anon_vma</code> object used by anonymous folios mapped exclusively to this VMA.<br>
+Initially set by <code>anon_vma_prepare()</code> serialised by the <code>page_table_lock</code>.</p>
+</blockquote>
+<p>“mapped exclusively to this VMA”是字面情况；非独占（如 fork 后）会通过 <code>anon_vma_clone</code> / <code>anon_vma_chain</code> 进一步组织。设计目标是同一个：让回收路径只需要走一棵小树，而不是全局扫描。</p>
+<h3 id="anon-vma-chain：vma-与-anon-vma-之间的连接节点">anon_vma_chain：VMA 与 anon_vma 之间的连接节点</h3>
+<p><code>struct anon_vma_chain</code>（简称 AVC）是理解 fork 场景下反向映射扩张的关键。每个 AVC 充当一个 VMA 和一个 anon_vma 之间的双向连接：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">VMA (child) --[avc]--&gt; anon_vma (parent)<br>                 |<br>                 +--&gt; 同时挂在 VMA 的 anon_vma_chain 链表<br>                 +--&gt; 同时挂在 anon_vma 的 rb_root 红黑树<br></code></pre></td></tr></table></figure>
+<p>fork 时的链接过程（<code>anon_vma_fork</code> → <code>anon_vma_clone</code>）：子进程的新 VMA 需要接入父 VMA 关联的<strong>所有</strong> anon_vma。具体做法是遍历父 VMA 的 AVC 链表，为每个 anon_vma 创建一个新 AVC，把子 VMA 连进去。这样，从任何一个祖先 anon_vma 出发做 <code>rmap_walk_anon</code>，都能通过红黑树找到所有子孙 VMA。</p>
+<p>这种设计的代价：深度 fork 链（如 fork-heavy 的 shell 脚本或容器 init 反复 fork）会让每个 VMA 的 AVC 链表线性增长，回收遍历变慢。内核通过 <code>anon_vma_prepare</code> 中的启发式（reuse 父 anon_vma 或新建）和 COW 后断开旧链接来控制扩张。</p>
+<h3 id="模式提炼：正向用于查询-反向用于维护">模式提炼：正向用于查询，反向用于维护</h3>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">forward index for lookup, reverse index for maintenance<br></code></pre></td></tr></table></figure>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>正向页表</th>
+<th>反向映射</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>谁查</td>
+<td>MMU（每次访问）</td>
+<td>内核（回收、迁移、COW 判定、KSM、splittling）</td>
+</tr>
+<tr>
+<td>输入</td>
+<td>虚拟地址</td>
+<td>物理页 / folio</td>
+</tr>
+<tr>
+<td>输出</td>
+<td>PFN + 权限</td>
+<td>一组 VMA + 对应 PTE 位置</td>
+</tr>
+<tr>
+<td>触发频率</td>
+<td>极高，硬件路径</td>
+<td>较低，事件驱动</td>
+</tr>
+<tr>
+<td>失败语义</td>
+<td>缺页异常</td>
+<td>维护操作回退或重试</td>
+</tr>
+</tbody>
+</table>
+<p>很多系统都有类似的“正反向索引”分工：数据库里的主索引与二级索引、对象存储里的 object key 与反向引用表、文件系统里的 inode 与 dentry。共同点是高频查询路径要简洁，低频维护路径要可达。</p>
+<h2 id="一个最小实验：两个进程映射同一文件">一个最小实验：两个进程映射同一文件</h2>
+<p>下面这个实验让两个进程同时 <code>mmap</code> 同一个文件，观察 <code>smaps</code> 中的 shared/private 统计与 <code>Pss</code>，验证文件页在多个地址空间出现。</p>
+<p>准备文件与脚本：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 准备一个 4MB 测试文件</span><br><span class="hljs-built_in">dd</span> <span class="hljs-keyword">if</span>=/dev/urandom of=/tmp/rmap_demo.bin bs=1M count=4<br><br><span class="hljs-comment"># 写一个最小程序：mmap 文件并空转</span><br><span class="hljs-built_in">cat</span> &gt; /tmp/rmap_holder.c &lt;&lt;<span class="hljs-string">&#x27;EOF&#x27;</span><br><span class="hljs-comment">#define _GNU_SOURCE</span><br><span class="hljs-comment">#include &lt;fcntl.h&gt;</span><br><span class="hljs-comment">#include &lt;stdio.h&gt;</span><br><span class="hljs-comment">#include &lt;stdlib.h&gt;</span><br><span class="hljs-comment">#include &lt;string.h&gt;</span><br><span class="hljs-comment">#include &lt;sys/mman.h&gt;</span><br><span class="hljs-comment">#include &lt;sys/stat.h&gt;</span><br><span class="hljs-comment">#include &lt;unistd.h&gt;</span><br><br>int main(int argc, char **argv) &#123;<br>    <span class="hljs-keyword">if</span> (argc != 2) &#123; fprintf(stderr, <span class="hljs-string">&quot;usage: %s &lt;file&gt;\n&quot;</span>, argv[0]); <span class="hljs-built_in">return</span> 1; &#125;<br>    int fd = open(argv[1], O_RDONLY);<br>    <span class="hljs-keyword">if</span> (fd &lt; 0) &#123; perror(<span class="hljs-string">&quot;open&quot;</span>); <span class="hljs-built_in">return</span> 1; &#125;<br>    struct <span class="hljs-built_in">stat</span> st;<br>    fstat(fd, &amp;st);<br>    void *p = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);<br>    <span class="hljs-keyword">if</span> (p == MAP_FAILED) &#123; perror(<span class="hljs-string">&quot;mmap&quot;</span>); <span class="hljs-built_in">return</span> 1; &#125;<br><br>    /* 触摸第一页和最后一页，强制建立 PTE。*/<br>    volatile char sink = ((char *)p)[<span class="hljs-number">0</span>];<br>    sink += ((char *)p)[st.st_size - <span class="hljs-number">1</span>];<br>    (void)sink;<br><br>    printf(&quot;pid=%d mapped at %p length=%ld\n&quot;,<br>           getpid(), p, (long)st.st_size);<br>    printf(&quot;inspect: cat /proc/%d/smaps\n&quot;, getpid());<br>    fflush(stdout);<br><br>    pause();  /* 等信号退出 */<br>    munmap(p, st.st_size);<br>    close(fd);<br>    <span class="hljs-built_in">return</span> 0;<br>&#125;<br>EOF<br>cc -Wall -Wextra -O2 /tmp/rmap_holder.c -o /tmp/rmap_holder<br><br><span class="hljs-comment"># 启动两份</span><br>/tmp/rmap_holder /tmp/rmap_demo.bin &amp;<br>PID_A=$!<br>/tmp/rmap_holder /tmp/rmap_demo.bin &amp;<br>PID_B=$!<br><span class="hljs-built_in">sleep</span> 1<br><br><span class="hljs-comment"># 查看各自的 smaps</span><br><span class="hljs-keyword">for</span> pid <span class="hljs-keyword">in</span> <span class="hljs-variable">$PID_A</span> <span class="hljs-variable">$PID_B</span>; <span class="hljs-keyword">do</span><br>  <span class="hljs-built_in">echo</span> <span class="hljs-string">&quot;--- pid=<span class="hljs-variable">$pid</span> ---&quot;</span><br>  awk -v target=<span class="hljs-string">&quot;/tmp/rmap_demo.bin&quot;</span> <span class="hljs-string">&#x27;</span><br><span class="hljs-string">    /^[0-9a-f]+-[0-9a-f]+/ &#123; in_seg=index($0,target); print; next &#125;</span><br><span class="hljs-string">    in_seg &amp;&amp; /^(Size|Rss|Pss|Shared_Clean|Shared_Dirty|Private_Clean|Private_Dirty|Anonymous|Referenced):/</span><br><span class="hljs-string">  &#x27;</span> /proc/<span class="hljs-variable">$pid</span>/smaps<br><span class="hljs-keyword">done</span><br><br><span class="hljs-built_in">kill</span> <span class="hljs-variable">$PID_A</span> <span class="hljs-variable">$PID_B</span><br></code></pre></td></tr></table></figure>
+<p>完成实验后清理：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">rm</span> -f /tmp/rmap_holder.c /tmp/rmap_holder /tmp/rmap_demo.bin<br></code></pre></td></tr></table></figure>
+<h2 id="读取实验结果">读取实验结果</h2>
+<p>预期看到的结构：</p>
+<p>每个 PID 都有一段对应 <code>/tmp/rmap_demo.bin</code> 的映射，权限 <code>r--s</code>（<code>MAP_SHARED</code> 文件映射）。两段 <code>Size</code> 都接近 4MB；<code>Rss</code> 接近“已触摸的页数 × 页大小”，受预读影响可能更大。</p>
+<p>关键观察在 <code>Shared_Clean</code> 和 <code>Pss</code>：</p>
+<ul>
+<li>两个 PID 的同段映射 <code>Shared_Clean</code> 都计入相同的一组文件页。这些页只有一份物理拷贝。</li>
+<li><code>Pss</code> 大致是 <code>Rss</code> 的一半（更准确：按当前共享数分摊），反映 page cache 中这组 folio 被两个进程同时引用。</li>
+</ul>
+<p>把这个观察反推回 rmap：当内核要回收其中任意一页时，必须能找到“目前正映射这一页的两个 VMA”，分别撤销它们的 PTE。<code>address_space-&gt;i_mmap</code> 这棵 interval tree 就是这条反查的入口。</p>
+<p>如果在一个进程里 <code>munmap</code> 这段映射，再读另一个进程的 <code>smaps</code>：</p>
+<ul>
+<li>第一个进程的对应段消失。</li>
+<li>第二个进程的 <code>Pss</code> 与 <code>Rss</code> 接近相等，因为页面不再共享。</li>
+</ul>
+<p>整段实验里没有写入。换成 <code>MAP_SHARED</code> 加写权限再写入若干字节，可以观察 <code>Shared_Dirty</code> 增加，以及 writeback 之后的 <code>Shared_Clean</code> 重新出现，这条路径接的就是 page cache 篇里讲过的 <code>page_mkwrite</code> 与 <code>writepages</code>。</p>
+<h3 id="模式提炼：维护点的复杂度由反向结构决定">模式提炼：维护点的复杂度由反向结构决定</h3>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">maintenance cost = walk reverse index for affected page<br>                  + per-VMA work to update PTE<br>                  + locking on rmap / page table<br></code></pre></td></tr></table></figure>
+<p>回收一页的代价不只是“清空 PTE 那几条指令”。它由三部分构成：找到所有映射方（反向索引开销）、对每个映射方做撤销（per-VMA 操作）、所有这些动作下的锁竞争（rmap 锁 + 页表锁）。</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>反向结构开销</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>匿名页只被一个进程映射</td>
+<td>单 anon_vma，rb tree 节点很少</td>
+</tr>
+<tr>
+<td>匿名页经过多次 fork 后被多进程映射</td>
+<td>anon_vma 链/树扩张，撤销代价升高</td>
+</tr>
+<tr>
+<td>文件页被许多 mmap 共享</td>
+<td>i_mmap interval tree 覆盖更多 VMA</td>
+</tr>
+<tr>
+<td>KSM 合并的同内容页</td>
+<td>还要叠加 KSM 自身的反向结构</td>
+</tr>
+</tbody>
+</table>
+<p>理解了这套代价构成，就能解释一些“看似简单的回收动作慢得离谱”的现象：往往不是回收逻辑本身重，而是反向结构上挂的映射方太多。</p>
+<h2 id="核心结构：anon-vma">核心结构：anon_vma</h2>
+<p><code>struct anon_vma</code> 的定义（<code>include/linux/rmap.h</code>，精简）：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">anon_vma</span> &#123;</span><br>    <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">anon_vma</span> *<span class="hljs-title">root</span>;</span>         <span class="hljs-comment">/* 整条 fork 链的根 anon_vma */</span><br>    <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">rw_semaphore</span> <span class="hljs-title">rwsem</span>;</span>     <span class="hljs-comment">/* 保护 rb_root 的读写锁 */</span><br>    <span class="hljs-type">atomic_t</span> refcount;             <span class="hljs-comment">/* 引用计数 */</span><br>    <span class="hljs-type">unsigned</span> <span class="hljs-type">long</span> num_children;    <span class="hljs-comment">/* 直接子 anon_vma 数 */</span><br>    <span class="hljs-type">unsigned</span> <span class="hljs-type">long</span> num_active_vmas; <span class="hljs-comment">/* 活跃 VMA 数 */</span><br>    <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">rb_root_cached</span> <span class="hljs-title">rb_root</span>;</span> <span class="hljs-comment">/* 所有关联 VMA 的红黑树 */</span><br>&#125;;<br></code></pre></td></tr></table></figure>
+<p><code>rmap_walk_anon</code> 遍历 <code>rb_root</code> 找到所有映射了目标页面的 VMA，对每个执行回调（如 <code>try_to_unmap_one</code>）。</p>
+<h2 id="源码锚点">源码锚点</h2>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>读它的目的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mm/rmap.c</code></td>
+<td><code>rmap_walk()</code>、<code>try_to_unmap()</code>、<code>page_referenced()</code>、<code>folio_mkclean()</code></td>
+</tr>
+<tr>
+<td><code>include/linux/rmap.h</code></td>
+<td>rmap 接口与遍历控制结构</td>
+</tr>
+<tr>
+<td><code>mm/mmap.c</code> / <code>mm/vma.c</code></td>
+<td>VMA 加入/移除 i_mmap、anon_vma 的路径</td>
+</tr>
+<tr>
+<td><code>kernel/fork.c</code></td>
+<td><code>anon_vma_fork()</code>、anon_vma 链扩张</td>
+</tr>
+<tr>
+<td><code>Documentation/mm/process_addrs.rst</code></td>
+<td>rmap 锁与 VMA 锁的关系</td>
+</tr>
+</tbody>
+</table>
+<p>读 <code>try_to_unmap</code> 时可以带着一个问题：在回收路径上，撤销 PTE 后页面的状态如何标记？这条问题会把第 9 篇的回收主题与本篇连起来。</p>
+<h2 id="研究生迁移表">研究生迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>Linux 概念</th>
+<th>一般系统设计</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正向页表</td>
+<td>主索引（高频查询）</td>
+</tr>
+<tr>
+<td>anon_vma / i_mmap</td>
+<td>反向索引（事件驱动维护）</td>
+</tr>
+<tr>
+<td><code>rmap_walk</code></td>
+<td>反向遍历框架</td>
+</tr>
+<tr>
+<td><code>try_to_unmap</code></td>
+<td>撤销引用的统一入口</td>
+</tr>
+<tr>
+<td>anon_vma 链</td>
+<td>写时复制场景下的引用追踪</td>
+</tr>
+<tr>
+<td>rmap 锁</td>
+<td>反向索引的一致性边界</td>
+</tr>
+</tbody>
+</table>
+<p>数据库的二级索引、引用计数的辅助表、分布式系统里的反向链接表、垃圾回收的引用追踪图，都共享同一个思路：高频路径只读主索引，低频维护路径走反向索引。</p>
+<h2 id="常见误解">常见误解</h2>
+<p>第一个误解是反向映射只服务回收。事实上 COW 判定、迁移、KSM、大页拆分、NUMA balancing、内存热移除都依赖反向映射。回收只是出现频率最高的那一个。</p>
+<p>第二个误解是匿名页和文件页 rmap 走同一棵树。它们走的是不同结构和不同锁：匿名页走 <code>anon_vma-&gt;rb_root</code>，文件页走 <code>address_space-&gt;i_mmap</code> interval tree。</p>
+<p>第三个误解是 fork 多次后 anon_vma 链可以无限扩张而不影响性能。anon_vma 链膨胀会让反向遍历变慢，从而拖慢回收。极端场景下这是真实的性能问题，内核里也持续有 anon_vma 相关的复杂度改进。</p>
+<p>第四个误解是 KSM 之后所有同内容页面都被反向映射统一管理。KSM 有自己的反向结构（<code>rmap_item</code>），与普通 anon_vma 不同。读源码时不要把它们混为一谈。</p>
+<p>第五个误解是 <code>/proc/&lt;pid&gt;/maps</code> 能看出 rmap。<code>maps</code> 是正向视图，列的是该进程的 VMA。要从反向角度看“一页被谁映射”，需要 <code>page_owner</code>、<code>kpagecount</code>、<code>kpageflags</code> 这一类接口，并且通常需要 root 权限。</p>
+<h2 id="练习">练习</h2>
+<p>第一，按文中实验运行两个进程同时 <code>mmap</code> 同一文件，记录两个 PID 的 <code>Pss</code>、<code>Shared_Clean</code>、<code>Rss</code>，再启动第三个进程做同样的事，比较 <code>Pss</code> 的变化。</p>
+<p>第二，把测试文件改成 <code>O_RDWR</code> + <code>MAP_SHARED</code> 写入若干页，观察 <code>Shared_Dirty</code> 与 <code>Shared_Clean</code> 的变化。<code>sync</code> 一次后再看 dirty 是否被清。</p>
+<p>第三，写一段 <code>fork</code> 的小程序：父进程分配 256MB 匿名内存并全写过，再 <code>fork</code> 三次。比较父子四个进程 <code>Anonymous</code> 段的 <code>Pss</code>，验证它们如何分摊同一组匿名页。</p>
+<p>第四，阅读 <code>mm/rmap.c</code> 中的 <code>rmap_walk_anon</code> 与 <code>rmap_walk_file</code>，画一张流程图，标出两条路径在“找到 VMA → 对 VMA 操作 → 解锁”三个阶段的差异。</p>
+<p>第五，查阅 <code>Documentation/mm/process_addrs.rst</code> 中关于 rmap 锁与 VMA 锁互相穿插的描述，列出在回收一页时按顺序需要拿到哪些锁、为什么这个顺序不能颠倒。</p>
+<h2 id="系列导航">系列导航</h2>
+<ul>
+<li>上一篇：<a href="/2026/05/23/folio-%E4%B8%BA%E4%BB%80%E4%B9%88%E5%86%85%E6%A0%B8%E9%87%8D%E6%96%B0%E7%BB%84%E7%BB%87-page-%E6%8A%BD%E8%B1%A1/">Folio：为什么内核重新组织 page 抽象</a></li>
+<li>本文：反向映射：从物理页找回虚拟地址</li>
+<li>下一篇：<a href="/2026/05/23/LRU-%E5%92%8C-workingset-%E5%86%85%E6%A0%B8%E5%A6%82%E4%BD%95%E8%BF%91%E4%BC%BC%E6%9C%80%E8%BF%91%E4%BD%BF%E7%94%A8/">LRU 和 workingset：内核如何近似”最近使用”</a></li>
+</ul>
+<h2 id="参考资料">参考资料</h2>
+<blockquote>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://docs.kernel.org/mm/process_addrs.html">Process Addresses - The Linux Kernel documentation</a></li>
+<li><a target="_blank" rel="noopener" href="https://docs.kernel.org/core-api/mm-api.html">Memory Management APIs - The Linux Kernel documentation</a></li>
+<li><a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man5/proc_pid_smaps.5.html">proc_pid_smaps(5) - Linux manual page</a></li>
+<li><a target="_blank" rel="noopener" href="https://docs.kernel.org/admin-guide/mm/pagemap.html">Examining Process Page Tables - The Linux Kernel documentation</a></li>
+</ul>
+</blockquote>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/">https://magicliang.github.io/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Linux/">Linux</a><a class="post-meta__tags" href="/tags/%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F/">操作系统</a><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84/">数据结构</a><a class="post-meta__tags" href="/tags/%E5%86%85%E6%A0%B8/">内核</a><a class="post-meta__tags" href="/tags/%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98/">虚拟内存</a></div><div class="post-share"><div class="social-share" data-image="/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/cover.svg" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/05/23/folio-%E4%B8%BA%E4%BB%80%E4%B9%88%E5%86%85%E6%A0%B8%E9%87%8D%E6%96%B0%E7%BB%84%E7%BB%87-page-%E6%8A%BD%E8%B1%A1/" title="Folio：为什么内核重新组织 page 抽象"><img class="cover" src="/2026/05/23/folio-%E4%B8%BA%E4%BB%80%E4%B9%88%E5%86%85%E6%A0%B8%E9%87%8D%E6%96%B0%E7%BB%84%E7%BB%87-page-%E6%8A%BD%E8%B1%A1/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-23</div><div class="info-item-2">Folio：为什么内核重新组织 page 抽象</div></div><div class="info-2"><div class="info-item-1">上一篇看完 page cache 如何把文件内容组织成一批页面。中间已经出现过 folio 这个词。这一篇正面回答它：folio 是什么、为什么出现、读源码时该怎样处理这个新名词。 一句话定位 folio 的角色：  folio 把”缓存和回收实际处理的一组页面”显式化，去掉 struct page 里 head/tail 二义性带来的语义负担。   问题从哪里来 struct page 在 Linux 内核里承担过太多角色：单页物理元数据、page cache 的索引单元、回收链表节点、复合页（compound page）的 head/tail、THP 的子页、SLUB 的 slab 元数据、设备直通的 page、ZONE_DEVICE 页等等。这个结构体在不同子系统里的字段复用方式不同，对同一个指针的解释也不同。 一个具体的痛点是复合页的 head/tail 二义性。复合页由若干物理页组成，其中第一页叫 head，其余叫 tail。许多接口要求传 head 不传 tail，或者反之；不少接口接受任意一个，但行为有微妙差异。LWN 在 folio 提案的报道里把这种混乱压成一句...</div></div></div></a><a class="pagination-related" href="/2026/05/23/%E7%BC%BA%E9%A1%B5%E5%BC%82%E5%B8%B8-%E4%B8%80%E6%AC%A1%E8%AE%BF%E9%97%AE%E5%A6%82%E4%BD%95%E8%BF%9B%E5%85%A5%E5%86%85%E6%A0%B8/" title="缺页异常：一次访问如何进入内核"><img class="cover" src="/2026/05/23/%E7%BC%BA%E9%A1%B5%E5%BC%82%E5%B8%B8-%E4%B8%80%E6%AC%A1%E8%AE%BF%E9%97%AE%E5%A6%82%E4%BD%95%E8%BF%9B%E5%85%A5%E5%86%85%E6%A0%B8/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-23</div><div class="info-item-2">缺页异常：一次访问如何进入内核</div></div><div class="info-2"><div class="info-item-1">上一篇区分了 VMA 与页表：VMA 是地址区间策略，页表是 CPU 当前可消费的翻译记录。当 VMA 合法、PTE 却不满足这次访问时，硬件会把异常抛回内核，由内核的缺页处理路径接管。这一篇把这条路径走一遍。 核心问题可以压成一句话：  page fault 不是错误的同义词，它是 Linux VM 延迟兑现承诺的主要入口。   问题从哪里来 “缺页异常”这个翻译容易引误解。它在英文里是 page fault，词义中性，本意只是“缺一次翻译”。大量正常程序每秒会产生上百次甚至数千次 page fault，进程跑得很好，没有任何错误。 mmap 完成后第一次访问、fork 后子进程写共享只读页、读一个尚未在 page cache 的文件、被回收过的匿名页再次访问、栈在合法范围内增长，都会触发 page fault。这些 fault 走完之后，程序继续执行下一条指令，用户态察觉不到任何异常。 只有少数情况会让 page fault 变成可见错误：访问完全不属于任何 VMA 的地址、对只读 VMA 写入、对不可执行区段取指令、内核回收阶段无法找到合适页面来满足需求。这些情况要么导致信...</div></div></div></a><a class="pagination-related" href="/2026/05/23/%E9%87%8D%E8%AF%BB-Linux-VM-%E7%BB%99%E7%B3%BB%E7%BB%9F%E7%A0%94%E7%A9%B6%E7%94%9F%E7%9A%84%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98%E5%AF%BC%E8%AF%BB/" title="重读 Linux VM：给系统研究生的虚拟内存导读"><img class="cover" src="/2026/05/23/%E9%87%8D%E8%AF%BB-Linux-VM-%E7%BB%99%E7%B3%BB%E7%BB%9F%E7%A0%94%E7%A9%B6%E7%94%9F%E7%9A%84%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98%E5%AF%BC%E8%AF%BB/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-23</div><div class="info-item-2">重读 Linux VM：给系统研究生的虚拟内存导读</div></div><div class="info-2"><div class="info-item-1">Linux VM 容易读散。它表面上在讲 mmap、页表、缺页异常、匿名页、page cache、folio、LRU、swap、NUMA、huge page、slab、cgroup memory 和 OOM killer，读起来像一串彼此相邻但没有主线的内核机制；主线可以压成一句话：  Linux VM 是一套把虚拟地址、物理页、文件、进程、CPU MMU 和 I/O 统一到同一个状态转移系统里的内核机制。  这句话一旦立住，虚拟内存就不再只是“地址翻译”或“把内存变大”。地址空间描述进程能够访问什么；页表描述 CPU 当前怎样翻译地址；物理页描述内核手里真实可调度的资源；page cache 把文件内容放进同一套页管理体系；缺页异常负责把尚未兑现的映射变成真实页面；页回收和 swap 则在内存压力下重新分配这些页面。 本系列以 Linux 6.x（主要参照 6.1–6.8）为基准。涉及版本敏感的机制时（如 maple tree 6.1 引入、per-VMA lock 6.4 稳定、Multi-Gen LRU 6.1 合入、folio 迁移 5.16–6.0 持续进行），各篇会标...</div></div></div></a><a class="pagination-related" href="/2026/05/24/cgroup-memory-%E5%86%85%E5%AD%98%E4%BB%8E%E5%85%A8%E5%B1%80%E8%B5%84%E6%BA%90%E5%8F%98%E6%88%90%E5%B1%80%E9%83%A8%E9%A2%84%E7%AE%97/" title="cgroup memory：内存从全局资源变成局部预算"><img class="cover" src="/2026/05/24/cgroup-memory-%E5%86%85%E5%AD%98%E4%BB%8E%E5%85%A8%E5%B1%80%E8%B5%84%E6%BA%90%E5%8F%98%E6%88%90%E5%B1%80%E9%83%A8%E9%A2%84%E7%AE%97/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-24</div><div class="info-item-2">cgroup memory：内存从全局资源变成局部预算</div></div><div class="info-2"><div class="info-item-1">上一篇讲了 SLUB 如何在页之上管理小对象的分配。到此为止，所有讨论都假设一个全局的内存资源池——进程共享同一组物理页，回收和 OOM 是全局决策。容器化环境打破了这个假设：一个容器不应该消耗完整机器的内存，它的 OOM 不应该波及其他容器。 核心问题可以压成一句话：  memcg 把全局 VM 策略投影到层级资源边界里，使回收、统计和 OOM 都带上 cgroup 语义。   问题从哪里来 传统 Linux 内存管理是全局视角：所有进程共享物理内存，kswapd 按全局水位线回收，OOM killer 从全局选 victim。这在单租户系统上没问题，但在多租户场景（容器、虚拟化、共享主机）上不够： 第一，隔离性缺失。一个行为异常的容器可以消耗所有可用内存，触发全局 OOM，导致无关容器的进程被杀。 第二，资源可预测性缺失。一个容器无法知道自己&quot;还能用多少内存&quot;——这取决于其他容器当前的使用情况。 第三，统计粒度缺失。管理员无法回答&quot;这个服务用了多少内存&quot;——/proc/meminfo 只有全局数据。 cgroup memory cont...</div></div></div></a><a class="pagination-related" href="/2026/05/24/Buddy-system-%E7%89%A9%E7%90%86%E9%A1%B5%E5%A6%82%E4%BD%95%E6%8C%89%E9%98%B6%E5%88%86%E9%85%8D/" title="Buddy system：物理页如何按阶分配"><img class="cover" src="/2026/05/24/Buddy-system-%E7%89%A9%E7%90%86%E9%A1%B5%E5%A6%82%E4%BD%95%E6%8C%89%E9%98%B6%E5%88%86%E9%85%8D/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-24</div><div class="info-item-2">Buddy system：物理页如何按阶分配</div></div><div class="info-2"><div class="info-item-1">上一篇讲了 huge page 如何通过增大映射粒度降低 TLB 和页表开销。但分配 2MB 连续物理内存本身就不是简单的事——物理页分配器必须能快速找到指定大小的连续空闲块。Buddy system 就是 Linux 用来解决这个问题的核心机制。 核心问题可以压成一句话：  buddy allocator 用按阶（order）拆分和合并管理连续物理页，解决的是页级分配与碎片控制问题。   问题从哪里来 内核需要分配连续物理页的场景很多：DMA buffer 要求物理连续、huge page 需要 order-9（2MB）的连续块（1GB 页通常在启动时通过 HugeTLB 机制预留，不走常规 buddy 路径）、设备驱动需要特定对齐的物理内存。 最简单的方案是维护一个空闲页链表。但这有两个问题：第一，找&quot;连续 N 页&quot;需要遍历链表检查物理地址连续性，时间复杂度不可控；第二，反复分配释放后内存碎片化，即使总空闲页足够也可能凑不出连续块。 Buddy system 用 power-of-two 分块解决这两个问题：只管理 2^n 大小的块（称为 order-n ...</div></div></div></a><a class="pagination-related" href="/2026/05/24/Swap-%E6%8D%A2%E5%87%BA%E5%8E%BB%E7%9A%84%E9%A1%B5%E6%80%8E%E6%A0%B7%E5%9B%9E%E6%9D%A5/" title="Swap：换出去的页怎样回来"><img class="cover" src="/2026/05/24/Swap-%E6%8D%A2%E5%87%BA%E5%8E%BB%E7%9A%84%E9%A1%B5%E6%80%8E%E6%A0%B7%E5%9B%9E%E6%9D%A5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-24</div><div class="info-item-2">Swap：换出去的页怎样回来</div></div><div class="info-2"><div class="info-item-1">上一篇把页回收的整体机制讲清楚了：水位线决定何时回收、kswapd 与 direct reclaim 决定谁来回收。但回收路径里对匿名页有一个前提条件——必须有地方可以把数据写出去。这个&quot;地方&quot;就是 swap。 理解 swap 的关键判断：  swap 是匿名页在内存压力下的 backing store；它不是系统失败的标志，而是把物理内存压力转成更慢的外部存储访问。   问题从哪里来 文件页天然有 backing store：磁盘上的原始文件。干净文件页可以直接丢弃，下次访问时从文件重新读入。脏文件页先写回再丢弃。无论哪种情况，数据都有归处。 匿名页没有这种归处。一块 malloc 出来的内存、一个栈帧、一段 mmap(MAP_ANONYMOUS) 区域——它们的内容只存在于物理内存中，没有对应文件。如果要回收这些页面，必须先把内容保存到某个外部存储，等将来再需要时读回来。 没有 swap 时，匿名页完全不可回收。内存压力一旦超过文件页能释放的量，系统直接到 OOM。这就是为什么纯粹&quot;关掉 swap&quot;在内存紧张的工作负载下会导致进程被杀—...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%97%AE%E9%A2%98%E4%BB%8E%E5%93%AA%E9%87%8C%E6%9D%A5"><span class="toc-number">1.</span> <span class="toc-text">问题从哪里来</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%80%E5%B0%8F%E6%A8%A1%E5%9E%8B"><span class="toc-number">2.</span> <span class="toc-text">最小模型</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#anon-vma-%E4%B8%8E-i-mmap-%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E5%90%8C"><span class="toc-number">3.</span> <span class="toc-text">anon_vma 与 i_mmap 为什么不同</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#anon-vma-chain%EF%BC%9Avma-%E4%B8%8E-anon-vma-%E4%B9%8B%E9%97%B4%E7%9A%84%E8%BF%9E%E6%8E%A5%E8%8A%82%E7%82%B9"><span class="toc-number">3.1.</span> <span class="toc-text">anon_vma_chain：VMA 与 anon_vma 之间的连接节点</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9A%E6%AD%A3%E5%90%91%E7%94%A8%E4%BA%8E%E6%9F%A5%E8%AF%A2-%E5%8F%8D%E5%90%91%E7%94%A8%E4%BA%8E%E7%BB%B4%E6%8A%A4"><span class="toc-number">3.2.</span> <span class="toc-text">模式提炼：正向用于查询，反向用于维护</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E4%B8%AA%E6%9C%80%E5%B0%8F%E5%AE%9E%E9%AA%8C%EF%BC%9A%E4%B8%A4%E4%B8%AA%E8%BF%9B%E7%A8%8B%E6%98%A0%E5%B0%84%E5%90%8C%E4%B8%80%E6%96%87%E4%BB%B6"><span class="toc-number">4.</span> <span class="toc-text">一个最小实验：两个进程映射同一文件</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%AF%BB%E5%8F%96%E5%AE%9E%E9%AA%8C%E7%BB%93%E6%9E%9C"><span class="toc-number">5.</span> <span class="toc-text">读取实验结果</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9A%E7%BB%B4%E6%8A%A4%E7%82%B9%E7%9A%84%E5%A4%8D%E6%9D%82%E5%BA%A6%E7%94%B1%E5%8F%8D%E5%90%91%E7%BB%93%E6%9E%84%E5%86%B3%E5%AE%9A"><span class="toc-number">5.1.</span> <span class="toc-text">模式提炼：维护点的复杂度由反向结构决定</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A0%B8%E5%BF%83%E7%BB%93%E6%9E%84%EF%BC%9Aanon-vma"><span class="toc-number">6.</span> <span class="toc-text">核心结构：anon_vma</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%BA%90%E7%A0%81%E9%94%9A%E7%82%B9"><span class="toc-number">7.</span> <span class="toc-text">源码锚点</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%A0%94%E7%A9%B6%E7%94%9F%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">8.</span> <span class="toc-text">研究生迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">9.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">10.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">11.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">12.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.1</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.4</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.4"></script><script src="/js/main.js?v=5.5.4"></script><script src="/js/tw_cn.js?v=5.5.4"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.12.2/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="ribbon" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-ribbon.min.js" size="150" alpha="0.6" zIndex="-1" mobile="false" data-click="true"></script><script id="canvas_nest" defer="defer" color="0,0,255" opacity="0.7" zIndex="-1" count="99" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-nest.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = true;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script id="click-heart" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/click-heart.min.js" async="async" mobile="false"></script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

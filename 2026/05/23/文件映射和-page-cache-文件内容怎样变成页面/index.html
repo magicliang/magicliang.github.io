@@ -1,0 +1,800 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>文件映射和 page cache：文件内容怎样变成页面 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇看了匿名页和 COW，它们处理的是没有文件 backing 的内存。文件 backing 是另一条主线：文件内容如何进入内核管理的页面池，又如何被 read() 复制到用户缓冲区或被 mmap() 映射进进程地址空间。这一切的共同枢纽是 page cache。 核心问题可以压成一句话：  page cache 让文件 I&#x2F;O 和虚拟内存共享同一批页面对象；read() 和 mmap() 只是">
+<meta property="og:type" content="article">
+<meta property="og:title" content="文件映射和 page cache：文件内容怎样变成页面">
+<meta property="og:url" content="https://magicliang.github.io/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇看了匿名页和 COW，它们处理的是没有文件 backing 的内存。文件 backing 是另一条主线：文件内容如何进入内核管理的页面池，又如何被 read() 复制到用户缓冲区或被 mmap() 映射进进程地址空间。这一切的共同枢纽是 page cache。 核心问题可以压成一句话：  page cache 让文件 I&#x2F;O 和虚拟内存共享同一批页面对象；read() 和 mmap() 只是">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/cover.svg">
+<meta property="article:published_time" content="2026-05-23T11:38:22.000Z">
+<meta property="article:modified_time" content="2026-05-23T17:03:38.088Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Linux">
+<meta property="article:tag" content="内核">
+<meta property="article:tag" content="操作系统">
+<meta property="article:tag" content="文件系统">
+<meta property="article:tag" content="虚拟内存">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "文件映射和 page cache：文件内容怎样变成页面",
+  "url": "https://magicliang.github.io/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/",
+  "image": "https://magicliang.github.io/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/cover.svg",
+  "datePublished": "2026-05-23T11:38:22.000Z",
+  "dateModified": "2026-05-23T17:03:38.088Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.4"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.1.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '文件映射和 page cache：文件内容怎样变成页面',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.1"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (false) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">442</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">484</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">31</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">文件映射和 page cache：文件内容怎样变成页面</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">文件映射和 page cache：文件内容怎样变成页面</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-05-23T11:38:22.000Z" title="Created 2026-05-23 19:38:22">2026-05-23</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-05-23T17:03:38.088Z" title="Updated 2026-05-24 01:03:38">2026-05-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.8k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>14mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><p>上一篇看了匿名页和 COW，它们处理的是没有文件 backing 的内存。文件 backing 是另一条主线：文件内容如何进入内核管理的页面池，又如何被 <code>read()</code> 复制到用户缓冲区或被 <code>mmap()</code> 映射进进程地址空间。这一切的共同枢纽是 page cache。</p>
+<p>核心问题可以压成一句话：</p>
+<blockquote>
+<p>page cache 让文件 I/O 和虚拟内存共享同一批页面对象；<code>read()</code> 和 <code>mmap()</code> 只是进入 page cache 的两种路径。</p>
+</blockquote>
+<span id="more"></span>
+<h2 id="问题从哪里来">问题从哪里来</h2>
+<p>教材常把文件 I/O 和虚拟内存分开讲。读文件用 <code>read</code>，写文件用 <code>write</code>，文件系统维护自己的“缓冲缓存”；进程内存用 <code>mmap</code>、<code>malloc</code>、<code>fork</code>，由 VM 子系统管理。两套体系，互不相干。</p>
+<p>Linux 不是这样实现的。当前官方文档对 page cache 给出的定位非常直接：</p>
+<blockquote>
+<p>The page cache is the primary way that the user and the rest of the kernel interact with filesystems.</p>
+</blockquote>
+<p>也就是说，绝大多数 read/write/mmap 都要从 page cache 经过。<code>O_DIRECT</code> 是一条主动绕过 page cache 的旁路，正因为是旁路，需要用户额外满足对齐和并发约束。</p>
+<p>这条架构选择有几个连带后果。一个文件被任何一个进程访问过，对应页面会进入 page cache 并被其他进程复用。<code>read()</code> 把 page cache 中的页面数据复制进用户缓冲区，<code>mmap()</code> 则把 page cache 中的页面直接映射进进程页表，前者是“拷一份给你”，后者是“给你一个翻译”。文件页和匿名页在回收路径上看似都是“页”，但写回机制完全不同：匿名页要回 swap，文件页可以写回原文件。</p>
+<p>把这一切串起来的就是 page cache。</p>
+<h2 id="最小模型">最小模型</h2>
+<p>文件内容进入页面的路径可以画成：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">file (inode, address_space)<br>  -&gt; page cache index by (mapping, pgoff)<br>  -&gt; folio / page<br>  -&gt; filled by filesystem read_folio or read_pages<br>  -&gt; consumed by<br>       read()  -&gt; copy_to_user<br>       mmap()  -&gt; install in page table (via filemap_fault)<br></code></pre></td></tr></table></figure>
+<p><code>address_space</code> 是文件在 page cache 端的句柄。它通过 inode 关联到具体文件系统，内部维护一棵以 <code>pgoff_t</code>（页对齐的文件偏移）为索引的结构，存放当前缓存的页面对象。</p>
+<p>页面进入 page cache 时不会立刻有内容。<code>read_folio</code> 这类回调由具体文件系统提供，负责把磁盘上的数据装进 folio。装好之后 folio 才解锁，等待消费者。文档对 <code>read_folio</code> 的描述很短：</p>
+<blockquote>
+<p><code>-&gt;read_folio()</code> unlocks the folio, either synchronously or via I/O completion.</p>
+</blockquote>
+<p><code>read()</code> 是一种消费者。它确认 page cache 中有命中的 folio（必要时触发 <code>read_folio</code>），再把 folio 中的字节复制到用户缓冲区。</p>
+<p><code>mmap()</code> 是另一种消费者。fault 入口 <code>filemap_fault</code> 找到或加载对应的 folio，把它安装进进程页表。后续访问 TLB miss 时硬件直接通过新装的 PTE 拿到 PFN，不经过 page cache 查找。</p>
+<p>两条路径的产物不同：<code>read()</code> 之后用户态拿到的是数据副本，<code>mmap()</code> 之后用户态指针直接指向 page cache 的物理页面。</p>
+<h2 id="map-shared-与-map-private-是两种-mmap">MAP_SHARED 与 MAP_PRIVATE 是两种 mmap</h2>
+<p><code>mmap</code> 文件时，最关键的标志是 <code>MAP_SHARED</code> 与 <code>MAP_PRIVATE</code>。它们决定写入语义如何穿过 page cache。</p>
+<table>
+<thead>
+<tr>
+<th>标志</th>
+<th>读语义</th>
+<th>写语义</th>
+<th>持久性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MAP_SHARED</code></td>
+<td>读 page cache 中的 folio</td>
+<td>写直接落到 page cache 的 folio，标脏后由 writeback 写回文件</td>
+<td>写入对其他进程和后续磁盘可见</td>
+</tr>
+<tr>
+<td><code>MAP_PRIVATE</code></td>
+<td>读 page cache 中的 folio</td>
+<td>写触发 COW：分配私有匿名页，复制原内容，写入新页</td>
+<td>写入只在本进程地址空间内可见，不回写文件</td>
+</tr>
+</tbody>
+</table>
+<p><code>MAP_SHARED</code> 的写路径上，第一次写到只读 PTE 会触发写保护异常，进入 <code>page_mkwrite</code>/<code>pfn_mkwrite</code>。文件系统在这里做必要的预留（块分配、quota、稀疏空洞填充）并把 folio 标脏。脏 folio 之后由 <code>writepages</code> 在 writeback 时机回写：</p>
+<blockquote>
+<p><code>-&gt;writepages()</code> is used for periodic writeback and for syscall-initiated sync operations.</p>
+</blockquote>
+<p><code>MAP_PRIVATE</code> 的写路径走 <code>do_wp_page</code>，逻辑与上一篇 fork 后的 COW 相同：分配新页、复制内容、把写入方的 PTE 改成可写并指向新页。新页此后是匿名页，不再属于 page cache 的文件视图，也不会被写回到原文件。</p>
+<p><code>/proc/&lt;pid&gt;/maps</code> 里的 <code>p</code> 和 <code>s</code> 标志区分这两种映射。<code>smaps</code> 中 <code>Shared_*</code> 与 <code>Private_*</code> 字段对应它们的页面分类。</p>
+<h2 id="read-和-mmap-各有代价">read() 和 mmap() 各有代价</h2>
+<p>两条消费路径不是“一种快、一种慢”的关系，而是各有适用场景。</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th><code>read()</code></th>
+<th><code>mmap()</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>触发 I/O</td>
+<td>同步 read（可能阻塞）或读 page cache</td>
+<td>缺页时按需触发</td>
+</tr>
+<tr>
+<td>数据访问</td>
+<td>用户缓冲区有副本</td>
+<td>用户指针直接指向 page cache</td>
+</tr>
+<tr>
+<td>内存压力</td>
+<td>用户缓冲区算进 RSS</td>
+<td>page cache 部分算进 RSS 与 PSS（<code>MAP_SHARED</code> 共享部分 PSS 较小）</td>
+</tr>
+<tr>
+<td>错误模型</td>
+<td>返回值/<code>errno</code></td>
+<td>缺页异常、<code>SIGBUS</code></td>
+</tr>
+<tr>
+<td>顺序读取</td>
+<td>容易让内核做预读</td>
+<td>也能预读，需要 <code>MADV_SEQUENTIAL</code> 等提示更明显</td>
+</tr>
+<tr>
+<td>小量随机访问</td>
+<td>多次 <code>pread</code> 切换开销大</td>
+<td>一次 <code>mmap</code> 后多次访问开销低</td>
+</tr>
+<tr>
+<td>写入语义</td>
+<td><code>write</code> 复制+提交</td>
+<td><code>MAP_SHARED</code> 直接脏 page cache；<code>MAP_PRIVATE</code> 走 COW</td>
+</tr>
+</tbody>
+</table>
+<p><code>read()</code> 把数据从 page cache 拷进用户缓冲区，意味着用户态多一份拷贝、多一次系统调用，但错误以返回值出现，处理简单。<code>mmap()</code> 省掉用户缓冲区那份拷贝，访问路径很短，但错误以信号形式出现，文件被 truncate 后访问超出范围的映射可能拿到 <code>SIGBUS</code>。</p>
+<p>理解“两种消费者共享同一个 page cache”这件事，比争论“read 快还是 mmap 快”更重要。命中 page cache 时两者都不读盘；未命中时两者都触发 <code>read_folio</code>，差别在于把数据交给谁。</p>
+<h3 id="模式提炼：cache-是接口的统一点">模式提炼：cache 是接口的统一点</h3>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">file offset -&gt; page cache index -&gt; folio -&gt; user access<br></code></pre></td></tr></table></figure>
+<p>page cache 不是 VM 子系统的私有缓存，也不是文件系统的私有缓存，而是两者之间的统一对象池。回收策略、脏页写回、reverse mapping 都围绕这个池子展开。</p>
+<table>
+<thead>
+<tr>
+<th>角色</th>
+<th>在 page cache 上做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>文件系统</td>
+<td>通过 <code>read_folio</code> 装填 folio；通过 <code>writepages</code> 写回</td>
+</tr>
+<tr>
+<td>VM 子系统</td>
+<td>通过 LRU 决定回收，通过 reclaim 释放 folio</td>
+</tr>
+<tr>
+<td><code>read</code>/<code>write</code> 系统调用</td>
+<td>把 folio 内容拷给用户或从用户拷进 folio</td>
+</tr>
+<tr>
+<td><code>mmap</code></td>
+<td>把 folio 直接安装进进程页表</td>
+</tr>
+<tr>
+<td>反向映射</td>
+<td>让回收路径找到映射该 folio 的所有进程</td>
+</tr>
+</tbody>
+</table>
+<p>理解这一点，后续 folio、回收、writeback、cgroup memory 几篇都会更顺。</p>
+<h2 id="一个最小实验：read-vs-mmap">一个最小实验：read vs mmap</h2>
+<p>这个实验创建一个 16MB 文件，分两阶段消费：先用 <code>read()</code> 顺序读，再用 <code>mmap()</code> 顺序访问。每阶段开始前在 shell 里手动丢一次 page cache。用 <code>mincore()</code> 观察哪些页面已经驻留。</p>
+<p>C 程序本身只做读取和观察，丢 cache 的动作放在 shell 里完成，避免依赖某些发行版上行为不一的 <code>POSIX_FADV_DONTNEED</code>。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br><span class="line">72</span><br><span class="line">73</span><br><span class="line">74</span><br><span class="line">75</span><br><span class="line">76</span><br><span class="line">77</span><br><span class="line">78</span><br><span class="line">79</span><br><span class="line">80</span><br><span class="line">81</span><br><span class="line">82</span><br><span class="line">83</span><br><span class="line">84</span><br><span class="line">85</span><br><span class="line">86</span><br><span class="line">87</span><br><span class="line">88</span><br><span class="line">89</span><br><span class="line">90</span><br><span class="line">91</span><br><span class="line">92</span><br><span class="line">93</span><br><span class="line">94</span><br><span class="line">95</span><br><span class="line">96</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-meta">#<span class="hljs-keyword">define</span> _GNU_SOURCE</span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;errno.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;fcntl.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;stdint.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;stdio.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;stdlib.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;string.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;sys/mman.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;sys/resource.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;sys/stat.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;unistd.h&gt;</span></span><br><br><span class="hljs-type">static</span> <span class="hljs-type">long</span> <span class="hljs-title function_">count_resident</span><span class="hljs-params">(<span class="hljs-type">unsigned</span> <span class="hljs-type">char</span> *vec, <span class="hljs-type">size_t</span> n)</span> &#123;<br>    <span class="hljs-type">long</span> c = <span class="hljs-number">0</span>;<br>    <span class="hljs-keyword">for</span> (<span class="hljs-type">size_t</span> i = <span class="hljs-number">0</span>; i &lt; n; i++) &#123;<br>        <span class="hljs-keyword">if</span> (vec[i] &amp; <span class="hljs-number">1</span>) c++;<br>    &#125;<br>    <span class="hljs-keyword">return</span> c;<br>&#125;<br><br><span class="hljs-type">static</span> <span class="hljs-type">void</span> <span class="hljs-title function_">report</span><span class="hljs-params">(<span class="hljs-type">const</span> <span class="hljs-type">char</span> *stage, <span class="hljs-keyword">struct</span> rusage *prev)</span> &#123;<br>    <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">rusage</span> <span class="hljs-title">cur</span>;</span><br>    getrusage(RUSAGE_SELF, &amp;cur);<br>    <span class="hljs-built_in">printf</span>(<span class="hljs-string">&quot;[%s] minflt=+%ld majflt=+%ld\n&quot;</span>,<br>           stage,<br>           cur.ru_minflt - prev-&gt;ru_minflt,<br>           cur.ru_majflt - prev-&gt;ru_majflt);<br>    *prev = cur;<br>&#125;<br><br><span class="hljs-type">static</span> <span class="hljs-type">int</span> <span class="hljs-title function_">do_read_stage</span><span class="hljs-params">(<span class="hljs-type">const</span> <span class="hljs-type">char</span> *path, <span class="hljs-keyword">struct</span> rusage *prev)</span> &#123;<br>    <span class="hljs-type">int</span> fd = open(path, O_RDONLY);<br>    <span class="hljs-keyword">if</span> (fd &lt; <span class="hljs-number">0</span>) &#123; perror(<span class="hljs-string">&quot;open(read)&quot;</span>); <span class="hljs-keyword">return</span> <span class="hljs-number">-1</span>; &#125;<br>    <span class="hljs-type">char</span> *buf = <span class="hljs-built_in">malloc</span>(<span class="hljs-number">64</span> * <span class="hljs-number">1024</span>);<br>    <span class="hljs-keyword">if</span> (!buf) &#123; perror(<span class="hljs-string">&quot;malloc&quot;</span>); close(fd); <span class="hljs-keyword">return</span> <span class="hljs-number">-1</span>; &#125;<br>    <span class="hljs-type">ssize_t</span> n;<br>    <span class="hljs-keyword">while</span> ((n = read(fd, buf, <span class="hljs-number">64</span> * <span class="hljs-number">1024</span>)) &gt; <span class="hljs-number">0</span>) &#123; <span class="hljs-comment">/* drain */</span> &#125;<br>    <span class="hljs-keyword">if</span> (n &lt; <span class="hljs-number">0</span>) &#123; perror(<span class="hljs-string">&quot;read&quot;</span>); &#125;<br>    report(<span class="hljs-string">&quot;after read() sequential&quot;</span>, prev);<br>    <span class="hljs-built_in">free</span>(buf);<br>    close(fd);<br>    <span class="hljs-keyword">return</span> <span class="hljs-number">0</span>;<br>&#125;<br><br><span class="hljs-type">static</span> <span class="hljs-type">int</span> <span class="hljs-title function_">do_mmap_stage</span><span class="hljs-params">(<span class="hljs-type">const</span> <span class="hljs-type">char</span> *path, <span class="hljs-keyword">struct</span> rusage *prev)</span> &#123;<br>    <span class="hljs-type">int</span> fd = open(path, O_RDONLY);<br>    <span class="hljs-keyword">if</span> (fd &lt; <span class="hljs-number">0</span>) &#123; perror(<span class="hljs-string">&quot;open(mmap)&quot;</span>); <span class="hljs-keyword">return</span> <span class="hljs-number">-1</span>; &#125;<br>    <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">stat</span> <span class="hljs-title">st</span>;</span><br>    <span class="hljs-keyword">if</span> (fstat(fd, &amp;st) != <span class="hljs-number">0</span>) &#123; perror(<span class="hljs-string">&quot;fstat&quot;</span>); close(fd); <span class="hljs-keyword">return</span> <span class="hljs-number">-1</span>; &#125;<br>    <span class="hljs-type">size_t</span> length = (<span class="hljs-type">size_t</span>)st.st_size;<br>    <span class="hljs-type">size_t</span> page = (<span class="hljs-type">size_t</span>)sysconf(_SC_PAGESIZE);<br>    <span class="hljs-type">size_t</span> npages = (length + page - <span class="hljs-number">1</span>) / page;<br><br>    <span class="hljs-type">void</span> *<span class="hljs-built_in">map</span> = mmap(<span class="hljs-literal">NULL</span>, length, PROT_READ, MAP_SHARED, fd, <span class="hljs-number">0</span>);<br>    <span class="hljs-keyword">if</span> (<span class="hljs-built_in">map</span> == MAP_FAILED) &#123; perror(<span class="hljs-string">&quot;mmap&quot;</span>); close(fd); <span class="hljs-keyword">return</span> <span class="hljs-number">-1</span>; &#125;<br><br>    <span class="hljs-type">unsigned</span> <span class="hljs-type">char</span> *vec = <span class="hljs-built_in">malloc</span>(npages);<br>    <span class="hljs-keyword">if</span> (!vec) &#123; perror(<span class="hljs-string">&quot;malloc vec&quot;</span>); munmap(<span class="hljs-built_in">map</span>, length); close(fd); <span class="hljs-keyword">return</span> <span class="hljs-number">-1</span>; &#125;<br><br>    mincore(<span class="hljs-built_in">map</span>, length, (<span class="hljs-type">void</span> *)vec);<br>    <span class="hljs-built_in">printf</span>(<span class="hljs-string">&quot;[after mmap, before access] resident pages = %ld / %zu\n&quot;</span>,<br>           count_resident(vec, npages), npages);<br><br>    <span class="hljs-keyword">volatile</span> <span class="hljs-type">long</span> sink = <span class="hljs-number">0</span>;<br>    <span class="hljs-keyword">for</span> (<span class="hljs-type">size_t</span> i = <span class="hljs-number">0</span>; i &lt; npages; i++) &#123;<br>        sink += ((<span class="hljs-type">char</span> *)<span class="hljs-built_in">map</span>)[i * page];<br>    &#125;<br>    (<span class="hljs-type">void</span>)sink;<br>    report(<span class="hljs-string">&quot;after mmap sequential access&quot;</span>, prev);<br><br>    mincore(<span class="hljs-built_in">map</span>, length, (<span class="hljs-type">void</span> *)vec);<br>    <span class="hljs-built_in">printf</span>(<span class="hljs-string">&quot;[after mmap, after access] resident pages = %ld / %zu\n&quot;</span>,<br>           count_resident(vec, npages), npages);<br><br>    <span class="hljs-built_in">free</span>(vec);<br>    munmap(<span class="hljs-built_in">map</span>, length);<br>    close(fd);<br>    <span class="hljs-keyword">return</span> <span class="hljs-number">0</span>;<br>&#125;<br><br><span class="hljs-type">int</span> <span class="hljs-title function_">main</span><span class="hljs-params">(<span class="hljs-type">int</span> argc, <span class="hljs-type">char</span> **argv)</span> &#123;<br>    <span class="hljs-keyword">if</span> (argc != <span class="hljs-number">3</span>) &#123;<br>        <span class="hljs-built_in">fprintf</span>(<span class="hljs-built_in">stderr</span>, <span class="hljs-string">&quot;usage: %s read|mmap &lt;path&gt;\n&quot;</span>, argv[<span class="hljs-number">0</span>]);<br>        <span class="hljs-keyword">return</span> <span class="hljs-number">1</span>;<br>    &#125;<br>    <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">rusage</span> <span class="hljs-title">prev</span>;</span><br>    getrusage(RUSAGE_SELF, &amp;prev);<br><br>    <span class="hljs-keyword">if</span> (<span class="hljs-built_in">strcmp</span>(argv[<span class="hljs-number">1</span>], <span class="hljs-string">&quot;read&quot;</span>) == <span class="hljs-number">0</span>) &#123;<br>        <span class="hljs-keyword">return</span> do_read_stage(argv[<span class="hljs-number">2</span>], &amp;prev) == <span class="hljs-number">0</span> ? <span class="hljs-number">0</span> : <span class="hljs-number">1</span>;<br>    &#125; <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (<span class="hljs-built_in">strcmp</span>(argv[<span class="hljs-number">1</span>], <span class="hljs-string">&quot;mmap&quot;</span>) == <span class="hljs-number">0</span>) &#123;<br>        <span class="hljs-keyword">return</span> do_mmap_stage(argv[<span class="hljs-number">2</span>], &amp;prev) == <span class="hljs-number">0</span> ? <span class="hljs-number">0</span> : <span class="hljs-number">1</span>;<br>    &#125;<br>    <span class="hljs-built_in">fprintf</span>(<span class="hljs-built_in">stderr</span>, <span class="hljs-string">&quot;unknown stage: %s\n&quot;</span>, argv[<span class="hljs-number">1</span>]);<br>    <span class="hljs-keyword">return</span> <span class="hljs-number">1</span>;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>准备文件并按阶段运行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">dd</span> <span class="hljs-keyword">if</span>=/dev/urandom of=/tmp/page_cache_demo.bin bs=1M count=16<br>cc -Wall -Wextra -O2 page_cache_demo.c -o page_cache_demo<br><br><span class="hljs-comment"># 丢一次 page cache（需要 root，影响整机）</span><br><span class="hljs-built_in">sudo</span> sh -c <span class="hljs-string">&#x27;echo 3 &gt; /proc/sys/vm/drop_caches&#x27;</span><br>./page_cache_demo <span class="hljs-built_in">read</span> /tmp/page_cache_demo.bin<br><br><span class="hljs-comment"># 再丢一次，跑 mmap 阶段</span><br><span class="hljs-built_in">sudo</span> sh -c <span class="hljs-string">&#x27;echo 3 &gt; /proc/sys/vm/drop_caches&#x27;</span><br>./page_cache_demo mmap /tmp/page_cache_demo.bin<br></code></pre></td></tr></table></figure>
+<p>如果不愿意 <code>drop_caches</code> 影响整机，可以用 <code>dd if=&lt;big-other-file&gt; of=/dev/null</code> 通过 LRU 压力把目标文件 page cache 自然挤出去，或者用 <code>vmtouch -e</code> 这类第三方工具单文件清理；前者不可控，后者不在标准发行版自带工具里。两种替代都不如 <code>drop_caches</code> 干净。</p>
+<h2 id="读取实验结果">读取实验结果</h2>
+<p>可能看到的结构是：</p>
+<p>第一阶段，<code>read()</code> 顺序读完文件。这是从冷 cache 开始的，所有页面都要从底层 backing 取上来。<code>majflt</code> 增量取决于内核 readahead 与 backing store 行为；<code>read()</code> 在用户态拿到的是缓冲区里的数据副本，与 page cache 中的 folio 内容相同。</p>
+<p>第二阶段，再次丢 cache 后 <code>mmap()</code>。此时 page cache 中没有该文件的 folio，<code>mincore</code> 报告几乎全部 0：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">[after mmap, before access] resident pages = 0 / 4096<br></code></pre></td></tr></table></figure>
+<p>第三阶段，顺序访问 <code>mmap</code> 区间的所有页。每次访问触发 <code>filemap_fault</code>，按需把 folio 装进 page cache 并安装进 PTE。结束后 <code>mincore</code> 报告几乎全部 1：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">[after mmap, after access] resident pages = 4096 / 4096<br></code></pre></td></tr></table></figure>
+<p><code>minflt</code> 与 <code>majflt</code> 的分布会随预读、<code>MAP_SHARED</code> 的写回机制和具体文件系统而变化。重要的不是某个具体数值，而是几个不变量：</p>
+<ul>
+<li><code>mmap</code> 本身不会让所有页驻留。<code>mincore</code> 在访问前显示 0，说明 mmap 是延迟兑现。</li>
+<li>第一次访问每一页都要走一次 fault；后续访问只要 PTE 还 present 就不再 fault。</li>
+<li>即便不同进程分别用 <code>read</code> 与 <code>mmap</code>，它们消费的都是同一组 folio。</li>
+</ul>
+<p>把 <code>mmap</code> 改成 <code>MAP_PRIVATE</code> 后写入第 0 页，再 <code>mincore</code> 看一次：那一页变成本进程的私有匿名页，从 page cache 视角看仍然有原始 folio，但写入数据不再可见也不会被写回。</p>
+<h3 id="模式提炼：访问层和缓存层解耦">模式提炼：访问层和缓存层解耦</h3>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">filesystem stores bytes<br>  -&gt; page cache caches them as folios<br>  -&gt; read() copies bytes out<br>  -&gt; mmap() exposes folios as a virtual range<br></code></pre></td></tr></table></figure>
+<p>把“持久化层、缓存层、访问层”分开看，能解释为什么修改文件不必一定通过 <code>write</code>：<code>MAP_SHARED</code> 写入 + writeback 也能做到，效率不同。也能解释为什么 <code>O_DIRECT</code> 那么严格：它绕过 cache 层，必须自己处理同步、对齐和与 cache 写回的竞争。</p>
+<h2 id="核心结构：address-space">核心结构：address_space</h2>
+<p><code>struct address_space</code> 是 page cache 的核心索引结构（<code>include/linux/fs.h</code>，精简）：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">address_space</span> &#123;</span><br>    <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">inode</span> *<span class="hljs-title">host</span>;</span>           <span class="hljs-comment">/* 所属 inode */</span><br>    <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">xarray</span> <span class="hljs-title">i_pages</span>;</span>        <span class="hljs-comment">/* 页面索引（xarray 替代了旧 radix tree） */</span><br>    <span class="hljs-type">atomic_t</span> i_mmap_writable;     <span class="hljs-comment">/* 可写共享映射计数 */</span><br>    <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">rb_root_cached</span> <span class="hljs-title">i_mmap</span>;</span> <span class="hljs-comment">/* 所有映射此文件的 VMA（interval tree） */</span><br>    <span class="hljs-type">unsigned</span> <span class="hljs-type">long</span> nrpages;        <span class="hljs-comment">/* 缓存中的总页数 */</span><br>    <span class="hljs-type">const</span> <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">address_space_operations</span> *<span class="hljs-title">a_ops</span>;</span>  <span class="hljs-comment">/* readpage/writepage 等 */</span><br>    <span class="hljs-type">unsigned</span> <span class="hljs-type">long</span> flags;          <span class="hljs-comment">/* GFP mask 等 */</span><br>&#125;;<br></code></pre></td></tr></table></figure>
+<p><code>i_pages</code>（xarray）按 <code>pgoff_t</code> 索引 folio，是文件缺页和 readahead 的查找入口。</p>
+<h2 id="源码锚点">源码锚点</h2>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>读它的目的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mm/filemap.c</code></td>
+<td><code>filemap_fault()</code>、<code>filemap_get_folio()</code>、<code>read_cache_folio()</code></td>
+</tr>
+<tr>
+<td><code>mm/readahead.c</code></td>
+<td>顺序读时的预读判断</td>
+</tr>
+<tr>
+<td><code>fs/buffer.c</code></td>
+<td>老的 buffer head 路径，看历史脉络</td>
+</tr>
+<tr>
+<td><code>include/linux/pagemap.h</code></td>
+<td>folio 与 page cache 的 API</td>
+</tr>
+<tr>
+<td><code>Documentation/filesystems/locking.rst</code></td>
+<td><code>address_space_operations</code> 与 <code>page_mkwrite</code></td>
+</tr>
+</tbody>
+</table>
+<p>读 <code>filemap_fault</code> 时可以带着一个问题：缺页路径如何与 readahead 配合，决定本次拉的是一页还是一组页。这条路径连接前一篇的 fault 主题与下一篇的 folio 抽象。</p>
+<h2 id="研究生迁移表">研究生迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>Linux 概念</th>
+<th>一般系统设计</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>address_space</code></td>
+<td>文件到页面索引的句柄</td>
+</tr>
+<tr>
+<td>page cache</td>
+<td>持久化层与访问层之间的统一对象池</td>
+</tr>
+<tr>
+<td><code>read_folio</code></td>
+<td>缓存填充回调</td>
+</tr>
+<tr>
+<td><code>writepages</code></td>
+<td>缓存写回回调</td>
+</tr>
+<tr>
+<td><code>filemap_fault</code></td>
+<td>mmap 的缺页适配器</td>
+</tr>
+<tr>
+<td><code>MAP_SHARED</code></td>
+<td>共享视图 + 写回义务</td>
+</tr>
+<tr>
+<td><code>MAP_PRIVATE</code></td>
+<td>共享读 + COW 写</td>
+</tr>
+<tr>
+<td><code>O_DIRECT</code></td>
+<td>旁路 cache，自己负责一致性</td>
+</tr>
+</tbody>
+</table>
+<p>这层架构在数据库（page cache + buffer pool）、对象存储客户端（远端对象 + 本地缓存）、CDN 边缘节点都能找到对应。共同点是“持久层是事实，缓存层是性能，访问层是接口”。</p>
+<h2 id="常见误解">常见误解</h2>
+<p>第一个误解是把 page cache 当成文件系统私有缓存。它是文件系统与 VM 的交集，回收、reverse mapping、cgroup memory 都把它纳入统一管理。</p>
+<p>第二个误解是认为 <code>read()</code> 总是慢于 <code>mmap()</code>。命中 page cache 时，<code>read()</code> 的开销主要是一次系统调用加一次拷贝；<code>mmap()</code> 的开销在第一次 fault，后续访问几乎无内核开销，但页表建立、TLB 占用、<code>munmap</code> 释放有自己的成本。哪一种快取决于访问模式。</p>
+<p>第三个误解是把 <code>MAP_SHARED</code> 视为“立即同步到磁盘”。<code>MAP_SHARED</code> 写入只是把 folio 标脏，真正回写依赖 writeback 路径。<code>msync(2)</code> 才能强制写回。</p>
+<p>第四个误解是把 <code>MAP_PRIVATE</code> 文件映射的写入视为“写不到文件”。写不到文件是事实，但写入的过程仍然走 COW，分配新页并复制；这一动作是 lazy 的，但成本真实。</p>
+<p>第五个误解是认为 <code>mincore()</code> 的结果稳定。man 页面写得很清楚：</p>
+<blockquote>
+<p>the information returned in vec is only a snapshot … pages that are not locked in memory can come and go at any moment.</p>
+</blockquote>
+<p><code>mincore</code> 适合做趋势性观察，不适合做并发判定。</p>
+<h2 id="练习">练习</h2>
+<p>第一，按文中代码跑实验，记录两个阶段的 <code>minflt</code>、<code>majflt</code> 增量和 <code>mincore</code> 报告的 resident 数量。重复 3 次，观察 readahead 是否让 <code>majflt</code> 出现明显波动。</p>
+<p>第二，在第二阶段后再读 <code>/proc/self/smaps</code> 中该映射段，比较 <code>Rss</code>、<code>Pss</code>、<code>Shared_Clean</code> 的关系。再开一个进程对同一文件 <code>mmap</code>，比较两个进程的 <code>Pss</code>。</p>
+<p>第三，把 <code>MAP_SHARED</code> 改成 <code>MAP_PRIVATE</code>，写入若干页，重新读 <code>smaps</code>。验证写入的页面在 <code>Private_Dirty</code>、未写入的页面仍在 <code>Shared_Clean</code> 或 <code>Private_Clean</code>。</p>
+<p>第四，配合 <code>strace -e trace=openat,read,mmap,munmap,fadvise64</code> 跑实验，观察系统调用次数与每次调用的字节量。从系统调用角度比较 <code>read</code> 与 <code>mmap</code> 的开销结构。</p>
+<p>第五，阅读 <code>mm/filemap.c</code> 中 <code>filemap_fault</code> 的实现，画一张流程图，标出 cache 命中、未命中、readahead 路径分别走到哪里。这条路径会成为 folio 篇的入口。</p>
+<h2 id="系列导航">系列导航</h2>
+<ul>
+<li>上一篇：<a href="/2026/05/23/%E5%8C%BF%E5%90%8D%E9%A1%B5%E5%92%8C-COW-fork-%E4%B8%BA%E4%BB%80%E4%B9%88%E4%BE%BF%E5%AE%9C-%E5%86%99%E5%85%A5%E4%B8%BA%E4%BB%80%E4%B9%88%E5%8F%98%E8%B4%B5/">匿名页和 COW：<code>fork</code> 为什么便宜，写入为什么变贵</a></li>
+<li>本文：文件映射和 page cache：文件内容怎样变成页面</li>
+<li>下一篇：<a href="/2026/05/23/folio-%E4%B8%BA%E4%BB%80%E4%B9%88%E5%86%85%E6%A0%B8%E9%87%8D%E6%96%B0%E7%BB%84%E7%BB%87-page-%E6%8A%BD%E8%B1%A1/">Folio：为什么内核重新组织 page 抽象</a></li>
+</ul>
+<h2 id="参考资料">参考资料</h2>
+<blockquote>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://docs.kernel.org/mm/page_cache.html">Page Cache - The Linux Kernel documentation</a></li>
+<li><a target="_blank" rel="noopener" href="https://docs.kernel.org/filesystems/locking.html">Locking - The Linux Kernel documentation</a></li>
+<li><a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man2/mmap.2.html">mmap(2) - Linux manual page</a></li>
+<li><a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man2/mincore.2.html">mincore(2) - Linux manual page</a></li>
+<li><a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man2/posix_fadvise.2.html">posix_fadvise(2) - Linux manual page</a></li>
+</ul>
+</blockquote>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/">https://magicliang.github.io/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Linux/">Linux</a><a class="post-meta__tags" href="/tags/%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F/">操作系统</a><a class="post-meta__tags" href="/tags/%E5%86%85%E6%A0%B8/">内核</a><a class="post-meta__tags" href="/tags/%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98/">虚拟内存</a><a class="post-meta__tags" href="/tags/%E6%96%87%E4%BB%B6%E7%B3%BB%E7%BB%9F/">文件系统</a></div><div class="post-share"><div class="social-share" data-image="/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/cover.svg" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/05/23/%E9%A1%B5%E5%9B%9E%E6%94%B6-kswapd-%E5%92%8C-direct-reclaim/" title="页回收：kswapd 和 direct reclaim"><img class="cover" src="/2026/05/23/%E9%A1%B5%E5%9B%9E%E6%94%B6-kswapd-%E5%92%8C-direct-reclaim/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-23</div><div class="info-item-2">页回收：kswapd 和 direct reclaim</div></div><div class="info-2"><div class="info-item-1">上一篇讲了内核如何用 LRU 近似和 workingset 检测来判断&quot;谁冷谁热&quot;。判断完之后，实际把页面释放出来的工作由回收子系统完成。回收不是一个单点事件，而是围绕水位线、后台线程和分配路径形成的一套压力响应机制。 核心问题可以压成一句话：  回收是围绕水位线的分级压力响应，不是耗尽后的单点动作。   问题从哪里来 内存分配在 Linux 里几乎无处不在：用户态 malloc 背后的匿名页、page cache 的文件页、内核自己的 slab 对象。每次分配都从 buddy allocator 拿物理页。物理页是有限的。 如果等到完全分配不出页面再回收，分配方会被阻塞很长时间——回收可能涉及写脏页、等待 I/O、遍历反向映射。这种&quot;等到没有了才动&quot;的策略延迟不可控。 Linux 的做法是提前开始。内核设定一组水位线（watermark），在不同压力级别触发不同强度的回收。大部分情况下由后台线程 kswapd 在压力升起时提前回收；只有来不及时才在分配路径上直接回收（direct reclaim）。 水位线模型 每个 zone 有三条基本...</div></div></div></a><a class="pagination-related" href="/2026/05/24/%E5%9B%9E%E5%88%B0%E5%B7%A5%E7%A8%8B-Linux-VM-%E5%A6%82%E4%BD%95%E6%94%B9%E5%8F%98%E6%80%A7%E8%83%BD%E8%AF%8A%E6%96%AD/" title="回到工程：Linux VM 如何改变性能诊断"><img class="cover" src="/2026/05/24/%E5%9B%9E%E5%88%B0%E5%B7%A5%E7%A8%8B-Linux-VM-%E5%A6%82%E4%BD%95%E6%94%B9%E5%8F%98%E6%80%A7%E8%83%BD%E8%AF%8A%E6%96%AD/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-24</div><div class="info-item-2">回到工程：Linux VM 如何改变性能诊断</div></div><div class="info-2"><div class="info-item-1">前面 16 篇从地址空间到 OOM，逐层拆解了 Linux 虚拟内存子系统的结构和机制。这些知识的价值不只在于读源码——更在于它提供了一种分层诊断习惯：遇到内存相关的性能问题时，先定位层次，再找对象，再看状态转移，最后用指标验证。 核心问题可以压成一句话：  Linux VM 的价值不只在源码知识，而在一种分层诊断习惯：先定位层次，再找对象，再看状态转移，最后用指标验证。   系列概念地图 整个系列覆盖的层次和对象： 1234567891011121314151617181920212223用户空间视角                     内核视角─────────────                  ──────────malloc / mmap                  VMA (vm_area_struct)    ↓ 虚拟地址                     ↓page fault                     页表 (PGD→P4D→PUD→PMD→PTE)    ↓ 物理页分配                   ↓RSS 增长  ...</div></div></div></a><a class="pagination-related" href="/2026/05/23/%E9%87%8D%E8%AF%BB-Linux-VM-%E7%BB%99%E7%B3%BB%E7%BB%9F%E7%A0%94%E7%A9%B6%E7%94%9F%E7%9A%84%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98%E5%AF%BC%E8%AF%BB/" title="重读 Linux VM：给系统研究生的虚拟内存导读"><img class="cover" src="/2026/05/23/%E9%87%8D%E8%AF%BB-Linux-VM-%E7%BB%99%E7%B3%BB%E7%BB%9F%E7%A0%94%E7%A9%B6%E7%94%9F%E7%9A%84%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98%E5%AF%BC%E8%AF%BB/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-23</div><div class="info-item-2">重读 Linux VM：给系统研究生的虚拟内存导读</div></div><div class="info-2"><div class="info-item-1">Linux VM 容易读散。它表面上在讲 mmap、页表、缺页异常、匿名页、page cache、folio、LRU、swap、NUMA、huge page、slab、cgroup memory 和 OOM killer，读起来像一串彼此相邻但没有主线的内核机制；主线可以压成一句话：  Linux VM 是一套把虚拟地址、物理页、文件、进程、CPU MMU 和 I/O 统一到同一个状态转移系统里的内核机制。  这句话一旦立住，虚拟内存就不再只是“地址翻译”或“把内存变大”。地址空间描述进程能够访问什么；页表描述 CPU 当前怎样翻译地址；物理页描述内核手里真实可调度的资源；page cache 把文件内容放进同一套页管理体系；缺页异常负责把尚未兑现的映射变成真实页面；页回收和 swap 则在内存压力下重新分配这些页面。 本系列以 Linux 6.x（主要参照 6.1–6.8）为基准。涉及版本敏感的机制时（如 maple tree 6.1 引入、per-VMA lock 6.4 稳定、Multi-Gen LRU 6.1 合入、folio 迁移 5.16–6.0 持续进行），各篇会标...</div></div></div></a><a class="pagination-related" href="/2026/05/24/OOM-Killer-%E5%86%85%E6%A0%B8%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E5%86%B3%E5%AE%9A%E6%9D%80%E8%BF%9B%E7%A8%8B/" title="OOM Killer：内核什么时候决定杀进程"><img class="cover" src="/2026/05/24/OOM-Killer-%E5%86%85%E6%A0%B8%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E5%86%B3%E5%AE%9A%E6%9D%80%E8%BF%9B%E7%A8%8B/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-24</div><div class="info-item-2">OOM Killer：内核什么时候决定杀进程</div></div><div class="info-2"><div class="info-item-1">上一篇讲了 memcg 如何把全局内存资源划分成层级预算。当预算用尽且回收无力时，最后一道防线是 OOM killer——通过终止进程来释放内存。这不是内存管理的常规路径，而是所有正常手段都失败后的兜底。 核心问题可以压成一句话：  OOM killer 是多轮分配、回收、压缩、写回、swap 都无法满足请求后的兜底路径，不是内存管理的常规目标。   问题从哪里来 内存分配失败的处理有一个基本问题：内核不能简单地对调用者返回&quot;分配失败&quot;。很多内核代码路径不检查分配失败（GFP_KERNEL 分配假设不会失败），即使返回错误，用户空间进程通常也没有合理的 fallback 逻辑。 所以内核的策略是：在返回失败之前，尽可能通过各种手段释放内存。如果所有手段都用尽仍然无法满足分配请求，最后才走 OOM kill——选择一个进程杀掉以释放它占用的内存。 到达 OOM kill 之前的完整路径： 1234567891011121314__alloc_pages() 分配请求  → 检查 zone 水位线：有空闲页? → 成功返回  → 唤醒 kswapd 后台回收  →...</div></div></div></a><a class="pagination-related" href="/2026/05/23/LRU-%E5%92%8C-workingset-%E5%86%85%E6%A0%B8%E5%A6%82%E4%BD%95%E8%BF%91%E4%BC%BC%E6%9C%80%E8%BF%91%E4%BD%BF%E7%94%A8/" title="LRU 和 workingset：内核如何近似&quot;最近使用&quot;"><img class="cover" src="/2026/05/23/LRU-%E5%92%8C-workingset-%E5%86%85%E6%A0%B8%E5%A6%82%E4%BD%95%E8%BF%91%E4%BC%BC%E6%9C%80%E8%BF%91%E4%BD%BF%E7%94%A8/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-23</div><div class="info-item-2">LRU 和 workingset：内核如何近似&quot;最近使用&quot;</div></div><div class="info-2"><div class="info-item-1">上一篇把反向映射讲清楚了：内核可以从物理页找回所有映射方。一旦找到，下一个问题是：在所有缓存着的页面中，选谁回收？这就是 LRU 和 workingset 机制要回答的事。 核心问题可以压成一句话：  Linux VM 无法知道未来访问序列，只能用最近访问证据、链表分层和 refault 信息近似估计 working set。   问题从哪里来 教材把 LRU 画成一个链表：每次访问把页面移到头部，回收时从尾部摘掉。理论上，这对局部性良好的负载接近最优。 实际系统无法直接实现教材 LRU。原因有三： 第一，每次内存访问都移动链表节点，开销不可承受。用户态一个循环可能每秒触发亿次内存访问，不可能每次都走内核锁链表。 第二，精确 LRU 需要全局排序。两个进程分别访问各自的页面，真正的 LRU 需要知道谁先谁后，需要一个全局时间戳或全局链表锁，NUMA 架构下这是严重瓶颈。 第三，内核的信息来源有限。硬件只提供 PTE 的 Accessed 位：访问过就置 1，内核定期清除再观察是否重新置 1。这是一个&quot;采样&quot;而不是&quot;时间戳&quot;。 因此 Linu...</div></div></div></a><a class="pagination-related" href="/2026/05/23/%E5%9C%B0%E5%9D%80%E7%A9%BA%E9%97%B4%E4%B8%8D%E6%98%AF%E6%95%B0%E7%BB%84-mm_struct-%E5%92%8C-vm_area_struct/" title="地址空间不是数组：mm_struct 和 vm_area_struct"><img class="cover" src="/2026/05/23/%E5%9C%B0%E5%9D%80%E7%A9%BA%E9%97%B4%E4%B8%8D%E6%98%AF%E6%95%B0%E7%BB%84-mm_struct-%E5%92%8C-vm_area_struct/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-23</div><div class="info-item-2">地址空间不是数组：mm_struct 和 vm_area_struct</div></div><div class="info-2"><div class="info-item-1">上一篇把 Linux VM 的主线压成“先承诺，再兑现”。这一篇先看承诺本身：一个进程说“这段地址可以读写”“这段地址来自某个文件”“这段地址不能访问”，这些信息在内核里不是按字节存成数组，而是按区间组织成一组 VMA。 用户态看见的是地址。内核看见的是地址空间、区间、权限和来源。 1virtual address -&gt; mm_struct -&gt; vm_area_struct -&gt; policy mm_struct 描述一个用户态地址空间，vm_area_struct 描述其中一段连续虚拟地址区间。页表回答“这个虚拟页当前能不能翻译到物理页”，VMA 先回答另一个问题：“这个地址原则上是不是属于进程，应该按什么规则处理”。  从 /proc/self/maps 看地址空间 先从最容易观察的地方开始。运行一个普通进程，查看 /proc/&lt;pid&gt;/maps，会看到类似这样的行： 123455f2b6f3a000-55f2b6f3b000 r--p 00000000 08:01 131104 /usr/bin/cat55f2b6f3b000-55f2b6...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%97%AE%E9%A2%98%E4%BB%8E%E5%93%AA%E9%87%8C%E6%9D%A5"><span class="toc-number">1.</span> <span class="toc-text">问题从哪里来</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%80%E5%B0%8F%E6%A8%A1%E5%9E%8B"><span class="toc-number">2.</span> <span class="toc-text">最小模型</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#map-shared-%E4%B8%8E-map-private-%E6%98%AF%E4%B8%A4%E7%A7%8D-mmap"><span class="toc-number">3.</span> <span class="toc-text">MAP_SHARED 与 MAP_PRIVATE 是两种 mmap</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#read-%E5%92%8C-mmap-%E5%90%84%E6%9C%89%E4%BB%A3%E4%BB%B7"><span class="toc-number">4.</span> <span class="toc-text">read() 和 mmap() 各有代价</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9Acache-%E6%98%AF%E6%8E%A5%E5%8F%A3%E7%9A%84%E7%BB%9F%E4%B8%80%E7%82%B9"><span class="toc-number">4.1.</span> <span class="toc-text">模式提炼：cache 是接口的统一点</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E4%B8%AA%E6%9C%80%E5%B0%8F%E5%AE%9E%E9%AA%8C%EF%BC%9Aread-vs-mmap"><span class="toc-number">5.</span> <span class="toc-text">一个最小实验：read vs mmap</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%AF%BB%E5%8F%96%E5%AE%9E%E9%AA%8C%E7%BB%93%E6%9E%9C"><span class="toc-number">6.</span> <span class="toc-text">读取实验结果</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9A%E8%AE%BF%E9%97%AE%E5%B1%82%E5%92%8C%E7%BC%93%E5%AD%98%E5%B1%82%E8%A7%A3%E8%80%A6"><span class="toc-number">6.1.</span> <span class="toc-text">模式提炼：访问层和缓存层解耦</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A0%B8%E5%BF%83%E7%BB%93%E6%9E%84%EF%BC%9Aaddress-space"><span class="toc-number">7.</span> <span class="toc-text">核心结构：address_space</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%BA%90%E7%A0%81%E9%94%9A%E7%82%B9"><span class="toc-number">8.</span> <span class="toc-text">源码锚点</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%A0%94%E7%A9%B6%E7%94%9F%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">9.</span> <span class="toc-text">研究生迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">10.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">11.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">12.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">13.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.1</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.4</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.4"></script><script src="/js/main.js?v=5.5.4"></script><script src="/js/tw_cn.js?v=5.5.4"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.12.2/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="ribbon" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-ribbon.min.js" size="150" alpha="0.6" zIndex="-1" mobile="false" data-click="true"></script><script id="canvas_nest" defer="defer" color="0,0,255" opacity="0.7" zIndex="-1" count="99" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-nest.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = true;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script id="click-heart" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/click-heart.min.js" async="async" mobile="false"></script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
