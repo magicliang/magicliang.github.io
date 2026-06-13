@@ -1,0 +1,818 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>Huge Page：TLB 压力和页表开销 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇讲了 NUMA 如何让内存访问不再均匀。但即使在单 node 系统上，当工作集足够大时，另一类开销浮现：TLB miss 和页表自身的内存消耗。Huge page 通过增大映射粒度来同时缓解这两个问题。 核心问题可以压成一句话：  huge page 用更大的映射粒度减少 TLB 和页表开销，但引入碎片、分配时机和回收复杂度作为代价。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Huge Page：TLB 压力和页表开销">
+<meta property="og:url" content="https://magicliang.github.io/2026/05/23/Huge-Page-TLB-%E5%8E%8B%E5%8A%9B%E5%92%8C%E9%A1%B5%E8%A1%A8%E5%BC%80%E9%94%80/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇讲了 NUMA 如何让内存访问不再均匀。但即使在单 node 系统上，当工作集足够大时，另一类开销浮现：TLB miss 和页表自身的内存消耗。Huge page 通过增大映射粒度来同时缓解这两个问题。 核心问题可以压成一句话：  huge page 用更大的映射粒度减少 TLB 和页表开销，但引入碎片、分配时机和回收复杂度作为代价。">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/05/23/Huge-Page-TLB-%E5%8E%8B%E5%8A%9B%E5%92%8C%E9%A1%B5%E8%A1%A8%E5%BC%80%E9%94%80/cover.svg">
+<meta property="article:published_time" content="2026-05-23T18:42:09.000Z">
+<meta property="article:modified_time" content="2026-06-13T08:02:51.902Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Linux">
+<meta property="article:tag" content="内核">
+<meta property="article:tag" content="性能">
+<meta property="article:tag" content="操作系统">
+<meta property="article:tag" content="虚拟内存">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/05/23/Huge-Page-TLB-%E5%8E%8B%E5%8A%9B%E5%92%8C%E9%A1%B5%E8%A1%A8%E5%BC%80%E9%94%80/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "Huge Page：TLB 压力和页表开销",
+  "url": "https://magicliang.github.io/2026/05/23/Huge-Page-TLB-%E5%8E%8B%E5%8A%9B%E5%92%8C%E9%A1%B5%E8%A1%A8%E5%BC%80%E9%94%80/",
+  "image": "https://magicliang.github.io/2026/05/23/Huge-Page-TLB-%E5%8E%8B%E5%8A%9B%E5%92%8C%E9%A1%B5%E8%A1%A8%E5%BC%80%E9%94%80/cover.svg",
+  "datePublished": "2026-05-23T18:42:09.000Z",
+  "dateModified": "2026-06-13T08:02:51.902Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/05/23/Huge-Page-TLB-%E5%8E%8B%E5%8A%9B%E5%92%8C%E9%A1%B5%E8%A1%A8%E5%BC%80%E9%94%80/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.4"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.1.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: 'Huge Page：TLB 压力和页表开销',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.1"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (false) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">442</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">484</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">31</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/05/23/Huge-Page-TLB-%E5%8E%8B%E5%8A%9B%E5%92%8C%E9%A1%B5%E8%A1%A8%E5%BC%80%E9%94%80/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">Huge Page：TLB 压力和页表开销</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">Huge Page：TLB 压力和页表开销</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-05-23T18:42:09.000Z" title="Created 2026-05-24 02:42:09">2026-05-24</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-06-13T08:02:51.902Z" title="Updated 2026-06-13 16:02:51">2026-06-13</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.8k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>14mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><p>上一篇讲了 NUMA 如何让内存访问不再均匀。但即使在单 node 系统上，当工作集足够大时，另一类开销浮现：TLB miss 和页表自身的内存消耗。Huge page 通过增大映射粒度来同时缓解这两个问题。</p>
+<p>核心问题可以压成一句话：</p>
+<blockquote>
+<p>huge page 用更大的映射粒度减少 TLB 和页表开销，但引入碎片、分配时机和回收复杂度作为代价。</p>
+</blockquote>
+<span id="more"></span>
+<h2 id="问题从哪里来">问题从哪里来</h2>
+<p>标准页大小 4KB。一个 64GB 内存的机器有 1600 万个物理页。如果一个进程映射了 8GB 工作集，对应 200 万个 PTE。</p>
+<p>TLB（Translation Lookaside Buffer）是 MMU 的地址翻译缓存。现代 CPU 的 L1 dTLB 通常只有 64-128 个条目，L2 sTLB 有 1024-2048 个条目。200 万个活跃页面对 2048 个 TLB 条目意味着 TLB 覆盖率不足 0.1%——绝大多数访问要走 page table walk。</p>
+<p>page table walk 不是免费的。它需要 4-5 次内存访问（每级页表一次），即使有 page walk cache 辅助，在 TLB miss 频繁时仍然构成明显开销。根据硬件厂商和学术文献的测量，TLB miss 导致的 stall 可占 CPU 时间的 10-30%（大内存工作负载，参见 Intel Optimization Reference Manual 及 Basu et al., ISCA 2013）。</p>
+<p>页表本身也消耗内存。映射 8GB 需要的页表页数：PGD 1 页 + P4D 1 页 + PUD 若干 + PMD 若干 + PTE 若干。其中 PTE 层是大头：200 万个 PTE × 8 字节 = 约 16MB 纯页表内存。</p>
+<p>如果把映射粒度从 4KB 提升到 2MB（PMD 级别），同样 8GB 只需要 4096 个映射条目。TLB 每个条目覆盖 2MB 而不是 4KB——覆盖率提升 512 倍。PTE 层完全不需要了，页表内存大幅减少。</p>
+<p>这就是 huge page 的核心价值：用更大的映射粒度降低翻译开销。</p>
+<h2 id="两种-huge-page-机制">两种 huge page 机制</h2>
+<p>Linux 提供两种不同的 huge page 支持，容易混淆：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>HugeTLB pages</th>
+<th>Transparent Huge Pages (THP)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>配置方式</td>
+<td>启动时或运行时预留</td>
+<td>自动分配</td>
+</tr>
+<tr>
+<td>接口</td>
+<td><code>hugetlbfs</code> + <code>mmap</code></td>
+<td>普通 <code>mmap</code>/<code>malloc</code>，内核透明处理</td>
+</tr>
+<tr>
+<td>大小</td>
+<td>可选（2MB、1GB 等）</td>
+<td>默认 PMD 级（2MB），可选多种大小</td>
+</tr>
+<tr>
+<td>预留</td>
+<td>必须预留，保证可用</td>
+<td>按需分配，可能失败</td>
+</tr>
+<tr>
+<td>回收</td>
+<td>不参与常规回收</td>
+<td>可拆分、可回收</td>
+</tr>
+<tr>
+<td>适用场景</td>
+<td>数据库 buffer pool 等已知大块分配</td>
+<td>通用工作负载透明优化</td>
+</tr>
+</tbody>
+</table>
+<p>HugeTLB 是较早的机制，需要管理员显式预留页面。预留后这些内存不能被系统其他部分使用。适合明确知道需要大页的场景（如数据库预分配 shared buffer）。</p>
+<p>THP 是后来引入的透明机制，对应用无感知。内核在 page fault 时尝试分配 huge page，失败则回退到普通 4KB 页。后台 <code>khugepaged</code> 线程扫描已映射的 4KB 页，尝试合并（collapse）成 huge page。</p>
+<p>本篇主要讨论 THP，因为它与前面几篇讨论的页回收、LRU、NUMA 机制直接交互。</p>
+<h2 id="thp-的分配路径">THP 的分配路径</h2>
+<p>THP 有两条主要的分配路径：</p>
+<p><strong>Fault-time allocation（缺页时分配）</strong>：进程第一次访问一个 2MB 对齐且长度足够的匿名区域时，内核尝试直接分配一个 2MB 的 compound page。如果成功，一次 fault 建立整个 2MB 的映射。如果分配失败（没有连续的 2MB 物理内存），回退到 4KB 逐页 fault。</p>
+<p><strong>khugepaged collapse（后台合并）</strong>：<code>khugepaged</code> 内核线程在后台扫描进程的页表。如果发现某个 PMD 范围内的 512 个 PTE 都已填充且可合并，就分配一个新的 order-9 compound page，把 512 个分散的 4KB 页数据复制过去，替换 512 个 PTE 为一个 PMD entry，再释放原来的 512 个 base page。原始 4KB 页不需要物理连续——连续性由新分配的 compound page 提供。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><code class="hljs text">fault-time path:<br>  page fault on 2MB-aligned address<br>  -&gt; try alloc_pages(order=9)  [2MB = 512 × 4KB = order 9]<br>  -&gt; success? install PMD entry (one TLB entry covers 2MB)<br>  -&gt; fail?    fallback to 4KB page<br><br>khugepaged path:<br>  scan process page tables<br>  -&gt; find PMD with 512 base pages all present and mergeable<br>  -&gt; allocate 2MB compound page<br>  -&gt; copy 512 × 4KB into 2MB page<br>  -&gt; replace 512 PTEs with one PMD entry<br>  -&gt; free original 512 base pages<br></code></pre></td></tr></table></figure>
+<p>Multi-size THP（mTHP）是较新的扩展，允许在 PMD 级别之外使用其他中间大小（16KB、32KB、64KB 等）。这降低了&quot;要么 2MB 要么 4KB&quot;的二选一限制——16KB 页面比 2MB 更容易分配到连续物理内存，同时仍然减少 4 倍 page fault。</p>
+<h2 id="thp-的配置">THP 的配置</h2>
+<p>三种全局模式：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">cat</span> /sys/kernel/mm/transparent_hugepage/enabled<br><span class="hljs-comment"># [always] madvise never</span><br></code></pre></td></tr></table></figure>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>always</code></td>
+<td>所有匿名映射都尝试使用 THP</td>
+</tr>
+<tr>
+<td><code>madvise</code></td>
+<td>只有标记了 <code>MADV_HUGEPAGE</code> 的区域使用 THP</td>
+</tr>
+<tr>
+<td><code>never</code></td>
+<td>禁用 THP fault-time 分配</td>
+</tr>
+</tbody>
+</table>
+<p><code>defrag</code> 参数控制分配 huge page 失败时是否触发内存压缩：</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>always</code></td>
+<td>直接做 compaction（可能阻塞，导致延迟尖刺）</td>
+</tr>
+<tr>
+<td><code>defer</code></td>
+<td>唤醒 kcompactd 后台压缩，不阻塞当前 fault</td>
+</tr>
+<tr>
+<td><code>madvise</code></td>
+<td>只对 <code>MADV_HUGEPAGE</code> 区域做直接 compaction</td>
+</tr>
+<tr>
+<td><code>never</code></td>
+<td>不做 compaction，只用当前可用的连续内存</td>
+</tr>
+</tbody>
+</table>
+<p>生产系统中常见配置是 <code>enabled=madvise</code> + <code>defrag=madvise</code>：只对明确标记的区域积极分配 THP，避免全局的延迟抖动。</p>
+<h2 id="thp-的代价">THP 的代价</h2>
+<p>THP 不是&quot;总是优化&quot;。它引入几类代价：</p>
+<p><strong>内存浪费</strong>：如果进程只访问 2MB 对齐区域中的少量 4KB 页面，整个 2MB 物理页仍然被占用。这在稀疏访问模式（如 JVM 的 G1 GC region 边界）下可能浪费大量内存。</p>
+<p><strong>分配延迟尖刺与 compaction</strong>：fault-time 分配 2MB 连续内存时，如果 buddy allocator 没有现成的 order-9 空闲块，内核会触发 compaction（内存碎片整理）。compaction 使用双向扫描：migrate scanner 从 zone 低地址向上寻找可移动页面，free scanner 从高地址向下寻找空闲 slot，通过迁移页面在低地址腾出连续物理区间。整个过程涉及页面迁移（分配目标页 → 复制数据 → 更新 rmap 和页表 → 释放原页），可能阻塞毫秒甚至十毫秒。如果 compaction 失败（<code>compact_result</code> 返回失败），内核回退到 direct reclaim 释放更多页面后重试。对延迟敏感的应用（交易系统、实时服务），这种不可预测的尖刺不可接受——这也是很多生产环境设置 <code>transparent_hugepage=madvise</code> 而不是 <code>always</code> 的原因。</p>
+<p><strong>拆分开销</strong>：当 huge page 中部分内容需要被 swap out、COW、或 NUMA 迁移时，整个 2MB 页面必须先拆分成 512 个 4KB 页面。拆分需要分配页表页、逐一建立 PTE、更新 rmap。这是一个 O(512) 的操作。</p>
+<p><strong>回收复杂度</strong>：huge page 的回收比 4KB 页面复杂。部分脏的 huge page 不能整体丢弃；部分被 mlock 的 huge page 不能整体移动。内核引入了 deferred split list 来延迟处理这些情况。</p>
+<h3 id="模式提炼：更大粒度降低元数据成本但提升分配风险">模式提炼：更大粒度降低元数据成本但提升分配风险</h3>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">larger granularity -&gt; lower metadata cost + higher allocation risk<br></code></pre></td></tr></table></figure>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>4KB 页</th>
+<th>2MB huge page</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TLB 条目覆盖</td>
+<td>4KB</td>
+<td>2MB（512×）</td>
+</tr>
+<tr>
+<td>页表层级</td>
+<td>需要 PTE 层</td>
+<td>跳过 PTE 层</td>
+</tr>
+<tr>
+<td>page fault 频率</td>
+<td>每 4KB 一次</td>
+<td>每 2MB 一次</td>
+</tr>
+<tr>
+<td>分配成功率</td>
+<td>几乎总是成功</td>
+<td>需要连续物理内存，可能失败</td>
+</tr>
+<tr>
+<td>内存浪费</td>
+<td>最多浪费 4KB-1</td>
+<td>最多浪费 2MB-1</td>
+</tr>
+<tr>
+<td>拆分代价</td>
+<td>无</td>
+<td>O(512)</td>
+</tr>
+</tbody>
+</table>
+<p>这种粒度权衡在系统设计中反复出现：文件系统的 block size（4KB vs 64KB）、网络的 MTU（1500 vs 9000 jumbo）、数据库的 page size（4KB vs 16KB vs 32KB）。核心规律是：大粒度降低 per-unit 管理成本，但升高碎片和分配压力。</p>
+<h2 id="一个最小实验：观察-thp-的效果">一个最小实验：观察 THP 的效果</h2>
+<p>这个实验分配大块匿名内存，比较启用和禁用 THP 时的行为差异。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br><span class="line">72</span><br><span class="line">73</span><br><span class="line">74</span><br><span class="line">75</span><br><span class="line">76</span><br><span class="line">77</span><br><span class="line">78</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-meta">#<span class="hljs-keyword">define</span> _GNU_SOURCE</span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;stdio.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;stdlib.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;string.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;sys/mman.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;time.h&gt;</span></span><br><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;unistd.h&gt;</span></span><br><br><span class="hljs-type">static</span> <span class="hljs-type">long</span> <span class="hljs-title function_">diff_ns</span><span class="hljs-params">(<span class="hljs-keyword">struct</span> timespec *start, <span class="hljs-keyword">struct</span> timespec *end)</span> &#123;<br>    <span class="hljs-keyword">return</span> (end-&gt;tv_sec - start-&gt;tv_sec) * <span class="hljs-number">1000000000L</span> +<br>           (end-&gt;tv_nsec - start-&gt;tv_nsec);<br>&#125;<br><br><span class="hljs-type">static</span> <span class="hljs-type">void</span> <span class="hljs-title function_">show_smaps_thp</span><span class="hljs-params">(<span class="hljs-type">void</span>)</span> &#123;<br>    <span class="hljs-type">char</span> path[<span class="hljs-number">64</span>];<br>    <span class="hljs-built_in">snprintf</span>(path, <span class="hljs-keyword">sizeof</span>(path), <span class="hljs-string">&quot;/proc/%d/smaps_rollup&quot;</span>, getpid());<br>    FILE *f = fopen(path, <span class="hljs-string">&quot;r&quot;</span>);<br>    <span class="hljs-keyword">if</span> (!f) &#123;<br>        <span class="hljs-comment">/* fallback: parse smaps manually */</span><br>        <span class="hljs-built_in">snprintf</span>(path, <span class="hljs-keyword">sizeof</span>(path), <span class="hljs-string">&quot;/proc/%d/smaps&quot;</span>, getpid());<br>        f = fopen(path, <span class="hljs-string">&quot;r&quot;</span>);<br>        <span class="hljs-keyword">if</span> (!f) <span class="hljs-keyword">return</span>;<br>    &#125;<br>    <span class="hljs-type">char</span> line[<span class="hljs-number">256</span>];<br>    <span class="hljs-keyword">while</span> (fgets(line, <span class="hljs-keyword">sizeof</span>(line), f)) &#123;<br>        <span class="hljs-keyword">if</span> (<span class="hljs-built_in">strncmp</span>(line, <span class="hljs-string">&quot;AnonHugePages:&quot;</span>, <span class="hljs-number">14</span>) == <span class="hljs-number">0</span> ||<br>            <span class="hljs-built_in">strncmp</span>(line, <span class="hljs-string">&quot;Rss:&quot;</span>, <span class="hljs-number">4</span>) == <span class="hljs-number">0</span>) &#123;<br>            <span class="hljs-built_in">printf</span>(<span class="hljs-string">&quot;  %s&quot;</span>, line);<br>        &#125;<br>    &#125;<br>    fclose(f);<br>&#125;<br><br><span class="hljs-type">int</span> <span class="hljs-title function_">main</span><span class="hljs-params">(<span class="hljs-type">void</span>)</span> &#123;<br>    <span class="hljs-type">size_t</span> size = <span class="hljs-number">256UL</span> * <span class="hljs-number">1024</span> * <span class="hljs-number">1024</span>; <span class="hljs-comment">/* 256MB */</span><br>    <span class="hljs-type">long</span> page_size = sysconf(_SC_PAGESIZE);<br><br>    <span class="hljs-built_in">printf</span>(<span class="hljs-string">&quot;Allocating %zu MB with mmap(MAP_ANONYMOUS)\n&quot;</span>, size &gt;&gt; <span class="hljs-number">20</span>);<br><br>    <span class="hljs-type">char</span> *buf = mmap(<span class="hljs-literal">NULL</span>, size, PROT_READ | PROT_WRITE,<br>                     MAP_ANONYMOUS | MAP_PRIVATE, <span class="hljs-number">-1</span>, <span class="hljs-number">0</span>);<br>    <span class="hljs-keyword">if</span> (buf == MAP_FAILED) &#123; perror(<span class="hljs-string">&quot;mmap&quot;</span>); <span class="hljs-keyword">return</span> <span class="hljs-number">1</span>; &#125;<br><br>    <span class="hljs-comment">/* 可选：标记为适合 THP */</span><br>    madvise(buf, size, MADV_HUGEPAGE);<br><br>    <span class="hljs-comment">/* 测量首次写入（触发 page fault）的耗时 */</span><br>    <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">timespec</span> <span class="hljs-title">t0</span>, <span class="hljs-title">t1</span>;</span><br>    clock_gettime(CLOCK_MONOTONIC, &amp;t0);<br>    <span class="hljs-keyword">for</span> (<span class="hljs-type">size_t</span> off = <span class="hljs-number">0</span>; off &lt; size; off += (<span class="hljs-type">size_t</span>)page_size)<br>        buf[off] = (<span class="hljs-type">char</span>)(off &amp; <span class="hljs-number">0xFF</span>);<br>    clock_gettime(CLOCK_MONOTONIC, &amp;t1);<br><br>    <span class="hljs-type">long</span> fault_time_ms = diff_ns(&amp;t0, &amp;t1) / <span class="hljs-number">1000000</span>;<br>    <span class="hljs-type">long</span> pages_faulted = (<span class="hljs-type">long</span>)(size / (<span class="hljs-type">size_t</span>)page_size);<br>    <span class="hljs-built_in">printf</span>(<span class="hljs-string">&quot;Fault time: %ld ms for %ld pages (~%ld ns/page)\n&quot;</span>,<br>           fault_time_ms, pages_faulted,<br>           diff_ns(&amp;t0, &amp;t1) / pages_faulted);<br><br>    <span class="hljs-built_in">printf</span>(<span class="hljs-string">&quot;Memory stats:\n&quot;</span>);<br>    show_smaps_thp();<br><br>    <span class="hljs-comment">/* 测量顺序访问延迟（TLB 效果） */</span><br>    <span class="hljs-keyword">volatile</span> <span class="hljs-type">char</span> sink = <span class="hljs-number">0</span>;<br>    clock_gettime(CLOCK_MONOTONIC, &amp;t0);<br>    <span class="hljs-keyword">for</span> (<span class="hljs-type">int</span> r = <span class="hljs-number">0</span>; r &lt; <span class="hljs-number">50</span>; r++) &#123;<br>        <span class="hljs-keyword">for</span> (<span class="hljs-type">size_t</span> off = <span class="hljs-number">0</span>; off &lt; size; off += (<span class="hljs-type">size_t</span>)page_size)<br>            sink += buf[off];<br>    &#125;<br>    clock_gettime(CLOCK_MONOTONIC, &amp;t1);<br>    (<span class="hljs-type">void</span>)sink;<br><br>    <span class="hljs-built_in">printf</span>(<span class="hljs-string">&quot;Sequential access: %ld ms (50 rounds)\n&quot;</span>,<br>           diff_ns(&amp;t0, &amp;t1) / <span class="hljs-number">1000000</span>);<br><br>    munmap(buf, size);<br>    <span class="hljs-keyword">return</span> <span class="hljs-number">0</span>;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>编译与运行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><code class="hljs bash">cc -Wall -Wextra -O2 thp_demo.c -o thp_demo<br><br><span class="hljs-comment"># 启用 THP 运行</span><br><span class="hljs-built_in">echo</span> always | <span class="hljs-built_in">sudo</span> <span class="hljs-built_in">tee</span> /sys/kernel/mm/transparent_hugepage/enabled<br>./thp_demo<br><br><span class="hljs-comment"># 禁用 THP 运行</span><br><span class="hljs-built_in">echo</span> never | <span class="hljs-built_in">sudo</span> <span class="hljs-built_in">tee</span> /sys/kernel/mm/transparent_hugepage/enabled<br>./thp_demo<br><br><span class="hljs-comment"># 恢复默认</span><br><span class="hljs-built_in">echo</span> madvise | <span class="hljs-built_in">sudo</span> <span class="hljs-built_in">tee</span> /sys/kernel/mm/transparent_hugepage/enabled<br></code></pre></td></tr></table></figure>
+<p>完成实验后清理：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">rm</span> -f thp_demo<br></code></pre></td></tr></table></figure>
+<h2 id="读取实验结果">读取实验结果</h2>
+<p>THP 启用 vs 禁用时预期看到的差异：</p>
+<p><strong>Fault time</strong>：THP 启用时，每个 page fault 覆盖 2MB，fault 总次数从 65536 降到约 128（256MB / 2MB）。总 fault 时间可能更短（因为每次 fault 的固定开销被摊销），但单次 fault 延迟更长（需要分配 order-9 页面）。</p>
+<p><strong>AnonHugePages</strong>：THP 启用时，<code>/proc/&lt;pid&gt;/smaps</code> 中 <code>AnonHugePages</code> 接近 256MB。禁用时为 0。</p>
+<p><strong>Sequential access</strong>：THP 启用时，每个 TLB 条目覆盖 2MB，TLB miss 减少。在 TLB 容量有限的机器上，顺序遍历 256MB 时 THP 版本可能快 10-30%（取决于 TLB 大小和访问模式）。</p>
+<p>关键观察：</p>
+<ul>
+<li><code>AnonHugePages</code> 非零但小于 <code>Rss</code>：说明只有部分区域成功获得了 huge page。未对齐或分配失败的区域仍用 4KB 页。</li>
+<li>如果 <code>defrag=always</code> 且系统内存碎片化，fault time 可能出现大的尖刺——某些 fault 触发了 compaction。</li>
+<li><code>/proc/vmstat</code> 中的 <code>thp_fault_alloc</code>（成功）和 <code>thp_fault_fallback</code>（回退到 4KB）直接反映 THP 分配的成功率。</li>
+</ul>
+<h3 id="模式提炼：透明优化依赖运行时条件">模式提炼：透明优化依赖运行时条件</h3>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">THP enabled ≠ THP effective<br>effective THP requires: alignment + contiguous memory + no split triggers<br></code></pre></td></tr></table></figure>
+<p>THP 的&quot;透明&quot;意味着应用不需要修改代码，但不意味着效果有保证。是否能实际获得 huge page 取决于运行时的物理内存碎片程度。这和其他&quot;透明优化&quot;类似：TCP 的 TSO/GRO 透明于应用但依赖网卡支持、编译器的自动向量化透明于源码但依赖数据对齐。</p>
+<h2 id="核心代码：pmd-级-huge-page-判定">核心代码：PMD 级 huge page 判定</h2>
+<p>THP 相关的 PMD 检测（<code>include/linux/pgtable.h</code> + <code>mm/huge_memory.c</code>，精简）：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-comment">/* 判断 PMD 是否指向一个 transparent huge page */</span><br><span class="hljs-type">static</span> <span class="hljs-keyword">inline</span> <span class="hljs-type">int</span> <span class="hljs-title function_">pmd_trans_huge</span><span class="hljs-params">(<span class="hljs-type">pmd_t</span> pmd)</span> &#123;<br>    <span class="hljs-keyword">return</span> (pmd_val(pmd) &amp; (_PAGE_PSE | _PAGE_PRESENT))<br>           == (_PAGE_PSE | _PAGE_PRESENT);<br>&#125;<br><br><span class="hljs-comment">/* THP page fault 入口 */</span><br><span class="hljs-type">vm_fault_t</span> <span class="hljs-title function_">do_huge_pmd_anonymous_page</span><span class="hljs-params">(<span class="hljs-keyword">struct</span> vm_fault *vmf)</span> &#123;<br>    <span class="hljs-comment">/* 尝试分配 order-9 页面 */</span><br>    folio = vma_alloc_folio(gfp, HPAGE_PMD_ORDER, vma, haddr);<br>    <span class="hljs-keyword">if</span> (!folio)<br>        <span class="hljs-keyword">goto</span> fallback;  <span class="hljs-comment">/* 回退到普通 4KB fault */</span><br>    ...<br>&#125;<br></code></pre></td></tr></table></figure>
+<p><code>_PAGE_PSE</code>（Page Size Extension）位在 PMD 级别表示&quot;这个 entry 直接映射 2MB，不再向下一级页表解引用&quot;。</p>
+<h2 id="源码锚点">源码锚点</h2>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>读它的目的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mm/huge_memory.c</code></td>
+<td><code>do_huge_pmd_anonymous_page()</code>：THP fault-time 分配</td>
+</tr>
+<tr>
+<td><code>mm/khugepaged.c</code></td>
+<td><code>khugepaged_scan_mm_slot()</code>：后台 collapse 扫描</td>
+</tr>
+<tr>
+<td><code>mm/huge_memory.c</code></td>
+<td><code>split_huge_page_to_list()</code>：拆分路径</td>
+</tr>
+<tr>
+<td><code>mm/hugetlb.c</code></td>
+<td>HugeTLB 预留页面管理（与 THP 不同）</td>
+</tr>
+<tr>
+<td><code>include/linux/huge_mm.h</code></td>
+<td>THP 相关宏和条件编译</td>
+</tr>
+</tbody>
+</table>
+<p>读 <code>do_huge_pmd_anonymous_page()</code> 时可以带着一个问题：分配 order-9 页面失败后，fallback 路径如何确保进程不会因为&quot;等待 compaction&quot;而被阻塞过久？</p>
+<h2 id="研究生迁移表">研究生迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>Linux 概念</th>
+<th>一般系统设计</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>huge page（2MB/1GB）</td>
+<td>大 block size（64KB filesystem block, jumbo frame）</td>
+</tr>
+<tr>
+<td>TLB miss</td>
+<td>cache miss（元数据缓存不命中）</td>
+</tr>
+<tr>
+<td>page table walk</td>
+<td>多级索引查找</td>
+</tr>
+<tr>
+<td>THP fault-time allocation</td>
+<td>乐观大块分配（try big, fallback small）</td>
+</tr>
+<tr>
+<td>khugepaged collapse</td>
+<td>后台碎片整理 / compaction</td>
+</tr>
+<tr>
+<td>THP split</td>
+<td>大粒度降级为小粒度（分片 split）</td>
+</tr>
+<tr>
+<td>defrag/compaction</td>
+<td>存储碎片整理</td>
+</tr>
+<tr>
+<td>mTHP（多种大小）</td>
+<td>多级 block size（adaptive block allocation）</td>
+</tr>
+</tbody>
+</table>
+<p>大粒度 vs 小粒度的权衡在任何分层存储系统中都存在。数据库用 large page 减少 buffer pool 管理开销、网络用 jumbo frame 减少 per-packet 处理、文件系统用 large block 减少 inode/extent 数量。核心取舍永远是：管理成本 vs 碎片浪费 vs 分配难度。</p>
+<h2 id="常见误解">常见误解</h2>
+<p>第一个误解是把 THP 和 HugeTLB 混为一谈。THP 是透明的、自动的、可拆分的。HugeTLB 是显式预留的、应用需要通过 hugetlbfs 接口使用的、不参与常规回收的。两者在内核中走不同的代码路径。</p>
+<p>第二个误解是认为 THP <code>always</code> 总是提升性能。对于稀疏访问模式（大量映射但只触碰少量页面）的工作负载，THP 可能浪费内存并增加 compaction 开销。很多生产系统明确设置 <code>enabled=madvise</code> 来避免这个问题。</p>
+<p>第三个误解是认为 THP 不会被回收。THP 参与正常的 LRU 回收流程。当需要回收一个 THP 中的部分页面时，内核先 split 再按 4KB 粒度回收。deferred split list 允许延迟这个 split 操作。</p>
+<p>第四个误解是认为 <code>MADV_HUGEPAGE</code> 保证获得 huge page。它只是一个提示——告诉内核这个区域值得尝试使用 THP。如果物理内存碎片化到无法分配 order-9 页面，提示不会生效。<code>MADV_COLLAPSE</code> 更强一些（主动触发 collapse），但仍可能因为内存不足而失败。</p>
+<p>第五个误解是认为 THP 只有 2MB 一种大小。Multi-size THP（mTHP）引入了 16KB、32KB、64KB 等中间大小。这些较小的 huge page 更容易分配成功，对 TLB 仍有帮助（某些架构支持 contiguous PTE hint），且浪费上限更小。</p>
+<h2 id="练习">练习</h2>
+<p>第一，在一台 Linux 机器上查看 THP 当前配置：读取 <code>/sys/kernel/mm/transparent_hugepage/</code> 下的 <code>enabled</code>、<code>defrag</code>、<code>hpage_pmd_size</code>。查看 <code>/proc/meminfo</code> 中 <code>AnonHugePages</code> 和 <code>HugePages_Total</code> 的值。</p>
+<p>第二，按文中实验分别在 <code>enabled=always</code> 和 <code>enabled=never</code> 下运行，记录 fault time、<code>AnonHugePages</code>、sequential access time 的差异。计算 TLB 覆盖率的理论差异（TLB 条目数 × 页大小 / 工作集大小）。</p>
+<p>第三，运行实验时同时观察 <code>/proc/vmstat</code> 中 <code>thp_fault_alloc</code>、<code>thp_fault_fallback</code>、<code>thp_collapse_alloc</code>、<code>thp_split_page</code> 的变化。解释每个计数器在实验的哪个阶段增长。</p>
+<p>第四，阅读 <code>mm/huge_memory.c</code> 中 <code>split_huge_page_to_list()</code> 的实现。列出 split 过程中需要做的所有操作：页表修改、rmap 更新、LRU 调整、引用计数变化。</p>
+<p>第五，在一个 Java 应用（如 Elasticsearch）运行时检查其 <code>/proc/&lt;pid&gt;/smaps</code> 中 <code>AnonHugePages</code> 的分布。对比设置 <code>MADV_HUGEPAGE</code>（通过 <code>-XX:+UseTransparentHugePages</code>）前后的内存布局差异。</p>
+<h2 id="系列导航">系列导航</h2>
+<ul>
+<li>上一篇：<a href="/2026/05/24/NUMA-%E5%86%85%E5%AD%98%E4%B8%BA%E4%BB%80%E4%B9%88%E6%9C%89%E8%BF%9C%E8%BF%91/">NUMA：内存为什么有远近</a></li>
+<li>本文：Huge Page：TLB 压力和页表开销</li>
+<li>下一篇：<a href="/2026/05/24/Buddy-system-%E7%89%A9%E7%90%86%E9%A1%B5%E5%A6%82%E4%BD%95%E6%8C%89%E9%98%B6%E5%88%86%E9%85%8D/">Buddy system：物理页如何按阶分配</a></li>
+</ul>
+<h2 id="参考资料">参考资料</h2>
+<blockquote>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://docs.kernel.org/admin-guide/mm/transhuge.html">Transparent Hugepage Support - The Linux Kernel documentation</a></li>
+<li><a target="_blank" rel="noopener" href="https://docs.kernel.org/admin-guide/mm/hugetlbpage.html">HugeTLB Pages - The Linux Kernel documentation</a></li>
+<li><a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man2/madvise.2.html">madvise(2) - Linux manual page</a></li>
+<li><a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man5/proc.5.html">proc(5) - /proc/meminfo - Linux manual page</a></li>
+</ul>
+</blockquote>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/05/23/Huge-Page-TLB-%E5%8E%8B%E5%8A%9B%E5%92%8C%E9%A1%B5%E8%A1%A8%E5%BC%80%E9%94%80/">https://magicliang.github.io/2026/05/23/Huge-Page-TLB-%E5%8E%8B%E5%8A%9B%E5%92%8C%E9%A1%B5%E8%A1%A8%E5%BC%80%E9%94%80/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Linux/">Linux</a><a class="post-meta__tags" href="/tags/%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F/">操作系统</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD/">性能</a><a class="post-meta__tags" href="/tags/%E5%86%85%E6%A0%B8/">内核</a><a class="post-meta__tags" href="/tags/%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98/">虚拟内存</a></div><div class="post-share"><div class="social-share" data-image="/2026/05/23/Huge-Page-TLB-%E5%8E%8B%E5%8A%9B%E5%92%8C%E9%A1%B5%E8%A1%A8%E5%BC%80%E9%94%80/cover.svg" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/05/23/%E5%9B%9E%E5%88%B0%E5%B7%A5%E7%A8%8B-Linux-VM-%E5%A6%82%E4%BD%95%E6%94%B9%E5%8F%98%E6%80%A7%E8%83%BD%E8%AF%8A%E6%96%AD/" title="回到工程：Linux VM 如何改变性能诊断"><img class="cover" src="/2026/05/23/%E5%9B%9E%E5%88%B0%E5%B7%A5%E7%A8%8B-Linux-VM-%E5%A6%82%E4%BD%95%E6%94%B9%E5%8F%98%E6%80%A7%E8%83%BD%E8%AF%8A%E6%96%AD/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-24</div><div class="info-item-2">回到工程：Linux VM 如何改变性能诊断</div></div><div class="info-2"><div class="info-item-1">前面 16 篇从地址空间到 OOM，逐层拆解了 Linux 虚拟内存子系统的结构和机制。这些知识的价值不只在于读源码——更在于它提供了一种分层诊断习惯：遇到内存相关的性能问题时，先定位层次，再找对象，再看状态转移，最后用指标验证。 核心问题可以压成一句话：  Linux VM 的价值不只在源码知识，而在一种分层诊断习惯：先定位层次，再找对象，再看状态转移，最后用指标验证。   系列概念地图 整个系列覆盖的层次和对象： 1234567891011121314151617181920212223用户空间视角                     内核视角─────────────                  ──────────malloc / mmap                  VMA (vm_area_struct)    ↓ 虚拟地址                     ↓page fault                     页表 (PGD→P4D→PUD→PMD→PTE)    ↓ 物理页分配                   ↓RSS 增长  ...</div></div></div></a><a class="pagination-related" href="/2026/05/23/%E9%A1%B5%E5%9B%9E%E6%94%B6-kswapd-%E5%92%8C-direct-reclaim/" title="页回收：kswapd 和 direct reclaim"><img class="cover" src="/2026/05/23/%E9%A1%B5%E5%9B%9E%E6%94%B6-kswapd-%E5%92%8C-direct-reclaim/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-23</div><div class="info-item-2">页回收：kswapd 和 direct reclaim</div></div><div class="info-2"><div class="info-item-1">上一篇讲了内核如何用 LRU 近似和 workingset 检测来判断&quot;谁冷谁热&quot;。判断完之后，实际把页面释放出来的工作由回收子系统完成。回收不是一个单点事件，而是围绕水位线、后台线程和分配路径形成的一套压力响应机制。 核心问题可以压成一句话：  回收是围绕水位线的分级压力响应，不是耗尽后的单点动作。   问题从哪里来 内存分配在 Linux 里几乎无处不在：用户态 malloc 背后的匿名页、page cache 的文件页、内核自己的 slab 对象。每次分配都从 buddy allocator 拿物理页。物理页是有限的。 如果等到完全分配不出页面再回收，分配方会被阻塞很长时间——回收可能涉及写脏页、等待 I/O、遍历反向映射。这种&quot;等到没有了才动&quot;的策略延迟不可控。 Linux 的做法是提前开始。内核设定一组水位线（watermark），在不同压力级别触发不同强度的回收。大部分情况下由后台线程 kswapd 在压力升起时提前回收；只有来不及时才在分配路径上直接回收（direct reclaim）。 水位线模型 每个 zone 有三条基本...</div></div></div></a><a class="pagination-related" href="/2026/05/23/Swap-%E6%8D%A2%E5%87%BA%E5%8E%BB%E7%9A%84%E9%A1%B5%E6%80%8E%E6%A0%B7%E5%9B%9E%E6%9D%A5/" title="Swap：换出去的页怎样回来"><img class="cover" src="/2026/05/23/Swap-%E6%8D%A2%E5%87%BA%E5%8E%BB%E7%9A%84%E9%A1%B5%E6%80%8E%E6%A0%B7%E5%9B%9E%E6%9D%A5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-24</div><div class="info-item-2">Swap：换出去的页怎样回来</div></div><div class="info-2"><div class="info-item-1">上一篇把页回收的整体机制讲清楚了：水位线决定何时回收、kswapd 与 direct reclaim 决定谁来回收。但回收路径里对匿名页有一个前提条件——必须有地方可以把数据写出去。这个&quot;地方&quot;就是 swap。 理解 swap 的关键判断：  swap 是匿名页在内存压力下的 backing store；它不是系统失败的标志，而是把物理内存压力转成更慢的外部存储访问。   问题从哪里来 文件页天然有 backing store：磁盘上的原始文件。干净文件页可以直接丢弃，下次访问时从文件重新读入。脏文件页先写回再丢弃。无论哪种情况，数据都有归处。 匿名页没有这种归处。一块 malloc 出来的内存、一个栈帧、一段 mmap(MAP_ANONYMOUS) 区域——它们的内容只存在于物理内存中，没有对应文件。如果要回收这些页面，必须先把内容保存到某个外部存储，等将来再需要时读回来。 没有 swap 时，匿名页完全不可回收。内存压力一旦超过文件页能释放的量，系统直接到 OOM。这就是为什么纯粹&quot;关掉 swap&quot;在内存紧张的工作负载下会导致进程被杀—...</div></div></div></a><a class="pagination-related" href="/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/" title="文件映射和 page cache：文件内容怎样变成页面"><img class="cover" src="/2026/05/23/%E6%96%87%E4%BB%B6%E6%98%A0%E5%B0%84%E5%92%8C-page-cache-%E6%96%87%E4%BB%B6%E5%86%85%E5%AE%B9%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E9%A1%B5%E9%9D%A2/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-23</div><div class="info-item-2">文件映射和 page cache：文件内容怎样变成页面</div></div><div class="info-2"><div class="info-item-1">上一篇看了匿名页和 COW，它们处理的是没有文件 backing 的内存。文件 backing 是另一条主线：文件内容如何进入内核管理的页面池，又如何被 read() 复制到用户缓冲区或被 mmap() 映射进进程地址空间。这一切的共同枢纽是 page cache。 核心问题可以压成一句话：  page cache 让文件 I/O 和虚拟内存共享同一批页面对象；read() 和 mmap() 只是进入 page cache 的两种路径。   问题从哪里来 教材常把文件 I/O 和虚拟内存分开讲。读文件用 read，写文件用 write，文件系统维护自己的“缓冲缓存”；进程内存用 mmap、malloc、fork，由 VM 子系统管理。两套体系，互不相干。 Linux 不是这样实现的。当前官方文档对 page cache 给出的定位非常直接：  The page cache is the primary way that the user and the rest of the kernel interact with filesystems.  也就是说，绝大多数 read/wr...</div></div></div></a><a class="pagination-related" href="/2026/05/23/Buddy-system-%E7%89%A9%E7%90%86%E9%A1%B5%E5%A6%82%E4%BD%95%E6%8C%89%E9%98%B6%E5%88%86%E9%85%8D/" title="Buddy system：物理页如何按阶分配"><img class="cover" src="/2026/05/23/Buddy-system-%E7%89%A9%E7%90%86%E9%A1%B5%E5%A6%82%E4%BD%95%E6%8C%89%E9%98%B6%E5%88%86%E9%85%8D/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-24</div><div class="info-item-2">Buddy system：物理页如何按阶分配</div></div><div class="info-2"><div class="info-item-1">上一篇讲了 huge page 如何通过增大映射粒度降低 TLB 和页表开销。但分配 2MB 连续物理内存本身就不是简单的事——物理页分配器必须能快速找到指定大小的连续空闲块。Buddy system 就是 Linux 用来解决这个问题的核心机制。 核心问题可以压成一句话：  buddy allocator 用按阶（order）拆分和合并管理连续物理页，解决的是页级分配与碎片控制问题。   问题从哪里来 内核需要分配连续物理页的场景很多：DMA buffer 要求物理连续、huge page 需要 order-9（2MB）的连续块（1GB 页通常在启动时通过 HugeTLB 机制预留，不走常规 buddy 路径）、设备驱动需要特定对齐的物理内存。 最简单的方案是维护一个空闲页链表。但这有两个问题：第一，找&quot;连续 N 页&quot;需要遍历链表检查物理地址连续性，时间复杂度不可控；第二，反复分配释放后内存碎片化，即使总空闲页足够也可能凑不出连续块。 Buddy system 用 power-of-two 分块解决这两个问题：只管理 2^n 大小的块（称为 order-n ...</div></div></div></a><a class="pagination-related" href="/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/" title="反向映射：从物理页找回虚拟地址"><img class="cover" src="/2026/05/23/%E5%8F%8D%E5%90%91%E6%98%A0%E5%B0%84-%E4%BB%8E%E7%89%A9%E7%90%86%E9%A1%B5%E6%89%BE%E5%9B%9E%E8%99%9A%E6%8B%9F%E5%9C%B0%E5%9D%80/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-23</div><div class="info-item-2">反向映射：从物理页找回虚拟地址</div></div><div class="info-2"><div class="info-item-1">上一篇把 folio 作为缓存与回收的管理单位。一旦讨论“回收”，立刻冒出一个问题：内核拿到一个准备回收的 folio，怎么知道哪些进程的页表还指着它？正向页表只能从虚拟地址走到物理页，反过来走不通。反向映射就是为这件事存在的。 核心问题可以压成一句话：  正向页表回答“这个地址翻译到哪一页”，反向映射回答“这一页被哪些地址空间映射”。   问题从哪里来 页表只解决一个方向：拿到一个虚拟地址，按 PGD→P4D→PUD→PMD→PTE 走下去，最终得到 PFN。这是 MMU 在用户态访问路径上需要的。 但内核在很多场景需要反方向：拿到一个物理页（或 folio），找到所有当前映射它的虚拟页和对应 PTE。典型场景包括：  回收一个 folio。释放前必须撤销所有指向它的 PTE，否则用户态访问会拿到已释放的物理页。 迁移一个 folio。把内容搬到新物理页之后，所有原指针都要改写到新 PFN。 COW 写入触发时。即使是 do_wp_page 的判断，也要确认有没有其他映射方共享同一物理页。 在大页拆分、NUMA balancing、kernel same-page mergin...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%97%AE%E9%A2%98%E4%BB%8E%E5%93%AA%E9%87%8C%E6%9D%A5"><span class="toc-number">1.</span> <span class="toc-text">问题从哪里来</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E7%A7%8D-huge-page-%E6%9C%BA%E5%88%B6"><span class="toc-number">2.</span> <span class="toc-text">两种 huge page 机制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#thp-%E7%9A%84%E5%88%86%E9%85%8D%E8%B7%AF%E5%BE%84"><span class="toc-number">3.</span> <span class="toc-text">THP 的分配路径</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#thp-%E7%9A%84%E9%85%8D%E7%BD%AE"><span class="toc-number">4.</span> <span class="toc-text">THP 的配置</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#thp-%E7%9A%84%E4%BB%A3%E4%BB%B7"><span class="toc-number">5.</span> <span class="toc-text">THP 的代价</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9A%E6%9B%B4%E5%A4%A7%E7%B2%92%E5%BA%A6%E9%99%8D%E4%BD%8E%E5%85%83%E6%95%B0%E6%8D%AE%E6%88%90%E6%9C%AC%E4%BD%86%E6%8F%90%E5%8D%87%E5%88%86%E9%85%8D%E9%A3%8E%E9%99%A9"><span class="toc-number">5.1.</span> <span class="toc-text">模式提炼：更大粒度降低元数据成本但提升分配风险</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E4%B8%AA%E6%9C%80%E5%B0%8F%E5%AE%9E%E9%AA%8C%EF%BC%9A%E8%A7%82%E5%AF%9F-thp-%E7%9A%84%E6%95%88%E6%9E%9C"><span class="toc-number">6.</span> <span class="toc-text">一个最小实验：观察 THP 的效果</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%AF%BB%E5%8F%96%E5%AE%9E%E9%AA%8C%E7%BB%93%E6%9E%9C"><span class="toc-number">7.</span> <span class="toc-text">读取实验结果</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9A%E9%80%8F%E6%98%8E%E4%BC%98%E5%8C%96%E4%BE%9D%E8%B5%96%E8%BF%90%E8%A1%8C%E6%97%B6%E6%9D%A1%E4%BB%B6"><span class="toc-number">7.1.</span> <span class="toc-text">模式提炼：透明优化依赖运行时条件</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A0%B8%E5%BF%83%E4%BB%A3%E7%A0%81%EF%BC%9Apmd-%E7%BA%A7-huge-page-%E5%88%A4%E5%AE%9A"><span class="toc-number">8.</span> <span class="toc-text">核心代码：PMD 级 huge page 判定</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%BA%90%E7%A0%81%E9%94%9A%E7%82%B9"><span class="toc-number">9.</span> <span class="toc-text">源码锚点</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%A0%94%E7%A9%B6%E7%94%9F%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">10.</span> <span class="toc-text">研究生迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">11.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">12.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">13.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">14.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.1</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.4</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.4"></script><script src="/js/main.js?v=5.5.4"></script><script src="/js/tw_cn.js?v=5.5.4"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.12.2/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="ribbon" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-ribbon.min.js" size="150" alpha="0.6" zIndex="-1" mobile="false" data-click="true"></script><script id="canvas_nest" defer="defer" color="0,0,255" opacity="0.7" zIndex="-1" count="99" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-nest.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = true;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script id="click-heart" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/click-heart.min.js" async="async" mobile="false"></script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
