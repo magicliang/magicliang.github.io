@@ -1,0 +1,749 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>etcd 与持久化：集群状态的唯一事实来源 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇讲完了 API Server 的请求管道。管道的终点是 etcd。这一篇进入 etcd 内部。 etcd 经常被简单地描述为&quot;分布式 KV 存储&quot;。这个描述成立，但掩盖了一个关键点：etcd 不是 Redis，也不是 Zookeeper，它是一个强一致的、以 Raft 为共识机制的、支持 Watch 的版本化存储。Kubernetes 之所以选择 etcd，正是因为这三个">
+<meta property="og:type" content="article">
+<meta property="og:title" content="etcd 与持久化：集群状态的唯一事实来源">
+<meta property="og:url" content="https://magicliang.github.io/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇讲完了 API Server 的请求管道。管道的终点是 etcd。这一篇进入 etcd 内部。 etcd 经常被简单地描述为&quot;分布式 KV 存储&quot;。这个描述成立，但掩盖了一个关键点：etcd 不是 Redis，也不是 Zookeeper，它是一个强一致的、以 Raft 为共识机制的、支持 Watch 的版本化存储。Kubernetes 之所以选择 etcd，正是因为这三个">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/cover.svg">
+<meta property="article:published_time" content="2026-06-20T02:02:00.000Z">
+<meta property="article:modified_time" content="2026-06-24T14:18:39.338Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Kubernetes">
+<meta property="article:tag" content="etcd">
+<meta property="article:tag" content="云原生">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "etcd 与持久化：集群状态的唯一事实来源",
+  "url": "https://magicliang.github.io/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/",
+  "image": "https://magicliang.github.io/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/cover.svg",
+  "datePublished": "2026-06-20T02:02:00.000Z",
+  "dateModified": "2026-06-24T14:18:39.338Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.5"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.2.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: 'etcd 与持久化：集群状态的唯一事实来源',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">492</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">548</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">8</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">etcd 与持久化：集群状态的唯一事实来源</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">etcd 与持久化：集群状态的唯一事实来源</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-06-20T02:02:00.000Z" title="Created 2026-06-20 10:02:00">2026-06-20</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-06-24T14:18:39.338Z" title="Updated 2026-06-24 22:18:39">2026-06-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%9F%BA%E7%A1%80%E8%AE%BE%E6%96%BD/">基础设施</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>15mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-06-24 22:18:39&quot;}" hidden></div><p>上一篇讲完了 API Server 的请求管道。管道的终点是 etcd。这一篇进入 etcd 内部。</p>
+<p>etcd 经常被简单地描述为&quot;分布式 KV 存储&quot;。这个描述成立，但掩盖了一个关键点：etcd 不是 Redis，也不是 Zookeeper，它是一个强一致的、以 Raft 为共识机制的、支持 Watch 的版本化存储。Kubernetes 之所以选择 etcd，正是因为这三个性质缺一不可——缺少任何一个，API Server 的 List-Watch 机制就无法建立在它之上。</p>
+<p>本文只问一个问题：etcd 的哪些设计让 Kubernetes 的 List-Watch 机制成为可能？</p>
+<h2 id="etcd-在集群中的位置">etcd 在集群中的位置</h2>
+<figure class="highlight pgsql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><code class="hljs pgsql">┌─────────────────────────────────────────────────────┐<br>│              Kubernetes Control Plane                │<br>│                                                     │<br>│   kubectl ──► kube-apiserver ──► etcd <span class="hljs-keyword">cluster</span>       │<br>│                    │              │                  │<br>│   controller-mgr ──┤              │ Raft <span class="hljs-keyword">replication</span> │<br>│   scheduler ───────┤              │ (leader→follower)│<br>│   kubelet ─────────┘              │                  │<br>│                              ┌────┴────┐             │<br>│                              │  etcd   │             │<br>│                              │ leader  │             │<br>│                              └────┬────┘             │<br>│                          ┌────────┴────────┐         │<br>│                      ┌───┴───┐         ┌───┴───┐     │<br>│                      │etcd<span class="hljs-number">-2</span> │         │etcd<span class="hljs-number">-3</span> │     │<br>│                      │follwer│         │follwer│     │<br>│                      └───────┘         └───────┘     │<br>└─────────────────────────────────────────────────────┘<br><br>所有写入路径：client → API <span class="hljs-keyword">Server</span> → etcd leader → quorum ACK → 返回<br>所有读取路径：client → API <span class="hljs-keyword">Server</span> → etcd（可读 follower，带 linearizable 选项）<br></code></pre></td></tr></table></figure>
+<p>etcd 是控制平面唯一的持久化存储，所有 Kubernetes 对象（Pod、Service、ConfigMap、RBAC 规则……）都以 protobuf 编码存在 etcd 中。API Server 的内存 watch cache 是 etcd 数据的投影，而非独立数据源。</p>
+<h2 id="raft-基础：写入如何达到强一致">Raft 基础：写入如何达到强一致</h2>
+<p>etcd 使用 Raft 共识算法保证多节点间的数据一致性。理解 Raft，才能理解&quot;为什么 etcd 是强一致的&quot;。</p>
+<h3 id="leader-election">Leader Election</h3>
+<p>Raft 集群在任意时刻只有一个 leader。Election 过程：</p>
+<figure class="highlight applescript"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs applescript">初始状态：所有节点都是 follower，等待 leader 心跳<br>↓（election <span class="hljs-keyword">timeout</span> 超时，没收到心跳）<br>节点 A 成为 candidate，term++ ，向所有节点发 RequestVote<br>↓（多数节点（N/<span class="hljs-number">2</span>+<span class="hljs-number">1</span>）返回 VoteGranted）<br>A 成为 leader，开始发送心跳（AppendEntries，无日志条目）<br>↓（其他节点收到心跳）<br>其他节点重置 election <span class="hljs-keyword">timeout</span>，继续作为 follower<br></code></pre></td></tr></table></figure>
+<p><code>term</code>（任期）是单调递增的整数，每次选举加一。节点发现更高 term 的消息时立即退化为 follower。这保证了在网络分区后恢复时，旧 leader 不会继续接受写入。</p>
+<h3 id="log-replication-与-quorum-commit">Log Replication 与 Quorum Commit</h3>
+<p>写入流程：</p>
+<figure class="highlight sqf"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs sqf">客户端写入 → <span class="hljs-built_in">leader</span> 接收<br><span class="hljs-built_in">leader</span> 追加日志条目（index, term, command）到本地 <span class="hljs-built_in">log</span><br><span class="hljs-built_in">leader</span> 并行发送 AppendEntries 给所有 follower<br>follower 写本地 <span class="hljs-built_in">log</span>，回复 ACK<br><span class="hljs-built_in">leader</span> 收到 ⌊N/<span class="hljs-number">2</span>⌋+<span class="hljs-number">1</span> 个 ACK（包括自身）→ 提交（commit）<br><span class="hljs-built_in">leader</span> 回复客户端成功<br><span class="hljs-built_in">leader</span> 在下一次心跳通知 follower 提交该条目<br>follower 应用该条目到状态机<br></code></pre></td></tr></table></figure>
+<p>关键：leader 不等所有 follower ACK，只需多数（quorum）。这意味着：3 节点集群可容忍 1 个节点故障；5 节点集群可容忍 2 个节点故障。节点数量是奇数最优，因为偶数节点无法提供比少一个奇数节点更高的容错能力，却增加了通信开销。</p>
+<p>Raft 的强一致性保证：所有提交的日志条目都被多数节点持久化，因此在任何故障后恢复的新 leader 一定包含所有已提交的条目（Leader Completeness Property）。</p>
+<h2 id="etcd-mvcc：版本化存储的核心">etcd MVCC：版本化存储的核心</h2>
+<p>etcd v3 使用多版本并发控制（MVCC）存储数据。每次写入（put 或 delete）都递增一个全局的 <code>revision</code> 计数器，并保留历史版本。</p>
+<figure class="highlight routeros"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs routeros">初始状态：revision = 0<br><br>PUT /foo = <span class="hljs-string">&quot;v1&quot;</span>   → revision = 1, 存储 (/foo, <span class="hljs-attribute">mod_revision</span>=1) = <span class="hljs-string">&quot;v1&quot;</span><br>PUT /bar = <span class="hljs-string">&quot;v2&quot;</span>   → revision = 2, 存储 (/bar, <span class="hljs-attribute">mod_revision</span>=2) = <span class="hljs-string">&quot;v2&quot;</span><br>PUT /foo = <span class="hljs-string">&quot;v3&quot;</span>   → revision = 3, 存储 (/foo, <span class="hljs-attribute">mod_revision</span>=3) = <span class="hljs-string">&quot;v3&quot;</span><br>                                         (/foo, <span class="hljs-attribute">mod_revision</span>=1) = <span class="hljs-string">&quot;v1&quot;</span>  ← 旧版本保留<br><br><span class="hljs-built_in">GET</span> /foo at <span class="hljs-attribute">revision</span>=1 → <span class="hljs-string">&quot;v1&quot;</span>   ← 时间旅行读取<br><span class="hljs-built_in">GET</span> /foo at <span class="hljs-attribute">revision</span>=3 → <span class="hljs-string">&quot;v3&quot;</span>   ← 当前版本<br></code></pre></td></tr></table></figure>
+<p>每个 key 有两个重要的 revision 元数据：</p>
+<ul>
+<li><code>create_revision</code>：该 key 首次创建时的全局 revision</li>
+<li><code>mod_revision</code>：该 key 最后一次修改时的全局 revision</li>
+</ul>
+<p>Kubernetes 对象的 <code>metadata.resourceVersion</code> 就是 etcd 中该 key 的 <code>mod_revision</code>。这解释了为什么 resourceVersion 是单调递增但不连续的：集群中任何对象的任何写入都会递增全局 revision，你的 Pod 的 resourceVersion 会受到完全无关的 ConfigMap 写入的影响（因为全局 revision 在增加）。</p>
+<h2 id="kubernetes-对象在-etcd-中的存储布局">Kubernetes 对象在 etcd 中的存储布局</h2>
+<figure class="highlight gradle"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs gradle">etcd key 格式：<span class="hljs-regexp">/registry/</span>&#123;resource-<span class="hljs-keyword">group</span>&#125;<span class="hljs-regexp">/&#123;resource-type&#125;/</span>&#123;namespace&#125;/&#123;name&#125;<br><br><span class="hljs-regexp">/registry/</span>pods<span class="hljs-regexp">/default/</span>nginx-xxx-yyy<br><span class="hljs-regexp">/registry/</span>services<span class="hljs-regexp">/endpoints/</span>kube-system/kube-dns<br><span class="hljs-regexp">/registry/</span>deployments<span class="hljs-regexp">/apps/</span>production/api-server<br><span class="hljs-regexp">/registry/</span>secrets<span class="hljs-regexp">/default/my</span>-token<br><span class="hljs-regexp">/registry/</span>configmaps<span class="hljs-regexp">/kube-system/</span>kubeadm-config<br><span class="hljs-regexp">/registry/</span>clusterroles<span class="hljs-comment">//cluster-admin          ← 集群级资源，namespace 段为空</span><br></code></pre></td></tr></table></figure>
+<p>value 是 protobuf 编码的 API 对象（带有 magic byte 前缀 <code>k8s\x00</code> 标识格式版本）。etcd 中存储的是 hub version（API Server 的内部版本），而不是用户请求的 API version。</p>
+<p>这个 key 结构允许高效的前缀查询：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 列出 default 命名空间所有 Pod</span><br>etcdctl get /registry/pods/default/ --prefix<br><br><span class="hljs-comment"># 列出所有命名空间的 Service</span><br>etcdctl get /registry/services/ --prefix<br></code></pre></td></tr></table></figure>
+<p>API Server 的 List 操作就是对应的 etcd prefix range query。</p>
+<h2 id="watch-原理：基于-revision-的流式推送">Watch 原理：基于 Revision 的流式推送</h2>
+<p>etcd Watch 是 List-Watch 机制的物理基础。</p>
+<figure class="highlight gradle"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs gradle">客户端: Watch <span class="hljs-regexp">/registry/</span>pods<span class="hljs-regexp">/default/</span> --prefix, startRevision=<span class="hljs-number">1000</span><br><br>etcd: 从 revision <span class="hljs-number">1000</span> 开始，将后续所有匹配前缀的写入事件流式推送给客户端<br><br>PUT <span class="hljs-regexp">/registry/</span>pods<span class="hljs-regexp">/default/</span>nginx (revision=<span class="hljs-number">1001</span>) → 推送 PUT 事件<br><span class="hljs-keyword">DELETE</span> <span class="hljs-regexp">/registry/</span>pods<span class="hljs-regexp">/default/</span>old-pod (revision=<span class="hljs-number">1002</span>) → 推送 <span class="hljs-keyword">DELETE</span> 事件<br>PUT <span class="hljs-regexp">/registry/</span>pods<span class="hljs-regexp">/production/</span>other (revision=<span class="hljs-number">1003</span>) → 前缀不匹配，不推送<br></code></pre></td></tr></table></figure>
+<p>Watch 事件结构：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs json"><span class="hljs-punctuation">&#123;</span><br>  <span class="hljs-attr">&quot;type&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;PUT&quot;</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;kv&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">&#123;</span><br>    <span class="hljs-attr">&quot;key&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;/registry/pods/default/nginx&quot;</span><span class="hljs-punctuation">,</span><br>    <span class="hljs-attr">&quot;value&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;&lt;protobuf bytes&gt;&quot;</span><span class="hljs-punctuation">,</span><br>    <span class="hljs-attr">&quot;create_revision&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-number">800</span><span class="hljs-punctuation">,</span><br>    <span class="hljs-attr">&quot;mod_revision&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-number">1001</span><span class="hljs-punctuation">,</span><br>    <span class="hljs-attr">&quot;version&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-number">3</span><br>  <span class="hljs-punctuation">&#125;</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;prev_kv&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">&#123;</span> ... <span class="hljs-punctuation">&#125;</span>   <span class="hljs-comment">// 修改前的值（需要开启 WithPrevKV 选项）</span><br><span class="hljs-punctuation">&#125;</span><br></code></pre></td></tr></table></figure>
+<p><code>startRevision</code> 参数允许客户端指定从哪个历史点开始接收事件。当 API Server 重启后，它从上次保存的 resourceVersion 继续 watch，不会漏掉中间的变更。</p>
+<p>但 etcd 不会永远保留历史版本——compaction 会清理旧 revision。若 startRevision 早于 compact revision，etcd 返回 <code>ErrCompacted</code>，API Server 收到这个错误后需要重新 List 获取快照，再从当前 revision 开始 Watch——这就是 API Server 的 list-watch 重建逻辑。</p>
+<h2 id="list-watch-分离：避免全量重传的核心设计">List-Watch 分离：避免全量重传的核心设计</h2>
+<p>Kubernetes 的 List-Watch 协议利用 MVCC revision 实现了高效的断点续传：</p>
+<figure class="highlight pgsql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><code class="hljs pgsql">阶段 <span class="hljs-number">1</span>：List（打快照）<br>  <span class="hljs-keyword">GET</span> /registry/pods/<span class="hljs-keyword">default</span>/ <span class="hljs-comment">--prefix</span><br>  → 返回当前所有 Pod + <span class="hljs-keyword">header</span>.revision = <span class="hljs-number">5000</span><br><br>阶段 <span class="hljs-number">2</span>：Watch（续流）<br>  Watch /registry/pods/<span class="hljs-keyword">default</span>/ <span class="hljs-comment">--prefix, startRevision = 5001</span><br>  → 从 <span class="hljs-number">5001</span> 开始接收增量事件<br><br>断线重连：<br>  记住最后收到的 revision = <span class="hljs-number">5300</span><br>  Watch startRevision = <span class="hljs-number">5301</span><br>  → 无缝续流，不漏事件<br><br>compact 导致 ErrCompacted：<br>  重新执行阶段 <span class="hljs-number">1</span>，获取新快照 revision<br>  从新 revision 开始 Watch<br></code></pre></td></tr></table></figure>
+<p>没有 MVCC，就无法做到&quot;List 快照 + Watch 续流&quot;，必须每次断线都全量重传。对于大型集群（数万个 Pod），全量重传会造成 API Server 和 etcd 的严重压力——这正是 Kubernetes 早期 v2 API（无 MVCC）遇到的问题，也是 v3 API 引入 MVCC 的核心动机。</p>
+<h2 id="lease：轻量级心跳机制">Lease：轻量级心跳机制</h2>
+<p>etcd Lease 是有 TTL 的租约。客户端必须在 TTL 过期前续租（keepalive），否则租约到期，所有关联了该租约的 key 自动删除。</p>
+<p>Kubernetes 用 Lease 实现 kubelet 节点心跳：</p>
+<figure class="highlight crmsh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs crmsh">kubelet 启动 → 在 kube-<span class="hljs-keyword">node</span><span class="hljs-title">-lease</span> 命名空间创建同名 Lease 对象<br>             → 每 <span class="hljs-number">10</span> 秒（默认）续租一次（PUT Lease 对象）<br><br>kube-controller-manager 的 <span class="hljs-keyword">node</span><span class="hljs-title">-lifecycle-controller</span><br>             → watch Lease 对象<br>             → 若某节点的 Lease 超过 <span class="hljs-number">40</span> 秒（默认）未续租<br>             → 标记节点为 NotReady<br>             → 超过一定时间后驱逐节点上的 Pod<br></code></pre></td></tr></table></figure>
+<p>在引入 Lease 之前（Kubernetes 1.13 之前），kubelet 每次心跳都要更新 Node 对象的 <code>status.conditions</code>（一个较大的对象）。大量节点同时心跳会给 etcd 造成巨大的写入压力。改用 Lease 后，心跳只更新一个小 Lease 对象，Node 对象只在状态真正变化时更新，写入量大幅下降。</p>
+<h2 id="compaction-与-defrag：空间管理">Compaction 与 Defrag：空间管理</h2>
+<p>etcd 保留所有历史 revision 会无限消耗磁盘空间，需要定期 compact。</p>
+<p>Compaction 的效果：</p>
+<figure class="highlight tap"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs tap">compact 到 revision<span class="hljs-number"> 5000 </span>之前：<br>  /foo 在 revision 1、3、5、5000 都有版本，共<span class="hljs-number"> 4 </span>条记录<br><br>compact 到 revision<span class="hljs-number"> 5000 </span>之后：<br>  只保留 /foo 在 revision<span class="hljs-number"> 5000 </span>的版本<br>  revision 1、3、5 的历史版本被删除<br>  startRevision &lt;<span class="hljs-number"> 5000 </span>的 Watch 请求返回 ErrCompacted<br></code></pre></td></tr></table></figure>
+<p>Compaction 本身不释放磁盘空间——它只是从 BoltDB（etcd 的底层存储引擎）的逻辑上删除记录，实际文件大小不变。释放物理空间需要 defrag（碎片整理）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs bash">etcdctl defrag --endpoints=https://127.0.0.1:2379 \<br>  --cacert=/etc/kubernetes/pki/etcd/ca.crt \<br>  --cert=/etc/kubernetes/pki/etcd/server.crt \<br>  --key=/etc/kubernetes/pki/etcd/server.key<br></code></pre></td></tr></table></figure>
+<p>defrag 会短暂锁定数据库，生产环境应在低峰期对每个节点逐一执行（先 follower 后 leader）。</p>
+<p>生产推荐配置：<code>--auto-compaction-mode=revision --auto-compaction-retention=10000</code>（保留最近 10000 个 revision 的历史），或 <code>--auto-compaction-mode=periodic --auto-compaction-retention=1h</code>（保留最近 1 小时的历史）。</p>
+<h2 id="可观察实验">可观察实验</h2>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 前提：kind 集群已运行</span><br><span class="hljs-comment"># 进入 etcd 容器</span><br>kubectl <span class="hljs-built_in">exec</span> -it -n kube-system etcd-kind-control-plane -- sh<br><br><span class="hljs-comment"># 设置 etcdctl 环境变量（在容器内）</span><br><span class="hljs-built_in">export</span> ETCDCTL_API=3<br><span class="hljs-built_in">export</span> ETCDCTL_CACERT=/etc/kubernetes/pki/etcd/ca.crt<br><span class="hljs-built_in">export</span> ETCDCTL_CERT=/etc/kubernetes/pki/etcd/server.crt<br><span class="hljs-built_in">export</span> ETCDCTL_KEY=/etc/kubernetes/pki/etcd/server.key<br><span class="hljs-built_in">export</span> ETCDCTL_ENDPOINTS=https://127.0.0.1:2379<br><br><span class="hljs-comment"># 1. 读取一个 Pod 对象的原始存储（protobuf，不可读）</span><br>etcdctl get /registry/pods/default/nginx-xxx 2&gt;/dev/null | xxd | <span class="hljs-built_in">head</span> -5<br><br><span class="hljs-comment"># 2. 列出所有 Deployment 的 key</span><br>etcdctl get /registry/deployments/ --prefix --keys-only<br><br><span class="hljs-comment"># 3. 观察全局 revision 随写入递增</span><br>etcdctl get /registry/pods/default/ --prefix --write-out=json | jq <span class="hljs-string">&#x27;.header.revision&#x27;</span><br><span class="hljs-comment"># 在另一个终端创建 Pod，回来再查 revision（应该增大了）</span><br><br><span class="hljs-comment"># 4. Watch etcd 原始事件流</span><br>etcdctl watch /registry/pods/default/ --prefix &amp;<br><span class="hljs-comment"># 在另一个终端：kubectl run watch-test --image=nginx</span><br><span class="hljs-comment"># 观察 etcd watch 事件（是 PUT 事件，value 是 protobuf bytes）</span><br><br><span class="hljs-comment"># 5. 查看 Lease（节点心跳）</span><br>etcdctl get /registry/leases/kube-node-lease/ --prefix --keys-only<br><br><span class="hljs-comment"># 6. 查看 etcd 集群状态（revision, leader, db size）</span><br>etcdctl endpoint status --write-out=table<br></code></pre></td></tr></table></figure>
+<h2 id="实验映射到内部机制">实验映射到内部机制</h2>
+<p>当执行 <code>kubectl run watch-test --image=nginx</code> 时，etcd 内部的事件序列：</p>
+<ol>
+<li>API Server 收到 POST <code>/api/v1/namespaces/default/pods</code></li>
+<li>经过 Admission 管道后，API Server 调用 etcd 的 txn 接口：<code>if revision == current_revision: put /registry/pods/default/watch-test &lt;protobuf&gt;</code></li>
+<li>etcd leader 接收请求，追加日志条目，等待 quorum ACK</li>
+<li>多数节点 ACK 后，leader 提交，全局 revision 递增（假设从 5000 变为 5001）</li>
+<li>etcd 触发所有 watch <code>/registry/pods/default/</code> 的客户端（包括 API Server 的 cacher）</li>
+<li>API Server cacher 收到 PUT 事件，更新内存 watch cache，广播给所有监听该前缀的 watcher</li>
+<li>kube-scheduler、kube-controller-manager 中的 Informer 收到事件，触发调度或控制循环</li>
+</ol>
+<p>kubectl 收到响应后，Pod 对象的 <code>metadata.resourceVersion</code> 就是步骤 4 中的全局 revision（5001）。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>
+<p>在 kind 集群中，用 <code>etcdctl endpoint status --write-out=table</code> 观察当前 leader 节点。然后删除 kind 集群的 etcd leader 容器（<code>docker stop kind-control-plane</code> 后重启，或用 <code>kubectl delete pod etcd-xxx -n kube-system</code>），观察 etcd 集群完成新一轮选举需要多长时间，以及期间 <code>kubectl get pods</code> 的响应情况。</p>
+</li>
+<li>
+<p>编写一个脚本，在 10 秒内创建 100 个 ConfigMap（<code>kubectl create configmap cm-{i} --from-literal=key=value</code>），然后用 <code>etcdctl endpoint status</code> 查看 revision 增长量和 db size 增量。再执行 <code>etcdctl compact</code> 和 <code>etcdctl defrag</code>，观察 db size 的变化。</p>
+</li>
+<li>
+<p>用 etcdctl watch 监听 <code>/registry/pods/default/ --prefix</code>，同时在另一个终端对一个 Deployment 执行滚动更新（修改镜像版本）。观察 watch 流中每个 Pod 经历的事件序列（创建新 Pod → 多次 PUT 表示状态变化 → 删除旧 Pod），将事件序列与 Pod 生命周期状态机（Pending → ContainerCreating → Running）对应起来。</p>
+</li>
+</ol>
+<h2 id="模式提炼">模式提炼</h2>
+<p>etcd 在 Kubernetes 中扮演的角色可以概括为&quot;带版本历史的强一致 KV + 发布订阅总线&quot;，而不是通用数据库。</p>
+<p>强一致 KV 方面：Raft 协议保证任意时刻只有一个 leader 接受写入，所有已提交写入按全局 revision 严格排序，任意节点读到的数据要么是最新的，要么明确告知需要等待（linearizable read）。这个保证使 API Server 可以放心地用 resourceVersion 做乐观锁——如果两个并发写入都携带相同的 resourceVersion，etcd 事务保证只有一个能成功，另一个返回失败，不会产生写入竞争导致的数据损坏。</p>
+<p>版本历史方面：MVCC 使 Watch 从任意历史位置续流成为可能，是 List-Watch 协议的物理基础。没有 MVCC，断线重连的唯一选择是全量重传——对大型集群（数万对象）这会造成严重压力。compaction 是版本历史的生命周期管理，清理过旧的历史以控制磁盘使用，同时通过 Bookmark 事件帮助客户端推进本地记录的 revision，降低 compaction 触发全量重传的频率。</p>
+<p>发布订阅方面：每次写入都通过 Watch 机制广播给所有订阅者，事件按 revision 严格有序，不遗漏，不乱序。这是 Kubernetes 所有控制器从&quot;感知变化&quot;到&quot;执行调谐&quot;的信息管道。etcd 在这里既是存储又是消息总线，两者共享同一个数据模型（key-value + revision），不需要额外的消息中间件。</p>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>etcd 机制</th>
+<th>工程类比</th>
+<th>关键相似点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Raft leader 选举</td>
+<td>MySQL MHA / Zookeeper leader election</td>
+<td>多节点共识，同一时刻只有一个写入点，防止脑裂</td>
+</tr>
+<tr>
+<td>Raft 日志复制 + quorum</td>
+<td>MySQL Group Replication (paxos)</td>
+<td>写入需要多数节点确认才提交，一致性优先于可用性</td>
+</tr>
+<tr>
+<td>全局 revision (MVCC)</td>
+<td>MySQL GTID / PostgreSQL LSN / Kafka offset</td>
+<td>全局单调递增的写入序列号，用于复制位点和增量追追</td>
+</tr>
+<tr>
+<td>Watch from revision</td>
+<td>Kafka consumer 从指定 offset 消费</td>
+<td>消费者从指定位置开始接收增量，不全量重传</td>
+</tr>
+<tr>
+<td>Compaction</td>
+<td>MySQL binlog purge / Kafka log retention</td>
+<td>清理历史数据，保留近期快照，控制磁盘用量</td>
+</tr>
+<tr>
+<td>Defrag</td>
+<td>MySQL OPTIMIZE TABLE / PostgreSQL VACUUM FULL</td>
+<td>逻辑删除后物理回收空间，需要短暂暂停服务</td>
+</tr>
+<tr>
+<td>etcd Lease (TTL key)</td>
+<td>Redis key TTL / 数据库心跳行</td>
+<td>客户端需定期续约，超时后数据自动失效，实现心跳检测</td>
+</tr>
+<tr>
+<td>etcd snapshot</td>
+<td>mysqldump + binlog / pg_basebackup</td>
+<td>全量快照加增量日志，备份恢复的标准模式</td>
+</tr>
+</tbody>
+</table>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：etcd 性能很强，可以存大对象，不需要担心容量。</p>
+<p>事实是 etcd 有严格的大小限制，单个 value 默认上限 1.5MB，官方建议不超过 8MB（即使调高 <code>--max-request-bytes</code>）。etcd 基于 Raft 日志复制，大 value 意味着更大的网络消息和更长的 fsync 时间，直接影响写入延迟和集群稳定性。Kubernetes 有意只把元数据（对象定义、状态、引用）存入 etcd，实际数据（镜像层、日志、指标）放在外部系统。如果 ConfigMap 需要存储大量配置内容，应考虑只存引用（S3 路径、数据库主键），而不是把内容直接写入 etcd。</p>
+<p>误解二：etcd Watch 会丢事件，控制器需要定时轮询兜底。</p>
+<p>etcd Watch 在连接存活期间不会丢失事件。Raft 保证每次写入有且仅有一次，Watch 按 revision 严格有序推送。“丢事件&quot;只发生在两种情况：Watch 连接断开、且重连时提供的 revision 已被 compaction 清理。Kubernetes 通过 Informer 的 reflector 处理这种情况——收到 <code>ErrCompacted</code> 时重新 List 打快照，再从当前 revision 续流。整个过程对控制器透明，控制器的 Reconcile 函数只需要处理&quot;当前状态”，不需要关心是否漏过了中间事件。额外的定时轮询只会增加 etcd 读压力，不能解决任何实际问题。</p>
+<p>误解三：etcd 集群只能是 3 节点，节点数越多越好。</p>
+<p>3 节点是最常见的生产配置，允许 1 个节点故障，对大多数场景够用。5 节点允许 2 个节点故障，适合对可用性要求更高的场景（如跨可用区部署，每个 AZ 各 1-2 节点，允许一个 AZ 整体故障）。7 节点以上收益递减：每次写入需要等待 4 个节点 ACK，延迟显著增加，而额外的容错能力（允许 3 节点故障）在实践中很少用到。节点数必须为奇数——4 节点需要 3 个 ACK（quorum = 3），与 3 节点相同（quorum 也是 2，但 4 节点 quorum 实际是 3），容错能力没有提升，写延迟却更高，所以 4 节点没有实际意义。</p>
+<h2 id="系列导航">系列导航</h2>
+<ul>
+<li><a href="/2026/02/07/Kubernetes-%E6%A0%B8%E5%BF%83%E6%A6%82%E5%BF%B5/">00 核心概念导读</a></li>
+<li><a href="/2026/06/20/API-Server-%E4%B8%8E%E5%A3%B0%E6%98%8E%E5%BC%8F-API-%E4%B8%80%E5%88%87%E7%9A%86%E8%B5%84%E6%BA%90/">01 API Server 与声明式 API</a></li>
+<li><a href="/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/">02 etcd 与持久化</a></li>
+<li><a href="/2026/06/20/%E6%8E%A7%E5%88%B6%E5%99%A8%E6%A8%A1%E5%BC%8F%E4%B8%8E-Informer-%E6%9C%BA%E5%88%B6-%E8%B0%83%E8%B0%90%E5%BE%AA%E7%8E%AF%E7%9A%84%E5%B7%A5%E7%A8%8B%E5%AE%9E%E7%8E%B0/">03 控制器模式与 Informer 机制</a></li>
+<li><a href="/2026/06/20/Pod-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-%E4%BB%8E-Pending-%E5%88%B0-Running-%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B7%AF%E5%BE%84/">04 Pod 生命周期</a></li>
+<li><a href="/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/">05 调度器深入</a></li>
+<li><a href="/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/">06 kubelet 与容器运行时</a></li>
+<li><a href="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/">07 网络模型与 CNI</a></li>
+<li><a href="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/">08 Service 与 kube-proxy</a></li>
+<li><a href="/2026/06/20/Ingress-%E4%B8%8E-Gateway-API-%E4%B8%83%E5%B1%82%E6%B5%81%E9%87%8F%E7%9A%84%E5%85%A5%E5%8F%A3%E6%BC%94%E8%BF%9B/">09 Ingress 与 Gateway API</a></li>
+<li><a href="/2026/06/20/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-PV-PVC-StorageClass-%E4%B8%8E-CSI/">10 存储体系</a></li>
+<li><a href="/2026/06/20/%E9%85%8D%E7%BD%AE%E4%B8%8E%E5%AF%86%E9%92%A5%E7%AE%A1%E7%90%86-ConfigMap-Secret-%E4%B8%8E%E5%A4%96%E9%83%A8%E9%9B%86%E6%88%90/">11 配置与密钥管理</a></li>
+<li><a href="/2026/06/20/RBAC-%E4%B8%8E%E5%AE%89%E5%85%A8%E6%A8%A1%E5%9E%8B-%E8%AE%A4%E8%AF%81-%E6%8E%88%E6%9D%83%E4%B8%8E%E5%87%86%E5%85%A5%E6%8E%A7%E5%88%B6/">12 RBAC 与安全模型</a></li>
+<li><a href="/2026/06/20/%E8%B5%84%E6%BA%90%E7%AE%A1%E7%90%86%E4%B8%8E%E8%87%AA%E5%8A%A8%E4%BC%B8%E7%BC%A9-requests-limits-HPA-%E4%B8%8E-VPA/">13 资源管理与自动伸缩</a></li>
+<li><a href="/2026/06/20/CRD-%E4%B8%8E-Operator-%E6%A8%A1%E5%BC%8F-%E6%89%A9%E5%B1%95-Kubernetes-%E7%9A%84%E6%A0%87%E5%87%86%E8%B7%AF%E5%BE%84/">14 CRD 与 Operator 模式</a></li>
+<li><a href="/2026/06/20/Helm-%E4%B8%8E%E5%BA%94%E7%94%A8%E6%89%93%E5%8C%85-%E4%BB%8E-YAML-%E5%88%B0%E5%8F%AF%E5%A4%8D%E7%94%A8%E5%88%B6%E5%93%81/">15 Helm 与应用打包</a></li>
+<li><a href="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/">16 可观测性</a></li>
+<li><a href="/2026/06/20/%E7%94%9F%E4%BA%A7%E9%9B%86%E7%BE%A4%E8%BF%90%E7%BB%B4-%E5%8D%87%E7%BA%A7-%E5%A4%87%E4%BB%BD-%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5%E4%B8%8E%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92/">17 生产集群运维</a></li>
+</ul>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>etcd Documentation: <a target="_blank" rel="noopener" href="https://etcd.io/docs/">https://etcd.io/docs/</a></li>
+<li>etcd Data Model (MVCC internals): <a target="_blank" rel="noopener" href="https://etcd.io/docs/v3.5/learning/data_model/">https://etcd.io/docs/v3.5/learning/data_model/</a></li>
+<li>Kubernetes etcd Cluster Administration: <a target="_blank" rel="noopener" href="https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/">https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/</a></li>
+<li>Raft Extended Paper: <a target="_blank" rel="noopener" href="https://raft.github.io/raft.pdf">https://raft.github.io/raft.pdf</a></li>
+<li>etcd Raft Implementation: <a target="_blank" rel="noopener" href="https://github.com/etcd-io/raft">https://github.com/etcd-io/raft</a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/">https://magicliang.github.io/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E4%BA%91%E5%8E%9F%E7%94%9F/">云原生</a><a class="post-meta__tags" href="/tags/Kubernetes/">Kubernetes</a><a class="post-meta__tags" href="/tags/etcd/">etcd</a></div><div class="post-share"><div class="social-share" data-image="/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/20/API-Server-%E4%B8%8E%E5%A3%B0%E6%98%8E%E5%BC%8F-API-%E4%B8%80%E5%88%87%E7%9A%86%E8%B5%84%E6%BA%90/" title="API Server 与声明式 API：一切皆资源"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/API-Server-%E4%B8%8E%E5%A3%B0%E6%98%8E%E5%BC%8F-API-%E4%B8%80%E5%88%87%E7%9A%86%E8%B5%84%E6%BA%90/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">API Server 与声明式 API：一切皆资源</div></div><div class="info-2"><div class="info-item-1">上一篇（核心概念导读）描述了 Kubernetes 的对象体系和控制器循环。这一篇进入 API Server 内部。API Server 不是普通的 HTTP 代理；它是整个集群的唯一写入路径，也是所有控制器、kubelet、用户工具共享的信息总线。 声明式 API 经常被描述为&quot;说你想要什么，而不是怎么做&quot;。这个描述准确，但不完整。Kubernetes 的声明式 API 背后有一套精确的语义：冲突检测、字段所有权、幂等写入。理解这些语义，才能解释为什么 kubectl apply 不是简单的 HTTP PUT。 本文只问一个问题：一个 apply 请求经过了哪些关卡？ 请求管道全貌 一个 kubectl apply 请求从客户端到 etcd 的完整路径： 12345678910111213141516171819202122232425262728kubectl apply -f deployment.yaml        │        │  HTTPS (mTLS)        ▼┌─────────────────────────────────...</div></div></div></a><a class="pagination-related" href="/2026/06/20/RBAC-%E4%B8%8E%E5%AE%89%E5%85%A8%E6%A8%A1%E5%9E%8B-%E8%AE%A4%E8%AF%81-%E6%8E%88%E6%9D%83%E4%B8%8E%E5%87%86%E5%85%A5%E6%8E%A7%E5%88%B6/" title="RBAC 与安全模型：认证、授权与准入控制"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/RBAC-%E4%B8%8E%E5%AE%89%E5%85%A8%E6%A8%A1%E5%9E%8B-%E8%AE%A4%E8%AF%81-%E6%8E%88%E6%9D%83%E4%B8%8E%E5%87%86%E5%85%A5%E6%8E%A7%E5%88%B6/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">RBAC 与安全模型：认证、授权与准入控制</div></div><div class="info-2"><div class="info-item-1">密钥只有在有效的访问控制下才有意义。Kubernetes 的安全控制分三层：认证（谁在访问）、授权（能做什么）、准入控制（允许什么操作）。三层各有职责，缺一不可。 在单体应用时代，安全通常集中在网络边界和数据库访问控制。容器化和微服务之后，工作负载数量激增，身份变得复杂：一个 Pod 就是一个独立的执行主体，可能需要读取 Secret、调用其他服务、操作集群资源。Kubernetes 的安全模型由哪三个层次组成、RBAC 的 Role/RoleBinding/ClusterRole/ClusterRoleBinding 如何组合使用，是本篇的核心内容。 三层安全模型 12345678910111213141516171819202122232425262728293031323334请求到达 API Server     │     ▼┌──────────────────────────────────┐│  1. Authentication（谁？）        ││  ────────────────────────────    ││  X.509 cert   → U...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/" title="可观测性——Metrics、Logging、Tracing 的集群实践"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">可观测性——Metrics、Logging、Tracing 的集群实践</div></div><div class="info-2"><div class="info-item-1">一个运行在 Kubernetes 上的分布式系统，出问题时最难回答的问题是&quot;发生了什么&quot;。单机时代，登录服务器查看进程状态和日志文件，基本能还原现场。容器化之后，Pod 随时可能被调度到不同节点，崩溃后立即重启，原始日志消失，这套方法彻底失效。可观测性（Observability）是对这个问题的系统性回答：通过在系统内部埋点、采集、存储和展示三类信号——Metrics（指标）、Logging（日志）、Tracing（链路追踪）——让工程师在不登录服务器的情况下理解系统行为。 Kubernetes 本身对可观测性有明确的架构分工。采集点（kubelet 内嵌的 cAdvisor、node-exporter DaemonSet、应用 SDK）由各组件负责暴露，聚合层（Prometheus、metrics-server）负责拉取和存储，展示层（Grafana、Jaeger UI）负责查询和可视化。这种&quot;采集点内建、存储和展示留给生态&quot;的设计，让 Kubernetes 本身保持简洁，同时允许不同规模的集群选择不同的存储方案。 理解可观测性的关键区分...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/" title="Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS</div></div><div class="info-2"><div class="info-item-1">Service 的 ClusterIP 是一个不存在于任何网卡的虚拟 IP。在节点上运行 ip addr，看不到它；用 ping 测试，收不到回应；但对它发起 TCP 连接，数据却能稳定到达某个后端 Pod。这个&quot;幽灵 IP&quot;能够工作，完全依赖 kube-proxy 写入每个节点内核的 iptables 或 IPVS 规则——规则在，转发在；规则消失，连接消失。 理解这一机制的起点是区分两种截然不同的角色：kube-proxy 是&quot;规则维护者&quot;，内核的 netfilter/IPVS 子系统才是&quot;数据面执行者&quot;。kube-proxy 进程本身从不处理任何用户请求，它只监听 kube-apiserver 上 Service 和 EndpointSlice 的变化，把这些变化翻译成内核规则，然后等待下一次变化。真正处理数据包的是内核——每个到达某 ClusterIP:port 的数据包，在经过 iptables nat 表的 PREROUTING 链时，被 DNAT 规则改写目标地址，转向某个真实的 Pod IP:port，整...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E8%B5%84%E6%BA%90%E7%AE%A1%E7%90%86%E4%B8%8E%E8%87%AA%E5%8A%A8%E4%BC%B8%E7%BC%A9-requests-limits-HPA-%E4%B8%8E-VPA/" title="资源管理与自动伸缩：requests、limits、HPA 与 VPA"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E8%B5%84%E6%BA%90%E7%AE%A1%E7%90%86%E4%B8%8E%E8%87%AA%E5%8A%A8%E4%BC%B8%E7%BC%A9-requests-limits-HPA-%E4%B8%8E-VPA/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">资源管理与自动伸缩：requests、limits、HPA 与 VPA</div></div><div class="info-2"><div class="info-item-1">安全模型控制谁能做什么，资源管理控制能用多少。这两个维度共同决定了集群的多租户能力。requests 和 limits 是 Kubernetes 资源模型的基础，理解它们的精确语义是做好容量规划的前提。HPA 和 VPA 在此基础上提供了自动化的弹性能力。 在传统物理机和虚拟机时代，资源隔离靠硬件分区或 hypervisor，资源弹性靠人工扩容。Kubernetes 把资源管理内置为一等公民，通过 cgroup 在内核层面强制执行，通过控制器实现自动化弹性。这一篇的核心问题是：requests 和 limits 如何影响调度和运行时行为，HPA 和 VPA 如何根据负载自动伸缩？ 资源模型全景 1234567891011121314151617181920212223242526调度时（kube-scheduler）  ┌────────────────────────────────────────────────────────────┐  │  Node Allocatable = Node Capacity - System Reserved        │  │  ─...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/" title="调度器深入：打分、抢占与拓扑约束"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">调度器深入：打分、抢占与拓扑约束</div></div><div class="info-2"><div class="info-item-1">调度器（kube-scheduler）是 Kubernetes 控制平面里最容易被低估的组件。它做的事情看起来简单：把没有 nodeName 的 Pod 绑定到某个节点。但&quot;选哪个节点&quot;这个问题背后，隐藏着资源感知、亲和性约束、拓扑分散、优先级抢占等多维度的决策过程。 从 Kubernetes 1.19 起，调度器的内部逻辑通过 Scheduling Framework 对外暴露为一组扩展点。原来散落在代码各处的调度逻辑被重新组织成插件，每个插件只负责一个扩展点。这让调度行为既可预测，又可扩展。 本文的核心问题是：Kubernetes 调度器用什么框架选节点，当资源不足时如何通过抢占让高优先级 Pod 运行？ 调度框架全景图 1234567891011121314151617181920212223242526Pod pending (no nodeName)     │     ▼  Scheduler（from ActiveQ by priority）  ┌──────────────────────────────────────────────────...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#etcd-%E5%9C%A8%E9%9B%86%E7%BE%A4%E4%B8%AD%E7%9A%84%E4%BD%8D%E7%BD%AE"><span class="toc-number">1.</span> <span class="toc-text">etcd 在集群中的位置</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#raft-%E5%9F%BA%E7%A1%80%EF%BC%9A%E5%86%99%E5%85%A5%E5%A6%82%E4%BD%95%E8%BE%BE%E5%88%B0%E5%BC%BA%E4%B8%80%E8%87%B4"><span class="toc-number">2.</span> <span class="toc-text">Raft 基础：写入如何达到强一致</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#leader-election"><span class="toc-number">2.1.</span> <span class="toc-text">Leader Election</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#log-replication-%E4%B8%8E-quorum-commit"><span class="toc-number">2.2.</span> <span class="toc-text">Log Replication 与 Quorum Commit</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#etcd-mvcc%EF%BC%9A%E7%89%88%E6%9C%AC%E5%8C%96%E5%AD%98%E5%82%A8%E7%9A%84%E6%A0%B8%E5%BF%83"><span class="toc-number">3.</span> <span class="toc-text">etcd MVCC：版本化存储的核心</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#kubernetes-%E5%AF%B9%E8%B1%A1%E5%9C%A8-etcd-%E4%B8%AD%E7%9A%84%E5%AD%98%E5%82%A8%E5%B8%83%E5%B1%80"><span class="toc-number">4.</span> <span class="toc-text">Kubernetes 对象在 etcd 中的存储布局</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#watch-%E5%8E%9F%E7%90%86%EF%BC%9A%E5%9F%BA%E4%BA%8E-revision-%E7%9A%84%E6%B5%81%E5%BC%8F%E6%8E%A8%E9%80%81"><span class="toc-number">5.</span> <span class="toc-text">Watch 原理：基于 Revision 的流式推送</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#list-watch-%E5%88%86%E7%A6%BB%EF%BC%9A%E9%81%BF%E5%85%8D%E5%85%A8%E9%87%8F%E9%87%8D%E4%BC%A0%E7%9A%84%E6%A0%B8%E5%BF%83%E8%AE%BE%E8%AE%A1"><span class="toc-number">6.</span> <span class="toc-text">List-Watch 分离：避免全量重传的核心设计</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#lease%EF%BC%9A%E8%BD%BB%E9%87%8F%E7%BA%A7%E5%BF%83%E8%B7%B3%E6%9C%BA%E5%88%B6"><span class="toc-number">7.</span> <span class="toc-text">Lease：轻量级心跳机制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#compaction-%E4%B8%8E-defrag%EF%BC%9A%E7%A9%BA%E9%97%B4%E7%AE%A1%E7%90%86"><span class="toc-number">8.</span> <span class="toc-text">Compaction 与 Defrag：空间管理</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%AF%E8%A7%82%E5%AF%9F%E5%AE%9E%E9%AA%8C"><span class="toc-number">9.</span> <span class="toc-text">可观察实验</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%E6%98%A0%E5%B0%84%E5%88%B0%E5%86%85%E9%83%A8%E6%9C%BA%E5%88%B6"><span class="toc-number">10.</span> <span class="toc-text">实验映射到内部机制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">11.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">12.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">13.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">14.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">15.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">16.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.5</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.5"></script><script src="/js/main.js?v=5.5.5"></script><script src="/js/tw_cn.js?v=5.5.5"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || item.innerHTML || ""
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    if (e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : window.location.href = e.request.responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.5.5"></script></div></div></body></html>

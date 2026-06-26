@@ -1,0 +1,780 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>网络模型与 CNI：每个 Pod 一个 IP 背后的实现 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="Kubernetes 对网络做出了一个看似简单的承诺：每个 Pod 拥有一个集群范围内唯一的可路由 IP，Pod 之间无需 NAT 可直接通信，节点访问 Pod 也无需 NAT。三条规则，没有一条涉及实现细节。这种&quot;定义行为、不定义机制&quot;的风格与 Kubernetes 整体的设计哲学一致，但也意味着没有任何一行核心代码实现了这个承诺——它完全由 CNI 插件负责兑现。 理解 C">
+<meta property="og:type" content="article">
+<meta property="og:title" content="网络模型与 CNI：每个 Pod 一个 IP 背后的实现">
+<meta property="og:url" content="https://magicliang.github.io/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="Kubernetes 对网络做出了一个看似简单的承诺：每个 Pod 拥有一个集群范围内唯一的可路由 IP，Pod 之间无需 NAT 可直接通信，节点访问 Pod 也无需 NAT。三条规则，没有一条涉及实现细节。这种&quot;定义行为、不定义机制&quot;的风格与 Kubernetes 整体的设计哲学一致，但也意味着没有任何一行核心代码实现了这个承诺——它完全由 CNI 插件负责兑现。 理解 C">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/cover.svg">
+<meta property="article:published_time" content="2026-06-20T02:07:00.000Z">
+<meta property="article:modified_time" content="2026-06-24T14:18:39.367Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="CNI">
+<meta property="article:tag" content="Kubernetes">
+<meta property="article:tag" content="云原生">
+<meta property="article:tag" content="容器">
+<meta property="article:tag" content="网络">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "网络模型与 CNI：每个 Pod 一个 IP 背后的实现",
+  "url": "https://magicliang.github.io/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/",
+  "image": "https://magicliang.github.io/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/cover.svg",
+  "datePublished": "2026-06-20T02:07:00.000Z",
+  "dateModified": "2026-06-24T14:18:39.367Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.5"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.2.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '网络模型与 CNI：每个 Pod 一个 IP 背后的实现',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">492</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">548</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">8</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">网络模型与 CNI：每个 Pod 一个 IP 背后的实现</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">网络模型与 CNI：每个 Pod 一个 IP 背后的实现</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-06-20T02:07:00.000Z" title="Created 2026-06-20 10:07:00">2026-06-20</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-06-24T14:18:39.367Z" title="Updated 2026-06-24 22:18:39">2026-06-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%9F%BA%E7%A1%80%E8%AE%BE%E6%96%BD/">基础设施</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">12.4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>43mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-06-24 22:18:39&quot;}" hidden></div><p>Kubernetes 对网络做出了一个看似简单的承诺：每个 Pod 拥有一个集群范围内唯一的可路由 IP，Pod 之间无需 NAT 可直接通信，节点访问 Pod 也无需 NAT。三条规则，没有一条涉及实现细节。这种&quot;定义行为、不定义机制&quot;的风格与 Kubernetes 整体的设计哲学一致，但也意味着没有任何一行核心代码实现了这个承诺——它完全由 CNI 插件负责兑现。</p>
+<p>理解 CNI 的切入点不是插件本身，而是 Linux 网络命名空间带来的问题。每个容器拥有独立的网络栈，包含独立的路由表、ARP 缓存、iptables 规则集。新建的命名空间里只有一个回环接口 <code>lo</code>，对外完全不可达——这正是容器隔离的本意。CNI 插件的全部工作就是在这种隔离性上凿出一条通道：创建 veth pair，把一端移入 Pod 命名空间，另一端挂到宿主机网桥，配置 IP 地址和路由，让 Pod 从完全隔离的孤岛变成集群网络里的一个节点。</p>
+<p>跨节点通信是第二层复杂性。同节点内的 Pod 通过共享网桥即可互通，但当数据包需要离开宿主机的物理网卡，穿越真实的交换机和路由器，抵达另一台节点，再精准地找到目标 Pod 的网络命名空间，就需要更多机制的介入。不同 CNI 插件的核心差异恰在这里：Flannel 选择 VXLAN overlay，把 Pod 网络帧封装进 UDP；Calico 选择 BGP，把每个节点变成路由器，直接通告 Pod 子网；Cilium 选择 eBPF，在内核数据路径上直接完成转发，绕过 iptables 和 netfilter 的整个处理链路。</p>
+<h2 id="数据流全景">数据流全景</h2>
+<figure class="highlight scss"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br></pre></td><td class="code"><pre><code class="hljs scss">Pod <span class="hljs-selector-tag">A</span> (ns: netns-a)        Node <span class="hljs-number">1</span>                          Node <span class="hljs-number">2</span><br>eth0 (<span class="hljs-number">10.244</span>.<span class="hljs-number">1.2</span>)          cni0 (<span class="hljs-number">10.244</span>.<span class="hljs-number">1.1</span>)               cni0 (<span class="hljs-number">10.244</span>.<span class="hljs-number">2.1</span>)<br>  │                         │             │                  │              │<br>  └── veth-a0 (宿主机端) ───┘             │                  └── veth-b0 ──┘<br>                                          │                                 │<br>                                   flannel<span class="hljs-selector-class">.1</span> (VTEP)                flannel<span class="hljs-selector-class">.1</span> (VTEP)<br>                                   VXLAN UDP <span class="hljs-number">8472</span> ────────────────►<br>                                          │                                 │<br>                                   Node1 eth0                       Node2 eth0<br>                                   (<span class="hljs-number">192.168</span>.<span class="hljs-number">10.1</span>)                   (<span class="hljs-number">192.168</span>.<span class="hljs-number">10.2</span>)<br><br>同节点通信路径：<br>  Pod <span class="hljs-selector-tag">A</span> eth0 → veth-a0 → cni0 bridge → veth-b0 → Pod <span class="hljs-selector-tag">B</span> eth0<br>  (纯 L2 交换，不经过 IP 路由)<br><br>跨节点通信路径 (Flannel VXLAN)：<br>  Pod <span class="hljs-selector-tag">A</span> eth0 → veth-a0 → cni0 → flannel<span class="hljs-selector-class">.1</span> (VXLAN 封装)<br>  → Node1 eth0 → 物理网络 → Node2 eth0<br>  → flannel<span class="hljs-selector-class">.1</span> (VXLAN 解封装) → cni0 → veth-b0 → Pod <span class="hljs-selector-tag">B</span> eth0<br><br>跨节点通信路径 (Calico BGP)：<br>  Pod <span class="hljs-selector-tag">A</span> eth0 → veth-a0 → Node1 路由表 (BGP 注入: <span class="hljs-number">10.244</span>.<span class="hljs-number">2.0</span>/<span class="hljs-number">24</span> via Node2)<br>  → Node1 eth0 → 物理网络 → Node2 eth0<br>  → Node2 路由表 → veth-b0 → Pod <span class="hljs-selector-tag">B</span> eth0<br>  (无封装，每跳均为标准三层转发)<br></code></pre></td></tr></table></figure>
+<h2 id="kubernetes-网络模型的三条规则">Kubernetes 网络模型的三条规则</h2>
+<p>K8s 网络规范不规定任何实现，只规定行为约束，任何 CNI 实现必须满足这三条：</p>
+<p>第一条，所有 Pod 之间通信不经过 NAT。Pod A 向 Pod B 发出的数据包，源 IP 和目的 IP 在整个路径上保持不变。这排除了 Docker 默认 bridge 模式里用宿主机 IP + 端口映射访问容器的模型——在那个模型里，容器 IP 在宿主机外不可见，跨主机容器通信需要在宿主机 IP 上做 DNAT/SNAT，源 IP 会变。K8s 明确禁止这种行为，要求 Pod IP 本身是集群范围可路由的一等公民。</p>
+<p>第二条，节点到 Pod 的通信不经过 NAT。运维人员从节点上直接 <code>curl &lt;pod-ip&gt;</code> 可以正常工作，Pod 收到请求时看到的来源 IP 就是节点 IP，而不是某个经过 SNAT 变换后的地址。这条规则保证了集群内的 Pod 可以准确识别连接来源，对基于 IP 的访问控制和审计日志至关重要。</p>
+<p>第三条，Pod 自己看到的 IP（<code>ip addr</code> 输出的 eth0 地址）与外部看到的 IP 相同。这条规则排除了&quot;容器内部有一套私有 IP，外部通过另一套 IP 访问&quot;的双映射情形，比如某些 NAT 穿透场景里容器不知道自己的公网 IP。K8s 要求 Pod 对自身 IP 的感知与真实路由一致。</p>
+<p>三条规则合在一起，定义了一个扁平的三层网络语义。底层可以是 VXLAN overlay、BGP 直路由、eBPF 转发或任何其他技术，只要最终行为符合这三条，就是合法的 CNI 实现。实现者在三层规则之上可以自由选择技术路线，调用方（kubelet、scheduler、kube-proxy）无需关心底层网络实现细节。</p>
+<h2 id="cni-规范：接口而非实现">CNI 规范：接口而非实现</h2>
+<p>CNI（Container Network Interface）是 CNCF 托管的一份轻量规范，核心是三个操作：<code>ADD</code>、<code>DEL</code>、<code>CHECK</code>。</p>
+<p><code>ADD</code> 操作：为容器分配网络资源。调用方传入容器 ID、网络命名空间路径（<code>/var/run/netns/XXX</code>）、网络接口名（通常是 <code>eth0</code>）以及 CNI 配置 JSON；插件在命名空间里创建网络接口，分配 IP，配置路由，把分配结果写回 stdout（包含 IP、网关、DNS 配置的结果 JSON）。ADD 的执行是同步的，完成后 Pod 网络即可用。</p>
+<p><code>DEL</code> 操作：释放容器的网络资源。Pod 被删除时调用，清理 veth 设备、IP 分配记录、路由规则等所有 ADD 时写入的内容。DEL 需要幂等——Pod 可能因为各种原因被多次调用 DEL，插件需要能正确处理&quot;资源已不存在&quot;的情形，而不是报错。</p>
+<p><code>CHECK</code> 操作：验证容器网络配置与 ADD 时的预期是否一致，供运行时健康检查使用。如果检查发现网络配置与预期不符（比如 veth 被意外删除），CHECK 返回错误，运行时可以触发修复流程。</p>
+<p>调用约定是纯 Unix 进程约定，没有守护进程、没有 socket 通信。kubelet（通过容器运行时接口 CRI）在 <code>/opt/cni/bin/</code> 里直接 exec 插件二进制，通过环境变量传递容器 ID、命名空间路径等参数，通过 stdin 传递配置 JSON，读取 stdout 的结果 JSON。插件执行时间计入 Pod 启动延迟；如果插件卡住，Pod 启动就会超时并重试。</p>
+<p>CNI 配置文件放在 <code>/etc/cni/net.d/</code>，按字典序选第一个文件（或 conflist 文件）。配置支持插件链：一个 <code>conflist</code> 文件里列多个插件，按顺序调用，前一个的输出作为后一个的输入。主插件（<code>ptp</code>/<code>bridge</code>/<code>macvlan</code>）负责创建网络设备和分配 IP，辅助插件（<code>portmap</code> 做端口映射，<code>bandwidth</code> 做流量整形，<code>firewall</code> 做防火墙规则）在其后追加能力。这种链式组合使 CNI 在不修改主插件代码的前提下，可以叠加不同的网络能力。</p>
+<p>kubelet 调用 CNI 的时机严格绑定在 Pod 沙箱的生命周期上：沙箱（pause 容器）被 CRI 创建后立刻调用 ADD，沙箱被删除前调用 DEL。pause 容器是一个极简的占位容器，它的唯一作用是持有 Pod 的网络命名空间，让其他业务容器可以加入同一个命名空间共享网络栈。CNI 看到的网络命名空间始终是 pause 容器的命名空间，而不是业务容器的命名空间。</p>
+<h2 id="linux-网络原语：veth-pair-与网桥">Linux 网络原语：veth pair 与网桥</h2>
+<p>所有主流 CNI 插件都建立在两个 Linux 内核原语之上，理解这两个原语是理解整个 CNI 体系的基础。</p>
+<p>veth pair 是 Linux 内核提供的虚拟网络设备对，行为像一段管道：数据从一端进，必从另一端出，双向传输。veth pair 天然成对存在，创建时就是两端。创建命令是 <code>ip link add veth0 type veth peer name veth1</code>，之后两个设备分别代表管道的两端。CNI 插件在 ADD 时创建一个 veth pair，把 <code>eth0</code> 这一端用 <code>setns</code> 系统调用移入 Pod 的网络命名空间，另一端（通常命名为 <code>veth</code> 加随机十六进制，如 <code>veth3a7b9c</code>）留在宿主机的默认网络命名空间。</p>
+<p>从 Pod 内看，<code>eth0</code> 是一块独立的网卡，分配了 IP 地址，有自己的路由表。从宿主机看，<code>veth3a7b9c</code> 是一个普通的网络接口，Pod 发出的所有流量都从这里流出，进入宿主机的网络栈。两者之间的对应关系可以通过 <code>/sys/class/net/eth0/iflink</code> 里记录的接口序号来追踪——Pod 内的 eth0 会记录宿主机端的接口序号，反向也可以查。</p>
+<p>Linux bridge 是内核实现的 L2 软件交换机，行为与物理以太网交换机相同：维护一张 MAC 地址 → 端口的转发表（FDB），根据目标 MAC 地址转发帧。CNI 插件在宿主机上创建一个名为 <code>cni0</code> 的网桥，把所有 Pod 的 veth 宿主机端都 attach 到这个网桥上。当 Pod A 向 Pod B 发送数据帧，帧从 Pod A 的 eth0 出来，经 veth 进入宿主机，到达 <code>cni0</code> 网桥；网桥查 FDB 找到 Pod B 对应的 veth 端口，把帧转发出去，进入 Pod B 的 veth 另一端，最终到达 Pod B 的 eth0。整个过程在 L2 完成，不经过 IP 路由层，延迟极低。</p>
+<p><code>cni0</code> 网桥本身被赋予一个 IP 地址（如 <code>10.244.1.1/24</code>），作为该节点上所有 Pod 的默认网关。Pod 内的路由表只有一条默认路由指向这个 IP，所有离开 Pod 的流量先到达网桥，由网桥决策：如果目标 MAC 是某个已知 Pod 的 MAC，在 L2 直接转发；如果目标不在本地，帧被发往网桥 IP 的三层路由处理，宿主机路由表决定下一跳。</p>
+<p>网桥在内核里的数据路径非常短：帧进入 veth 后直接到达 bridge 核心代码，完成 FDB 查找和转发，无需经过完整的 netfilter 链路（虽然 iptables 的 <code>br_netfilter</code> 模块可以让桥接流量也经过 iptables 规则，这在 kube-proxy 需要拦截 Pod 间流量时很重要）。</p>
+<h2 id="ipam：ip-地址管理">IPAM：IP 地址管理</h2>
+<p>IP 地址管理（IPAM，IP Address Management）是 CNI 规范里的一个重要子概念。IPAM 负责回答&quot;这个 Pod 应该分配哪个 IP&quot;的问题，以及记录哪些 IP 已被分配、哪些可用。IPAM 本身也是一个可插拔的子插件，在 CNI 配置的 <code>ipam</code> 字段里指定。</p>
+<p><code>host-local</code> 是最简单的 IPAM 实现，在节点本地文件系统（通常是 <code>/var/lib/cni/networks/</code>）里记录已分配的 IP。每次 ADD 时，读取已分配列表，找到下一个可用 IP，分配给 Pod，写入记录文件（以 IP 地址为文件名，内容是容器 ID）。DEL 时删除对应的文件，释放 IP。host-local 只在单节点范围内工作，不同节点之间相互独立——只要各节点的 PodCIDR 不重叠，就不会冲突。Flannel 使用 host-local IPAM，因为 Flannel 已经为每个节点分配了不重叠的 /24 子网，host-local 只需在这个 /24 范围内分配即可。</p>
+<p><code>calico-ipam</code> 是 Calico 的 IPAM 实现，通过 Calico 的 IPAM 控制器在集群级别管理 IP 分配，支持跨节点的 IP 池（IPPool）管理、IP 地址块（block）的动态分配和回收，以及基于 label 的 IP 策略（某些 namespace 的 Pod 从特定 IP 池分配）。calico-ipam 通过 Kubernetes API 或 etcd 存储 IP 分配状态，确保跨节点的全局唯一性。一个 Calico IPPool 可以跨越整个集群，IPAM 控制器按需把 IP 块分配给各节点，节点需要时再从自己的块里分配给 Pod。这种两层分配模式（全局池 → 节点块 → Pod IP）避免了大规模集群下的分配冲突，同时减少了控制面的通信开销。</p>
+<p><code>whereabouts</code> 是一个独立的 IPAM 插件，支持跨节点的 IP 范围管理，用 etcd 或 Kubernetes API 做分布式状态存储，适合不使用特定 CNI 但需要跨节点 IP 唯一性保证的场景（如 SR-IOV 网卡直通）。whereabouts 的设计目标是做一个&quot;厂商中立&quot;的集群级 IPAM，可以与任何 CNI 主插件配合，只负责 IP 分配这一件事。</p>
+<p>IPAM 分配失败是 Pod 启动失败的常见原因之一。当节点的 PodCIDR 耗尽（默认 /24 = 254 个可用 IP，减去网关等保留地址，约 252 个），后续 Pod ADD 调用会返回错误，Pod 停留在 ContainerCreating 状态。诊断方式：检查 <code>kubectl describe pod</code> 的 Events，看到 <code>failed to allocate for range 0: no IP addresses available in range set: ...</code> 即为 IPAM 耗尽。解决方式取决于 CNI 实现：Flannel 需要调整 PodCIDR 范围（kubeadm 的 <code>--pod-network-cidr</code> 参数），Calico 可以在线添加新的 IPPool。</p>
+<h2 id="flannel-vxlan-模式深入">Flannel VXLAN 模式深入</h2>
+<p>Flannel 是最早被广泛采用的 CNI 插件之一，设计目标是在任意 IP 网络上运行，不对底层网络做额外要求。只要节点间 UDP 8472 端口可通，Flannel VXLAN 就能工作。这种兼容性是 Flannel 最大的优势，也是它在早期 Kubernetes 采用率极高的原因。</p>
+<p>Flannel 的守护进程 <code>flanneld</code> 启动时从 kube-apiserver 读取节点对象，为每个节点分配一个 Pod 子网（由集群的 <code>--pod-cidr</code> 总范围切分，如每个节点分配一个 <code>/24</code> 子网），把分配结果写回节点的 annotation（<code>flannel.alpha.coreos.com/subnet</code>）。flanneld 持续 watch 节点对象，感知新节点加入和旧节点退出。当新节点加入时，flanneld 更新本节点内核的转发规则，让本节点能访问新节点的 Pod 子网；当旧节点退出时，清理对应的规则。</p>
+<p>VXLAN 的工作原理是把 L2 以太帧封装在 UDP/IP 报文里，通过 UDP 在 IP 网络上传输。封装格式：外层以太网头（14B）+ 外层 IP 头（20B）+ UDP 头（8B）+ VXLAN 头（8B）+ 原始 L2 帧。其中 VXLAN 头里的 VNI（VXLAN Network Identifier）用于区分不同的虚拟网络，Flannel 通常使用固定的 VNI 1。</p>
+<p>每个节点上有一个 VTEP（VXLAN Tunnel Endpoint）设备，通常命名为 <code>flannel.1</code>。当宿主机路由表把目标 Pod 子网的流量引向 <code>flannel.1</code>，该设备需要知道&quot;目标 VTEP 在哪个节点上&quot;才能封装外层 UDP 目标 IP。flanneld 通过 Netlink 接口把这个映射关系写入内核的两张表：</p>
+<p>第一张是 FDB 表（Forwarding Database）。FDB 里记录&quot;目标 VTEP 的 MAC → 远端节点的 IP（隧道终点）&quot;。当 <code>flannel.1</code> 需要封装一个发往远端 VTEP 的帧，先查 ARP 缓存得到目标 Pod 对应的 VTEP MAC，再查 FDB 得到该 MAC 对应的远端节点 IP，最后封装 UDP 包发出。</p>
+<p>第二张是 ARP 缓存（邻居表）。ARP 缓存里记录&quot;目标 Pod IP → 目标 VTEP 的 MAC&quot;。这是一个静态的、由 flanneld 维护的 ARP 表项，而不是通过 ARP 广播动态学习的。flanneld 在得知某个 Pod 子网归属于某个节点后，在 ARP 表里预先写入该子网所有可能的 Pod IP → 目标 VTEP MAC 的映射（或者在收到第一次查询时写入）。</p>
+<p>内核的 VXLAN 模块查这两张表完成封装，全程不进用户态。flanneld 不处理任何数据包，它只负责维护这两张内核表的状态。这与 kube-proxy 的职责模式完全对称：控制面守护进程维护内核规则，内核负责实际的数据面处理。</p>
+<p>VXLAN 封装带来额外开销：每个数据包增加约 50 字节头部，实际有效 MTU 从 1500 降低约到 1450。CNI 配置里的 <code>mtu</code> 参数需要与此匹配，否则大包会在封装后超过物理 MTU，被分片（fragmentation），引发性能下降。Flannel 在配置里默认设置 <code>&quot;mtu&quot;: 1450</code>，kubelet 会把这个值传给 Pod 内的 eth0。现代 Linux 内核（5.x+）对 VXLAN 有 hardware offload 支持，部分网卡可以在硬件层面完成 VXLAN 封装/解封装，大幅减少 CPU 开销。</p>
+<p>Flannel 本身不实现 NetworkPolicy。需要网络策略能力时，需要叠加 Calico 的网络策略组件（Canal 方案，即 Flannel 负责网络连通 + Calico 的 Felix 负责策略执行），或者直接迁移到支持 NetworkPolicy 的 CNI（Calico/Cilium/Weave）。</p>
+<p>Flannel 还有一种 <code>host-gw</code> 后端模式，完全不做封装：flanneld 在宿主机路由表里写入&quot;目标 Pod 子网 via 目标节点 IP&quot;的静态路由，数据包不经任何 VTEP，直接三层转发到对端节点。host-gw 性能接近裸金属，但要求所有节点在同一个 L2 域（能直接 ARP 互通），无法跨子网工作。</p>
+<h2 id="calico-bgp-模式深入">Calico BGP 模式深入</h2>
+<p>Calico 的核心设计思路是：不需要封装，直接用 IP 路由。每个节点运行 BIRD BGP 路由守护进程，通过 BGP 协议向其他节点（或上游路由器）通告本节点负责的 Pod 子网路由。</p>
+<p>BGP（Border Gateway Protocol）本是互联网骨干路由协议，Calico 把它用于数据中心内部的 Pod 网络路由通告。默认情况下，所有节点之间建立 BGP 全互联（full mesh）——每对节点互相通告路由，节点数量 N 时连接数为 N*(N-1)/2。节点数量超过 50-100 时，全互联的连接数和路由通告量会成为瓶颈，通常需要在几个节点上部署路由反射器（Route Reflector，RR），让其他节点只与 RR 建立 BGP 会话，由 RR 集中转发路由通告。Calico 提供了 <code>calico-node</code> 的 RR 模式，也支持与外部路由器（如 ToR 交换机）建立 BGP peering，把 Pod 路由通告到数据中心的骨干网络。</p>
+<p>数据包的跨节点路径在 Calico BGP 模式下：宿主机路由表有由 BIRD 注入的条目（标记 <code>proto bird</code>），如 <code>10.244.2.0/24 via 192.168.10.2 dev eth0</code>，直接把目标 Pod 子网的流量路由到对应节点的物理 IP；目标节点收到包，本地路由表有 <code>10.244.2.3 dev cali-xxxxxxxx</code>（Calico 用 <code>cali-</code> 前缀命名 veth），把包交给对应 Pod。整个路径里没有任何封装设备，每一跳都是标准的三层 IP 转发。</p>
+<p>Calico 对底层网络有要求：节点之间必须能做任意 IP 路由。在同一个 L2 域（同一个 VLAN/交换机）里的节点可以直接路由；跨 L3 边界时，底层路由器需要学习到 Calico 的 Pod 子网路由（通过 BGP peering 与边界路由器建立会话）。在公有云 VPC 里，通常不允许自定义路由协议，节点也可能跨可用区，这时 Calico 会自动检测并回退到 IPIP 或 VXLAN 封装模式。IPIP 封装比 VXLAN 开销小（只增加 20 字节 IP 头），在需要封装的场景下是 Calico 的默认选择。</p>
+<p>Calico 原生支持 NetworkPolicy，每个节点上的 Felix 守护进程 watch Kubernetes NetworkPolicy 和 Calico 自定义的 NetworkPolicy 资源，把策略转译为 iptables（或 eBPF）规则链写入内核。Felix 的同步是增量的：策略变更只更新对应的 iptables 链，不需要全量重写所有规则，在策略规则多时效率明显优于 kube-proxy 的全量同步。Calico 的 NetworkPolicy 还扩展了 Kubernetes 原生 NetworkPolicy 的表达能力：支持 FQDN（基于域名的出口策略）、支持基于 ServiceAccount 的策略、支持全局策略（GlobalNetworkPolicy，跨命名空间生效）。</p>
+<p>Calico 在宿主机上还会为每个 Pod 创建一个 proxy_arp 接口（将对应 veth 的 proxy_arp 设为 1），使得宿主机代理 Pod 的 ARP 请求。Pod 内只有一条默认路由指向网关地址（通常是 <code>169.254.1.1</code>，一个 link-local 地址），这个地址实际上被 veth 宿主机端的 proxy_arp 响应，从而把 Pod 的所有出口流量都引导到宿主机路由表。这种设计不需要网桥设备（cni0），减少了一层 L2 转发。</p>
+<h2 id="cilium-ebpf-模式深入">Cilium eBPF 模式深入</h2>
+<p>Cilium 代表了最新一代的 CNI 实现路径。它不依赖 iptables，而是把网络处理逻辑写成 eBPF 程序，加载到内核的 TC（Traffic Control）钩子和 XDP（eXpress Data Path）钩子上，在内核数据路径里直接完成路由、NAT、连接追踪、负载均衡等操作，完全绕过了 netfilter/iptables 的处理链路。</p>
+<p>eBPF（extended Berkeley Packet Filter）的核心机制是：程序被编译成字节码，经过内核的 Verifier 做安全验证（确保不存在无限循环、越界访问等危险操作），再由 JIT（Just-In-Time）编译器转为原生机器指令执行。eBPF 程序加载到内核后，运行时性能接近内核模块，但不需要修改内核代码，且可以动态加载和更新——Cilium 可以在不重启节点的情况下升级网络策略和转发逻辑。</p>
+<p>eBPF Map 是 eBPF 程序与用户态之间共享的数据结构，存储在内核内存里，支持多种类型（哈希表、数组、LRU 哈希等）。Cilium 用 eBPF Map 存储路由信息（目标 Pod IP → 目标 veth 接口）、Service 到 Pod 的映射、网络策略规则、连接追踪状态等，所有数据结构都在内核内存里，数据路径处理时无需用户态到内核态的切换。</p>
+<p>Cilium 的转发路径具体分为两条：</p>
+<p>TC 钩子（Traffic Control hook）挂在网络设备的 ingress/egress 路径上，每个 veth 接口的 tc ingress 和 tc egress 都可以挂 eBPF 程序。数据包进入 veth 时，tc ingress 程序做策略检查（NetworkPolicy）、路由查找（目标是本节点 Pod 还是远端）；数据包离开 veth 时，tc egress 程序做 SNAT/DNAT 处理。对于同节点 Pod 间通信，Cilium 可以通过 <code>redirect</code> 指令在两个 veth 之间直接转发，完全绕过 IP 路由层，延迟极低。</p>
+<p>XDP 钩子（eXpress Data Path）挂在网卡驱动层，是最早的数据包处理点，比 TC 还要早。Cilium 把 XDP 用于 NodePort 和 LoadBalancer 的快速路径：外部包进入网卡后，XDP 程序直接做 DNAT，把目标 IP 改写为 Pod IP，再发给本地 Pod，全程不经过内核网络栈的其余部分，延迟极低。</p>
+<p>与 iptables 相比，Cilium 的优势体现在三个维度：查找效率（eBPF Map 哈希表 O(1) vs iptables 链遍历 O(n)）；同步效率（eBPF Map 支持原子更新 vs iptables 全量重写）；协议感知能力（eBPF 程序可以解析 HTTP/gRPC/Kafka 应用层协议，实现 L7 策略，iptables 只能处理 L3/L4 字段）。</p>
+<p>Cilium 还提供 Hubble，一个利用 eBPF 收集连接事件的可观测性层，提供 Pod 间流量的实时拓扑、请求延迟分布、错误率，不需要在应用里注入任何 sidecar。Hubble Relay 把各节点的 Hubble 数据汇聚成集群级别的视图，Hubble UI 提供交互式的服务依赖图。在需要服务网格可观测性但不想引入 Istio 复杂度的场景里，Cilium + Hubble 是一个有竞争力的替代方案。</p>
+<p>Cilium 对内核版本要求较高（建议 Linux 5.4+，部分特性需要 5.10+ 或 5.15+），且 eBPF 的调试工具（<code>bpftool</code>、<code>bpftrace</code>）与传统网络工具（<code>tcpdump</code>、<code>iptables -L</code>）不同，团队需要额外的知识投入。<code>bpftool prog list</code> 可以列出所有加载的 eBPF 程序，<code>bpftool map dump</code> 可以查看 eBPF Map 的内容，<code>cilium bpf ct list global</code> 可以查看 Cilium 的连接追踪表。</p>
+<h2 id="可运行实验">可运行实验</h2>
+<p>以下实验需要一个 kind 集群（<code>kind create cluster</code>）和节点访问权限（通过 <code>docker exec kind-control-plane</code>）。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 确认 CNI 配置文件（kind 使用 kindnet）</span><br>docker <span class="hljs-built_in">exec</span> kind-control-plane <span class="hljs-built_in">cat</span> /etc/cni/net.d/10-kindnet.conflist<br><br><span class="hljs-comment"># 列出宿主机上所有 veth 接口（每个 Pod 对应一个）</span><br>docker <span class="hljs-built_in">exec</span> kind-control-plane ip <span class="hljs-built_in">link</span> show <span class="hljs-built_in">type</span> veth<br><br><span class="hljs-comment"># 观察 cni0 网桥及其挂载的接口</span><br>docker <span class="hljs-built_in">exec</span> kind-control-plane ip <span class="hljs-built_in">link</span> show master cni0<br><br><span class="hljs-comment"># 启动一个测试 Pod</span><br>kubectl run nettest --image=busybox --restart=Never -- <span class="hljs-built_in">sleep</span> 3600<br>kubectl <span class="hljs-built_in">wait</span> --<span class="hljs-keyword">for</span>=condition=Ready pod/nettest --<span class="hljs-built_in">timeout</span>=60s<br><br><span class="hljs-comment"># 在 Pod 内查看网络接口和路由</span><br>kubectl <span class="hljs-built_in">exec</span> nettest -- ip addr show eth0<br>kubectl <span class="hljs-built_in">exec</span> nettest -- ip route<br><br><span class="hljs-comment"># 找到 Pod 的 veth 宿主机端</span><br><span class="hljs-comment"># 先获取 Pod 内 eth0 的 peer ifindex</span><br>kubectl <span class="hljs-built_in">exec</span> nettest -- <span class="hljs-built_in">cat</span> /sys/class/net/eth0/iflink<br><span class="hljs-comment"># 假设输出是 7，则在宿主机上找对应接口</span><br>docker <span class="hljs-built_in">exec</span> kind-control-plane ip <span class="hljs-built_in">link</span> show | grep <span class="hljs-string">&quot;^7:&quot;</span><br><br><span class="hljs-comment"># 验证 K8s 网络模型：跨 Pod 通信无 NAT</span><br>kubectl run nettest2 --image=busybox --restart=Never -- <span class="hljs-built_in">sleep</span> 3600<br>kubectl <span class="hljs-built_in">wait</span> --<span class="hljs-keyword">for</span>=condition=Ready pod/nettest2 --<span class="hljs-built_in">timeout</span>=60s<br>POD2_IP=$(kubectl get pod nettest2 -o jsonpath=<span class="hljs-string">&#x27;&#123;.status.podIP&#125;&#x27;</span>)<br><br><span class="hljs-comment"># 在 nettest 内 ping nettest2，源 IP 就是 nettest 的 Pod IP，无 SNAT</span><br>kubectl <span class="hljs-built_in">exec</span> nettest -- ping -c 3 <span class="hljs-string">&quot;<span class="hljs-variable">$POD2_IP</span>&quot;</span><br><br><span class="hljs-comment"># 在宿主机上抓 cni0 接口的包，验证 Pod IP 直接可见（无 NAT 变换）</span><br>docker <span class="hljs-built_in">exec</span> kind-control-plane <span class="hljs-built_in">timeout</span> 10 tcpdump -i cni0 -n icmp 2&gt;/dev/null | <span class="hljs-built_in">head</span> -20<br><br><span class="hljs-comment"># 查看宿主机路由表，找到 CNI 注入的 Pod 子网路由</span><br>docker <span class="hljs-built_in">exec</span> kind-control-plane ip route<br><br><span class="hljs-comment"># 查看 IPAM 本地分配记录（kindnet/Flannel 用 host-local）</span><br>docker <span class="hljs-built_in">exec</span> kind-control-plane <span class="hljs-built_in">ls</span> /var/lib/cni/networks/<br><br><span class="hljs-comment"># 清理</span><br>kubectl delete pod nettest nettest2<br></code></pre></td></tr></table></figure>
+<h2 id="实验结果映射">实验结果映射</h2>
+<p><code>ip link show type veth</code> 列出的每个接口对应一个运行中的 Pod。数量应与 <code>kubectl get pods -A --field-selector=status.phase=Running | wc -l</code> 的 Pod 数量基本一致（包含系统 Pod）。</p>
+<p><code>ip link show master cni0</code> 列出挂载到网桥的所有接口。同一节点上所有 Pod 的 veth 宿主机端都出现在这里，每个接口对应一个 Pod。网桥充当节点上 Pod 间的&quot;局域网交换机&quot;。</p>
+<p><code>/sys/class/net/eth0/iflink</code> 里读到的数字是 veth pair 宿主机端的接口序号（ifindex）。在宿主机上 <code>ip link show | grep &quot;^&lt;ifindex&gt;:&quot;</code> 可以找到对应的接口名，确认 Pod 的 eth0 与宿主机上的哪个 veth 是一对。这是在不依赖任何额外工具的情况下追踪 veth pair 对应关系的方法。</p>
+<p><code>ip route</code> 在宿主机上的输出里，<code>10.244.X.0/24 dev cni0</code> 是本节点 Pod 子网的路由（流量留在本地，走网桥），<code>10.244.Y.0/24 via X.X.X.X dev flannel.1</code>（Flannel 模式）或 <code>10.244.Y.0/24 via X.X.X.X dev eth0</code>（Calico BGP 模式）是其他节点 Pod 子网的路由。这两类路由的区分就是 CNI 插件跨节点转发机制的直接体现——前者不离开本节点，后者需要跨物理网络。</p>
+<p>tcpdump 在 <code>cni0</code> 上抓到的 ICMP 包，源 IP 和目标 IP 与 Pod IP 完全一致，没有任何 SNAT/DNAT 的痕迹，直接验证了 K8s 网络模型的&quot;无 NAT&quot;承诺。如果在 <code>eth0</code> 上同时抓包（Flannel VXLAN 模式），能看到 VXLAN 封装的 UDP 报文——外层是节点 IP，内层才是 Pod IP，对比两个接口的抓包结果可以直观感受封装的工作方式。</p>
+<p><code>/var/lib/cni/networks/</code> 里的文件是 host-local IPAM 的分配记录，每个文件名是已分配的 IP，内容是占用该 IP 的容器 ID。删除一个 Pod 后，对应的文件被删除，IP 被释放。如果 kubelet 异常终止（节点断电、OOM kill），host-local 的文件可能残留，导致 IP 泄漏（该 IP 无法再分配，直到手动清理或重启 kubelet 触发 CNI DEL）。</p>
+<h2 id="模式提炼">模式提炼</h2>
+<p>CNI 是&quot;网络命名空间的注册中心&quot;。Pod 被创建时，kubelet 触发 CNI ADD，插件把 Pod 的网络命名空间注册进集群网络拓扑；Pod 被删除时，kubelet 触发 CNI DEL，插件注销这个命名空间。整个过程是同步的、事务性的：ADD 失败则 Pod 创建失败，DEL 失败则留有资源泄漏。</p>
+<p>这种插件化设计把网络实现从 Kubernetes 核心完全解耦，让不同环境使用最适合自己的网络方案，而对上层的 Pod 调度和 Service 访问保持透明。调度器决定 Pod 放在哪个节点时，只需要知道节点剩余容量和 PodCIDR，不需要了解该节点用的是 VXLAN 还是 BGP。</p>
+<p>三个主流 CNI 的取舍：兼容性（Flannel 最好，任意 IP 网络均可工作）、性能上限（Calico BGP 无封装在 IDC 可控网络里最好，Cilium eBPF 在高并发短连接下优势最显著）、能力广度（Cilium 最广，L7 策略、完整可观测性、kube-proxy 替代、服务网格能力一体化）。三个维度彼此制衡，没有在所有场景下同时占优的选项。</p>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>传统技术 / Docker 概念</th>
+<th>Kubernetes CNI 对应物</th>
+<th>差异说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Docker 默认 bridge（172.17.0.0/16，单节点，有 SNAT）</td>
+<td>Pod 网络（集群范围 IP，无 NAT）</td>
+<td>K8s Pod IP 跨节点可路由，Docker 默认不可路由</td>
+</tr>
+<tr>
+<td>Docker overlay（Swarm 内置 VXLAN）</td>
+<td>Flannel VXLAN</td>
+<td>概念相同，Flannel 由 kube-apiserver 协调，不依赖 Swarm</td>
+</tr>
+<tr>
+<td>Linux bridge <code>docker0</code></td>
+<td><code>cni0</code> 网桥</td>
+<td>角色相同，CNI 创建，名称可配置</td>
+</tr>
+<tr>
+<td>OVS（Open vSwitch）</td>
+<td>部分 CNI 插件（如 OVN-Kubernetes）</td>
+<td>OVS 提供可编程流表，用于更复杂的 SDN 场景</td>
+</tr>
+<tr>
+<td>手写 iptables 规则</td>
+<td>NetworkPolicy 对象（由 CNI 实现）</td>
+<td>CNI 把声明式策略转为内核规则，无需手动维护</td>
+</tr>
+<tr>
+<td>IPAM（DHCP 或静态分配）</td>
+<td>CNI IPAM 子插件（host-local / calico-ipam）</td>
+<td>集群级 IP 分配，防止跨节点 IP 冲突</td>
+</tr>
+<tr>
+<td>traceroute 路径诊断</td>
+<td><code>cilium monitor</code> / <code>hubble observe</code></td>
+<td>CNI 层面的流量可见性，比 traceroute 更精准</td>
+</tr>
+<tr>
+<td>VMware vSwitch 端口组</td>
+<td>cni0 网桥 + veth pair</td>
+<td>虚拟化层做的隔离转移到内核命名空间</td>
+</tr>
+</tbody>
+</table>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：Kubernetes 安装好就有网络，不需要额外配置。</p>
+<p>这个误解在初学者中极为常见。kubeadm 初始化的裸集群，如果不手动安装 CNI 插件，CoreDNS Pod 会停在 Pending 状态，任何新建的 Pod 都无法获得 IP，网络完全不通。kind 之所以能直接用，是因为 kind 默认安装了 kindnet（一个轻量 CNI）。生产集群使用 kubeadm 时，<code>kubeadm init</code> 完成后必须紧接着安装 CNI——这步骤在官方文档里写得很清楚，但常被教程省略，导致初学者困惑。</p>
+<p>误解二：Pod IP 重启后不变，可以在应用配置里硬编码 Pod IP。</p>
+<p>Pod IP 与 Pod 对象的生命周期绑定，不与容器进程绑定。Pod 被删除再重建（Deployment 滚动更新、节点故障导致 Pod 迁移、<code>kubectl delete pod</code> 手动重建），新 Pod 会从 IPAM 重新分配地址，通常与原来不同。StatefulSet 保证 Pod 名称稳定（<code>web-0</code>、<code>web-1</code>），但同样不保证 IP 稳定。需要稳定地址的场景应通过 Service ClusterIP 或 Headless Service 的 DNS 名访问，不要直接依赖 Pod IP。</p>
+<p>误解三：Calico 一定比 Flannel 快，Cilium 一定比 Calico 快。</p>
+<p>性能对比高度依赖场景和基础设施环境。在节点间有直接三层路由的环境（IDC 可控网络），Calico BGP 无封装确实在吞吐量上有优势（约 5-15%），延迟也更低；但在公有云 VPC 里，Calico 也要走 IPIP/VXLAN，差距大幅缩小。现代内核（5.x+）上的 VXLAN 有硬件 offload 支持，Flannel 的封装开销远低于早期版本。Cilium 在高并发短连接场景（每秒大量新建 TCP 连接）下，因为 eBPF socket 级负载均衡减少了 conntrack 开销，延迟优势最显著；但在长连接、大吞吐场景下，三者差距可能在测量误差范围内。选型时，性能往往不是第一决策因素——运维团队的熟悉程度、网络策略需求、可观测性要求、底层网络约束，通常更具决定性。</p>
+<h2 id="练习">练习</h2>
+<p>练习一：在 kind 多节点集群里，找到两个分别在不同节点上的 Pod，在宿主机的 <code>cni0</code> 接口和物理 <code>eth0</code> 接口上同时 <code>tcpdump</code>，然后让两个 Pod 互相 <code>ping</code>。观察 <code>cni0</code> 上抓到的是 Pod IP 的 ICMP 包，<code>eth0</code> 上抓到的是封装后的 VXLAN UDP 包（Flannel 模式）或原始 ICMP 包但外层是节点 IP（Calico BGP 模式）。对比两个接口的输出，理解封装层次。</p>
+<p>练习二：用 <code>ip netns exec</code> 手动模拟 CNI ADD 的过程：创建一个网络命名空间，创建一个 veth pair，把一端移入命名空间并命名为 <code>eth0</code>，把另一端 attach 到 <code>cni0</code> 网桥，在命名空间内配置 IP 地址和默认路由，然后从宿主机 ping 这个命名空间的 IP。整个过程用不超过 10 条 <code>ip</code> 命令完成，理解 CNI 的本质是一组 <code>ip</code> 命令的自动化。</p>
+<p>练习三：阅读 kindnet 的源码（GitHub 上约 500 行 Go 代码），找到它调用 CNI ADD 的位置，理解 kubelet → CRI → CNI 的调用链。对比 Flannel 的 <code>flanneld</code> 源码，找到它通过 Netlink 写入 FDB 表的代码（<code>netlink.NeighSet</code>），理解守护进程如何维护内核的转发表而不自己处理数据包。</p>
+<p>练习四：在使用 Calico 的集群里，用 <code>ip route show proto bird</code> 查看 BIRD 注入的路由，找到某个远端节点 Pod 子网的路由条目，用 <code>traceroute &lt;pod-ip&gt;</code> 验证数据包只经过节点 IP 中转，没有任何 VTEP 中间设备。再对比 Flannel 集群的 <code>traceroute</code> 输出，理解有封装（VTEP 出现在路径里）和无封装（只有节点 IP）模式的实际路径差异。</p>
+<h2 id="networkpolicy-与流量隔离">NetworkPolicy 与流量隔离</h2>
+<p>CNI 插件负责连通性，NetworkPolicy 负责隔离性，两者是互补而非对立的关系。Kubernetes 的 NetworkPolicy 对象描述&quot;哪些 Pod 之间允许通信&quot;，CNI 插件负责把这个声明转化为内核规则执行。</p>
+<p>NetworkPolicy 的默认行为是&quot;全通&quot;：集群里没有任何 NetworkPolicy 时，所有 Pod 之间、Pod 与 Service 之间、Pod 与外部之间都可以任意通信。一旦某个 Pod 被至少一条 NetworkPolicy 的 <code>podSelector</code> 选中，该 Pod 就进入受管控状态——所有不被任何 NetworkPolicy 显式允许的流量都被拒绝（白名单模式）。</p>
+<p>一条 NetworkPolicy 的结构包含三部分：<code>podSelector</code>（选中被保护的 Pod 集合）、<code>policyTypes</code>（声明控制入方向 <code>Ingress</code>、出方向 <code>Egress</code> 还是两者）、以及 <code>ingress</code>/<code>egress</code> 规则列表（列出允许的来源或目标）。<code>ingress</code> 规则里可以用 <code>from</code> 字段组合三种选择器：<code>namespaceSelector</code>（允许来自特定命名空间的 Pod）、<code>podSelector</code>（允许来自满足标签条件的 Pod）、<code>ipBlock</code>（允许来自特定 CIDR 的流量）。三种选择器可以组合：同一条 <code>from</code> 里的多个字段是 AND 关系，<code>from</code> 列表里的多条规则是 OR 关系。</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br></pre></td><td class="code"><pre><code class="hljs yaml"><span class="hljs-attr">apiVersion:</span> <span class="hljs-string">networking.k8s.io/v1</span><br><span class="hljs-attr">kind:</span> <span class="hljs-string">NetworkPolicy</span><br><span class="hljs-attr">metadata:</span><br>  <span class="hljs-attr">name:</span> <span class="hljs-string">allow-api-only</span><br>  <span class="hljs-attr">namespace:</span> <span class="hljs-string">production</span><br><span class="hljs-attr">spec:</span><br>  <span class="hljs-attr">podSelector:</span><br>    <span class="hljs-attr">matchLabels:</span><br>      <span class="hljs-attr">app:</span> <span class="hljs-string">database</span><br>  <span class="hljs-attr">policyTypes:</span><br>  <span class="hljs-bullet">-</span> <span class="hljs-string">Ingress</span><br>  <span class="hljs-bullet">-</span> <span class="hljs-string">Egress</span><br>  <span class="hljs-attr">ingress:</span><br>  <span class="hljs-bullet">-</span> <span class="hljs-attr">from:</span><br>    <span class="hljs-bullet">-</span> <span class="hljs-attr">namespaceSelector:</span><br>        <span class="hljs-attr">matchLabels:</span><br>          <span class="hljs-attr">env:</span> <span class="hljs-string">production</span><br>      <span class="hljs-attr">podSelector:</span>          <span class="hljs-comment"># 同一 from 里 AND: 来自 production ns 且带 app=api 标签的 Pod</span><br>        <span class="hljs-attr">matchLabels:</span><br>          <span class="hljs-attr">app:</span> <span class="hljs-string">api</span><br>    <span class="hljs-attr">ports:</span><br>    <span class="hljs-bullet">-</span> <span class="hljs-attr">protocol:</span> <span class="hljs-string">TCP</span><br>      <span class="hljs-attr">port:</span> <span class="hljs-number">5432</span><br>  <span class="hljs-attr">egress:</span><br>  <span class="hljs-bullet">-</span> <span class="hljs-attr">to:</span>                     <span class="hljs-comment"># 允许访问 DNS（CoreDNS）</span><br>    <span class="hljs-bullet">-</span> <span class="hljs-attr">namespaceSelector:</span><br>        <span class="hljs-attr">matchLabels:</span><br>          <span class="hljs-attr">kubernetes.io/metadata.name:</span> <span class="hljs-string">kube-system</span><br>    <span class="hljs-attr">ports:</span><br>    <span class="hljs-bullet">-</span> <span class="hljs-attr">protocol:</span> <span class="hljs-string">UDP</span><br>      <span class="hljs-attr">port:</span> <span class="hljs-number">53</span><br></code></pre></td></tr></table></figure>
+<p>NetworkPolicy 的执行完全由 CNI 插件负责，Kubernetes 核心代码不执行任何策略。Flannel 不实现 NetworkPolicy——部署了 Flannel 的集群里，NetworkPolicy 对象可以创建，但没有任何效果，所有流量仍然畅通。Calico（Felix 组件）和 Cilium 都实现了 NetworkPolicy，并且扩展了原生规范的能力。</p>
+<p>Calico 的扩展：GlobalNetworkPolicy（集群范围，不限命名空间）、按 ServiceAccount 匹配的策略（比按 Pod 标签更安全，SA 与应用身份绑定更紧密）、基于 FQDN 的出口策略（允许 Pod 访问 <code>*.s3.amazonaws.com</code>，拒绝其他外部域名）。Felix 把 NetworkPolicy 翻译为 iptables 链，策略规则多时采用 ipset 优化：不是逐条 IP 匹配，而是把允许的 IP 集合放进 ipset，iptables 规则只需匹配 ipset 名，O(1) 查找。</p>
+<p>Cilium 的 L7 NetworkPolicy：eBPF 程序可以解析 HTTP，允许按 HTTP 方法（GET/POST）、URL path、Header 内容做策略，甚至可以解析 gRPC 的 service/method。这是传统 iptables 根本无法实现的能力——iptables 只能看到 TCP 的源/目标端口，无法看到 HTTP 层的内容。Cilium 的 L7 策略让零信任安全在 Kubernetes 内部可以精确到 API 粒度，而不仅仅是 IP 粒度。</p>
+<p>NetworkPolicy 的常见陷阱：一是忘记放行 DNS，导致 Pod 无法解析服务名；二是 <code>policyTypes</code> 里声明了 <code>Egress</code> 但 <code>egress</code> 规则列表为空，等价于&quot;拒绝所有出站流量&quot;，会把 Pod 的一切对外通信切断；三是 <code>namespaceSelector</code> 和 <code>podSelector</code> 写在同一个 <code>from</code> 条目里（AND）与分开写两个条目（OR）行为完全不同。</p>
+<h2 id="cni-选型决策框架">CNI 选型决策框架</h2>
+<p>三种主流 CNI 的选型应从以下几个维度评估：</p>
+<p>底层网络约束是第一优先级。如果节点部署在公有云 VPC 里，且 VPC 不支持自定义路由协议（大多数 VPC 不支持 BGP），Calico 纯 BGP 模式无法工作，必须配置 IPIP 或 VXLAN overlay。如果底层是可控的 IDC 网络，节点间三层可达，Calico BGP 无封装模式性能最优。如果是边缘节点或混合云，网络异构性高，Flannel VXLAN 的兼容性最好。</p>
+<p>NetworkPolicy 需求是第二优先级。如果业务需要 L7 策略（按 HTTP 路径隔离）、FQDN 出口控制（限制 Pod 能访问的外部域名）、或 mTLS 等服务网格能力，Cilium 是唯一选择。如果只需要标准 NetworkPolicy（L3/L4），Calico 和 Cilium 都能满足，Flannel 需要搭配 Calico。如果完全不需要网络策略，Flannel 是最简单的选项。</p>
+<p>运维团队能力是第三优先级。Flannel 最简单，故障排查用 <code>tcpdump</code> + <code>iptables -L</code> 等传统工具。Calico 中等复杂度，需要了解 BIRD BGP 守护进程和 Felix 的调试方式（<code>calicoctl node status</code>、<code>calicoctl get node -o yaml</code>）。Cilium 复杂度最高，需要学习 eBPF 调试工具（<code>bpftool</code>、<code>cilium monitor</code>、<code>hubble observe</code>），但换来的是最强的可观测性。</p>
+<p>集群规模是第四优先级。小于 50 节点时，三者差距可以忽略。50-200 节点时，Calico BGP 的全互联连接数开始增多，需要规划 Route Reflector。超过 200 节点时，Cilium 的 eBPF 数据路径优势开始显现，iptables 规则数量也开始成为 kube-proxy 的瓶颈，此时 Cilium kube-proxy 替代是自然选择。超过 1000 节点的超大集群，Cilium 几乎是唯一经过充分验证的选项（Google GKE 的 Dataplane V2 底层就是 Cilium）。</p>
+<p>CNI 迁移的风险与节奏：从 Flannel 迁移到 Calico 或 Cilium，需要替换所有节点上的 CNI 配置，通常需要节点滚动重启或 drain/cordon 操作。迁移期间，新旧 CNI 不能共存于同一节点（配置文件冲突），但不同节点可以短暂处于不同 CNI 状态（跨节点通信在切换期间可能不稳定）。生产环境迁移时，推荐在低流量时段，按批次替换节点，每批次迁移后验证网络连通性再继续。如果可以，使用蓝绿节点池（新建配置 Calico/Cilium 的节点池，逐步把 Pod 驱逐到新节点池，旧节点池缩容至零）是最安全的迁移策略，切换期间两套节点池并存，失败时可以快速回滚。</p>
+<p>可观测性对比：Flannel 和 Calico 在传统工具（<code>tcpdump</code>、<code>iptables -L</code>、<code>ip route</code>）的调试体验上几乎相同，学习成本低。Cilium 额外引入了 <code>cilium monitor</code>（实时查看 eBPF 事件流：哪个 Pod 发包、命中哪条策略、是否被丢弃）和 Hubble（基于 eBPF 的网络可观测性平台，提供服务依赖拓扑、请求延迟分位数、L7 请求统计）。Hubble 能在不修改应用代码的前提下，提供接近服务网格的可观测性深度，这是传统 CNI 无法比拟的。</p>
+<h2 id="cni-故障排查思路">CNI 故障排查思路</h2>
+<p>网络问题是 Kubernetes 故障中最难定位的一类，因为数据路径跨越多个抽象层（应用、Service、kube-proxy 规则、CNI 插件、内核网络栈、物理网络），每一层都可能是问题所在。建立分层排查的思路比记忆具体命令更重要。</p>
+<p>第一步，确认 Pod 自身网络配置正确。进入 Pod 内部（<code>kubectl exec -it &lt;pod&gt; -- sh</code>），检查 <code>ip addr show eth0</code>（确认有 IP 地址且地址在预期的 PodCIDR 范围内）、<code>ip route</code>（确认有默认路由指向网关，通常是 <code>cni0</code> 的 IP）、<code>cat /etc/resolv.conf</code>（确认 nameserver 指向 CoreDNS 的 ClusterIP）。这三项都正确，说明 CNI ADD 成功执行，Pod 的基础网络配置无误。</p>
+<p>第二步，测试同节点 Pod 间通信。从 Pod A ping 同一节点的 Pod B（<code>kubectl exec podA -- ping &lt;podB-ip&gt;</code>），如果不通，问题在节点内的 L2 转发（网桥 FDB 表、veth pair 状态）。检查 <code>ip link show master cni0</code> 确认 Pod 的 veth 宿主机端已挂载到网桥，<code>bridge fdb show dev cni0</code> 查看 FDB 表，<code>arp -n</code> 查看 ARP 缓存。</p>
+<p>第三步，测试跨节点 Pod 间通信。从 Pod A ping 另一个节点上的 Pod B，如果同节点通了但跨节点不通，问题在跨节点转发机制。Flannel 模式下检查 <code>flannel.1</code> VTEP 是否正常（<code>ip link show flannel.1</code>）、FDB 表是否有远端节点的条目（<code>bridge fdb show dev flannel.1</code>）、<code>flanneld</code> 是否正常运行（<code>kubectl get pod -n kube-flannel</code>）。Calico 模式下检查 BIRD 是否建立了 BGP 会话（<code>calicoctl node status</code>）、路由表是否有对端节点的 Pod 子网路由（<code>ip route show proto bird</code>）。</p>
+<p>第四步，测试 DNS 解析。<code>kubectl exec &lt;pod&gt; -- nslookup kubernetes</code>，如果 DNS 不通，先确认 CoreDNS Pod 是否正常运行（<code>kubectl get pod -n kube-system -l k8s-app=kube-dns</code>），再从测试 Pod ping CoreDNS 的 ClusterIP，然后用 <code>dig @&lt;coreDNS-clusterIP&gt; kubernetes.default.svc.cluster.local</code> 直接测试 DNS 查询，逐步缩小故障范围。</p>
+<p>第五步，测试 Service 访问。<code>kubectl exec &lt;pod&gt; -- curl http://&lt;service-clusterIP&gt;:&lt;port&gt;</code>，如果 Pod 直通 OK 但 Service 不通，问题在 kube-proxy 规则。检查 <code>iptables -t nat -L KUBE-SERVICES -n | grep &lt;clusterIP&gt;</code> 确认规则存在，<code>kubectl get endpoints &lt;svc-name&gt;</code> 确认有就绪端点，<code>kubectl logs -n kube-system &lt;kube-proxy-pod&gt;</code> 查看同步错误。</p>
+<p><code>tcpdump</code> 是贯穿所有步骤的利器。在 <code>cni0</code> 上抓包可以看到节点内的所有 Pod 流量；在 <code>flannel.1</code> 或 <code>eth0</code> 上抓包可以看到跨节点的封装流量；在 Pod 内的 <code>eth0</code> 上抓包可以看到 Pod 视角的原始流量。对比不同接口的抓包结果，可以精确定位数据包在哪一层消失。</p>
+<p>常见的 CNI 故障现象与原因对照：Pod 创建后 IP 地址是 <code>&lt;none&gt;</code> 或 <code>1.1.1.1</code>（CNI ADD 调用返回错误，检查 kubelet 日志和 <code>/var/log/pods/</code> 里的 CNI 日志）；Pod IP 分配了但同节点 ping 不通（veth pair 未挂载到 cni0，或 cni0 本身 down，<code>ip link show cni0</code> 验证）；跨节点 ping 不通但同节点正常（路由或 VXLAN FDB 表缺失，Flannel 模式下优先检查 <code>flanneld</code> Pod 是否崩溃）；DNS 解析超时（CoreDNS Pod 本身不正常，或 ndots:5 触发了不必要的 search 域展开导致查询时序问题，<code>kubectl logs -n kube-system -l k8s-app=kube-dns</code> 查看错误）；跨命名空间通信被拒绝（NetworkPolicy 默认拒绝规则生效，<code>kubectl get networkpolicy -A</code> 排查）。</p>
+<p>CNI 升级与版本管理也是生产运维中容易忽视的点。CNI 插件的版本与 Kubernetes 版本有兼容矩阵，升级 Kubernetes 时需要同步检查 CNI 插件的兼容性（如 Calico 3.x 对应 K8s 1.24+，Cilium 1.14+ 对应 K8s 1.26+）。CNI 配置文件（<code>/etc/cni/net.d/</code>）在节点上直接生效，修改后对新建 Pod 立即生效，对已运行 Pod 不影响（已建立的 veth 对和路由不会重建）。升级 Calico 或 Cilium 时，推荐先在非生产节点验证，再滚动更新 DaemonSet，每个节点的升级过程中该节点上已有 Pod 的网络不受影响，但新建 Pod 可能短暂出现 CNI 不可用的窗口期（通常小于 30 秒）。</p>
+<p>IP 地址规划是集群网络长期健康的基础。Pod CIDR 规划不足是扩容时最头疼的问题之一——一旦节点数增多，每个节点的 PodCIDR 子网用完，新 Pod 就无法获得 IP。Kubernetes 通过 <code>--cluster-cidr</code> 给整个集群分配 Pod IP 段，<code>--node-cidr-mask-size</code> 决定每个节点分到的子网大小（默认 <code>/24</code>，即每个节点最多 254 个 Pod IP）。如果节点数超过了集群 CIDR 能容纳的 <code>/24</code> 子网数量（例如集群 CIDR 是 <code>/16</code>，最多支持 256 个节点），就需要把 <code>node-cidr-mask-size</code> 调大（例如 <code>/25</code>，每节点 128 个 Pod IP），或者扩展集群 CIDR 范围。修改已有集群的 CIDR 是高风险操作，通常需要重建集群——因此 IP 地址规划应在集群初始化时就按照预期最大规模的 2-3 倍预留空间。</p>
+<p>多网卡节点（节点有多个网络接口）场景下，CNI 需要明确知道使用哪块网卡作为 Pod 流量的出口网卡。Flannel 通过 <code>--iface</code> 参数指定，Calico 通过 <code>IP_AUTODETECTION_METHOD</code> 环境变量（支持 <code>first-found</code>、<code>can-reach=&lt;IP&gt;</code>、<code>interface=eth0</code> 等模式）指定，Cilium 通过 <code>--direct-routing-device</code> 指定。指定错误的出口网卡会导致跨节点流量从错误的接口发出，是多网卡环境里最常见的 CNI 配置问题。</p>
+<p>Kubernetes 1.28 引入的 <code>NetworkPolicy</code> v2 功能扩展（仍在 alpha 阶段）将进一步完善网络策略模型，计划加入 <code>AdminNetworkPolicy</code>（集群管理员级别的全局策略，优先于命名空间级别的 NetworkPolicy）和 <code>BaselineAdminNetworkPolicy</code>（默认允许/拒绝策略，在没有命名空间级策略时生效）。这两个对象的引入是为了解决多租户场景下，平台管理员无法用标准 NetworkPolicy 强制实施全局安全基线的问题——目前 Calico 的 GlobalNetworkPolicy 和 Cilium 的 ClusterwideCiliumNetworkPolicy 各有私有实现，<code>AdminNetworkPolicy</code> 是 SIG Network 推进的标准化尝试。</p>
+<p>eBPF 对 CNI 生态的影响远不止 Cilium 一家。Calico 从 3.18 版本开始引入 eBPF 数据路径（与 Felix 传统 iptables 路径并列，可切换），在保留 Calico BGP 控制平面和 NetworkPolicy 生态的同时，获得 eBPF 的性能优势。这意味着 CNI 的竞争格局正在从&quot;谁用 eBPF&quot;转向&quot;eBPF 用得有多深&quot;——Cilium 的 eBPF 覆盖了从 L3/L4 转发到 L7 策略的完整路径，而 Calico eBPF 目前主要替换数据路径的转发部分，控制平面仍沿用 Felix。</p>
+<p>WireGuard 加密是 CNI 领域近年来采用率上升最快的特性之一。Calico 从 3.13 版本支持 WireGuard 节点间加密（<code>calico-node</code> 自动管理 WireGuard 密钥对，无需手动配置），Flannel 的 WireGuard 后端从 0.14 版本提供，Cilium 同样支持 WireGuard 作为跨节点加密选项。WireGuard 相比传统 IPsec 的优势是配置极简（内核原生支持，无需 IKE 守护进程）、性能更高（基于现代密码学算法 ChaCha20-Poly1305）、密钥自动轮换。在合规要求传输层加密的场景（金融、医疗），WireGuard CNI 加密是比服务网格 mTLS 更轻量的选择，因为它在 L3 层透明加密，不需要修改应用或注入 sidecar。</p>
+<p>不同 CNI 在大规模场景下的控制平面压力也值得关注。Flannel 的控制平面极简，<code>flanneld</code> 只需要从 etcd 或 kube-apiserver 读取节点子网信息，控制平面负载极低，即使 1000+ 节点也不会成为瓶颈。Calico 的 Felix 需要监听所有节点的 WorkloadEndpoint、NetworkPolicy 变化，在策略复杂、Pod 数量多的集群里，Felix 的 CPU 占用可能显著上升；Calico Typha 组件（介于 kube-apiserver 和 Felix 之间的缓存代理）是 100+ 节点时的推荐配置，能大幅减少 Felix 对 apiserver 的直接 watch 连接数。Cilium 的 Operator 和 Agent 在大规模集群里同样需要关注内存用量，eBPF Map 的大小有内核限制，需要根据集群 Pod 密度调整 <code>--bpf-ct-global-any-max</code> 等参数。</p>
+<p>CNI 插件的健康状态监控应当纳入集群监控体系。Calico 提供 Prometheus 指标端点（<code>calico-node</code> 的 9091 端口），暴露 Felix 的策略同步延迟、数据路径错误计数、BGP 会话状态等指标。Cilium 的指标更为丰富，<code>cilium-agent</code> 在 9962 端口暴露数百个 Prometheus 指标，涵盖 eBPF Map 使用率、策略执行延迟、DNS 代理请求计数、Hubble 流量统计等。Flannel 指标相对简单，主要关注 <code>flanneld</code> 进程存活和 VXLAN 封包计数。将 CNI 指标接入 Prometheus + Grafana 告警体系，是生产集群网络可靠性保障的基础建设。</p>
+<h2 id="系列导航">系列导航</h2>
+<ul>
+<li><a href="/2026/02/07/Kubernetes-%E6%A0%B8%E5%BF%83%E6%A6%82%E5%BF%B5/">00 核心概念导读</a></li>
+<li><a href="/2026/06/20/API-Server-%E4%B8%8E%E5%A3%B0%E6%98%8E%E5%BC%8F-API-%E4%B8%80%E5%88%87%E7%9A%86%E8%B5%84%E6%BA%90/">01 API Server 与声明式 API</a></li>
+<li><a href="/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/">02 etcd 与持久化</a></li>
+<li><a href="/2026/06/20/%E6%8E%A7%E5%88%B6%E5%99%A8%E6%A8%A1%E5%BC%8F%E4%B8%8E-Informer-%E6%9C%BA%E5%88%B6-%E8%B0%83%E8%B0%90%E5%BE%AA%E7%8E%AF%E7%9A%84%E5%B7%A5%E7%A8%8B%E5%AE%9E%E7%8E%B0/">03 控制器模式与 Informer 机制</a></li>
+<li><a href="/2026/06/20/Pod-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-%E4%BB%8E-Pending-%E5%88%B0-Running-%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B7%AF%E5%BE%84/">04 Pod 生命周期</a></li>
+<li><a href="/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/">05 调度器深入</a></li>
+<li><a href="/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/">06 kubelet 与容器运行时</a></li>
+<li><a href="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/">07 网络模型与 CNI</a></li>
+<li><a href="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/">08 Service 与 kube-proxy</a></li>
+<li><a href="/2026/06/20/Ingress-%E4%B8%8E-Gateway-API-%E4%B8%83%E5%B1%82%E6%B5%81%E9%87%8F%E7%9A%84%E5%85%A5%E5%8F%A3%E6%BC%94%E8%BF%9B/">09 Ingress 与 Gateway API</a></li>
+<li><a href="/2026/06/20/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-PV-PVC-StorageClass-%E4%B8%8E-CSI/">10 存储体系</a></li>
+<li><a href="/2026/06/20/%E9%85%8D%E7%BD%AE%E4%B8%8E%E5%AF%86%E9%92%A5%E7%AE%A1%E7%90%86-ConfigMap-Secret-%E4%B8%8E%E5%A4%96%E9%83%A8%E9%9B%86%E6%88%90/">11 配置与密钥管理</a></li>
+<li><a href="/2026/06/20/RBAC-%E4%B8%8E%E5%AE%89%E5%85%A8%E6%A8%A1%E5%9E%8B-%E8%AE%A4%E8%AF%81-%E6%8E%88%E6%9D%83%E4%B8%8E%E5%87%86%E5%85%A5%E6%8E%A7%E5%88%B6/">12 RBAC 与安全模型</a></li>
+<li><a href="/2026/06/20/%E8%B5%84%E6%BA%90%E7%AE%A1%E7%90%86%E4%B8%8E%E8%87%AA%E5%8A%A8%E4%BC%B8%E7%BC%A9-requests-limits-HPA-%E4%B8%8E-VPA/">13 资源管理与自动伸缩</a></li>
+<li><a href="/2026/06/20/CRD-%E4%B8%8E-Operator-%E6%A8%A1%E5%BC%8F-%E6%89%A9%E5%B1%95-Kubernetes-%E7%9A%84%E6%A0%87%E5%87%86%E8%B7%AF%E5%BE%84/">14 CRD 与 Operator 模式</a></li>
+<li><a href="/2026/06/20/Helm-%E4%B8%8E%E5%BA%94%E7%94%A8%E6%89%93%E5%8C%85-%E4%BB%8E-YAML-%E5%88%B0%E5%8F%AF%E5%A4%8D%E7%94%A8%E5%88%B6%E5%93%81/">15 Helm 与应用打包</a></li>
+<li><a href="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/">16 可观测性</a></li>
+<li><a href="/2026/06/20/%E7%94%9F%E4%BA%A7%E9%9B%86%E7%BE%A4%E8%BF%90%E7%BB%B4-%E5%8D%87%E7%BA%A7-%E5%A4%87%E4%BB%BD-%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5%E4%B8%8E%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92/">17 生产集群运维</a></li>
+</ul>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://github.com/containernetworking/cni/blob/main/SPEC.md">CNI Specification</a> — CNI 接口规范原文，ADD/DEL/CHECK 三个操作的完整定义和 JSON 格式约定</li>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/docs/concepts/cluster-administration/networking/">Kubernetes Networking Model</a> — K8s 官方文档对网络模型三条规则的权威表述</li>
+<li><a target="_blank" rel="noopener" href="https://github.com/flannel-io/flannel/blob/master/Documentation/backends.md">Flannel Backends</a> — Flannel 各后端模式（VXLAN/host-gw/IPIP/WireGuard）的技术说明和适用场景</li>
+<li><a target="_blank" rel="noopener" href="https://docs.tigera.io/calico/latest/reference/architecture/overview">Calico Architecture</a> — Calico 组件架构，包含 Felix 策略引擎、BIRD BGP 守护进程、IPAM 的详细说明</li>
+<li><a target="_blank" rel="noopener" href="https://docs.cilium.io/en/stable/network/ebpf/intro/">Cilium eBPF Datapath</a> — Cilium 基于 eBPF 的数据路径实现，XDP/TC hook 的工作位置和 eBPF Map 的使用方式</li>
+<li><a target="_blank" rel="noopener" href="https://vincent.bernat.ch/en/blog/2017-vxlan-linux">Linux VXLAN</a> — Vincent Bernat 的 VXLAN 深入分析，包含 FDB 表手动操作和内核 VXLAN 模块工作原理</li>
+<li><a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man7/namespaces.7.html">Linux namespaces(7)</a> — Linux 命名空间手册，网络命名空间（netns）是 CNI 运作的基础隔离原语</li>
+<li><a target="_blank" rel="noopener" href="https://docs.tigera.io/calico/latest/reference/typha/overview">Calico Typha</a> — Typha 组件说明，大规模集群下减少 Felix 与 apiserver 直连的缓存代理架构</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/">https://magicliang.github.io/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E4%BA%91%E5%8E%9F%E7%94%9F/">云原生</a><a class="post-meta__tags" href="/tags/Kubernetes/">Kubernetes</a><a class="post-meta__tags" href="/tags/%E5%AE%B9%E5%99%A8/">容器</a><a class="post-meta__tags" href="/tags/%E7%BD%91%E7%BB%9C/">网络</a><a class="post-meta__tags" href="/tags/CNI/">CNI</a></div><div class="post-share"><div class="social-share" data-image="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/" title="Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS</div></div><div class="info-2"><div class="info-item-1">Service 的 ClusterIP 是一个不存在于任何网卡的虚拟 IP。在节点上运行 ip addr，看不到它；用 ping 测试，收不到回应；但对它发起 TCP 连接，数据却能稳定到达某个后端 Pod。这个&quot;幽灵 IP&quot;能够工作，完全依赖 kube-proxy 写入每个节点内核的 iptables 或 IPVS 规则——规则在，转发在；规则消失，连接消失。 理解这一机制的起点是区分两种截然不同的角色：kube-proxy 是&quot;规则维护者&quot;，内核的 netfilter/IPVS 子系统才是&quot;数据面执行者&quot;。kube-proxy 进程本身从不处理任何用户请求，它只监听 kube-apiserver 上 Service 和 EndpointSlice 的变化，把这些变化翻译成内核规则，然后等待下一次变化。真正处理数据包的是内核——每个到达某 ClusterIP:port 的数据包，在经过 iptables nat 表的 PREROUTING 链时，被 DNAT 规则改写目标地址，转向某个真实的 Pod IP:port，整...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Ingress-%E4%B8%8E-Gateway-API-%E4%B8%83%E5%B1%82%E6%B5%81%E9%87%8F%E7%9A%84%E5%85%A5%E5%8F%A3%E6%BC%94%E8%BF%9B/" title="Ingress 与 Gateway API：七层流量的入口演进"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Ingress-%E4%B8%8E-Gateway-API-%E4%B8%83%E5%B1%82%E6%B5%81%E9%87%8F%E7%9A%84%E5%85%A5%E5%8F%A3%E6%BC%94%E8%BF%9B/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Ingress 与 Gateway API：七层流量的入口演进</div></div><div class="info-2"><div class="info-item-1">Service 把集群内部的流量调度问题解决了，但把服务暴露到集群外部的 HTTP/HTTPS 流量需要另一层抽象。NodePort 和 LoadBalancer 都在四层工作——它们能把外部 TCP 流量转发进来，但无法根据 HTTP 的 Host 头或 URL 路径做路由决策，也无法终止 TLS、做 URL 重写、实现金丝雀发布。Ingress 就是 Kubernetes 为七层 HTTP 路由设计的原生对象，它在 1.1 版本进入 alpha，1.19 版本 GA，至今仍是绝大多数集群的 HTTP 入口方案。 Ingress 的设计在简单场景里非常直观：声明哪个 host + 哪个路径对应哪个 Service，TLS 证书放在 Secret 里引用，一个 Controller（Nginx、Traefik、HAProxy 等）负责把这些规则翻译成实际的反向代理配置。这套模型在业务不复杂时运作良好，但当需要金丝雀发布、基于请求头的路由、跨命名空间的服务暴露、gRPC 原生路由时，规范本身的表达能力不够，各家 Controller 用 annotation 扩展——结果是注解的命...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/" title="可观测性——Metrics、Logging、Tracing 的集群实践"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">可观测性——Metrics、Logging、Tracing 的集群实践</div></div><div class="info-2"><div class="info-item-1">一个运行在 Kubernetes 上的分布式系统，出问题时最难回答的问题是&quot;发生了什么&quot;。单机时代，登录服务器查看进程状态和日志文件，基本能还原现场。容器化之后，Pod 随时可能被调度到不同节点，崩溃后立即重启，原始日志消失，这套方法彻底失效。可观测性（Observability）是对这个问题的系统性回答：通过在系统内部埋点、采集、存储和展示三类信号——Metrics（指标）、Logging（日志）、Tracing（链路追踪）——让工程师在不登录服务器的情况下理解系统行为。 Kubernetes 本身对可观测性有明确的架构分工。采集点（kubelet 内嵌的 cAdvisor、node-exporter DaemonSet、应用 SDK）由各组件负责暴露，聚合层（Prometheus、metrics-server）负责拉取和存储，展示层（Grafana、Jaeger UI）负责查询和可视化。这种&quot;采集点内建、存储和展示留给生态&quot;的设计，让 Kubernetes 本身保持简洁，同时允许不同规模的集群选择不同的存储方案。 理解可观测性的关键区分...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-PV-PVC-StorageClass-%E4%B8%8E-CSI/" title="存储体系：PV、PVC、StorageClass 与 CSI"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-PV-PVC-StorageClass-%E4%B8%8E-CSI/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">存储体系：PV、PVC、StorageClass 与 CSI</div></div><div class="info-2"><div class="info-item-1">前几篇建立了计算（Pod 调度和运行）和网络（Pod 间通信和服务发现）的模型。有状态应用（数据库、消息队列、对象存储）需要持久化存储，Pod 重启后数据不丢失。Kubernetes 通过 PV/PVC/StorageClass 三层抽象解耦了存储的供应和使用。 在虚拟机时代，存储通常由运维工程师手动挂载：NFS 目录、SAN LUN、本地磁盘，挂载路径硬编码在部署脚本里。容器化之后，Pod 随时可能漂移到不同节点，存储和计算的生命周期必须显式解耦。Kubernetes 的回答是引入三个层次：PV（实际存储的抽象）、PVC（应用的存储需求声明）、StorageClass（动态供应的策略工厂）。PV/PVC 的绑定机制和 CSI 驱动如何让外部存储系统成为 K8s 的一等公民，是本篇的核心内容。 CSI（Container Storage Interface）的出现解决了 in-tree 驱动的历史包袱。此前，每个云厂商、每个存储系统都要向 Kubernetes 主代码库提交驱动代码，升级路径混乱且周期漫长。CSI 定义了一套 gRPC 接口，任何存储厂商都可以编写独立的驱动程序，...</div></div></div></a><a class="pagination-related" href="/2026/06/20/CRD-%E4%B8%8E-Operator-%E6%A8%A1%E5%BC%8F-%E6%89%A9%E5%B1%95-Kubernetes-%E7%9A%84%E6%A0%87%E5%87%86%E8%B7%AF%E5%BE%84/" title="CRD 与 Operator 模式——扩展 Kubernetes 的标准路径"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/CRD-%E4%B8%8E-Operator-%E6%A8%A1%E5%BC%8F-%E6%89%A9%E5%B1%95-Kubernetes-%E7%9A%84%E6%A0%87%E5%87%86%E8%B7%AF%E5%BE%84/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">CRD 与 Operator 模式——扩展 Kubernetes 的标准路径</div></div><div class="info-2"><div class="info-item-1">Kubernetes 的核心设计哲学之一是可扩展性。API Server 内置的资源类型——Pod、Deployment、Service——只能覆盖通用计算模型，但现实中的应用远不止于此：数据库集群有自己的主从切换逻辑，消息队列有 topic 副本的分配策略，机器学习训练任务有 GPU 亲和性和检查点管理。CustomResourceDefinition（CRD）和 Operator 模式正是 Kubernetes 给出的扩展机制：让用户把领域知识编码进集群本身，而不是写在外部脚本或运维手册里。 CRD 的核心能力是向 API Server 注册新的 Group/Version/Kind（GVK）。注册完成后，kubectl get myapp 和 kubectl get pod 在 API 层面对等——同样走 REST 接口，同样存储到 etcd，同样支持 watch、label selector 和 RBAC 授权。Operator 在 CRD 之上再加一层：部署一个 Controller，持续监听自定义资源的变化，把用户声明的期望状态翻译成若干内置 Kubernetes 资...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Pod-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-%E4%BB%8E-Pending-%E5%88%B0-Running-%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B7%AF%E5%BE%84/" title="Pod 生命周期：从 Pending 到 Running 的完整路径"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Pod-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-%E4%BB%8E-Pending-%E5%88%B0-Running-%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B7%AF%E5%BE%84/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Pod 生命周期：从 Pending 到 Running 的完整路径</div></div><div class="info-2"><div class="info-item-1">一个 kubectl apply -f pod.yaml 之后，终端里出现了 pod/my-app created。这行输出只意味着 API Server 接受了资源定义并写入 etcd——Pod 还没有运行在任何节点上，甚至还没有被任何节点知晓。从这个瞬间到容器真正响应流量，Pod 经历了一条由多个组件接力完成的状态转换链。 这条链不是黑盒。Kubernetes 把每个阶段都编码进 status.phase、status.conditions、status.containerStatuses 三个字段里，并通过 Events 记录关键节点的时间戳。理解这条链，就能在 Pod 卡住时精确定位是调度失败、镜像拉取失败、探针失败，还是 OOM Kill。 本文的核心问题是：一个 Pod 从 kubectl apply 到 Running 经历了哪些状态转换，每个状态背后是哪个组件在操作？ 状态转换全景图 12345678910111213141516171819202122232425kubectl apply     │     ▼  etcd (Pod phase=Pending...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%B0%E6%8D%AE%E6%B5%81%E5%85%A8%E6%99%AF"><span class="toc-number">1.</span> <span class="toc-text">数据流全景</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#kubernetes-%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E7%9A%84%E4%B8%89%E6%9D%A1%E8%A7%84%E5%88%99"><span class="toc-number">2.</span> <span class="toc-text">Kubernetes 网络模型的三条规则</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#cni-%E8%A7%84%E8%8C%83%EF%BC%9A%E6%8E%A5%E5%8F%A3%E8%80%8C%E9%9D%9E%E5%AE%9E%E7%8E%B0"><span class="toc-number">3.</span> <span class="toc-text">CNI 规范：接口而非实现</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#linux-%E7%BD%91%E7%BB%9C%E5%8E%9F%E8%AF%AD%EF%BC%9Aveth-pair-%E4%B8%8E%E7%BD%91%E6%A1%A5"><span class="toc-number">4.</span> <span class="toc-text">Linux 网络原语：veth pair 与网桥</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#ipam%EF%BC%9Aip-%E5%9C%B0%E5%9D%80%E7%AE%A1%E7%90%86"><span class="toc-number">5.</span> <span class="toc-text">IPAM：IP 地址管理</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#flannel-vxlan-%E6%A8%A1%E5%BC%8F%E6%B7%B1%E5%85%A5"><span class="toc-number">6.</span> <span class="toc-text">Flannel VXLAN 模式深入</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#calico-bgp-%E6%A8%A1%E5%BC%8F%E6%B7%B1%E5%85%A5"><span class="toc-number">7.</span> <span class="toc-text">Calico BGP 模式深入</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#cilium-ebpf-%E6%A8%A1%E5%BC%8F%E6%B7%B1%E5%85%A5"><span class="toc-number">8.</span> <span class="toc-text">Cilium eBPF 模式深入</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%AF%E8%BF%90%E8%A1%8C%E5%AE%9E%E9%AA%8C"><span class="toc-number">9.</span> <span class="toc-text">可运行实验</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%E7%BB%93%E6%9E%9C%E6%98%A0%E5%B0%84"><span class="toc-number">10.</span> <span class="toc-text">实验结果映射</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">11.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">12.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">13.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">14.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#networkpolicy-%E4%B8%8E%E6%B5%81%E9%87%8F%E9%9A%94%E7%A6%BB"><span class="toc-number">15.</span> <span class="toc-text">NetworkPolicy 与流量隔离</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#cni-%E9%80%89%E5%9E%8B%E5%86%B3%E7%AD%96%E6%A1%86%E6%9E%B6"><span class="toc-number">16.</span> <span class="toc-text">CNI 选型决策框架</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#cni-%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5%E6%80%9D%E8%B7%AF"><span class="toc-number">17.</span> <span class="toc-text">CNI 故障排查思路</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">18.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">19.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.5</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.5"></script><script src="/js/main.js?v=5.5.5"></script><script src="/js/tw_cn.js?v=5.5.5"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || item.innerHTML || ""
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    if (e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : window.location.href = e.request.responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.5.5"></script></div></div></body></html>

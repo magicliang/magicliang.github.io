@@ -1,0 +1,780 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>kubelet 与容器运行时：节点上到底发生了什么 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="前两篇讲了调度（选节点）和 Pod 生命周期（状态机）。这一篇下到节点层：kubelet 在节点上把一个 Pod spec 变成真实运行的进程。 容器运行时曾经等于 Docker。Kubernetes 1.24 移除了 dockershim，此后所有节点必须使用实现了 CRI（Container Runtime Interface）的运行时：containerd、CRI-O 或其他。这次迁移对用户">
+<meta property="og:type" content="article">
+<meta property="og:title" content="kubelet 与容器运行时：节点上到底发生了什么">
+<meta property="og:url" content="https://magicliang.github.io/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="前两篇讲了调度（选节点）和 Pod 生命周期（状态机）。这一篇下到节点层：kubelet 在节点上把一个 Pod spec 变成真实运行的进程。 容器运行时曾经等于 Docker。Kubernetes 1.24 移除了 dockershim，此后所有节点必须使用实现了 CRI（Container Runtime Interface）的运行时：containerd、CRI-O 或其他。这次迁移对用户">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/cover.svg">
+<meta property="article:published_time" content="2026-06-20T02:06:00.000Z">
+<meta property="article:modified_time" content="2026-06-24T14:18:39.343Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Kubernetes">
+<meta property="article:tag" content="云原生">
+<meta property="article:tag" content="容器">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "kubelet 与容器运行时：节点上到底发生了什么",
+  "url": "https://magicliang.github.io/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/",
+  "image": "https://magicliang.github.io/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/cover.svg",
+  "datePublished": "2026-06-20T02:06:00.000Z",
+  "dateModified": "2026-06-24T14:18:39.343Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.5"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.2.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: 'kubelet 与容器运行时：节点上到底发生了什么',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">492</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">548</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">8</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">kubelet 与容器运行时：节点上到底发生了什么</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">kubelet 与容器运行时：节点上到底发生了什么</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-06-20T02:06:00.000Z" title="Created 2026-06-20 10:06:00">2026-06-20</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-06-24T14:18:39.343Z" title="Updated 2026-06-24 22:18:39">2026-06-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%9F%BA%E7%A1%80%E8%AE%BE%E6%96%BD/">基础设施</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>16mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-06-24 22:18:39&quot;}" hidden></div><p>前两篇讲了调度（选节点）和 Pod 生命周期（状态机）。这一篇下到节点层：kubelet 在节点上把一个 Pod spec 变成真实运行的进程。</p>
+<p>容器运行时曾经等于 Docker。Kubernetes 1.24 移除了 dockershim，此后所有节点必须使用实现了 CRI（Container Runtime Interface）的运行时：containerd、CRI-O 或其他。这次迁移对用户基本无感，但原理上有重要变化——kubelet 和运行时之间的通信从内嵌的特定实现变成了标准 gRPC 接口。</p>
+<p>本文只问一个问题：从 <code>pod.spec.nodeName</code> 被写入，到容器进程在节点上跑起来，发生了什么？</p>
+<span id="more"></span>
+<h2 id="节点内部全景图">节点内部全景图</h2>
+<figure class="highlight nix"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br></pre></td><td class="code"><pre><code class="hljs nix">API Server → etcd (Pod.spec.nodeName <span class="hljs-operator">=</span> this-node)<br>     │<br>     ▼<br>kubelet (watches own node&#x27;s Pods via Informer)<br>┌────────────────────────────────────────────────────┐<br>│ SyncPod <span class="hljs-params">loop:</span>                                      │<br>│ <span class="hljs-number">1</span>. Admit        — 本地资源检查                      │<br>│ <span class="hljs-number">2</span>. Mount volumes — CSI driver (PVC<span class="hljs-operator">/</span>configMap<span class="hljs-operator">/</span>secret)│<br>│ <span class="hljs-number">3</span>. Pull image   — CRI ImageService.PullImage        │<br>│ <span class="hljs-number">4</span>. RunPodSandbox                                    │<br>│    └─ pause container (holds netns <span class="hljs-operator">+</span> ipcns)        │<br>│       └─ CNI <span class="hljs-params">plugin:</span> allocate IP, setup veth pair  │<br>│ <span class="hljs-number">5</span>. Init containers (sequential)                    │<br>│    └─ <span class="hljs-params">CRI:</span> CreateContainer → StartContainer        │<br>│ <span class="hljs-number">6</span>. App containers (parallel)                       │<br>│    └─ <span class="hljs-params">CRI:</span> CreateContainer → StartContainer        │<br>│ <span class="hljs-number">7</span>. Start probes (<span class="hljs-params">goroutines:</span> liveness<span class="hljs-operator">/</span>readiness)   │<br>└────────────────────────────────────────────────────┘<br>     │<br>     ▼<br>containerd → containerd-shim-runc-v2 → runc → container process<br><span class="hljs-params">cgroup:</span> <span class="hljs-operator">/</span>sys<span class="hljs-operator">/</span>fs<span class="hljs-operator">/</span>cgroup<span class="hljs-operator">/</span>kubepods<span class="hljs-operator">/</span>pod<span class="hljs-symbol">&lt;uid&gt;</span><span class="hljs-operator">/</span>container<span class="hljs-symbol">&lt;id&gt;</span><span class="hljs-symbol">/</span><br>        <span class="hljs-attr">cpu.max</span><span class="hljs-operator">=</span><span class="hljs-number">100000</span> <span class="hljs-number">200000</span>  (<span class="hljs-number">50</span>% of <span class="hljs-number">1</span> CPU)<br>        <span class="hljs-attr">memory.max</span><span class="hljs-operator">=</span><span class="hljs-number">134217728</span>   (<span class="hljs-number">128</span>Mi)<br></code></pre></td></tr></table></figure>
+<p>kubelet 是控制平面在每个节点上的代理，但它不直接创建容器——它通过 CRI gRPC 接口把创建请求委托给容器运行时，容器运行时再调用底层的 OCI 运行时（通常是 runc）完成真正的进程创建。</p>
+<hr>
+<h2 id="kubelet-的工作循环：syncpod">kubelet 的工作循环：syncPod</h2>
+<p>kubelet 通过 Informer 监听 API Server，过滤出 <code>spec.nodeName</code> 等于本节点名的 Pod 事件。每次事件到来，触发对应 Pod 的 <code>syncPod</code> 调用。<code>syncPod</code> 是幂等的调谐函数：比较期望状态（Pod spec）和当前状态（CRI 查询的容器状态），做出最小化的操作使二者一致。</p>
+<h3 id="第一步：admit-准入检查">第一步：Admit（准入检查）</h3>
+<p>kubelet 在本地做资源预检，确认节点的可分配资源能满足 Pod 的 <code>requests</code>。这是在调度器已经做过一次资源检查之后的再次确认——调度器基于 API Server 中的统计信息，kubelet 基于本地实际状态，两者可能存在轻微偏差（如节点上有其他未通过 API Server 调度的进程在消耗资源）。</p>
+<p>Admit 失败时，Pod 保持 <code>Pending</code> 状态，kubelet 在本地日志中记录原因，但不会写入 API Server 的 Events（这与调度失败不同，调度失败会产生可见的 Event）。</p>
+<h3 id="第二步：挂载-volume">第二步：挂载 Volume</h3>
+<p>kubelet 调用 VolumeManager，后者通过 CSI（Container Storage Interface）插件将 PVC 声明的存储卷挂载到本地路径。对于 <code>configMap</code> 和 <code>secret</code> 类型的 volume，kubelet 直接从 API Server 获取数据并写入 tmpfs 文件系统，挂载到容器内。</p>
+<p><code>hostPath</code> volume 直接引用节点文件系统路径，不需要额外驱动，但破坏了 Pod 的可移植性——这是不推荐在生产中使用 <code>hostPath</code> 的主要原因之一。</p>
+<p>Volume 挂载必须在容器创建之前完成。如果 CSI 驱动响应超时或卷无法挂载，Pod 会停留在 <code>ContainerCreating</code> 状态，<code>kubectl describe pod</code> 的 Events 会显示具体的挂载错误。</p>
+<h3 id="第三步：拉取镜像">第三步：拉取镜像</h3>
+<p>kubelet 通过 CRI <code>ImageService.PullImage</code> 接口向容器运行时发送拉取请求，运行时负责与镜像仓库交互。kubelet 本身不理解镜像格式，只知道镜像名称和拉取策略（<code>imagePullPolicy</code>）。</p>
+<p>拉取进度体现在 <code>status.containerStatuses[].state.waiting.message</code> 字段。拉取失败后，kubelet 引入指数退避：先等 10 秒，失败后等 20 秒、40 秒……直到最长 300 秒。这个状态就是 <code>ImagePullBackOff</code>。</p>
+<p><code>ImagePullBackOff</code> 和 <code>ErrImagePull</code> 的区别：<code>ErrImagePull</code> 是第一次失败（正在拉取），<code>ImagePullBackOff</code> 是后续重试期间等待退避（暂时停止尝试）。两者都表示镜像拉取失败，只是所处阶段不同。</p>
+<h3 id="第四步：创建-sandbox-pause-容器">第四步：创建 Sandbox（pause 容器）</h3>
+<p>Sandbox 是 Pod 的基础设施层。kubelet 调用 CRI <code>RunPodSandbox</code> 接口，容器运行时创建一个特殊的 pause 容器：</p>
+<ul>
+<li>pause 容器只运行一个几乎什么都不做的进程（<code>/pause</code>），其唯一职责是持有 Linux 命名空间（network namespace、IPC namespace、UTS namespace）。</li>
+<li>CNI 插件在这一步被调用。CNI 接受 <code>netns</code> 文件路径，在该网络命名空间内配置网络接口（veth pair）、分配 Pod IP、设置路由规则。</li>
+<li>所有后续容器（init container、应用容器）共享 pause 容器的 network namespace，这就是为什么同一 Pod 内的容器可以通过 <code>localhost</code> 互相访问。</li>
+</ul>
+<p>pause 容器崩溃意味着整个 Pod sandbox 销毁，所有共享该命名空间的容器都会消失。这就是为什么 pause 进程被设计得极其简单——几乎不可能崩溃。</p>
+<h3 id="第五步和第六步：启动容器">第五步和第六步：启动容器</h3>
+<p>Init container 按顺序启动，每个调用 CRI <code>CreateContainer</code> + <code>StartContainer</code>。应用容器并行启动，调用相同的 CRI 接口但不等待彼此完成。</p>
+<p>CRI <code>CreateContainer</code> 传入 <code>ContainerConfig</code>，包含镜像名、命令、环境变量、volume 挂载点、资源限制等信息。容器运行时（containerd）将这些信息转换为 OCI bundle（<code>config.json</code> + rootfs 目录），然后调用 OCI 运行时（runc）创建容器进程。</p>
+<h3 id="第七步：启动探针">第七步：启动探针</h3>
+<p>所有应用容器启动后，kubelet 为每个配置了探针的容器启动探针 goroutine（Go 协程）。探针在 kubelet 进程内运行，周期性地对容器发起检查（exec/httpGet/tcpSocket），根据结果更新 <code>status.containerStatuses[].ready</code> 字段，进而影响 Pod 的 <code>conditions.Ready</code>。</p>
+<hr>
+<h2 id="cri：kubelet-与运行时的标准接口">CRI：kubelet 与运行时的标准接口</h2>
+<p>CRI 是 kubelet 与容器运行时之间的 gRPC 接口，定义在 <code>k8s.io/cri-api</code>（proto 文件）。任何实现了 CRI 的运行时都可以作为 Kubernetes 的节点运行时，这是 Kubernetes 支持 containerd、CRI-O 等多种运行时的基础。</p>
+<p>CRI 分为两个服务：</p>
+<p><strong>ImageService</strong> — 管理镜像：</p>
+<figure class="highlight stylus"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs stylus"><span class="hljs-function"><span class="hljs-title">PullImage</span><span class="hljs-params">(image, auth, sandbox_config)</span></span> → image_ref<br><span class="hljs-function"><span class="hljs-title">ListImages</span><span class="hljs-params">(filter)</span></span> → <span class="hljs-selector-attr">[image]</span><br><span class="hljs-function"><span class="hljs-title">ImageStatus</span><span class="hljs-params">(image)</span></span> → image_info<br><span class="hljs-function"><span class="hljs-title">RemoveImage</span><span class="hljs-params">(image)</span></span><br><span class="hljs-function"><span class="hljs-title">ImageFsInfo</span><span class="hljs-params">()</span></span> → <span class="hljs-selector-attr">[filesystem_usage]</span><br></code></pre></td></tr></table></figure>
+<p><strong>RuntimeService</strong> — 管理 Sandbox 和容器：</p>
+<figure class="highlight stylus"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs stylus"><span class="hljs-function"><span class="hljs-title">RunPodSandbox</span><span class="hljs-params">(config, runtime_handler)</span></span> → pod_sandbox_id<br><span class="hljs-function"><span class="hljs-title">StopPodSandbox</span><span class="hljs-params">(pod_sandbox_id)</span></span><br><span class="hljs-function"><span class="hljs-title">RemovePodSandbox</span><span class="hljs-params">(pod_sandbox_id)</span></span><br><br><span class="hljs-function"><span class="hljs-title">CreateContainer</span><span class="hljs-params">(pod_sandbox_id, config, sandbox_config)</span></span> → container_id<br><span class="hljs-function"><span class="hljs-title">StartContainer</span><span class="hljs-params">(container_id)</span></span><br><span class="hljs-function"><span class="hljs-title">StopContainer</span><span class="hljs-params">(container_id, timeout)</span></span><br><span class="hljs-function"><span class="hljs-title">RemoveContainer</span><span class="hljs-params">(container_id)</span></span><br><br><span class="hljs-function"><span class="hljs-title">ExecSync</span><span class="hljs-params">(container_id, cmd, timeout)</span></span> → stdout, stderr, exit_code<br><span class="hljs-function"><span class="hljs-title">Exec</span><span class="hljs-params">(container_id, cmd, tty, stdin, stdout, stderr)</span></span> → url (streaming)<br></code></pre></td></tr></table></figure>
+<p><code>kubectl exec</code> 的实现：API Server 收到 exec 请求后，通过 kubelet 的 streaming server 将请求转发，kubelet 调用 CRI <code>Exec</code> 接口获取流式连接 URL，将 WebSocket 连接直接桥接到容器运行时的流式端点。</p>
+<hr>
+<h2 id="containerd-内部组件链">containerd 内部组件链</h2>
+<p>containerd 是目前最主流的 Kubernetes CRI 实现。它的内部组织形成了一条职责分离的调用链：</p>
+<figure class="highlight angelscript"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><code class="hljs angelscript">kubelet<br>  │ (gRPC CRI)<br>  ▼<br>containerd daemon<br>  │ (内部 API)<br>  ▼<br>containerd-shim-runc-v2  ← 每个 Pod sandbox 一个 shim 进程<br>  │ (OCI runtime API)<br>  ▼<br>runc<br>  │ (clone syscall + cgroup + <span class="hljs-keyword">namespace</span> <span class="hljs-symbol">setup</span>)<br>  ▼<br><span class="hljs-symbol">container</span> <span class="hljs-symbol">process</span> (<span class="hljs-symbol">PID</span> <span class="hljs-symbol">1</span> <span class="hljs-symbol">in</span> <span class="hljs-symbol">container</span>)<br></code></pre></td></tr></table></figure>
+<p><strong>containerd-shim 的关键设计</strong>：shim 是连接 containerd 和容器进程的中间层。containerd daemon 重启时，shim 进程保持运行，容器进程的生命周期不受影响。这解决了 Docker 早期&quot;daemon 重启杀死所有容器&quot;的问题。shim 通过 <code>io.containerd.runtime.v2.task</code> 协议与 containerd 通信，负责：</p>
+<ul>
+<li>代理 containerd 与容器进程之间的 I/O 流（stdin/stdout/stderr）</li>
+<li>在容器进程退出后收集退出码，上报给 containerd</li>
+<li>管理容器的 PID 文件</li>
+</ul>
+<p><strong>OCI bundle</strong>：runc 的输入是一个 OCI bundle 目录，包含：</p>
+<ul>
+<li><code>config.json</code>：容器的运行时配置（命名空间、cgroup、挂载点、进程配置、能力）</li>
+<li><code>rootfs/</code>：容器文件系统（镜像层解压或 overlay 挂载点）</li>
+</ul>
+<hr>
+<h2 id="cgroup-v2：资源隔离的内核实现">cgroup v2：资源隔离的内核实现</h2>
+<p>Kubernetes 从 1.25 起默认启用 cgroup v2。kubelet 为每个 Pod 创建 cgroup 层级，将容器的资源使用限定在 spec 定义的范围内。</p>
+<figure class="highlight nix"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs nix"><span class="hljs-operator">/</span>sys<span class="hljs-operator">/</span>fs<span class="hljs-operator">/</span>cgroup<span class="hljs-symbol">/</span><br>└── kubepods<span class="hljs-symbol">/</span><br>    ├── burstable<span class="hljs-symbol">/</span><br>    │   └── pod<span class="hljs-symbol">&lt;uid&gt;</span><span class="hljs-symbol">/</span>           ← Pod 级别 cgroup<br>    │       ├── container<span class="hljs-symbol">&lt;id&gt;</span><span class="hljs-symbol">/</span>  ← 容器级别 cgroup<br>    │       │   ├── cpu.max      <span class="hljs-operator">=</span> <span class="hljs-string">&quot;100000 200000&quot;</span> (<span class="hljs-number">50</span>% of <span class="hljs-number">1</span> CPU)<br>    │       │   └── memory.max   <span class="hljs-operator">=</span> <span class="hljs-string">&quot;134217728&quot;</span> (<span class="hljs-number">128</span>Mi)<br>    │       └── container<span class="hljs-symbol">&lt;id2&gt;</span><span class="hljs-symbol">/</span><br>    ├── guaranteed<span class="hljs-symbol">/</span><br>    └── besteffort<span class="hljs-operator">/</span><br></code></pre></td></tr></table></figure>
+<p><code>cpu.max</code> 的格式是 <code>quota period</code>，表示在 <code>period</code> 微秒内最多使用 <code>quota</code> 微秒的 CPU 时间。<code>500m</code>（500 millicores）对应 <code>100000 200000</code>（100ms/200ms = 50%）。</p>
+<p><code>memory.max</code> 直接对应 <code>limits.memory</code>，超出时触发容器内的 OOM killer，杀死内存用量最大的进程。如果主进程被 OOM 杀死，kubelet 检测到容器退出，根据 <code>restartPolicy</code> 决定是否重启，<code>reason</code> 记录为 <code>OOMKilled</code>。</p>
+<p>cgroup v2 相比 v1 的主要改进：统一层级（v1 各子系统分开），<code>memory.oom.group</code>（整组进程被 OOM 时一起杀死，而不是只杀一个进程），<code>io.max</code> 统一磁盘 IO 限制。</p>
+<hr>
+<h2 id="pleg：pod-状态感知的核心机制">PLEG：Pod 状态感知的核心机制</h2>
+<p>PLEG（Pod Lifecycle Event Generator）是 kubelet 内部的状态同步机制。kubelet 无法在运行时收到容器变化的主动通知（不同于 watch API Server），只能通过轮询 CRI 来获知容器状态变化。</p>
+<p>PLEG 的工作流程：</p>
+<ol>
+<li>每秒调用 CRI <code>ListPodSandbox</code> 和 <code>ListContainers</code> 获取所有容器的当前状态快照。</li>
+<li>与上一次快照对比，生成 lifecycle events（<code>ContainerStarted</code>、<code>ContainerDied</code>、<code>ContainerRemoved</code>）。</li>
+<li>每个 event 触发对应 Pod 的 <code>syncPod</code> 调用，kubelet 根据新状态更新 API Server 中的 Pod status。</li>
+</ol>
+<p>PLEG 有一个常见的告警：<code>PLEG is not healthy</code>，出现在 PLEG 轮询超时（默认 3 分钟内未完成一次完整列举）时。通常原因是容器运行时响应过慢（如 containerd 卡顿）或节点上容器数量过多。这个告警不会直接影响已运行的容器，但会导致 kubelet 无法及时感知容器状态变化。</p>
+<hr>
+<h2 id="可观察实验">可观察实验</h2>
+<p>使用 kind 创建本地集群并观察节点内部状态。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 创建 kind 集群</span><br>kind create cluster --name kubelet-demo<br><br><span class="hljs-comment"># SSH 进控制平面节点</span><br>docker <span class="hljs-built_in">exec</span> -it kind-control-plane bash<br><br><span class="hljs-comment"># 安装 crictl（crictl 是 CRI 的命令行工具，替代 docker CLI）</span><br><span class="hljs-comment"># kind 节点通常已预装</span><br>crictl --runtime-endpoint unix:///run/containerd/containerd.sock version<br></code></pre></td></tr></table></figure>
+<h3 id="用-crictl-观察容器-不用-docker">用 crictl 观察容器（不用 docker）</h3>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 列出所有 Pod sandbox</span><br>crictl pods<br><br><span class="hljs-comment"># 输出示例：</span><br><span class="hljs-comment"># POD ID         CREATED        STATE   NAME           NAMESPACE    ATTEMPT</span><br><span class="hljs-comment"># 3f8a12c4e9ab   2 minutes ago  Ready   coredns-xxx    kube-system  0</span><br><br><span class="hljs-comment"># 列出所有容器</span><br>crictl ps<br><br><span class="hljs-comment"># 查看容器详情（OCI config 等）</span><br>crictl inspect &lt;container-id&gt;<br><br><span class="hljs-comment"># 查看容器日志</span><br>crictl logs &lt;container-id&gt;<br><br><span class="hljs-comment"># 在容器内执行命令（等价于 docker exec）</span><br>crictl <span class="hljs-built_in">exec</span> -it &lt;container-id&gt; sh<br></code></pre></td></tr></table></figure>
+<h3 id="观察-cgroup-资源限制">观察 cgroup 资源限制</h3>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 先找到目标 Pod 的 UID</span><br>kubectl get pod &lt;pod-name&gt; -o jsonpath=<span class="hljs-string">&#x27;&#123;.metadata.uid&#125;&#x27;</span><br><br><span class="hljs-comment"># 查看 cgroup（在节点内）</span><br>POD_UID=<span class="hljs-string">&quot;&lt;pod-uid&gt;&quot;</span><br><span class="hljs-built_in">ls</span> /sys/fs/cgroup/kubepods/burstable/pod<span class="hljs-variable">$&#123;POD_UID&#125;</span>/<br><br><span class="hljs-comment"># 查看 CPU 限制</span><br><span class="hljs-built_in">cat</span> /sys/fs/cgroup/kubepods/burstable/pod<span class="hljs-variable">$&#123;POD_UID&#125;</span>/*/cpu.max<br><br><span class="hljs-comment"># 查看内存限制</span><br><span class="hljs-built_in">cat</span> /sys/fs/cgroup/kubepods/burstable/pod<span class="hljs-variable">$&#123;POD_UID&#125;</span>/*/memory.max<br><br><span class="hljs-comment"># 查看实际内存用量</span><br><span class="hljs-built_in">cat</span> /sys/fs/cgroup/kubepods/burstable/pod<span class="hljs-variable">$&#123;POD_UID&#125;</span>/*/memory.current<br></code></pre></td></tr></table></figure>
+<h3 id="观察-containerd-shim-进程">观察 containerd-shim 进程</h3>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 在节点内查看 shim 进程</span><br>ps aux | grep containerd-shim<br><br><span class="hljs-comment"># 每个 shim 对应一个 Pod sandbox，参数中包含 pod sandbox ID</span><br><span class="hljs-comment"># 例：containerd-shim-runc-v2 -namespace k8s.io -id 3f8a12c4e9ab ...</span><br><br><span class="hljs-comment"># 查看 CNI 配置</span><br><span class="hljs-built_in">cat</span> /etc/cni/net.d/*.conf<br><span class="hljs-comment"># 在 kind 中通常是 kindnet 或 flannel 配置</span><br></code></pre></td></tr></table></figure>
+<h3 id="观察-pause-容器">观察 pause 容器</h3>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 找到 pause 容器（镜像名包含 pause）</span><br>crictl ps -a | grep pause<br><br><span class="hljs-comment"># 或通过 crictl pods 列出 sandbox，再用 inspect 查看</span><br>crictl inspectp &lt;pod-sandbox-id&gt; | jq <span class="hljs-string">&#x27;.info.runtimeSpec.linux.namespaces&#x27;</span><br><span class="hljs-comment"># 输出显示 sandbox 持有的 network、ipc、uts namespace 路径</span><br></code></pre></td></tr></table></figure>
+<hr>
+<h2 id="将实验映射回内部机制">将实验映射回内部机制</h2>
+<p>通过 crictl 看到的每个 pod sandbox，对应 kubelet 的一次 <code>RunPodSandbox</code> CRI 调用。</p>
+<ul>
+<li><code>crictl pods</code> 中的 STATE=Ready，表示 pause 容器正在运行，网络命名空间已由 CNI 配置好。</li>
+<li><code>crictl ps</code> 中的容器列表，是 kubelet 在 <code>RunPodSandbox</code> 之后调用 <code>CreateContainer</code> + <code>StartContainer</code> 的结果。</li>
+<li>cgroup 层级中的 <code>cpu.max</code> 和 <code>memory.max</code>，是 kubelet 在调用 <code>CreateContainer</code> 时通过 <code>LinuxContainerResources</code> 字段传给 containerd 的，containerd 在创建 OCI bundle 时写入 <code>config.json</code>，runc 在创建容器时通过 <code>clone</code> 系统调用设置 cgroup。</li>
+</ul>
+<p><code>kubectl describe pod</code> 中的 Events（如 <code>Created container app</code>、<code>Started container app</code>）是 kubelet 在 CRI 调用成功后通过 API Server 写入 etcd 的，每个 Event 对应一次 CRI 操作的完成。</p>
+<p>当容器因 OOM 退出时，runc 检测到 <code>memory.max</code> 超出并触发 OOM kill，退出码为 137（128 + SIGKILL）。shim 收集退出码，上报给 containerd，containerd 通知 kubelet（通过 PLEG 轮询），kubelet 更新 <code>status.containerStatuses[].lastTerminationState</code>，设置 <code>reason: OOMKilled</code>，并根据 <code>restartPolicy</code> 决定是否重建容器。</p>
+<hr>
+<h2 id="模式提炼">模式提炼</h2>
+<p>kubelet 是&quot;本地 reconciler&quot;——把一个 Pod spec 持续翻译成 cgroup + namespace + OCI bundle 的组合，并通过 PLEG 轮询持续监控实际状态与期望状态的一致性。</p>
+<p>三层接口的设计体现了关注点分离：</p>
+<ul>
+<li>kubelet ↔ 容器运行时：CRI gRPC（标准接口，运行时可替换）</li>
+<li>containerd ↔ OCI 运行时：OCI Runtime Spec（runc/kata/gVisor 可替换）</li>
+<li>kubelet ↔ 存储驱动：CSI（存储供应商可替换）</li>
+</ul>
+<p>每一层接口都是一道隔离层，上层不需要知道下层的具体实现。这是 Kubernetes 支持多运行时、多存储方案的基础。</p>
+<hr>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>kubelet 机制</th>
+<th>工程类比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CRI gRPC 接口</td>
+<td>JDBC 驱动接口，解耦上层应用和数据库实现</td>
+</tr>
+<tr>
+<td>pause 容器持有 namespace</td>
+<td>Unix 进程组共享文件描述符，socket pair</td>
+</tr>
+<tr>
+<td>containerd-shim 解耦</td>
+<td>守护进程 double-fork，父进程退出子进程继续运行</td>
+</tr>
+<tr>
+<td>cgroup v2 层级</td>
+<td>JVM -Xmx 内存限制，OS ulimit，线程池 maximumPoolSize</td>
+</tr>
+<tr>
+<td>PLEG 轮询</td>
+<td>连接池健康检查（testOnBorrow），Consul service health poll</td>
+</tr>
+<tr>
+<td>SyncPod 幂等调谐</td>
+<td>systemd unit 状态机，Ansible idempotent task</td>
+</tr>
+<tr>
+<td>OOM killer</td>
+<td>JVM OutOfMemoryError + GC overhead limit，Go runtime GC pressure</td>
+</tr>
+<tr>
+<td>imagePullBackOff</td>
+<td>指数退避重连（Exponential Backoff Retry），Circuit Breaker half-open</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：Docker 仍然是 Kubernetes 的默认容器运行时。</p>
+<p>自 Kubernetes 1.24 起，dockershim 从 kubelet 代码中完全移除。现代 Kubernetes 节点使用 containerd（大多数发行版的默认值）或 CRI-O。<code>docker</code> CLI 命令在节点上不再能看到 Kubernetes 管理的容器；应使用 <code>crictl</code> 替代。即使节点上安装了 Docker，它也不参与 Kubernetes 容器的创建流程——Docker 自身使用 containerd，而 Kubernetes 直接对接 containerd 的 CRI 接口。</p>
+<p>误解二：pause 容器没有实际作用，可以忽略。</p>
+<p>pause 容器是整个 Pod 网络的基础。所有应用容器的网络接口都来自 pause 容器的 network namespace，Pod IP 地址分配给的是 pause 容器。如果 pause 容器崩溃（极罕见），整个 Pod sandbox 被销毁，所有容器的网络连接立即断开。理解 pause 容器也解释了为什么同 Pod 内的容器可以通过 <code>localhost</code> 通信：它们共享同一个网络命名空间，本质上在同一台&quot;主机&quot;上。</p>
+<p>误解三：kubelet 直接调用 runc 创建容器。</p>
+<p>kubelet 调用的是 CRI 接口（gRPC），接收方是 containerd（或 CRI-O）。containerd 再通过 containerd-shim 调用 runc。这是三层调用链，不是直接调用。kubelet 不知道也不需要知道底层用的是 runc 还是其他 OCI 运行时（如 kata-containers、gVisor）。</p>
+<p>误解四：不设 limits 就没有资源隔离。</p>
+<p>即使不设置 <code>limits</code>，容器仍然运行在 cgroup 内（BestEffort QoS 的 cgroup 层级），只是没有 <code>cpu.max</code> 和 <code>memory.max</code> 的上限约束。节点内存压力时，BestEffort 容器的 <code>oom_score_adj</code> 为 1000，是 OOM killer 的最高优先目标，比 Guaranteed（-997）高出近 2000 分。没有 limits 不是&quot;没有隔离&quot;，而是&quot;有隔离但没有上限保护&quot;。</p>
+<p>误解五：PLEG 告警意味着容器已经不正常。</p>
+<p><code>PLEG is not healthy</code> 告警表示 kubelet 的状态轮询超时，不代表容器本身出现问题。已运行的容器在告警期间继续运行，只是 kubelet 暂时无法感知状态变化。告警通常由容器运行时（containerd）的响应延迟引起，排查方向是 containerd 进程状态和节点上的容器数量。</p>
+<hr>
+<h2 id="练习">练习</h2>
+<p>练习一：用 crictl 替代 docker 操作容器。</p>
+<p>在 kind 集群的控制平面节点内，用 <code>crictl pods</code> 和 <code>crictl ps</code> 列出所有 Pod 和容器。找到 coredns 的容器 ID，用 <code>crictl inspect</code> 查看它的 OCI 配置，找到 <code>linux.namespaces</code> 字段确认它使用了哪些 Linux 命名空间。用 <code>crictl logs</code> 查看它的日志，与 <code>kubectl logs -n kube-system &lt;coredns-pod&gt;</code> 的输出对比。</p>
+<p>练习二：验证 cgroup 资源限制。</p>
+<p>创建一个设置了 <code>resources.limits.cpu: &quot;500m&quot;</code> 和 <code>resources.limits.memory: &quot;128Mi&quot;</code> 的 Pod。进入 kind 节点，找到该 Pod 的 UID，在 <code>/sys/fs/cgroup/kubepods/</code> 下定位对应的 cgroup 目录。读取 <code>cpu.max</code> 和 <code>memory.max</code>，验证与 spec 设置的对应关系（500m 对应 100000 200000，128Mi 对应 134217728）。</p>
+<p>练习三：观察 OOM Kill。</p>
+<p>创建一个 <code>limits.memory: &quot;64Mi&quot;</code> 的 Pod，在容器内运行分配超过 64Mi 内存的命令（如 <code>dd if=/dev/zero of=/dev/shm/test bs=1M count=100</code>）。通过 <code>kubectl describe pod</code> 观察 <code>lastState.terminated.reason: OOMKilled</code> 和 <code>restartCount</code> 的变化。比较 BestEffort（无 limits）Pod 和 Guaranteed Pod 在节点内存压力时的 OOM 顺序差异。</p>
+<p>练习四：追踪一次完整的 Pod 创建 CRI 调用序列。</p>
+<p>启动 containerd 的 debug 日志（或在 kind 节点查看 containerd 日志），创建一个 Pod，在日志中找到对应的 <code>RunPodSandbox</code>、<code>CreateContainer</code>（init container）、<code>CreateContainer</code>（app container）、<code>StartContainer</code> 调用序列，确认调用顺序与 syncPod 流程一致。记录每个 CRI 调用的耗时，分析 Pod 启动时间分布在哪个阶段。</p>
+<hr>
+<h2 id="系列导航">系列导航</h2>
+<ul>
+<li><a href="/2026/02/07/Kubernetes-%E6%A0%B8%E5%BF%83%E6%A6%82%E5%BF%B5/">00 核心概念导读</a></li>
+<li><a href="/2026/06/20/API-Server-%E4%B8%8E%E5%A3%B0%E6%98%8E%E5%BC%8F-API-%E4%B8%80%E5%88%87%E7%9A%86%E8%B5%84%E6%BA%90/">01 API Server 与声明式 API</a></li>
+<li><a href="/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/">02 etcd 与持久化</a></li>
+<li><a href="/2026/06/20/%E6%8E%A7%E5%88%B6%E5%99%A8%E6%A8%A1%E5%BC%8F%E4%B8%8E-Informer-%E6%9C%BA%E5%88%B6-%E8%B0%83%E8%B0%90%E5%BE%AA%E7%8E%AF%E7%9A%84%E5%B7%A5%E7%A8%8B%E5%AE%9E%E7%8E%B0/">03 控制器模式与 Informer 机制</a></li>
+<li><a href="/2026/06/20/Pod-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-%E4%BB%8E-Pending-%E5%88%B0-Running-%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B7%AF%E5%BE%84/">04 Pod 生命周期</a></li>
+<li><a href="/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/">05 调度器深入</a></li>
+<li><a href="/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/">06 kubelet 与容器运行时</a></li>
+<li><a href="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/">07 网络模型与 CNI</a></li>
+<li><a href="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/">08 Service 与 kube-proxy</a></li>
+<li><a href="/2026/06/20/Ingress-%E4%B8%8E-Gateway-API-%E4%B8%83%E5%B1%82%E6%B5%81%E9%87%8F%E7%9A%84%E5%85%A5%E5%8F%A3%E6%BC%94%E8%BF%9B/">09 Ingress 与 Gateway API</a></li>
+<li><a href="/2026/06/20/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-PV-PVC-StorageClass-%E4%B8%8E-CSI/">10 存储体系</a></li>
+<li><a href="/2026/06/20/%E9%85%8D%E7%BD%AE%E4%B8%8E%E5%AF%86%E9%92%A5%E7%AE%A1%E7%90%86-ConfigMap-Secret-%E4%B8%8E%E5%A4%96%E9%83%A8%E9%9B%86%E6%88%90/">11 配置与密钥管理</a></li>
+<li><a href="/2026/06/20/RBAC-%E4%B8%8E%E5%AE%89%E5%85%A8%E6%A8%A1%E5%9E%8B-%E8%AE%A4%E8%AF%81-%E6%8E%88%E6%9D%83%E4%B8%8E%E5%87%86%E5%85%A5%E6%8E%A7%E5%88%B6/">12 RBAC 与安全模型</a></li>
+<li><a href="/2026/06/20/%E8%B5%84%E6%BA%90%E7%AE%A1%E7%90%86%E4%B8%8E%E8%87%AA%E5%8A%A8%E4%BC%B8%E7%BC%A9-requests-limits-HPA-%E4%B8%8E-VPA/">13 资源管理与自动伸缩</a></li>
+<li><a href="/2026/06/20/CRD-%E4%B8%8E-Operator-%E6%A8%A1%E5%BC%8F-%E6%89%A9%E5%B1%95-Kubernetes-%E7%9A%84%E6%A0%87%E5%87%86%E8%B7%AF%E5%BE%84/">14 CRD 与 Operator 模式</a></li>
+<li><a href="/2026/06/20/Helm-%E4%B8%8E%E5%BA%94%E7%94%A8%E6%89%93%E5%8C%85-%E4%BB%8E-YAML-%E5%88%B0%E5%8F%AF%E5%A4%8D%E7%94%A8%E5%88%B6%E5%93%81/">15 Helm 与应用打包</a></li>
+<li><a href="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/">16 可观测性</a></li>
+<li><a href="/2026/06/20/%E7%94%9F%E4%BA%A7%E9%9B%86%E7%BE%A4%E8%BF%90%E7%BB%B4-%E5%8D%87%E7%BA%A7-%E5%A4%87%E4%BB%BD-%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5%E4%B8%8E%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92/">17 生产集群运维</a></li>
+</ul>
+<hr>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>CRI API: <a target="_blank" rel="noopener" href="https://kubernetes.io/docs/concepts/architecture/cri/">https://kubernetes.io/docs/concepts/architecture/cri/</a></li>
+<li>containerd 官方文档: <a target="_blank" rel="noopener" href="https://containerd.io/docs/">https://containerd.io/docs/</a></li>
+<li>kubelet Architecture: <a target="_blank" rel="noopener" href="https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/">https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/</a></li>
+<li>CRI-API proto 定义: <a target="_blank" rel="noopener" href="https://github.com/kubernetes/cri-api">https://github.com/kubernetes/cri-api</a></li>
+<li>OCI Runtime Spec: <a target="_blank" rel="noopener" href="https://github.com/opencontainers/runtime-spec">https://github.com/opencontainers/runtime-spec</a></li>
+<li>cgroup v2 内核文档: <a target="_blank" rel="noopener" href="https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html">https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html</a></li>
+<li>PLEG 设计文档: <a target="_blank" rel="noopener" href="https://github.com/kubernetes/community/blob/master/contributors/design-proposals/node/pod-lifecycle-event-generator.md">https://github.com/kubernetes/community/blob/master/contributors/design-proposals/node/pod-lifecycle-event-generator.md</a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/">https://magicliang.github.io/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E4%BA%91%E5%8E%9F%E7%94%9F/">云原生</a><a class="post-meta__tags" href="/tags/Kubernetes/">Kubernetes</a><a class="post-meta__tags" href="/tags/%E5%AE%B9%E5%99%A8/">容器</a></div><div class="post-share"><div class="social-share" data-image="/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/20/%E7%94%9F%E4%BA%A7%E9%9B%86%E7%BE%A4%E8%BF%90%E7%BB%B4-%E5%8D%87%E7%BA%A7-%E5%A4%87%E4%BB%BD-%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5%E4%B8%8E%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92/" title="生产集群运维——升级、备份、故障排查与容量规划"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E7%94%9F%E4%BA%A7%E9%9B%86%E7%BE%A4%E8%BF%90%E7%BB%B4-%E5%8D%87%E7%BA%A7-%E5%A4%87%E4%BB%BD-%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5%E4%B8%8E%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">生产集群运维——升级、备份、故障排查与容量规划</div></div><div class="info-2"><div class="info-item-1">把 Kubernetes 集群跑起来是第一步，让它在生产环境中长期稳定运行才是真正的挑战。版本升级、etcd 备份恢复、节点维护、故障排查、容量规划——这些 Day-2 运维场景，每一个都有足以让集群中断服务的操作风险。Kubernetes 为这些场景提供了明确的工具和流程约定，但操作顺序和细节上的失误仍然是生产事故的主要来源。 版本升级是最高风险的操作之一。Kubernetes 的 API 在版本间存在兼容性约束（skew policy），错误的升级顺序——例如先升级 kubelet 而非先升级 control plane——会导致集群进入不一致状态，轻则调度异常，重则 API Server 无法与节点通信。etcd 备份看似简单，但备份时机（必须在升级前）、恢复流程（必须停止 API Server 再恢复）、验证方式（恢复后检查关键对象）如果有任何一步出错，都可能导致数据丢失或集群无法启动。 节点维护（drain + upgrade + uncordon）有 PodDisruptionBudget（PDB）这道安全网，但前提是 PDB 本身配置正确。容量规划需要理解&quot...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/" title="Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS</div></div><div class="info-2"><div class="info-item-1">Service 的 ClusterIP 是一个不存在于任何网卡的虚拟 IP。在节点上运行 ip addr，看不到它；用 ping 测试，收不到回应；但对它发起 TCP 连接，数据却能稳定到达某个后端 Pod。这个&quot;幽灵 IP&quot;能够工作，完全依赖 kube-proxy 写入每个节点内核的 iptables 或 IPVS 规则——规则在，转发在；规则消失，连接消失。 理解这一机制的起点是区分两种截然不同的角色：kube-proxy 是&quot;规则维护者&quot;，内核的 netfilter/IPVS 子系统才是&quot;数据面执行者&quot;。kube-proxy 进程本身从不处理任何用户请求，它只监听 kube-apiserver 上 Service 和 EndpointSlice 的变化，把这些变化翻译成内核规则，然后等待下一次变化。真正处理数据包的是内核——每个到达某 ClusterIP:port 的数据包，在经过 iptables nat 表的 PREROUTING 链时，被 DNAT 规则改写目标地址，转向某个真实的 Pod IP:port，整...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-PV-PVC-StorageClass-%E4%B8%8E-CSI/" title="存储体系：PV、PVC、StorageClass 与 CSI"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-PV-PVC-StorageClass-%E4%B8%8E-CSI/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">存储体系：PV、PVC、StorageClass 与 CSI</div></div><div class="info-2"><div class="info-item-1">前几篇建立了计算（Pod 调度和运行）和网络（Pod 间通信和服务发现）的模型。有状态应用（数据库、消息队列、对象存储）需要持久化存储，Pod 重启后数据不丢失。Kubernetes 通过 PV/PVC/StorageClass 三层抽象解耦了存储的供应和使用。 在虚拟机时代，存储通常由运维工程师手动挂载：NFS 目录、SAN LUN、本地磁盘，挂载路径硬编码在部署脚本里。容器化之后，Pod 随时可能漂移到不同节点，存储和计算的生命周期必须显式解耦。Kubernetes 的回答是引入三个层次：PV（实际存储的抽象）、PVC（应用的存储需求声明）、StorageClass（动态供应的策略工厂）。PV/PVC 的绑定机制和 CSI 驱动如何让外部存储系统成为 K8s 的一等公民，是本篇的核心内容。 CSI（Container Storage Interface）的出现解决了 in-tree 驱动的历史包袱。此前，每个云厂商、每个存储系统都要向 Kubernetes 主代码库提交驱动代码，升级路径混乱且周期漫长。CSI 定义了一套 gRPC 接口，任何存储厂商都可以编写独立的驱动程序，...</div></div></div></a><a class="pagination-related" href="/2026/06/20/CRD-%E4%B8%8E-Operator-%E6%A8%A1%E5%BC%8F-%E6%89%A9%E5%B1%95-Kubernetes-%E7%9A%84%E6%A0%87%E5%87%86%E8%B7%AF%E5%BE%84/" title="CRD 与 Operator 模式——扩展 Kubernetes 的标准路径"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/CRD-%E4%B8%8E-Operator-%E6%A8%A1%E5%BC%8F-%E6%89%A9%E5%B1%95-Kubernetes-%E7%9A%84%E6%A0%87%E5%87%86%E8%B7%AF%E5%BE%84/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">CRD 与 Operator 模式——扩展 Kubernetes 的标准路径</div></div><div class="info-2"><div class="info-item-1">Kubernetes 的核心设计哲学之一是可扩展性。API Server 内置的资源类型——Pod、Deployment、Service——只能覆盖通用计算模型，但现实中的应用远不止于此：数据库集群有自己的主从切换逻辑，消息队列有 topic 副本的分配策略，机器学习训练任务有 GPU 亲和性和检查点管理。CustomResourceDefinition（CRD）和 Operator 模式正是 Kubernetes 给出的扩展机制：让用户把领域知识编码进集群本身，而不是写在外部脚本或运维手册里。 CRD 的核心能力是向 API Server 注册新的 Group/Version/Kind（GVK）。注册完成后，kubectl get myapp 和 kubectl get pod 在 API 层面对等——同样走 REST 接口，同样存储到 etcd，同样支持 watch、label selector 和 RBAC 授权。Operator 在 CRD 之上再加一层：部署一个 Controller，持续监听自定义资源的变化，把用户声明的期望状态翻译成若干内置 Kubernetes 资...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/" title="网络模型与 CNI：每个 Pod 一个 IP 背后的实现"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">网络模型与 CNI：每个 Pod 一个 IP 背后的实现</div></div><div class="info-2"><div class="info-item-1">Kubernetes 对网络做出了一个看似简单的承诺：每个 Pod 拥有一个集群范围内唯一的可路由 IP，Pod 之间无需 NAT 可直接通信，节点访问 Pod 也无需 NAT。三条规则，没有一条涉及实现细节。这种&quot;定义行为、不定义机制&quot;的风格与 Kubernetes 整体的设计哲学一致，但也意味着没有任何一行核心代码实现了这个承诺——它完全由 CNI 插件负责兑现。 理解 CNI 的切入点不是插件本身，而是 Linux 网络命名空间带来的问题。每个容器拥有独立的网络栈，包含独立的路由表、ARP 缓存、iptables 规则集。新建的命名空间里只有一个回环接口 lo，对外完全不可达——这正是容器隔离的本意。CNI 插件的全部工作就是在这种隔离性上凿出一条通道：创建 veth pair，把一端移入 Pod 命名空间，另一端挂到宿主机网桥，配置 IP 地址和路由，让 Pod 从完全隔离的孤岛变成集群网络里的一个节点。 跨节点通信是第二层复杂性。同节点内的 Pod 通过共享网桥即可互通，但当数据包需要离开宿主机的物理网卡，穿越真实的交换机和路由器，抵达另一台节点，再...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Pod-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-%E4%BB%8E-Pending-%E5%88%B0-Running-%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B7%AF%E5%BE%84/" title="Pod 生命周期：从 Pending 到 Running 的完整路径"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Pod-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-%E4%BB%8E-Pending-%E5%88%B0-Running-%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B7%AF%E5%BE%84/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Pod 生命周期：从 Pending 到 Running 的完整路径</div></div><div class="info-2"><div class="info-item-1">一个 kubectl apply -f pod.yaml 之后，终端里出现了 pod/my-app created。这行输出只意味着 API Server 接受了资源定义并写入 etcd——Pod 还没有运行在任何节点上，甚至还没有被任何节点知晓。从这个瞬间到容器真正响应流量，Pod 经历了一条由多个组件接力完成的状态转换链。 这条链不是黑盒。Kubernetes 把每个阶段都编码进 status.phase、status.conditions、status.containerStatuses 三个字段里，并通过 Events 记录关键节点的时间戳。理解这条链，就能在 Pod 卡住时精确定位是调度失败、镜像拉取失败、探针失败，还是 OOM Kill。 本文的核心问题是：一个 Pod 从 kubectl apply 到 Running 经历了哪些状态转换，每个状态背后是哪个组件在操作？ 状态转换全景图 12345678910111213141516171819202122232425kubectl apply     │     ▼  etcd (Pod phase=Pending...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%8A%82%E7%82%B9%E5%86%85%E9%83%A8%E5%85%A8%E6%99%AF%E5%9B%BE"><span class="toc-number">1.</span> <span class="toc-text">节点内部全景图</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#kubelet-%E7%9A%84%E5%B7%A5%E4%BD%9C%E5%BE%AA%E7%8E%AF%EF%BC%9Asyncpod"><span class="toc-number">2.</span> <span class="toc-text">kubelet 的工作循环：syncPod</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%B8%80%E6%AD%A5%EF%BC%9Aadmit-%E5%87%86%E5%85%A5%E6%A3%80%E6%9F%A5"><span class="toc-number">2.1.</span> <span class="toc-text">第一步：Admit（准入检查）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%BA%8C%E6%AD%A5%EF%BC%9A%E6%8C%82%E8%BD%BD-volume"><span class="toc-number">2.2.</span> <span class="toc-text">第二步：挂载 Volume</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%B8%89%E6%AD%A5%EF%BC%9A%E6%8B%89%E5%8F%96%E9%95%9C%E5%83%8F"><span class="toc-number">2.3.</span> <span class="toc-text">第三步：拉取镜像</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E5%9B%9B%E6%AD%A5%EF%BC%9A%E5%88%9B%E5%BB%BA-sandbox-pause-%E5%AE%B9%E5%99%A8"><span class="toc-number">2.4.</span> <span class="toc-text">第四步：创建 Sandbox（pause 容器）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%BA%94%E6%AD%A5%E5%92%8C%E7%AC%AC%E5%85%AD%E6%AD%A5%EF%BC%9A%E5%90%AF%E5%8A%A8%E5%AE%B9%E5%99%A8"><span class="toc-number">2.5.</span> <span class="toc-text">第五步和第六步：启动容器</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%B8%83%E6%AD%A5%EF%BC%9A%E5%90%AF%E5%8A%A8%E6%8E%A2%E9%92%88"><span class="toc-number">2.6.</span> <span class="toc-text">第七步：启动探针</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#cri%EF%BC%9Akubelet-%E4%B8%8E%E8%BF%90%E8%A1%8C%E6%97%B6%E7%9A%84%E6%A0%87%E5%87%86%E6%8E%A5%E5%8F%A3"><span class="toc-number">3.</span> <span class="toc-text">CRI：kubelet 与运行时的标准接口</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#containerd-%E5%86%85%E9%83%A8%E7%BB%84%E4%BB%B6%E9%93%BE"><span class="toc-number">4.</span> <span class="toc-text">containerd 内部组件链</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#cgroup-v2%EF%BC%9A%E8%B5%84%E6%BA%90%E9%9A%94%E7%A6%BB%E7%9A%84%E5%86%85%E6%A0%B8%E5%AE%9E%E7%8E%B0"><span class="toc-number">5.</span> <span class="toc-text">cgroup v2：资源隔离的内核实现</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#pleg%EF%BC%9Apod-%E7%8A%B6%E6%80%81%E6%84%9F%E7%9F%A5%E7%9A%84%E6%A0%B8%E5%BF%83%E6%9C%BA%E5%88%B6"><span class="toc-number">6.</span> <span class="toc-text">PLEG：Pod 状态感知的核心机制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%AF%E8%A7%82%E5%AF%9F%E5%AE%9E%E9%AA%8C"><span class="toc-number">7.</span> <span class="toc-text">可观察实验</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%94%A8-crictl-%E8%A7%82%E5%AF%9F%E5%AE%B9%E5%99%A8-%E4%B8%8D%E7%94%A8-docker"><span class="toc-number">7.1.</span> <span class="toc-text">用 crictl 观察容器（不用 docker）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%82%E5%AF%9F-cgroup-%E8%B5%84%E6%BA%90%E9%99%90%E5%88%B6"><span class="toc-number">7.2.</span> <span class="toc-text">观察 cgroup 资源限制</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%82%E5%AF%9F-containerd-shim-%E8%BF%9B%E7%A8%8B"><span class="toc-number">7.3.</span> <span class="toc-text">观察 containerd-shim 进程</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%82%E5%AF%9F-pause-%E5%AE%B9%E5%99%A8"><span class="toc-number">7.4.</span> <span class="toc-text">观察 pause 容器</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B0%86%E5%AE%9E%E9%AA%8C%E6%98%A0%E5%B0%84%E5%9B%9E%E5%86%85%E9%83%A8%E6%9C%BA%E5%88%B6"><span class="toc-number">8.</span> <span class="toc-text">将实验映射回内部机制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">9.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">10.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">11.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">12.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">13.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">14.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.5</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.5"></script><script src="/js/main.js?v=5.5.5"></script><script src="/js/tw_cn.js?v=5.5.5"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || item.innerHTML || ""
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    if (e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : window.location.href = e.request.responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.5.5"></script></div></div></body></html>

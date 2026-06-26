@@ -1,0 +1,812 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>日志存储：Segment、Index 与零拷贝 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇看到了 Kafka 集群的全景：broker 存储日志，controller 管理元数据，topic 通过 partition 映射到磁盘目录。这一篇进入单个 partition 内部，看日志文件到底怎么组织。 一个 partition 不是一个巨大的文件。更准确的说法是：一个 partition 是一组按 offset 范围切分的 segment 文件，每个 segment 由数据文件、o">
+<meta property="og:type" content="article">
+<meta property="og:title" content="日志存储：Segment、Index 与零拷贝">
+<meta property="og:url" content="https://magicliang.github.io/2026/06/20/%E6%97%A5%E5%BF%97%E5%AD%98%E5%82%A8-Segment-Index-%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇看到了 Kafka 集群的全景：broker 存储日志，controller 管理元数据，topic 通过 partition 映射到磁盘目录。这一篇进入单个 partition 内部，看日志文件到底怎么组织。 一个 partition 不是一个巨大的文件。更准确的说法是：一个 partition 是一组按 offset 范围切分的 segment 文件，每个 segment 由数据文件、o">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/06/20/%E6%97%A5%E5%BF%97%E5%AD%98%E5%82%A8-Segment-Index-%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D/cover.svg">
+<meta property="article:published_time" content="2026-06-20T02:20:00.000Z">
+<meta property="article:modified_time" content="2026-06-24T14:18:39.364Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Kafka">
+<meta property="article:tag" content="分布式系统">
+<meta property="article:tag" content="存储">
+<meta property="article:tag" content="日志">
+<meta property="article:tag" content="消息队列">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/06/20/%E6%97%A5%E5%BF%97%E5%AD%98%E5%82%A8-Segment-Index-%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "日志存储：Segment、Index 与零拷贝",
+  "url": "https://magicliang.github.io/2026/06/20/%E6%97%A5%E5%BF%97%E5%AD%98%E5%82%A8-Segment-Index-%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D/",
+  "image": "https://magicliang.github.io/2026/06/20/%E6%97%A5%E5%BF%97%E5%AD%98%E5%82%A8-Segment-Index-%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D/cover.svg",
+  "datePublished": "2026-06-20T02:20:00.000Z",
+  "dateModified": "2026-06-24T14:18:39.364Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/06/20/%E6%97%A5%E5%BF%97%E5%AD%98%E5%82%A8-Segment-Index-%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.5"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.2.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '日志存储：Segment、Index 与零拷贝',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">492</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">548</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">8</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/06/20/%E6%97%A5%E5%BF%97%E5%AD%98%E5%82%A8-Segment-Index-%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">日志存储：Segment、Index 与零拷贝</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">日志存储：Segment、Index 与零拷贝</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-06-20T02:20:00.000Z" title="Created 2026-06-20 10:20:00">2026-06-20</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-06-24T14:18:39.364Z" title="Updated 2026-06-24 22:18:39">2026-06-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.3k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>12mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-06-24 22:18:39&quot;}" hidden></div><p>上一篇看到了 Kafka 集群的全景：broker 存储日志，controller 管理元数据，topic 通过 partition 映射到磁盘目录。这一篇进入单个 partition 内部，看日志文件到底怎么组织。</p>
+<p>一个 partition 不是一个巨大的文件。更准确的说法是：一个 partition 是一组按 offset 范围切分的 segment 文件，每个 segment 由数据文件、offset 索引文件和时间索引文件组成。</p>
+<p>本文只抓一个问题：一条 produce 请求写入的字节如何变成磁盘上的 segment 文件，以及 fetch 请求如何通过零拷贝把这些字节送到网络上。</p>
+<span id="more"></span>
+<h2 id="segment-文件：日志的物理切片">Segment 文件：日志的物理切片</h2>
+<p>一个 partition 的日志目录中，segment 文件按 base offset 命名。Base offset 是该 segment 中第一条记录的 offset，用 20 位数字左补零表示。</p>
+<figure class="highlight livecodeserver"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs livecodeserver">partition 目录: orders<span class="hljs-number">-0</span>/<br>├── <span class="hljs-number">00000000000000000000.</span><span class="hljs-built_in">log</span>          ← <span class="hljs-keyword">segment</span> <span class="hljs-number">0</span> 的数据文件<br>├── <span class="hljs-number">00000000000000000000.</span>index        ← <span class="hljs-keyword">segment</span> <span class="hljs-number">0</span> 的 <span class="hljs-built_in">offset</span> 索引<br>├── <span class="hljs-number">00000000000000000000.</span>timeindex    ← <span class="hljs-keyword">segment</span> <span class="hljs-number">0</span> 的时间索引<br>├── <span class="hljs-number">00000000000000005000.</span><span class="hljs-built_in">log</span>          ← <span class="hljs-keyword">segment</span> <span class="hljs-number">1</span> (base <span class="hljs-built_in">offset</span> = <span class="hljs-number">5000</span>)<br>├── <span class="hljs-number">00000000000000005000.</span>index<br>├── <span class="hljs-number">00000000000000005000.</span>timeindex<br>├── <span class="hljs-number">00000000000000010000.</span><span class="hljs-built_in">log</span>          ← active <span class="hljs-keyword">segment</span> (当前写入点)<br>├── <span class="hljs-number">00000000000000010000.</span>index<br>└── <span class="hljs-number">00000000000000010000.</span>timeindex<br></code></pre></td></tr></table></figure>
+<p>Segment 滚动的触发条件由以下参数控制（取最先满足的条件）：</p>
+<ul>
+<li><code>log.segment.bytes</code>：单个 segment 文件的大小上限，默认 1 GB。</li>
+<li><code>log.roll.ms</code> / <code>log.roll.hours</code>：segment 的最大存活时间，默认 7 天。</li>
+</ul>
+<p>当 active segment 达到任一条件时，Kafka 关闭当前 segment（使其变为只读），创建一个新的 segment 文件作为 active segment。只有 active segment 接受写入，已关闭的 segment 不可变。</p>
+<p>这个设计的直接好处是：segment 的不可变性使得旧 segment 可以被安全地读取、复制和删除，不需要与写入路径加锁协调。</p>
+<h2 id="从-produce-请求到磁盘字节">从 Produce 请求到磁盘字节</h2>
+<p>一条 produce 请求到达 leader broker 后，经过以下路径写入磁盘：</p>
+<figure class="highlight excel"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><code class="hljs excel">Producer                     Leader Broker<br>   │                              │<br>   │── ProduceRequest ──→         │<br>   │   (topic, partition,         │<br>   │    RecordBatch)              │<br>   │                              │<br>   │                     ┌────────┴────────┐<br>   │                     │ <span class="hljs-number">1</span>. 校验 CRC     │<br>   │                     │ <span class="hljs-number">2</span>. 分配 <span class="hljs-built_in">offset</span>   │<br>   │                     │ <span class="hljs-number">3</span>. 追加到 active  │<br>   │                     │    segment 的    │<br>   │                     │    .<span class="hljs-built_in">log</span> 文件     │<br>   │                     │ <span class="hljs-number">4</span>. 更新 .<span class="hljs-built_in">index</span>   │<br>   │                     │    和 .timeindex │<br>   │                     └────────┬────────┘<br>   │                              │<br>   │←── ProduceResponse ──        │<br>   │   (<span class="hljs-built_in">base</span> <span class="hljs-built_in">offset</span>,              │<br>   │    <span class="hljs-built_in">log</span> append <span class="hljs-built_in">time</span>)          │<br></code></pre></td></tr></table></figure>
+<p>ProduceRequest 中的消息以 RecordBatch 为单位组织。一个 RecordBatch 可以包含多条记录（record），这是 producer 端攒批（batching）的结果，将在第 03 篇展开。</p>
+<p>写入过程的关键步骤：</p>
+<ol>
+<li>校验 RecordBatch 的 CRC 校验和，确保网络传输没有损坏数据。</li>
+<li>为 batch 中的每条 record 分配连续的 offset。Offset 分配是单调递增的，在 partition 级别保证唯一。</li>
+<li>将整个 RecordBatch 的字节追加到 active segment 的 <code>.log</code> 文件尾部。这是一次顺序写入。</li>
+<li>在 <code>.index</code> 文件中记录 offset 到文件物理位置（position）的映射。在 <code>.timeindex</code> 文件中记录时间戳到 offset 的映射。</li>
+</ol>
+<p>写入操作默认不立即调用 fsync。Kafka 依赖操作系统的 page cache 来缓冲写入，由 OS 决定何时将脏页刷到磁盘。这个设计选择用持久性的微小风险换取写入吞吐的大幅提升——如果 broker 进程崩溃但 OS 没有崩溃，page cache 中的数据仍然会被刷盘；如果 OS 也崩溃，副本机制（replication）提供保护。</p>
+<h2 id="offset-索引：稀疏索引与二分查找">Offset 索引：稀疏索引与二分查找</h2>
+<p><code>.index</code> 文件不为每一条记录建索引。它是一个稀疏索引（sparse index），每隔一定字节量（由 <code>index.interval.bytes</code> 控制，默认 4096 字节）在 index 中插入一个条目。</p>
+<p>每个 index 条目是一个 8 字节的定长记录：</p>
+<figure class="highlight scss"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs scss">┌──────────────────┬──────────────────┐<br>│  相对 <span class="hljs-attribute">offset</span> (<span class="hljs-number">4</span>B) │  物理位置 (<span class="hljs-number">4</span>B)    │<br>└──────────────────┴──────────────────┘<br></code></pre></td></tr></table></figure>
+<p>&quot;相对 offset&quot;是该记录的 offset 减去 segment 的 base offset。这样 4 字节整数就足以表示一个 segment 内部的 offset 范围（一个 segment 默认最大 1 GB，按最小记录大小计算，4 字节整数足够覆盖）。</p>
+<p>查找某个 offset 的过程：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><code class="hljs yaml"><span class="hljs-string">目标:</span> <span class="hljs-string">读取</span> <span class="hljs-string">offset</span> <span class="hljs-string">=</span> <span class="hljs-number">7500</span> <span class="hljs-string">的记录</span><br><br><span class="hljs-number">1</span><span class="hljs-string">.</span> <span class="hljs-string">定位</span> <span class="hljs-attr">segment:</span><br>   <span class="hljs-string">已知</span> <span class="hljs-string">segment</span> <span class="hljs-string">列表:</span> [<span class="hljs-number">0</span>, <span class="hljs-number">5000</span>, <span class="hljs-number">10000</span>]<br>   <span class="hljs-number">7500</span> <span class="hljs-string">&gt;=</span> <span class="hljs-number">5000</span> <span class="hljs-string">且</span> <span class="hljs-number">7500</span> <span class="hljs-string">&lt;</span> <span class="hljs-number">10000</span><br>   <span class="hljs-string">→</span> <span class="hljs-string">目标在</span> <span class="hljs-string">segment</span> <span class="hljs-number">00000000000000005000</span><br><br><span class="hljs-number">2</span><span class="hljs-string">.</span> <span class="hljs-string">在该</span> <span class="hljs-string">segment</span> <span class="hljs-string">的</span> <span class="hljs-string">.index</span> <span class="hljs-string">中二分查找:</span><br>   <span class="hljs-string">index</span> <span class="hljs-string">条目:</span> [<span class="hljs-string">(0</span>, <span class="hljs-string">pos=0)</span>, <span class="hljs-string">(500</span>, <span class="hljs-string">pos=4096)</span>, <span class="hljs-string">(1000</span>, <span class="hljs-string">pos=8192)</span>, <span class="hljs-string">...</span>]<br>   <span class="hljs-string">相对</span> <span class="hljs-string">offset</span> <span class="hljs-string">=</span> <span class="hljs-number">7500</span> <span class="hljs-bullet">-</span> <span class="hljs-number">5000</span> <span class="hljs-string">=</span> <span class="hljs-number">2500</span><br>   <span class="hljs-string">找到</span> <span class="hljs-string">&lt;=</span> <span class="hljs-number">2500</span> <span class="hljs-string">的最大条目:</span> <span class="hljs-string">(2500,</span> <span class="hljs-string">pos=20480)</span><br>   <span class="hljs-string">→</span> <span class="hljs-string">从</span> <span class="hljs-string">.log</span> <span class="hljs-string">文件的</span> <span class="hljs-string">position</span> <span class="hljs-number">20480</span> <span class="hljs-string">开始</span><br><br><span class="hljs-number">3</span><span class="hljs-string">.</span> <span class="hljs-string">从</span> <span class="hljs-string">position</span> <span class="hljs-number">20480</span> <span class="hljs-string">开始顺序扫描:</span><br>   <span class="hljs-string">读取每条</span> <span class="hljs-string">record</span> <span class="hljs-string">的</span> <span class="hljs-string">offset，直到找到</span> <span class="hljs-string">offset</span> <span class="hljs-string">=</span> <span class="hljs-number">7500</span><br></code></pre></td></tr></table></figure>
+<p>这个两级查找的时间复杂度是 O(log S + log I + K)，其中 S 是 segment 数量，I 是 index 条目数量，K 是从 index 命中位置到目标 offset 的顺序扫描记录数。由于 K 受 <code>index.interval.bytes</code> 限制，通常很小。</p>
+<h2 id="时间索引">时间索引</h2>
+<p><code>.timeindex</code> 文件的结构与 <code>.index</code> 类似，但映射关系是时间戳到 offset：</p>
+<figure class="highlight scss"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs scss">┌──────────────────┬──────────────────┐<br>│  时间戳 (<span class="hljs-number">8</span>B)      │  相对 <span class="hljs-attribute">offset</span> (<span class="hljs-number">4</span>B) │<br>└──────────────────┴──────────────────┘<br></code></pre></td></tr></table></figure>
+<p>时间索引用于支持按时间戳查找消息（<code>offsetsForTimes</code> API），以及基于时间的 retention 策略。Consumer 可以通过 <code>KafkaConsumer.offsetsForTimes()</code> 方法找到某个时间戳之后的第一个 offset，然后从该 offset 开始消费——这在数据回放和故障恢复场景中非常有用。</p>
+<h2 id="零拷贝：sendfile-与-page-cache">零拷贝：sendfile 与 page cache</h2>
+<p>Fetch 请求的数据传输路径是 Kafka 高吞吐的关键。传统的数据传输需要四次数据复制：</p>
+<figure class="highlight livecodeserver"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs livecodeserver">传统路径 (<span class="hljs-built_in">read</span> + <span class="hljs-built_in">write</span>):<br>  磁盘 → 内核 page cache → 用户态缓冲区 → 内核 <span class="hljs-built_in">socket</span> 缓冲区 → 网卡<br><br>  <span class="hljs-number">4</span> 次数据复制，<span class="hljs-number">2</span> 次上下文切换（内核态 ↔ 用户态）<br></code></pre></td></tr></table></figure>
+<p>Kafka 使用 Java NIO 的 <code>FileChannel.transferTo()</code> 方法，底层对应 Linux 的 <code>sendfile()</code> 系统调用：</p>
+<figure class="highlight tap"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs tap">零拷贝路径 (sendfile):<br>  磁盘 → 内核 page cache → 网卡 (DMA 直传)<br><br> <span class="hljs-number"> 2 </span>次数据复制（如果网卡支持 scatter-gather DMA，可以减少到<span class="hljs-number"> 1 </span>次）<br> <span class="hljs-number"> 0 </span>次用户态复制<br></code></pre></td></tr></table></figure>
+<p>零拷贝的核心在于：数据从 page cache 直接传到网卡缓冲区，不经过 Kafka broker 的 JVM 堆内存。这意味着：</p>
+<ul>
+<li>数据传输不受 GC 影响。大量数据在内核态完成传输，JVM 堆没有分配任何临时对象。</li>
+<li>broker 的内存消耗与数据吞吐量不成正比。即使传输 GB 级别的数据，broker 的堆内存使用量几乎不变。</li>
+</ul>
+<p>Kafka broker 不维护自己的消息缓存或 buffer pool。缓存完全依赖操作系统的 page cache。当 consumer 的消费速度跟得上 producer 的写入速度时，fetch 请求读取的数据很可能仍然在 page cache 中——这意味着 fetch 请求甚至不触发磁盘 I/O，直接从内存中零拷贝到网络。</p>
+<figure class="highlight pgsql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs pgsql">写入路径:                      读取路径:<br>Producer → Broker              Broker → Consumer<br>         → append <span class="hljs-keyword">to</span> .<span class="hljs-keyword">log</span>               ← sendfile() <span class="hljs-keyword">from</span> .<span class="hljs-keyword">log</span><br>         → 数据进入 page <span class="hljs-keyword">cache</span>           ← 如果数据仍在 page <span class="hljs-keyword">cache</span>:<br>                                           直接从内存到网卡,<br>                                           不触发磁盘 I/O<br></code></pre></td></tr></table></figure>
+<p>这个设计让 Kafka 的读写性能高度依赖操作系统的 page cache 管理。在生产环境中，为 Kafka broker 预留足够的系统内存（不分配给 JVM 堆）是性能调优的关键——这些内存会被 OS 自动用作 page cache。</p>
+<h2 id="实验：写入消息并检查-segment-文件">实验：写入消息并检查 segment 文件</h2>
+<p>以下实验向一个 topic 写入大量消息，然后用 <code>kafka-dump-log</code> 工具检查 segment 文件的内部结构。</p>
+<p>创建 topic 并写入 10 万条消息：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 创建 topic，设置较小的 segment 大小以便观察 segment 滚动</span><br>bin/kafka-topics.sh --create --topic storage-demo \<br>  --partitions 1 --replication-factor 1 \<br>  --config segment.bytes=1048576 \<br>  --bootstrap-server localhost:9092<br><br><span class="hljs-comment"># 生成 100000 条消息并写入</span><br><span class="hljs-built_in">seq</span> 1 100000 | bin/kafka-console-producer.sh \<br>  --topic storage-demo --bootstrap-server localhost:9092<br></code></pre></td></tr></table></figure>
+<p>检查 partition 目录中的 segment 文件：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">ls</span> -lh /tmp/kafka-logs-0/storage-demo-0/<br></code></pre></td></tr></table></figure>
+<p>输出类似：</p>
+<figure class="highlight brainfuck"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs brainfuck"><span class="hljs-literal">-</span><span class="hljs-comment">rw</span><span class="hljs-literal">-</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span>  <span class="hljs-comment">1 kafka  staff  1</span><span class="hljs-string">.</span><span class="hljs-comment">0M  00000000000000000000</span><span class="hljs-string">.</span><span class="hljs-comment">log</span><br><span class="hljs-literal">-</span><span class="hljs-comment">rw</span><span class="hljs-literal">-</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span>  <span class="hljs-comment">1 kafka  staff  10M   00000000000000000000</span><span class="hljs-string">.</span><span class="hljs-comment">index</span><br><span class="hljs-literal">-</span><span class="hljs-comment">rw</span><span class="hljs-literal">-</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span>  <span class="hljs-comment">1 kafka  staff  10M   00000000000000000000</span><span class="hljs-string">.</span><span class="hljs-comment">timeindex</span><br><span class="hljs-literal">-</span><span class="hljs-comment">rw</span><span class="hljs-literal">-</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span>  <span class="hljs-comment">1 kafka  staff  1</span><span class="hljs-string">.</span><span class="hljs-comment">0M  00000000000000065536</span><span class="hljs-string">.</span><span class="hljs-comment">log</span><br><span class="hljs-literal">-</span><span class="hljs-comment">rw</span><span class="hljs-literal">-</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span>  <span class="hljs-comment">1 kafka  staff  10M   00000000000000065536</span><span class="hljs-string">.</span><span class="hljs-comment">index</span><br><span class="hljs-literal">-</span><span class="hljs-comment">rw</span><span class="hljs-literal">-</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span>  <span class="hljs-comment">1 kafka  staff  10M   00000000000000065536</span><span class="hljs-string">.</span><span class="hljs-comment">timeindex</span><br><span class="hljs-literal">-</span><span class="hljs-comment">rw</span><span class="hljs-literal">-</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span>  <span class="hljs-comment">1 kafka  staff  524K  00000000000000131072</span><span class="hljs-string">.</span><span class="hljs-comment">log   ← active segment</span><br><span class="hljs-literal">-</span><span class="hljs-comment">rw</span><span class="hljs-literal">-</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span>  <span class="hljs-comment">1 kafka  staff  10M   00000000000000131072</span><span class="hljs-string">.</span><span class="hljs-comment">index</span><br><span class="hljs-literal">-</span><span class="hljs-comment">rw</span><span class="hljs-literal">-</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span><span class="hljs-comment">r</span><span class="hljs-literal">--</span>  <span class="hljs-comment">1 kafka  staff  10M   00000000000000131072</span><span class="hljs-string">.</span><span class="hljs-comment">timeindex</span><br></code></pre></td></tr></table></figure>
+<p>index 和 timeindex 文件预分配了固定大小（由 <code>segment.index.bytes</code> 控制，默认 10 MB），实际使用的空间在 segment 关闭时才会截断。</p>
+<p>使用 <code>kafka-dump-log</code> 查看 segment 内部结构：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash">bin/kafka-dump-log.sh --files /tmp/kafka-logs-0/storage-demo-0/00000000000000000000.<span class="hljs-built_in">log</span> \<br>  --print-data-log | <span class="hljs-built_in">head</span> -20<br></code></pre></td></tr></table></figure>
+<p>输出展示每个 RecordBatch 的元信息和其中的 record：</p>
+<figure class="highlight nix"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs nix">Dumping <span class="hljs-symbol">/tmp/kafka-logs-0/storage-demo-0/00000000000000000000.log</span><br>Starting <span class="hljs-params">offset:</span> <span class="hljs-number">0</span><br><span class="hljs-params">baseOffset:</span> <span class="hljs-number">0</span> <span class="hljs-params">lastOffset:</span> <span class="hljs-number">249</span> <span class="hljs-params">count:</span> <span class="hljs-number">250</span> ... <span class="hljs-params">position:</span> <span class="hljs-number">0</span> ...<br>| <span class="hljs-params">offset:</span> <span class="hljs-number">0</span> ... <span class="hljs-params">payload:</span> <span class="hljs-number">1</span><br>| <span class="hljs-params">offset:</span> <span class="hljs-number">1</span> ... <span class="hljs-params">payload:</span> <span class="hljs-number">2</span><br>| <span class="hljs-params">offset:</span> <span class="hljs-number">2</span> ... <span class="hljs-params">payload:</span> <span class="hljs-number">3</span><br>...<br></code></pre></td></tr></table></figure>
+<p>查看 index 文件的内容：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">bin/kafka-dump-log.sh --files /tmp/kafka-logs-0/storage-demo-0/00000000000000000000.index<br></code></pre></td></tr></table></figure>
+<p>输出展示稀疏索引条目——不是每个 offset 都有索引，只有间隔超过 <code>index.interval.bytes</code> 的位置才记录：</p>
+<figure class="highlight nix"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs nix">Dumping <span class="hljs-symbol">/tmp/kafka-logs-0/storage-demo-0/00000000000000000000.index</span><br><span class="hljs-params">offset:</span> <span class="hljs-number">250</span> <span class="hljs-params">position:</span> <span class="hljs-number">4144</span><br><span class="hljs-params">offset:</span> <span class="hljs-number">500</span> <span class="hljs-params">position:</span> <span class="hljs-number">8288</span><br><span class="hljs-params">offset:</span> <span class="hljs-number">750</span> <span class="hljs-params">position:</span> <span class="hljs-number">12432</span><br>...<br></code></pre></td></tr></table></figure>
+<h2 id="模式提炼">模式提炼</h2>
+<p>Kafka 的 segment 存储是日志结构存储（log-structured storage）的一种实现。这个模式的核心特征：</p>
+<ul>
+<li>写入只追加到当前活跃文件的尾部，是纯顺序 I/O。</li>
+<li>文件按时间或大小切片，旧文件不可变。</li>
+<li>读取通过索引结构定位，避免全文件扫描。</li>
+<li>空间回收通过删除整个旧文件实现，不需要在文件内部做 compaction。</li>
+</ul>
+<p>与 LSM-tree（如 RocksDB、LevelDB）的区别：LSM-tree 的 SSTable 文件也是不可变的，但 LSM-tree 需要 compaction 过程来合并不同层级的文件、消除重复 key。Kafka 的 segment 文件之间没有 key 重叠——每个 segment 负责一段连续的 offset 范围，不需要合并。（Kafka 的 log compaction 功能是另一回事，将在第 10 篇展开。）</p>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Kafka segment</th>
+<th>RocketMQ MappedFile</th>
+<th>数据库 WAL segment</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>文件组织</td>
+<td>每个 partition 独立的 segment 文件</td>
+<td>所有 topic 共享一个 CommitLog，按固定大小切片</td>
+<td>按 LSN 或时间切片的日志文件</td>
+</tr>
+<tr>
+<td>命名规则</td>
+<td>base offset（20 位数字）</td>
+<td>起始物理偏移量</td>
+<td>LSN 或序号</td>
+</tr>
+<tr>
+<td>索引方式</td>
+<td>稀疏 offset 索引 + 时间索引</td>
+<td>ConsumeQueue（每个 topic-partition 一个索引文件）</td>
+<td>无独立索引（顺序回放）</td>
+</tr>
+<tr>
+<td>写入方式</td>
+<td>FileChannel.write() / page cache</td>
+<td>mmap (MappedByteBuffer)</td>
+<td>取决于数据库实现</td>
+</tr>
+<tr>
+<td>读取传输</td>
+<td>sendfile() 零拷贝</td>
+<td>mmap 读取 + 网络写入</td>
+<td>顺序回放</td>
+</tr>
+<tr>
+<td>空间回收</td>
+<td>按 retention 删除整个 segment</td>
+<td>按过期时间删除整个 MappedFile</td>
+<td>checkpoint 后截断</td>
+</tr>
+</tbody>
+</table>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：“Kafka 用 mmap 读取消息。”</p>
+<p>Kafka broker 的消息读取路径使用 <code>FileChannel.transferTo()</code>（对应 sendfile 系统调用），不使用 mmap。RocketMQ 使用 mmap（MappedByteBuffer）进行读写，这是两者在存储层的重要区别。Kafka 的 index 文件使用 mmap 方式加载到内存，但数据文件（.log）的读取走 sendfile。</p>
+<p>误解二：“索引存储每个 offset 的位置。”</p>
+<p>Kafka 的 offset 索引是稀疏的，不为每条记录建索引条目。索引条目的密度由 <code>index.interval.bytes</code>（默认 4096 字节）控制——每当累计写入的字节数超过这个阈值时，才插入一个新的索引条目。这意味着查找一个特定 offset 时，先通过二分查找定位到最近的索引条目，然后从该位置开始顺序扫描若干条记录。</p>
+<p>误解三：“Kafka 的高性能来自内存数据库式的设计。”</p>
+<p>Kafka broker 没有维护任何应用层的消息缓存。数据直接写入文件系统（由 page cache 缓冲），读取时通过 sendfile 直接从文件系统传到网络。Kafka 的性能模型是&quot;让操作系统做它最擅长的事&quot;——顺序 I/O、page cache 管理、零拷贝传输。JVM 堆的大小对 Kafka 的吞吐量影响很小，系统空闲内存（用于 page cache）的大小影响很大。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>
+<p>在上面的实验中，修改 <code>segment.bytes</code> 为不同的值（如 100 KB、10 MB），重新创建 topic 并写入相同数量的消息。观察 segment 文件的数量和大小如何变化。</p>
+</li>
+<li>
+<p>使用 <code>kafka-dump-log.sh --files xxx.index</code> 检查 index 文件的条目间隔。修改 topic 配置 <code>index.interval.bytes</code> 为不同的值，重新写入消息后对比 index 条目的密度变化。</p>
+</li>
+<li>
+<p>查阅 Linux <code>sendfile()</code> 系统调用的 man page，理解其参数和返回值。思考在什么条件下 sendfile 会退化为普通的 read+write（提示：跨文件系统、加密传输）。</p>
+</li>
+</ol>
+<h2 id="系列导航">系列导航</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align:right">序号</th>
+<th>主题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:right">00</td>
+<td><a href="/2026/06/20/%E5%AF%BC%E8%AF%BB-%E4%B8%BA%E4%BB%80%E4%B9%88-Kafka-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%98%AF%E4%B8%80%E6%A0%B9%E6%97%A5%E5%BF%97/">导读：为什么 Kafka 的核心是一根日志</a></td>
+</tr>
+<tr>
+<td style="text-align:right">01</td>
+<td><a href="/2026/06/20/%E6%9E%B6%E6%9E%84%E6%80%BB%E8%A7%88-Broker-Controller-%E4%B8%8E%E5%85%83%E6%95%B0%E6%8D%AE%E7%AE%A1%E7%90%86/">架构总览：Broker、Controller 与元数据管理</a></td>
+</tr>
+<tr>
+<td style="text-align:right"><strong>02</strong></td>
+<td><strong>日志存储：Segment、Index 与零拷贝</strong></td>
+</tr>
+<tr>
+<td style="text-align:right">03</td>
+<td><a href="/2026/06/20/Producer-%E5%86%85%E9%83%A8%E6%9C%BA%E5%88%B6-%E6%94%92%E6%89%B9-%E5%88%86%E5%8C%BA%E4%B8%8E-acks/">Producer 内部机制：攒批、分区与 acks</a></td>
+</tr>
+<tr>
+<td style="text-align:right">04</td>
+<td><a href="/2026/06/20/%E5%B9%82%E7%AD%89-Producer-%E4%B8%8E%E5%BA%8F%E5%88%97%E5%8F%B7-%E6%B6%88%E6%81%AF%E4%B8%8D%E9%87%8D%E4%B8%8D%E4%B8%A2%E7%9A%84%E7%AC%AC%E4%B8%80%E5%B1%82/">幂等 Producer 与序列号：消息不重不丢的第一层</a></td>
+</tr>
+<tr>
+<td style="text-align:right">05</td>
+<td><a href="/2026/06/20/Consumer-Group-%E5%8D%8F%E8%AE%AE-%E5%88%86%E9%85%8D-%E9%87%8D%E5%B9%B3%E8%A1%A1%E4%B8%8E%E9%9D%99%E6%80%81%E6%88%90%E5%91%98/">Consumer Group 协议：分配、重平衡与静态成员</a></td>
+</tr>
+<tr>
+<td style="text-align:right">06</td>
+<td><a href="/2026/06/20/Offset-%E7%AE%A1%E7%90%86-%E6%8F%90%E4%BA%A4-%E9%87%8D%E7%BD%AE%E4%B8%8E%E6%B6%88%E8%B4%B9%E8%AF%AD%E4%B9%89/">Offset 管理：提交、重置与消费语义</a></td>
+</tr>
+<tr>
+<td style="text-align:right">07</td>
+<td><a href="/2026/06/20/%E5%89%AF%E6%9C%AC%E4%B8%8E-ISR-%E9%AB%98%E5%8F%AF%E7%94%A8%E7%9A%84%E4%BB%A3%E4%BB%B7%E5%92%8C%E6%8A%98%E4%B8%AD/">副本与 ISR：高可用的代价和折中</a></td>
+</tr>
+<tr>
+<td style="text-align:right">08</td>
+<td><a href="/2026/06/20/Controller-%E4%B8%8E-KRaft-%E4%BB%8E-ZooKeeper-%E5%88%B0%E5%86%85%E7%BD%AE%E5%85%B1%E8%AF%86/">Controller 与 KRaft：从 ZooKeeper 到内置共识</a></td>
+</tr>
+<tr>
+<td style="text-align:right">09</td>
+<td><a href="/2026/06/20/Exactly-Once-%E4%B8%8E%E4%BA%8B%E5%8A%A1-%E8%B7%A8-partition-%E7%9A%84%E5%8E%9F%E5%AD%90%E5%86%99%E5%85%A5/">Exactly-Once 与事务：跨 partition 的原子写入</a></td>
+</tr>
+<tr>
+<td style="text-align:right">10</td>
+<td><a href="/2026/06/20/%E6%97%A5%E5%BF%97%E5%8E%8B%E7%BC%A9-%E6%8A%8A-topic-%E5%BD%93-KV-%E8%A1%A8%E7%94%A8/">日志压缩：把 topic 当 KV 表用</a></td>
+</tr>
+<tr>
+<td style="text-align:right">11</td>
+<td><a href="/2026/06/20/Kafka-Streams-%E5%9C%A8%E6%97%A5%E5%BF%97%E4%B9%8B%E4%B8%8A%E6%9E%84%E5%BB%BA%E6%B5%81%E5%A4%84%E7%90%86/">Kafka Streams：在日志之上构建流处理</a></td>
+</tr>
+<tr>
+<td style="text-align:right">12</td>
+<td><a href="/2026/06/20/Kafka-Connect-%E6%A0%87%E5%87%86%E5%8C%96%E7%9A%84%E6%95%B0%E6%8D%AE%E7%AE%A1%E9%81%93/">Kafka Connect：标准化的数据管道</a></td>
+</tr>
+<tr>
+<td style="text-align:right">13</td>
+<td><a href="/2026/06/20/Schema-Registry-%E4%B8%8E%E6%95%B0%E6%8D%AE%E6%B2%BB%E7%90%86-%E7%BB%99%E6%B6%88%E6%81%AF%E5%8A%A0%E4%B8%8A%E5%A5%91%E7%BA%A6/">Schema Registry 与数据治理：给消息加上契约</a></td>
+</tr>
+<tr>
+<td style="text-align:right">14</td>
+<td><a href="/2026/06/20/%E6%80%A7%E8%83%BD%E6%A8%A1%E5%9E%8B-%E5%90%9E%E5%90%90-%E5%BB%B6%E8%BF%9F%E4%B8%8E%E8%B0%83%E4%BC%98%E6%80%9D%E8%B7%AF/">性能模型：吞吐、延迟与调优思路</a></td>
+</tr>
+<tr>
+<td style="text-align:right">15</td>
+<td><a href="/2026/06/20/%E5%AE%89%E5%85%A8%E4%BD%93%E7%B3%BB-%E8%AE%A4%E8%AF%81-%E6%8E%88%E6%9D%83%E4%B8%8E%E5%8A%A0%E5%AF%86/">安全体系：认证、授权与加密</a></td>
+</tr>
+<tr>
+<td style="text-align:right">16</td>
+<td><a href="/2026/06/20/%E7%94%9F%E4%BA%A7%E8%BF%90%E7%BB%B4-%E9%9B%86%E7%BE%A4%E6%89%A9%E7%BC%A9-%E7%9B%91%E6%8E%A7%E6%8C%87%E6%A0%87%E4%B8%8E%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5/">生产运维：集群扩缩、监控指标与故障排查</a></td>
+</tr>
+<tr>
+<td style="text-align:right">17</td>
+<td><a href="/2026/06/20/Kafka-%E4%B8%8E-RocketMQ-%E4%B8%A4%E7%A7%8D%E6%B6%88%E6%81%AF%E7%B3%BB%E7%BB%9F%E7%9A%84%E8%AE%BE%E8%AE%A1%E9%80%89%E6%8B%A9/">Kafka 与 RocketMQ：两种消息系统的设计选择</a></td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考资料">参考资料</h2>
+<ol>
+<li>Apache Kafka Documentation — Design: Log. <a target="_blank" rel="noopener" href="https://kafka.apache.org/documentation/#design_filesystem">https://kafka.apache.org/documentation/#design_filesystem</a></li>
+<li>Apache Kafka Documentation — Design: Efficiency (Zero-Copy). <a target="_blank" rel="noopener" href="https://kafka.apache.org/documentation/#maximizingefficiency">https://kafka.apache.org/documentation/#maximizingefficiency</a></li>
+<li>Linux man page: sendfile(2). <a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man2/sendfile.2.html">https://man7.org/linux/man-pages/man2/sendfile.2.html</a></li>
+<li>Apache Kafka Source Code — <code>kafka.log.LogSegment</code>, <code>kafka.log.OffsetIndex</code>. <a target="_blank" rel="noopener" href="https://github.com/apache/kafka">https://github.com/apache/kafka</a></li>
+<li>Neha Narkhede, Gwen Shapira, Todd Palino. <em>Kafka: The Definitive Guide.</em> O’Reilly. Chapter 5: Kafka Internals — Log Storage.</li>
+</ol>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/06/20/%E6%97%A5%E5%BF%97%E5%AD%98%E5%82%A8-Segment-Index-%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D/">https://magicliang.github.io/2026/06/20/%E6%97%A5%E5%BF%97%E5%AD%98%E5%82%A8-Segment-Index-%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/%E5%AD%98%E5%82%A8/">存储</a><a class="post-meta__tags" href="/tags/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><a class="post-meta__tags" href="/tags/Kafka/">Kafka</a><a class="post-meta__tags" href="/tags/%E6%97%A5%E5%BF%97/">日志</a></div><div class="post-share"><div class="social-share" data-image="/2026/06/20/%E6%97%A5%E5%BF%97%E5%AD%98%E5%82%A8-Segment-Index-%E4%B8%8E%E9%9B%B6%E6%8B%B7%E8%B4%9D/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/20/%E6%97%A5%E5%BF%97%E5%8E%8B%E7%BC%A9-%E6%8A%8A-topic-%E5%BD%93-KV-%E8%A1%A8%E7%94%A8/" title="日志压缩：把 topic 当 KV 表用"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E6%97%A5%E5%BF%97%E5%8E%8B%E7%BC%A9-%E6%8A%8A-topic-%E5%BD%93-KV-%E8%A1%A8%E7%94%A8/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">日志压缩：把 topic 当 KV 表用</div></div><div class="info-2"><div class="info-item-1">前面的文章中，日志的保留策略一直是基于时间或大小的删除。这一篇介绍另一种保留策略：日志压缩。 日志压缩容易被理解成&quot;压缩存储空间&quot;。更准确的说法是：日志压缩是一种按 key 去重的保留策略，对每个 key 只保留最新的 value，把一个 append-only 的日志变成一个可以反映最新状态的 KV 快照。 本文只抓一个问题：日志压缩的语义、执行机制和适用场景。 两种保留策略 Kafka 的日志保留由 topic 级别的 cleanup.policy 参数控制，有三种取值： 123cleanup.policy=delete     基于时间或大小删除整个 segmentcleanup.policy=compact    按 key 去重，保留每个 key 的最新 valuecleanup.policy=compact,delete  先压缩去重，再按时间/大小删除 delete 策略是前面几篇文章一直在讨论的默认行为：segment 文件超过 retention.ms 或 retention.bytes 后被整体删除，不关心消息的 key 是什么。 comp...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E5%AF%BC%E8%AF%BB-%E4%B8%BA%E4%BB%80%E4%B9%88-Kafka-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%98%AF%E4%B8%80%E6%A0%B9%E6%97%A5%E5%BF%97/" title="导读：为什么 Kafka 的核心是一根日志"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E5%AF%BC%E8%AF%BB-%E4%B8%BA%E4%BB%80%E4%B9%88-Kafka-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%98%AF%E4%B8%80%E6%A0%B9%E6%97%A5%E5%BF%97/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">导读：为什么 Kafka 的核心是一根日志</div></div><div class="info-2"><div class="info-item-1">Kafka 不是一个消息队列。更准确的说法是：Kafka 是一个分布式追加日志（append-only log）系统，消息队列的语义只是日志操作的一种投影。 本文只抓一个问题：追加日志这个数据结构，如何成为 Kafka 全部机制的起点。  追加日志：一种最朴素的数据结构 追加日志的定义可以压成三条规则：  写入只能追加到尾部（append）。 每条记录获得一个单调递增的序号（offset）。 已写入的记录不可修改（immutable）。  用 ASCII 表示一根日志的状态： 123456offset:  0    1    2    3    4    5    6       +----+----+----+----+----+----+----+       | m0 | m1 | m2 | m3 | m4 | m5 |    | ← 写入点       +----+----+----+----+----+----+----+                                       ^                                   ...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E5%B9%82%E7%AD%89-Producer-%E4%B8%8E%E5%BA%8F%E5%88%97%E5%8F%B7-%E6%B6%88%E6%81%AF%E4%B8%8D%E9%87%8D%E4%B8%8D%E4%B8%A2%E7%9A%84%E7%AC%AC%E4%B8%80%E5%B1%82/" title="幂等 Producer 与序列号：消息不重不丢的第一层"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E5%B9%82%E7%AD%89-Producer-%E4%B8%8E%E5%BA%8F%E5%88%97%E5%8F%B7-%E6%B6%88%E6%81%AF%E4%B8%8D%E9%87%8D%E4%B8%8D%E4%B8%A2%E7%9A%84%E7%AC%AC%E4%B8%80%E5%B1%82/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">幂等 Producer 与序列号：消息不重不丢的第一层</div></div><div class="info-2"><div class="info-item-1">上一篇走完了 Producer 的发送管线。这一篇解决一个写入端的经典问题：网络超时后重试，消息会不会写两遍。 重试导致重复是分布式系统的常见症状。Producer 发出一个请求，broker 写入成功但响应在网络中丢失，Producer 不知道成功了于是重发——同一条消息在日志中出现了两次。Kafka 从 0.11 版本开始，在 broker 端引入了基于序列号的去重机制，称为 idempotent producer。 本文只抓一个问题：幂等 Producer 是怎么用 PID 和序列号在 broker 端做去重的，它的边界在哪里。 重复问题的根源 先看一个没有幂等保护时的场景： 1234567891011Producer                          Broker (Leader)   |                                  |   |--- ProduceRequest(msg-A) -------&gt;|   |                                  |--- 写入 partition log...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Kafka-Connect-%E6%A0%87%E5%87%86%E5%8C%96%E7%9A%84%E6%95%B0%E6%8D%AE%E7%AE%A1%E9%81%93/" title="Kafka Connect：标准化的数据管道"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Kafka-Connect-%E6%A0%87%E5%87%86%E5%8C%96%E7%9A%84%E6%95%B0%E6%8D%AE%E7%AE%A1%E9%81%93/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Kafka Connect：标准化的数据管道</div></div><div class="info-2"><div class="info-item-1">上一篇看了 Kafka 内置的流处理库。这一篇转向数据集成：怎么把外部系统的数据可靠地搬进搬出 Kafka。 数据集成容易退化成&quot;给每个数据源写一个 producer，给每个数据目标写一个 consumer&quot;。当数据源和目标各有几十个时，组合爆炸。Kafka Connect 的目标是把这个问题标准化：用统一的框架和插件机制，把数据管道的公共逻辑（offset 追踪、序列化、容错、分布式任务分配）收到框架层，让开发者只关注&quot;怎么从特定系统读数据&quot;和&quot;怎么往特定系统写数据&quot;。 本文只抓一个问题：Kafka Connect 如何用标准化的 connector/task 模型实现可靠的数据管道。 架构模型 123456789101112    Kafka Connect Cluster┌────────────────────────────┐│   Worker 1    Worker 2     ││  ┌────────┐ ┌────────┐    ││  │Task A-0│ │Task A-1│    │  ← So...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E6%9E%B6%E6%9E%84%E6%80%BB%E8%A7%88-Broker-Controller-%E4%B8%8E%E5%85%83%E6%95%B0%E6%8D%AE%E7%AE%A1%E7%90%86/" title="架构总览：Broker、Controller 与元数据管理"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E6%9E%B6%E6%9E%84%E6%80%BB%E8%A7%88-Broker-Controller-%E4%B8%8E%E5%85%83%E6%95%B0%E6%8D%AE%E7%AE%A1%E7%90%86/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">架构总览：Broker、Controller 与元数据管理</div></div><div class="info-2"><div class="info-item-1">上一篇确立了追加日志是 Kafka 的核心抽象。这一篇展开这根日志运行在什么样的集群架构上。 一个常见的简化说法是&quot;Kafka 是一组 broker&quot;。更准确的描述是：Kafka 集群由若干 broker 进程组成，其中一个 broker 承担 controller 角色，负责元数据管理和 partition leader 选举。 本文只抓一个问题：从 topic 到磁盘目录，数据和元数据分别如何组织。  Broker：存储日志并服务读写请求 Broker 是 Kafka 集群中的工作进程。每个 broker 做两件事：  存储分配给它的 partition 的日志文件（.log、.index、.timeindex）。 服务 produce 请求（追加记录到日志尾部）和 fetch 请求（按 offset 从日志中读取记录）。  一个 broker 可以同时持有多个 topic 的多个 partition。每个 partition 在磁盘上是一个独立的目录，目录名格式为 {topic名}-{partition号}。 1234567891011broker-0 ...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Producer-%E5%86%85%E9%83%A8%E6%9C%BA%E5%88%B6-%E6%94%92%E6%89%B9-%E5%88%86%E5%8C%BA%E4%B8%8E-acks/" title="Producer 内部机制：攒批、分区与 acks"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Producer-%E5%86%85%E9%83%A8%E6%9C%BA%E5%88%B6-%E6%94%92%E6%89%B9-%E5%88%86%E5%8C%BA%E4%B8%8E-acks/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Producer 内部机制：攒批、分区与 acks</div></div><div class="info-2"><div class="info-item-1">上一篇拆解了 partition 内部的存储结构。这一篇转向写入端——Producer 把一条消息发出去，到底经过了哪些步骤。 很多使用者把 producer.send() 当成一次网络调用。实际情况是，send() 只是把消息丢进了一个内存缓冲区，真正的网络 I/O 发生在另一个线程里。Producer 内部是一条两阶段管线：主线程负责序列化和分区选择，后台 Sender 线程负责攒批和网络传输。 本文只抓一个问题：一条消息从 send() 调用到 broker 确认，经过了哪些对象、哪些线程、哪些等待。 发送管线总览 Producer 内部的数据流可以压成下面的路径： 123456789101112131415161718192021222324252627282930Main Thread                         Sender Thread    |                                    |    v                                    | Interceptors          ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#segment-%E6%96%87%E4%BB%B6%EF%BC%9A%E6%97%A5%E5%BF%97%E7%9A%84%E7%89%A9%E7%90%86%E5%88%87%E7%89%87"><span class="toc-number">1.</span> <span class="toc-text">Segment 文件：日志的物理切片</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BB%8E-produce-%E8%AF%B7%E6%B1%82%E5%88%B0%E7%A3%81%E7%9B%98%E5%AD%97%E8%8A%82"><span class="toc-number">2.</span> <span class="toc-text">从 Produce 请求到磁盘字节</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#offset-%E7%B4%A2%E5%BC%95%EF%BC%9A%E7%A8%80%E7%96%8F%E7%B4%A2%E5%BC%95%E4%B8%8E%E4%BA%8C%E5%88%86%E6%9F%A5%E6%89%BE"><span class="toc-number">3.</span> <span class="toc-text">Offset 索引：稀疏索引与二分查找</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%97%B6%E9%97%B4%E7%B4%A2%E5%BC%95"><span class="toc-number">4.</span> <span class="toc-text">时间索引</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9B%B6%E6%8B%B7%E8%B4%9D%EF%BC%9Asendfile-%E4%B8%8E-page-cache"><span class="toc-number">5.</span> <span class="toc-text">零拷贝：sendfile 与 page cache</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%EF%BC%9A%E5%86%99%E5%85%A5%E6%B6%88%E6%81%AF%E5%B9%B6%E6%A3%80%E6%9F%A5-segment-%E6%96%87%E4%BB%B6"><span class="toc-number">6.</span> <span class="toc-text">实验：写入消息并检查 segment 文件</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">7.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">8.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">9.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">10.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">11.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">12.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.5</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.5"></script><script src="/js/main.js?v=5.5.5"></script><script src="/js/tw_cn.js?v=5.5.5"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || item.innerHTML || ""
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    if (e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : window.location.href = e.request.responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.5.5"></script></div></div></body></html>

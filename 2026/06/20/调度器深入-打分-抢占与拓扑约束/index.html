@@ -1,0 +1,777 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>调度器深入：打分、抢占与拓扑约束 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="调度器（kube-scheduler）是 Kubernetes 控制平面里最容易被低估的组件。它做的事情看起来简单：把没有 nodeName 的 Pod 绑定到某个节点。但&quot;选哪个节点&quot;这个问题背后，隐藏着资源感知、亲和性约束、拓扑分散、优先级抢占等多维度的决策过程。 从 Kubernetes 1.19 起，调度器的内部逻辑通过 Scheduling Framework 对外暴">
+<meta property="og:type" content="article">
+<meta property="og:title" content="调度器深入：打分、抢占与拓扑约束">
+<meta property="og:url" content="https://magicliang.github.io/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="调度器（kube-scheduler）是 Kubernetes 控制平面里最容易被低估的组件。它做的事情看起来简单：把没有 nodeName 的 Pod 绑定到某个节点。但&quot;选哪个节点&quot;这个问题背后，隐藏着资源感知、亲和性约束、拓扑分散、优先级抢占等多维度的决策过程。 从 Kubernetes 1.19 起，调度器的内部逻辑通过 Scheduling Framework 对外暴">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/cover.svg">
+<meta property="article:published_time" content="2026-06-20T02:05:00.000Z">
+<meta property="article:modified_time" content="2026-06-24T14:18:39.369Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Kubernetes">
+<meta property="article:tag" content="云原生">
+<meta property="article:tag" content="容器">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "调度器深入：打分、抢占与拓扑约束",
+  "url": "https://magicliang.github.io/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/",
+  "image": "https://magicliang.github.io/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/cover.svg",
+  "datePublished": "2026-06-20T02:05:00.000Z",
+  "dateModified": "2026-06-24T14:18:39.369Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.5"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.2.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '调度器深入：打分、抢占与拓扑约束',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">492</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">548</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">8</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">调度器深入：打分、抢占与拓扑约束</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">调度器深入：打分、抢占与拓扑约束</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-06-20T02:05:00.000Z" title="Created 2026-06-20 10:05:00">2026-06-20</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-06-24T14:18:39.369Z" title="Updated 2026-06-24 22:18:39">2026-06-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%9F%BA%E7%A1%80%E8%AE%BE%E6%96%BD/">基础设施</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.8k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>13mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-06-24 22:18:39&quot;}" hidden></div><p>调度器（kube-scheduler）是 Kubernetes 控制平面里最容易被低估的组件。它做的事情看起来简单：把没有 <code>nodeName</code> 的 Pod 绑定到某个节点。但&quot;选哪个节点&quot;这个问题背后，隐藏着资源感知、亲和性约束、拓扑分散、优先级抢占等多维度的决策过程。</p>
+<p>从 Kubernetes 1.19 起，调度器的内部逻辑通过 Scheduling Framework 对外暴露为一组扩展点。原来散落在代码各处的调度逻辑被重新组织成插件，每个插件只负责一个扩展点。这让调度行为既可预测，又可扩展。</p>
+<p>本文的核心问题是：Kubernetes 调度器用什么框架选节点，当资源不足时如何通过抢占让高优先级 Pod 运行？</p>
+<h2 id="调度框架全景图">调度框架全景图</h2>
+<figure class="highlight mipsasm"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br></pre></td><td class="code"><pre><code class="hljs mipsasm">Pod pending (no nodeName)<br>     │<br>     ▼<br>  <span class="hljs-keyword">Scheduler（from </span>ActiveQ <span class="hljs-keyword">by </span>priority）<br>  ┌──────────────────────────────────────────────────────┐<br>  │ <span class="hljs-keyword">PreFilter </span>  — 预计算共享状态（如 Pod affinity 拓扑键） │<br>  │ Filter      — 过滤不满足条件的节点                    │─► feasible nodes<br>  │                                                      │<br>  │ PostFilter  — 如果 feasible=<span class="hljs-number">0</span>，触发抢占逻辑           │<br>  │                                                      │<br>  │ PreScore    — 为打分准备数据                          │<br>  │ <span class="hljs-keyword">Score </span>      — 对 feasible nodes 打分（<span class="hljs-number">0</span><span class="hljs-number">-100</span>）         │─► ranked nodes<br>  │ <span class="hljs-keyword">NormalizeScore </span>— 归一化各插件分数                     │<br>  │                                                      │<br>  │ Reserve     — 乐观锁定，预留资源（可回滚）             │<br>  │ Permit      — gang <span class="hljs-keyword">scheduling </span>等待                   │<br>  │ PreBind     — 绑定前置操作                            │<br>  │ <span class="hljs-keyword">Bind </span>       — 更新 Pod.spec.nodeName                 │<br>  │ PostBind    — 绑定后通知                              │<br>  └──────────────────────────────────────────────────────┘<br>     │<br>     ▼<br>  Pod.Spec.NodeName = <span class="hljs-string">&quot;node-X&quot;</span>（写入 etcd）<br>     │<br>     ▼<br>  kubelet on node-X 开始 <span class="hljs-keyword">syncPod</span><br></code></pre></td></tr></table></figure>
+<h2 id="filter-阶段：淘汰不可用节点">Filter 阶段：淘汰不可用节点</h2>
+<p>Filter 阶段的目标是从集群所有节点里找出&quot;可行节点&quot;（feasible nodes）——所有满足 Pod 约束的节点。只要有一个 Filter 插件对某节点返回失败，该节点就被从候选集里剔除。</p>
+<p>主要 Filter 插件：</p>
+<h3 id="noderesourcesfit">NodeResourcesFit</h3>
+<p>检查节点的可分配资源（<code>allocatable</code>）减去已分配资源（所有已调度 Pod 的 <code>requests</code> 之和）是否满足当前 Pod 的 <code>requests</code>。</p>
+<p>注意：调度器用的是 <code>requests</code>，不是 <code>limits</code>。节点上实际运行的容器可以突破 <code>requests</code>，但调度决策基于 <code>requests</code>。这意味着如果所有 Pod 都突破 <code>requests</code>，节点可能 OOM，但调度器在调度时并不知道这件事。</p>
+<h3 id="nodeselector-与-nodeaffinity">NodeSelector 与 NodeAffinity</h3>
+<p><code>nodeSelector</code> 是简单的标签匹配，要求节点带有指定标签键值对。<code>nodeAffinity</code> 表达力更强，支持 <code>In</code>、<code>NotIn</code>、<code>Exists</code>、<code>DoesNotExist</code>、<code>Gt</code>、<code>Lt</code> 等操作符，并区分硬约束（<code>requiredDuringSchedulingIgnoredDuringExecution</code>）和软约束（<code>preferredDuringSchedulingIgnoredDuringExecution</code>）。</p>
+<p>硬约束的 <code>nodeAffinity</code> 在 Filter 阶段执行——不满足就淘汰节点。软约束在 Score 阶段执行——满足得分更高，但不满足也不淘汰。</p>
+<h3 id="tainttoleration">TaintToleration</h3>
+<p>节点可以打 Taint（污点），Pod 必须有对应的 Toleration 才能调度到该节点。三种 Taint effect：</p>
+<ul>
+<li><code>NoSchedule</code>：新 Pod 不能调度到该节点（Filter 阶段执行）</li>
+<li><code>PreferNoSchedule</code>：尽量不调度到该节点（Score 阶段降分）</li>
+<li><code>NoExecute</code>：已运行的 Pod 也会被驱逐（不由调度器处理，由 Node controller 处理）</li>
+</ul>
+<h3 id="podaffinity-与-podantiaffinity">PodAffinity 与 PodAntiAffinity</h3>
+<p>PodAffinity 允许 Pod 指定与哪些 Pod 在同一拓扑域（如同一节点、同一可用区）运行。PodAntiAffinity 则是相反约束——与某些 Pod 不在同一拓扑域。</p>
+<p>这两个插件的计算复杂度随集群规模上升：每个 Pod 调度都需要查询已运行的 Pod 的标签。大规模集群中过度使用 PodAffinity 是调度器性能问题的常见来源。</p>
+<h3 id="interpodaffinity">InterPodAffinity</h3>
+<p>处理 PodAffinity/PodAntiAffinity 的 Filter 阶段逻辑（硬约束部分）。如果一个 Pod 要求必须和带某标签的 Pod 在同一节点，但某节点上没有带该标签的 Pod，该节点被过滤掉。</p>
+<h2 id="score-阶段：对可行节点打分">Score 阶段：对可行节点打分</h2>
+<p>Filter 之后剩下的节点都是合法选择，Score 阶段决定优先选哪个。每个 Score 插件给每个节点打 0-100 分，加权求和后排名，分最高的节点胜出（如有相同分数，随机选一个）。</p>
+<p>主要 Score 插件：</p>
+<h3 id="leastallocated">LeastAllocated</h3>
+<p>优先选择已分配资源最少的节点。具体计算：<code>(cpu_free / cpu_total + mem_free / mem_total) / 2 * 100</code>，值越大得分越高。</p>
+<p>这是默认启用的主要打分插件，倾向于将 Pod 分散到不同节点，避免单节点过载。</p>
+<h3 id="mostallocated">MostAllocated</h3>
+<p>与 LeastAllocated 相反，优先选择已分配资源最多的节点。适用于想&quot;装箱&quot;以腾出空闲节点关机（云端省钱）的场景。与 LeastAllocated 互斥使用。</p>
+<h3 id="imagelocality">ImageLocality</h3>
+<p>给已经有容器镜像的节点加分。如果某个节点已经拉取过 Pod 所需的镜像，拉起容器更快。得分基于节点上已有的镜像总大小。</p>
+<h3 id="nodeaffinitypriority">NodeAffinityPriority</h3>
+<p>对满足软约束 <code>preferredDuringScheduling</code> 的 <code>nodeAffinity</code> 节点加分。</p>
+<h3 id="interpodaffinitypriority">InterPodAffinityPriority</h3>
+<p>对满足软约束 <code>PodAffinity/PodAntiAffinity</code> 的节点加分或减分。</p>
+<h2 id="podtopologyspread：更精细的拓扑分散">PodTopologySpread：更精细的拓扑分散</h2>
+<p><code>PodTopologySpread</code>（1.19 GA，1.24 成为默认插件）用来替代 <code>PodAntiAffinity</code> 实现更精细的拓扑分散控制。</p>
+<p>核心参数：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs yaml"><span class="hljs-attr">topologySpreadConstraints:</span><br><span class="hljs-bullet">-</span> <span class="hljs-attr">maxSkew:</span> <span class="hljs-number">1</span><br>  <span class="hljs-attr">topologyKey:</span> <span class="hljs-string">kubernetes.io/hostname</span><br>  <span class="hljs-attr">whenUnsatisfiable:</span> <span class="hljs-string">DoNotSchedule</span><br>  <span class="hljs-attr">labelSelector:</span><br>    <span class="hljs-attr">matchLabels:</span><br>      <span class="hljs-attr">app:</span> <span class="hljs-string">my-app</span><br></code></pre></td></tr></table></figure>
+<ul>
+<li><code>maxSkew</code>：允许的最大偏差。如果最多的域有 3 个 Pod，最少的域有 1 个 Pod，skew 为 2。<code>maxSkew: 1</code> 要求任意两个域的 Pod 数量差不超过 1。</li>
+<li><code>topologyKey</code>：定义&quot;域&quot;的节点标签键。<code>kubernetes.io/hostname</code> 意味着每个节点是一个域；<code>topology.kubernetes.io/zone</code> 意味着每个可用区是一个域。</li>
+<li><code>whenUnsatisfiable</code>：约束无法满足时的行为。<code>DoNotSchedule</code> 是硬约束（在 Filter 阶段执行）；<code>ScheduleAnyway</code> 是软约束（在 Score 阶段，选 skew 增加最少的节点）。</li>
+</ul>
+<p>与 <code>PodAntiAffinity</code> 对比：<code>PodAntiAffinity</code> 是&quot;不能和某 Pod 在同一域&quot;，是全有或全无的约束；<code>PodTopologySpread</code> 是&quot;Pod 在各域的分布不超过 maxSkew&quot;，更灵活。5 副本的 Deployment 跨 3 个可用区用 <code>PodAntiAffinity</code> 无法保证均匀分布，而 <code>PodTopologySpread</code> 可以。</p>
+<h2 id="priorityclass-与抢占机制">PriorityClass 与抢占机制</h2>
+<h3 id="priorityclass">PriorityClass</h3>
+<p>PriorityClass 是集群级别的对象，给 Pod 赋予数值优先级（0-1000000000，系统组件通常用 2000000000 以上）：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs yaml"><span class="hljs-attr">apiVersion:</span> <span class="hljs-string">scheduling.k8s.io/v1</span><br><span class="hljs-attr">kind:</span> <span class="hljs-string">PriorityClass</span><br><span class="hljs-attr">metadata:</span><br>  <span class="hljs-attr">name:</span> <span class="hljs-string">high-priority</span><br><span class="hljs-attr">value:</span> <span class="hljs-number">1000</span><br><span class="hljs-attr">globalDefault:</span> <span class="hljs-literal">false</span><br><span class="hljs-attr">description:</span> <span class="hljs-string">&quot;High priority workloads&quot;</span><br></code></pre></td></tr></table></figure>
+<p>Pod 在 <code>spec.priorityClassName</code> 里引用这个 PriorityClass。调度器的优先级队列按这个值排序——高优先级 Pod 先调度。</p>
+<h3 id="抢占-preemption-触发条件">抢占（Preemption）触发条件</h3>
+<p>当 Filter 阶段找不到任何可行节点（feasible nodes 为空），PostFilter 插件触发抢占逻辑：</p>
+<ol>
+<li>遍历所有节点，模拟&quot;如果驱逐该节点上某些低优先级 Pod，当前 Pod 能否调度到该节点&quot;。</li>
+<li>找到能腾出足够资源的节点后，选择一个&quot;最优&quot;候选节点（优先选需要驱逐 Pod 数量最少的节点；数量相同时，优先选被驱逐 Pod 中最高优先级最小的节点）。</li>
+<li>向 API Server 发送驱逐请求（Eviction API），被驱逐 Pod 的所属 Deployment/ReplicaSet controller 负责重建它们。</li>
+<li>在被驱逐 Pod 的 gracePeriod 内，当前 Pod 在那个节点上等待（<code>nominatedNodeName</code> 字段记录这个节点）。被驱逐 Pod 全部删除后，调度器重新尝试调度当前 Pod。</li>
+</ol>
+<p>抢占只驱逐优先级低于当前 Pod 的 Pod，不驱逐相同或更高优先级的 Pod。</p>
+<h3 id="poddisruptionbudget-pdb-与抢占">PodDisruptionBudget（PDB）与抢占</h3>
+<p>PDB 定义了允许同时不可用的 Pod 数量上限（<code>maxUnavailable</code>）或必须保持可用的下限（<code>minAvailable</code>）。抢占逻辑尊重 PDB——如果驱逐某个 Pod 会违反其 PDB，调度器不会驱逐它，而是寻找其他可驱逐的 Pod 组合。</p>
+<h2 id="可观测实验：观察抢占过程">可观测实验：观察抢占过程</h2>
+<h3 id="准备环境">准备环境</h3>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">kind create cluster --name scheduler-demo<br></code></pre></td></tr></table></figure>
+<h3 id="创建两个-priorityclass">创建两个 PriorityClass</h3>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">cat</span> &lt;&lt;<span class="hljs-string">&#x27;EOF&#x27;</span> | kubectl apply -f -<br>apiVersion: scheduling.k8s.io/v1<br>kind: PriorityClass<br>metadata:<br>  name: low-priority<br>value: 100<br>globalDefault: <span class="hljs-literal">false</span><br>---<br>apiVersion: scheduling.k8s.io/v1<br>kind: PriorityClass<br>metadata:<br>  name: high-priority<br>value: 1000<br>globalDefault: <span class="hljs-literal">false</span><br>EOF<br></code></pre></td></tr></table></figure>
+<h3 id="用低优先级-pod-占满节点资源">用低优先级 Pod 占满节点资源</h3>
+<p>先查节点可分配资源：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">kubectl describe node kind-control-plane | grep -A5 <span class="hljs-string">&quot;Allocatable:&quot;</span><br></code></pre></td></tr></table></figure>
+<p>创建低优先级 Pod，请求足够多的 CPU 让节点接近满载：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">cat</span> &lt;&lt;<span class="hljs-string">&#x27;EOF&#x27;</span> | kubectl apply -f -<br>apiVersion: v1<br>kind: Pod<br>metadata:<br>  name: low-1<br>spec:<br>  priorityClassName: low-priority<br>  containers:<br>  - name: stress<br>    image: busybox:1.35<br>    <span class="hljs-built_in">command</span>: [<span class="hljs-string">&quot;sh&quot;</span>, <span class="hljs-string">&quot;-c&quot;</span>, <span class="hljs-string">&quot;while true; do sleep 3600; done&quot;</span>]<br>    resources:<br>      requests:<br>        cpu: <span class="hljs-string">&quot;500m&quot;</span><br>        memory: <span class="hljs-string">&quot;256Mi&quot;</span><br>EOF<br></code></pre></td></tr></table></figure>
+<p>根据节点实际资源，创建足够多的低优先级 Pod 让节点资源耗尽。</p>
+<h3 id="创建高优先级-pod-触发抢占">创建高优先级 Pod 触发抢占</h3>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">cat</span> &lt;&lt;<span class="hljs-string">&#x27;EOF&#x27;</span> | kubectl apply -f -<br>apiVersion: v1<br>kind: Pod<br>metadata:<br>  name: high-1<br>spec:<br>  priorityClassName: high-priority<br>  containers:<br>  - name: app<br>    image: busybox:1.35<br>    <span class="hljs-built_in">command</span>: [<span class="hljs-string">&quot;sh&quot;</span>, <span class="hljs-string">&quot;-c&quot;</span>, <span class="hljs-string">&quot;while true; do sleep 3600; done&quot;</span>]<br>    resources:<br>      requests:<br>        cpu: <span class="hljs-string">&quot;600m&quot;</span><br>        memory: <span class="hljs-string">&quot;256Mi&quot;</span><br>EOF<br></code></pre></td></tr></table></figure>
+<h3 id="观察抢占事件">观察抢占事件</h3>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">kubectl get events --sort-by=<span class="hljs-string">&#x27;.lastTimestamp&#x27;</span> | grep -E <span class="hljs-string">&quot;Preempt|Evict|Scheduled&quot;</span><br></code></pre></td></tr></table></figure>
+<p>预期看到类似：</p>
+<figure class="highlight mel"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs mel"><span class="hljs-number">2</span>s    Normal   Preempting          pod/high<span class="hljs-number">-1</span>    Preempted pod <span class="hljs-keyword">default</span>/low<span class="hljs-number">-1</span> on node kind-<span class="hljs-keyword">control</span>-<span class="hljs-keyword">plane</span><br><span class="hljs-number">1</span>s    Normal   Killing             pod/low<span class="hljs-number">-1</span>     Stopping <span class="hljs-keyword">container</span> stress<br><span class="hljs-number">0</span>s    Normal   Scheduled           pod/high<span class="hljs-number">-1</span>    Successfully assigned <span class="hljs-keyword">default</span>/high<span class="hljs-number">-1</span> to kind-<span class="hljs-keyword">control</span>-<span class="hljs-keyword">plane</span><br></code></pre></td></tr></table></figure>
+<h3 id="观察-nominatednodename">观察 nominatedNodeName</h3>
+<p>在 <code>high-1</code> 进入 Pending + 等待驱逐的短暂窗口期：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">kubectl get pod high-1 -o jsonpath=<span class="hljs-string">&#x27;&#123;.status.nominatedNodeName&#125;&#x27;</span><br></code></pre></td></tr></table></figure>
+<p>这个字段显示调度器选定的目标节点，在 Pod 实际绑定之前存在。</p>
+<h3 id="观察调度器打分过程">观察调度器打分过程</h3>
+<p>调度器的详细日志（在 kind 控制平面容器里）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">docker <span class="hljs-built_in">exec</span> kind-control-plane <span class="hljs-built_in">cat</span> /var/log/kube-scheduler.log 2&gt;/dev/null | grep -i <span class="hljs-string">&quot;score&quot;</span> | <span class="hljs-built_in">tail</span> -20<br></code></pre></td></tr></table></figure>
+<p>或者通过调度器的 verbose 日志（需要启用 <code>--v=5</code>）看到每个节点的打分明细。</p>
+<h2 id="将实验结果映射到-k8s-对象">将实验结果映射到 K8s 对象</h2>
+<p><code>kubectl get events</code> 里看到的 <code>Preempting</code> 事件，来源于调度器在 PostFilter 扩展点执行的 <code>DefaultPreemption</code> 插件。这个插件的执行结果是：向 API Server 发送 Eviction 对象，更新目标 Pod 的 <code>status.nominatedNodeName</code>。</p>
+<p>被驱逐的 Pod 进入 Terminating 状态（<code>deletionTimestamp</code> 被设置），其 gracePeriodSeconds 计时开始。这段时间里，高优先级 Pod 在队列中等待，不断重新尝试调度，直到节点资源实际释放。</p>
+<p><code>kubectl describe pod high-1</code> 的 Events 会显示多次调度尝试和最终成功的时间戳，这反映了调度器的重试机制。</p>
+<p>调度结果写入 <code>pod.spec.nodeName</code> 后，kubelet 通过 Informer 发现并开始 <code>syncPod</code>（详见<a href="/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/">06 kubelet 与容器运行时</a>）。</p>
+<h2 id="模式提炼">模式提炼</h2>
+<p>Scheduling Framework 是&quot;责任链 + 插件积分&quot;调度模型。</p>
+<p>责任链体现在 Filter 阶段：任意一个插件的拒绝导致节点被淘汰，整个链是逻辑与（AND）。</p>
+<p>插件积分体现在 Score 阶段：多个插件独立给节点打分，加权求和，最终分数是向量的线性组合。不同场景可以通过调整权重改变调度偏好，而不需要修改代码。</p>
+<p>抢占是对&quot;当前无法满足&quot;的特殊处理路径：当没有节点通过 Filter，触发 PostFilter 的补偿逻辑，通过驱逐低价值 Pod 为高价值 Pod 腾出空间。这是优先级反转问题的主动解决方案，不是被动等待资源释放。</p>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>K8s 机制</th>
+<th>类比概念</th>
+<th>差异点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Filter 阶段（责任链）</td>
+<td>Spring Security FilterChain / Servlet Filter</td>
+<td>K8s Filter 是只读的，只决定是否淘汰节点；Servlet Filter 可以修改请求/响应</td>
+</tr>
+<tr>
+<td>Score 阶段（加权求和）</td>
+<td>负载均衡器权重轮询 / 推荐系统打分模型</td>
+<td>调度器的分数是多插件加权聚合，负载均衡器通常是单维度权重</td>
+</tr>
+<tr>
+<td>PriorityClass + Preemption</td>
+<td>线程池任务队列优先级（Java PriorityBlockingQueue）</td>
+<td>线程池拒绝低优先级任务，K8s 调度器驱逐已运行的低优先级 Pod；K8s 提供了资源的主动回收，线程池没有</td>
+</tr>
+<tr>
+<td>LeastAllocated Score</td>
+<td>Nginx upstream least_conn / 数据库连接池负载均衡</td>
+<td>LeastAllocated 基于资源 requests 的剩余量；least_conn 基于当前活跃连接数</td>
+</tr>
+<tr>
+<td>PostFilter（抢占）Cost Model</td>
+<td>数据库查询优化器选择执行计划</td>
+<td>查询优化器基于统计信息选最低 cost 路径，调度抢占基于被驱逐 Pod 数量和优先级选最小代价节点</td>
+</tr>
+<tr>
+<td>PodTopologySpread</td>
+<td>CDN 多 PoP 节点流量分发 / 数据库分片均衡</td>
+<td>PodTopologySpread 控制拓扑域间 Pod 数量偏差，数据库分片均衡控制数据量偏差</td>
+</tr>
+<tr>
+<td>Taint/Toleration</td>
+<td>数据库连接池黑名单 / 专用线程池（任务只给特定线程）</td>
+<td>Taint 是节点拒绝调度的标记，Toleration 是 Pod 的豁免声明；方向是节点推 Pod，而不是 Pod 选节点</td>
+</tr>
+</tbody>
+</table>
+<h2 id="常见误解">常见误解</h2>
+<h3 id="误解一：调度器直接运行-pod">误解一：调度器直接运行 Pod</h3>
+<p>调度器只做一件事：将 <code>pod.spec.nodeName</code> 从空设置为某个节点名称。运行 Pod（拉取镜像、创建容器、配置网络）是 kubelet 的职责，在调度完成之后触发。</p>
+<p>调度器是无状态的控制平面组件，不维护任何节点上容器的运行时状态。它依赖 API Server 中 Pod 对象的 <code>spec.requests</code> 字段计算已用资源，而不是查询容器运行时的实际用量。</p>
+<h3 id="误解二：nodeselector-和-nodeaffinity-是同一机制的不同写法">误解二：nodeSelector 和 nodeAffinity 是同一机制的不同写法</h3>
+<p><code>nodeSelector</code> 是早期 API，只支持精确匹配（<code>key=value</code>），在 Filter 阶段作为硬约束执行。<code>nodeAffinity</code> 是后来引入的更丰富的 API，支持集合操作符，且区分硬约束（<code>required</code>，Filter 阶段）和软约束（<code>preferred</code>，Score 阶段）。</p>
+<p>两者可以同时使用，但语义不同：<code>nodeSelector</code> 只要一项不匹配就淘汰节点，<code>nodeAffinity.preferred</code> 不满足时节点仍然是候选，只是分数较低。混用时两者同时生效，是逻辑与关系。</p>
+<h3 id="误解三：被抢占驱逐的-pod-会立刻消失-高优先级-pod-立刻调度">误解三：被抢占驱逐的 Pod 会立刻消失，高优先级 Pod 立刻调度</h3>
+<p>抢占触发后，低优先级 Pod 进入 Terminating 状态，但会等待 <code>terminationGracePeriodSeconds</code>（默认 30 秒）。在这段时间里，高优先级 Pod 处于 Pending 状态，<code>status.nominatedNodeName</code> 记录目标节点，但 <code>spec.nodeName</code> 还是空的——还没真正调度成功。</p>
+<p>只有当目标节点上足够多的被驱逐 Pod 实际退出、资源真正释放后，调度器重新对高优先级 Pod 运行 Filter + Score，确认资源满足，才完成绑定。如果在这段等待时间里有其他更高优先级的 Pod 出现，之前的抢占计划可能被重新评估。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>
+<p>查看当前集群的调度器配置（<code>kubectl -n kube-system get pod -l component=kube-scheduler -o yaml</code>），找到 <code>--config</code> 参数指定的 KubeSchedulerConfiguration 文件，查看哪些 Score 插件被启用，默认权重是多少。</p>
+</li>
+<li>
+<p>创建三个 Deployment（各 4 副本）在一个有 3 个 worker 节点的集群中，分别配置 <code>maxSkew: 1</code> 的 <code>PodTopologySpread</code>（按节点），观察 Pod 分布是否均匀；然后将其中一个节点 cordoned（<code>kubectl cordon</code>），观察 Deployment 的 Pod 分布如何变化，以及新调度的 Pod 是否违反约束。</p>
+</li>
+<li>
+<p>模拟优先级抢占：先创建足够多的低优先级 Pod 占满一个节点，然后创建一个高优先级 Pod，用 <code>kubectl get events -w</code> 全程观察；在被驱逐 Pod 的 gracePeriod 期间，用 <code>kubectl get pod high-xxx -o jsonpath='{.status.nominatedNodeName}'</code> 确认目标节点已被提名但尚未绑定。</p>
+</li>
+<li>
+<p>编写一个 KubeSchedulerConfiguration，将 <code>LeastAllocated</code> 插件权重改为 0，<code>MostAllocated</code> 权重改为 1，部署到 kind 集群，观察 Pod 调度是否从&quot;分散优先&quot;变为&quot;装箱优先&quot;（多个 Pod 集中调度到同一节点）。</p>
+</li>
+</ol>
+<h2 id="系列导航">系列导航</h2>
+<ul>
+<li><a href="/2026/02/07/Kubernetes-%E6%A0%B8%E5%BF%83%E6%A6%82%E5%BF%B5/">00 核心概念导读</a></li>
+<li><a href="/2026/06/20/API-Server-%E4%B8%8E%E5%A3%B0%E6%98%8E%E5%BC%8F-API-%E4%B8%80%E5%88%87%E7%9A%86%E8%B5%84%E6%BA%90/">01 API Server 与声明式 API</a></li>
+<li><a href="/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/">02 etcd 与持久化</a></li>
+<li><a href="/2026/06/20/%E6%8E%A7%E5%88%B6%E5%99%A8%E6%A8%A1%E5%BC%8F%E4%B8%8E-Informer-%E6%9C%BA%E5%88%B6-%E8%B0%83%E8%B0%90%E5%BE%AA%E7%8E%AF%E7%9A%84%E5%B7%A5%E7%A8%8B%E5%AE%9E%E7%8E%B0/">03 控制器模式与 Informer 机制</a></li>
+<li><a href="/2026/06/20/Pod-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-%E4%BB%8E-Pending-%E5%88%B0-Running-%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B7%AF%E5%BE%84/">04 Pod 生命周期</a></li>
+<li><a href="/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/">05 调度器深入</a></li>
+<li><a href="/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/">06 kubelet 与容器运行时</a></li>
+<li><a href="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/">07 网络模型与 CNI</a></li>
+<li><a href="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/">08 Service 与 kube-proxy</a></li>
+<li><a href="/2026/06/20/Ingress-%E4%B8%8E-Gateway-API-%E4%B8%83%E5%B1%82%E6%B5%81%E9%87%8F%E7%9A%84%E5%85%A5%E5%8F%A3%E6%BC%94%E8%BF%9B/">09 Ingress 与 Gateway API</a></li>
+<li><a href="/2026/06/20/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-PV-PVC-StorageClass-%E4%B8%8E-CSI/">10 存储体系</a></li>
+<li><a href="/2026/06/20/%E9%85%8D%E7%BD%AE%E4%B8%8E%E5%AF%86%E9%92%A5%E7%AE%A1%E7%90%86-ConfigMap-Secret-%E4%B8%8E%E5%A4%96%E9%83%A8%E9%9B%86%E6%88%90/">11 配置与密钥管理</a></li>
+<li><a href="/2026/06/20/RBAC-%E4%B8%8E%E5%AE%89%E5%85%A8%E6%A8%A1%E5%9E%8B-%E8%AE%A4%E8%AF%81-%E6%8E%88%E6%9D%83%E4%B8%8E%E5%87%86%E5%85%A5%E6%8E%A7%E5%88%B6/">12 RBAC 与安全模型</a></li>
+<li><a href="/2026/06/20/%E8%B5%84%E6%BA%90%E7%AE%A1%E7%90%86%E4%B8%8E%E8%87%AA%E5%8A%A8%E4%BC%B8%E7%BC%A9-requests-limits-HPA-%E4%B8%8E-VPA/">13 资源管理与自动伸缩</a></li>
+<li><a href="/2026/06/20/CRD-%E4%B8%8E-Operator-%E6%A8%A1%E5%BC%8F-%E6%89%A9%E5%B1%95-Kubernetes-%E7%9A%84%E6%A0%87%E5%87%86%E8%B7%AF%E5%BE%84/">14 CRD 与 Operator 模式</a></li>
+<li><a href="/2026/06/20/Helm-%E4%B8%8E%E5%BA%94%E7%94%A8%E6%89%93%E5%8C%85-%E4%BB%8E-YAML-%E5%88%B0%E5%8F%AF%E5%A4%8D%E7%94%A8%E5%88%B6%E5%93%81/">15 Helm 与应用打包</a></li>
+<li><a href="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/">16 可观测性</a></li>
+<li><a href="/2026/06/20/%E7%94%9F%E4%BA%A7%E9%9B%86%E7%BE%A4%E8%BF%90%E7%BB%B4-%E5%8D%87%E7%BA%A7-%E5%A4%87%E4%BB%BD-%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5%E4%B8%8E%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92/">17 生产集群运维</a></li>
+</ul>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/">Scheduling Framework - Kubernetes Official Documentation</a></li>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/">Pod Priority and Preemption</a></li>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/">Pod Topology Spread Constraints</a></li>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/">Assigning Pods to Nodes (nodeAffinity)</a></li>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/">Taints and Tolerations</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/kubernetes/kubernetes/tree/master/pkg/scheduler/framework">kube-scheduler source: Scheduling Framework plugin extension points</a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/">https://magicliang.github.io/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E4%BA%91%E5%8E%9F%E7%94%9F/">云原生</a><a class="post-meta__tags" href="/tags/Kubernetes/">Kubernetes</a><a class="post-meta__tags" href="/tags/%E5%AE%B9%E5%99%A8/">容器</a></div><div class="post-share"><div class="social-share" data-image="/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/20/Pod-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-%E4%BB%8E-Pending-%E5%88%B0-Running-%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B7%AF%E5%BE%84/" title="Pod 生命周期：从 Pending 到 Running 的完整路径"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Pod-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-%E4%BB%8E-Pending-%E5%88%B0-Running-%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B7%AF%E5%BE%84/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Pod 生命周期：从 Pending 到 Running 的完整路径</div></div><div class="info-2"><div class="info-item-1">一个 kubectl apply -f pod.yaml 之后，终端里出现了 pod/my-app created。这行输出只意味着 API Server 接受了资源定义并写入 etcd——Pod 还没有运行在任何节点上，甚至还没有被任何节点知晓。从这个瞬间到容器真正响应流量，Pod 经历了一条由多个组件接力完成的状态转换链。 这条链不是黑盒。Kubernetes 把每个阶段都编码进 status.phase、status.conditions、status.containerStatuses 三个字段里，并通过 Events 记录关键节点的时间戳。理解这条链，就能在 Pod 卡住时精确定位是调度失败、镜像拉取失败、探针失败，还是 OOM Kill。 本文的核心问题是：一个 Pod 从 kubectl apply 到 Running 经历了哪些状态转换，每个状态背后是哪个组件在操作？ 状态转换全景图 12345678910111213141516171819202122232425kubectl apply     │     ▼  etcd (Pod phase=Pending...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E6%8E%A7%E5%88%B6%E5%99%A8%E6%A8%A1%E5%BC%8F%E4%B8%8E-Informer-%E6%9C%BA%E5%88%B6-%E8%B0%83%E8%B0%90%E5%BE%AA%E7%8E%AF%E7%9A%84%E5%B7%A5%E7%A8%8B%E5%AE%9E%E7%8E%B0/" title="控制器模式与 Informer 机制：调谐循环的工程实现"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E6%8E%A7%E5%88%B6%E5%99%A8%E6%A8%A1%E5%BC%8F%E4%B8%8E-Informer-%E6%9C%BA%E5%88%B6-%E8%B0%83%E8%B0%90%E5%BE%AA%E7%8E%AF%E7%9A%84%E5%B7%A5%E7%A8%8B%E5%AE%9E%E7%8E%B0/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">控制器模式与 Informer 机制：调谐循环的工程实现</div></div><div class="info-2"><div class="info-item-1">Kubernetes 的控制平面由一批控制器组成，每个控制器负责把某种资源的实际状态收敛到期望状态。Deployment 控制器确保 ReplicaSet 数量正确，ReplicaSet 控制器确保 Pod 数量正确，StatefulSet 控制器维护有序 Pod 的标识和存储绑定。这些控制器全部运行在 kube-controller-manager 进程中，共享同一个 Go runtime，但逻辑上彼此独立。 控制器的核心模式是调谐循环（Reconcile Loop）：读取资源当前状态，与期望状态对比，对差异执行操作，然后等待下一次触发。这个循环不是基于轮询的——每隔几秒查一次 etcd 的方式在规模上不可持续。实际实现依赖 Informer 机制：Informer 在本地维护一份与 etcd 同步的缓存，用 Watch 接收增量变更，把变更转换成事件分发给控制器。控制器从工作队列取出事件，执行 Reconcile，写回 API Server。 这篇的核心问题是：从 etcd 的一次写入，到控制器的一次 Reconcile 调用，中间经历了哪些层次，每层解决什么问题？ Info...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E7%94%9F%E4%BA%A7%E9%9B%86%E7%BE%A4%E8%BF%90%E7%BB%B4-%E5%8D%87%E7%BA%A7-%E5%A4%87%E4%BB%BD-%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5%E4%B8%8E%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92/" title="生产集群运维——升级、备份、故障排查与容量规划"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E7%94%9F%E4%BA%A7%E9%9B%86%E7%BE%A4%E8%BF%90%E7%BB%B4-%E5%8D%87%E7%BA%A7-%E5%A4%87%E4%BB%BD-%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5%E4%B8%8E%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">生产集群运维——升级、备份、故障排查与容量规划</div></div><div class="info-2"><div class="info-item-1">把 Kubernetes 集群跑起来是第一步，让它在生产环境中长期稳定运行才是真正的挑战。版本升级、etcd 备份恢复、节点维护、故障排查、容量规划——这些 Day-2 运维场景，每一个都有足以让集群中断服务的操作风险。Kubernetes 为这些场景提供了明确的工具和流程约定，但操作顺序和细节上的失误仍然是生产事故的主要来源。 版本升级是最高风险的操作之一。Kubernetes 的 API 在版本间存在兼容性约束（skew policy），错误的升级顺序——例如先升级 kubelet 而非先升级 control plane——会导致集群进入不一致状态，轻则调度异常，重则 API Server 无法与节点通信。etcd 备份看似简单，但备份时机（必须在升级前）、恢复流程（必须停止 API Server 再恢复）、验证方式（恢复后检查关键对象）如果有任何一步出错，都可能导致数据丢失或集群无法启动。 节点维护（drain + upgrade + uncordon）有 PodDisruptionBudget（PDB）这道安全网，但前提是 PDB 本身配置正确。容量规划需要理解&quot...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/" title="可观测性——Metrics、Logging、Tracing 的集群实践"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">可观测性——Metrics、Logging、Tracing 的集群实践</div></div><div class="info-2"><div class="info-item-1">一个运行在 Kubernetes 上的分布式系统，出问题时最难回答的问题是&quot;发生了什么&quot;。单机时代，登录服务器查看进程状态和日志文件，基本能还原现场。容器化之后，Pod 随时可能被调度到不同节点，崩溃后立即重启，原始日志消失，这套方法彻底失效。可观测性（Observability）是对这个问题的系统性回答：通过在系统内部埋点、采集、存储和展示三类信号——Metrics（指标）、Logging（日志）、Tracing（链路追踪）——让工程师在不登录服务器的情况下理解系统行为。 Kubernetes 本身对可观测性有明确的架构分工。采集点（kubelet 内嵌的 cAdvisor、node-exporter DaemonSet、应用 SDK）由各组件负责暴露，聚合层（Prometheus、metrics-server）负责拉取和存储，展示层（Grafana、Jaeger UI）负责查询和可视化。这种&quot;采集点内建、存储和展示留给生态&quot;的设计，让 Kubernetes 本身保持简洁，同时允许不同规模的集群选择不同的存储方案。 理解可观测性的关键区分...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/" title="网络模型与 CNI：每个 Pod 一个 IP 背后的实现"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">网络模型与 CNI：每个 Pod 一个 IP 背后的实现</div></div><div class="info-2"><div class="info-item-1">Kubernetes 对网络做出了一个看似简单的承诺：每个 Pod 拥有一个集群范围内唯一的可路由 IP，Pod 之间无需 NAT 可直接通信，节点访问 Pod 也无需 NAT。三条规则，没有一条涉及实现细节。这种&quot;定义行为、不定义机制&quot;的风格与 Kubernetes 整体的设计哲学一致，但也意味着没有任何一行核心代码实现了这个承诺——它完全由 CNI 插件负责兑现。 理解 CNI 的切入点不是插件本身，而是 Linux 网络命名空间带来的问题。每个容器拥有独立的网络栈，包含独立的路由表、ARP 缓存、iptables 规则集。新建的命名空间里只有一个回环接口 lo，对外完全不可达——这正是容器隔离的本意。CNI 插件的全部工作就是在这种隔离性上凿出一条通道：创建 veth pair，把一端移入 Pod 命名空间，另一端挂到宿主机网桥，配置 IP 地址和路由，让 Pod 从完全隔离的孤岛变成集群网络里的一个节点。 跨节点通信是第二层复杂性。同节点内的 Pod 通过共享网桥即可互通，但当数据包需要离开宿主机的物理网卡，穿越真实的交换机和路由器，抵达另一台节点，再...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Helm-%E4%B8%8E%E5%BA%94%E7%94%A8%E6%89%93%E5%8C%85-%E4%BB%8E-YAML-%E5%88%B0%E5%8F%AF%E5%A4%8D%E7%94%A8%E5%88%B6%E5%93%81/" title="Helm 与应用打包——从 YAML 到可复用制品"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Helm-%E4%B8%8E%E5%BA%94%E7%94%A8%E6%89%93%E5%8C%85-%E4%BB%8E-YAML-%E5%88%B0%E5%8F%AF%E5%A4%8D%E7%94%A8%E5%88%B6%E5%93%81/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Helm 与应用打包——从 YAML 到可复用制品</div></div><div class="info-2"><div class="info-item-1">在 Kubernetes 上部署一个生产级应用，往往需要几十个甚至上百个 YAML 文件：Deployment、Service、ConfigMap、Ingress、RBAC 规则、HorizontalPodAutoscaler……这些文件之间存在依赖关系，不同环境（开发、预发、生产）需要不同参数，手工管理极易出错。Helm 正是为了解决这个问题而生：把一组相关的 Kubernetes 资源打包成一个可版本化、可参数化、可共享的制品（Chart），并提供安装、升级、回滚、卸载的生命周期管理。 Helm 的本质是&quot;带版本历史的 YAML 打包器&quot;。它不追踪资源的真实运行状态（那是 Operator 的职责），只记录&quot;这次 install/upgrade 渲染出了哪些 manifest，交给 Kubernetes 执行&quot;。Release 状态存储在集群内的 Secret 对象中（key 为 helm.sh/release.v1），每次升级都新增一个版本，rollback 本质上是重新 apply 旧版本的 manifest 集合。 理解 Helm...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%B0%83%E5%BA%A6%E6%A1%86%E6%9E%B6%E5%85%A8%E6%99%AF%E5%9B%BE"><span class="toc-number">1.</span> <span class="toc-text">调度框架全景图</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#filter-%E9%98%B6%E6%AE%B5%EF%BC%9A%E6%B7%98%E6%B1%B0%E4%B8%8D%E5%8F%AF%E7%94%A8%E8%8A%82%E7%82%B9"><span class="toc-number">2.</span> <span class="toc-text">Filter 阶段：淘汰不可用节点</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#noderesourcesfit"><span class="toc-number">2.1.</span> <span class="toc-text">NodeResourcesFit</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#nodeselector-%E4%B8%8E-nodeaffinity"><span class="toc-number">2.2.</span> <span class="toc-text">NodeSelector 与 NodeAffinity</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#tainttoleration"><span class="toc-number">2.3.</span> <span class="toc-text">TaintToleration</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#podaffinity-%E4%B8%8E-podantiaffinity"><span class="toc-number">2.4.</span> <span class="toc-text">PodAffinity 与 PodAntiAffinity</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#interpodaffinity"><span class="toc-number">2.5.</span> <span class="toc-text">InterPodAffinity</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#score-%E9%98%B6%E6%AE%B5%EF%BC%9A%E5%AF%B9%E5%8F%AF%E8%A1%8C%E8%8A%82%E7%82%B9%E6%89%93%E5%88%86"><span class="toc-number">3.</span> <span class="toc-text">Score 阶段：对可行节点打分</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#leastallocated"><span class="toc-number">3.1.</span> <span class="toc-text">LeastAllocated</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#mostallocated"><span class="toc-number">3.2.</span> <span class="toc-text">MostAllocated</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#imagelocality"><span class="toc-number">3.3.</span> <span class="toc-text">ImageLocality</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#nodeaffinitypriority"><span class="toc-number">3.4.</span> <span class="toc-text">NodeAffinityPriority</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#interpodaffinitypriority"><span class="toc-number">3.5.</span> <span class="toc-text">InterPodAffinityPriority</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#podtopologyspread%EF%BC%9A%E6%9B%B4%E7%B2%BE%E7%BB%86%E7%9A%84%E6%8B%93%E6%89%91%E5%88%86%E6%95%A3"><span class="toc-number">4.</span> <span class="toc-text">PodTopologySpread：更精细的拓扑分散</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#priorityclass-%E4%B8%8E%E6%8A%A2%E5%8D%A0%E6%9C%BA%E5%88%B6"><span class="toc-number">5.</span> <span class="toc-text">PriorityClass 与抢占机制</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#priorityclass"><span class="toc-number">5.1.</span> <span class="toc-text">PriorityClass</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%8A%A2%E5%8D%A0-preemption-%E8%A7%A6%E5%8F%91%E6%9D%A1%E4%BB%B6"><span class="toc-number">5.2.</span> <span class="toc-text">抢占（Preemption）触发条件</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#poddisruptionbudget-pdb-%E4%B8%8E%E6%8A%A2%E5%8D%A0"><span class="toc-number">5.3.</span> <span class="toc-text">PodDisruptionBudget（PDB）与抢占</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%AF%E8%A7%82%E6%B5%8B%E5%AE%9E%E9%AA%8C%EF%BC%9A%E8%A7%82%E5%AF%9F%E6%8A%A2%E5%8D%A0%E8%BF%87%E7%A8%8B"><span class="toc-number">6.</span> <span class="toc-text">可观测实验：观察抢占过程</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%87%86%E5%A4%87%E7%8E%AF%E5%A2%83"><span class="toc-number">6.1.</span> <span class="toc-text">准备环境</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%88%9B%E5%BB%BA%E4%B8%A4%E4%B8%AA-priorityclass"><span class="toc-number">6.2.</span> <span class="toc-text">创建两个 PriorityClass</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%94%A8%E4%BD%8E%E4%BC%98%E5%85%88%E7%BA%A7-pod-%E5%8D%A0%E6%BB%A1%E8%8A%82%E7%82%B9%E8%B5%84%E6%BA%90"><span class="toc-number">6.3.</span> <span class="toc-text">用低优先级 Pod 占满节点资源</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%88%9B%E5%BB%BA%E9%AB%98%E4%BC%98%E5%85%88%E7%BA%A7-pod-%E8%A7%A6%E5%8F%91%E6%8A%A2%E5%8D%A0"><span class="toc-number">6.4.</span> <span class="toc-text">创建高优先级 Pod 触发抢占</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%82%E5%AF%9F%E6%8A%A2%E5%8D%A0%E4%BA%8B%E4%BB%B6"><span class="toc-number">6.5.</span> <span class="toc-text">观察抢占事件</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%82%E5%AF%9F-nominatednodename"><span class="toc-number">6.6.</span> <span class="toc-text">观察 nominatedNodeName</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A7%82%E5%AF%9F%E8%B0%83%E5%BA%A6%E5%99%A8%E6%89%93%E5%88%86%E8%BF%87%E7%A8%8B"><span class="toc-number">6.7.</span> <span class="toc-text">观察调度器打分过程</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B0%86%E5%AE%9E%E9%AA%8C%E7%BB%93%E6%9E%9C%E6%98%A0%E5%B0%84%E5%88%B0-k8s-%E5%AF%B9%E8%B1%A1"><span class="toc-number">7.</span> <span class="toc-text">将实验结果映射到 K8s 对象</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">8.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">9.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">10.</span> <span class="toc-text">常见误解</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%AF%AF%E8%A7%A3%E4%B8%80%EF%BC%9A%E8%B0%83%E5%BA%A6%E5%99%A8%E7%9B%B4%E6%8E%A5%E8%BF%90%E8%A1%8C-pod"><span class="toc-number">10.1.</span> <span class="toc-text">误解一：调度器直接运行 Pod</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%AF%AF%E8%A7%A3%E4%BA%8C%EF%BC%9Anodeselector-%E5%92%8C-nodeaffinity-%E6%98%AF%E5%90%8C%E4%B8%80%E6%9C%BA%E5%88%B6%E7%9A%84%E4%B8%8D%E5%90%8C%E5%86%99%E6%B3%95"><span class="toc-number">10.2.</span> <span class="toc-text">误解二：nodeSelector 和 nodeAffinity 是同一机制的不同写法</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%AF%AF%E8%A7%A3%E4%B8%89%EF%BC%9A%E8%A2%AB%E6%8A%A2%E5%8D%A0%E9%A9%B1%E9%80%90%E7%9A%84-pod-%E4%BC%9A%E7%AB%8B%E5%88%BB%E6%B6%88%E5%A4%B1-%E9%AB%98%E4%BC%98%E5%85%88%E7%BA%A7-pod-%E7%AB%8B%E5%88%BB%E8%B0%83%E5%BA%A6"><span class="toc-number">10.3.</span> <span class="toc-text">误解三：被抢占驱逐的 Pod 会立刻消失，高优先级 Pod 立刻调度</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">11.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">12.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">13.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.5</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.5"></script><script src="/js/main.js?v=5.5.5"></script><script src="/js/tw_cn.js?v=5.5.5"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || item.innerHTML || ""
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    if (e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : window.location.href = e.request.responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.5.5"></script></div></div></body></html>

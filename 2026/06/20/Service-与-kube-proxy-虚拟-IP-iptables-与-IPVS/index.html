@@ -1,0 +1,789 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="Service 的 ClusterIP 是一个不存在于任何网卡的虚拟 IP。在节点上运行 ip addr，看不到它；用 ping 测试，收不到回应；但对它发起 TCP 连接，数据却能稳定到达某个后端 Pod。这个&quot;幽灵 IP&quot;能够工作，完全依赖 kube-proxy 写入每个节点内核的 iptables 或 IPVS 规则——规则在，转发在；规则消失，连接消失。 理解这一机制的">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS">
+<meta property="og:url" content="https://magicliang.github.io/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="Service 的 ClusterIP 是一个不存在于任何网卡的虚拟 IP。在节点上运行 ip addr，看不到它；用 ping 测试，收不到回应；但对它发起 TCP 连接，数据却能稳定到达某个后端 Pod。这个&quot;幽灵 IP&quot;能够工作，完全依赖 kube-proxy 写入每个节点内核的 iptables 或 IPVS 规则——规则在，转发在；规则消失，连接消失。 理解这一机制的">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/cover.svg">
+<meta property="article:published_time" content="2026-06-20T02:08:00.000Z">
+<meta property="article:modified_time" content="2026-06-24T14:18:39.332Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Kubernetes">
+<meta property="article:tag" content="云原生">
+<meta property="article:tag" content="容器">
+<meta property="article:tag" content="网络">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS",
+  "url": "https://magicliang.github.io/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/",
+  "image": "https://magicliang.github.io/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/cover.svg",
+  "datePublished": "2026-06-20T02:08:00.000Z",
+  "dateModified": "2026-06-24T14:18:39.332Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.5"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.2.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: 'Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">492</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">548</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">8</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">Service 与 kube-proxy：虚拟 IP、iptables 与 IPVS</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-06-20T02:08:00.000Z" title="Created 2026-06-20 10:08:00">2026-06-20</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-06-24T14:18:39.332Z" title="Updated 2026-06-24 22:18:39">2026-06-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%9F%BA%E7%A1%80%E8%AE%BE%E6%96%BD/">基础设施</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">12.1k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>43mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-06-24 22:18:39&quot;}" hidden></div><p>Service 的 ClusterIP 是一个不存在于任何网卡的虚拟 IP。在节点上运行 <code>ip addr</code>，看不到它；用 <code>ping</code> 测试，收不到回应；但对它发起 TCP 连接，数据却能稳定到达某个后端 Pod。这个&quot;幽灵 IP&quot;能够工作，完全依赖 kube-proxy 写入每个节点内核的 iptables 或 IPVS 规则——规则在，转发在；规则消失，连接消失。</p>
+<p>理解这一机制的起点是区分两种截然不同的角色：kube-proxy 是&quot;规则维护者&quot;，内核的 netfilter/IPVS 子系统才是&quot;数据面执行者&quot;。kube-proxy 进程本身从不处理任何用户请求，它只监听 kube-apiserver 上 Service 和 EndpointSlice 的变化，把这些变化翻译成内核规则，然后等待下一次变化。真正处理数据包的是内核——每个到达某 ClusterIP:port 的数据包，在经过 iptables nat 表的 PREROUTING 链时，被 DNAT 规则改写目标地址，转向某个真实的 Pod IP:port，整个过程对应用完全透明。</p>
+<p>这种设计的优雅之处在于分层解耦：控制面（kube-proxy watch + 规则同步）与数据面（内核包转发）完全解耦。数据面没有单点，没有用户态瓶颈，每个节点独立维护自己的转发规则；kube-proxy 进程崩溃后，已有规则继续生效，已建立的 TCP 连接不受影响，只有新的 Service/Pod 变更不再被同步。代价是规则同步本身的复杂性，以及 iptables 在大规模下的线性遍历开销，这正是 IPVS 模式和 Cilium eBPF 替代方案要解决的问题。</p>
+<h2 id="转发路径全景">转发路径全景</h2>
+<figure class="highlight elm"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br></pre></td><td class="code"><pre><code class="hljs elm"><span class="hljs-type">Pod</span> <span class="hljs-type">A</span> → <span class="hljs-type">ClusterIP</span>:<span class="hljs-number">80</span> (e.g. <span class="hljs-number">10.96</span><span class="hljs-number">.0</span><span class="hljs-number">.10</span>:<span class="hljs-number">80</span>)<br>  │<br>  ▼<br>内核 netfilter <span class="hljs-type">PREROUTING</span> 链<br>  ├─ <span class="hljs-type">KUBE</span>-<span class="hljs-type">SERVICES</span> 链 (匹配 <span class="hljs-type">ClusterIP</span>:<span class="hljs-keyword">port</span>)<br>  │    └─ KUBE-SVC-XXXXXXXX 链 (该 <span class="hljs-type">Service</span> 的规则链)<br>  │         ├─ statistic mode random prob 0.333 → KUBE-SEP-P1<br>  │         │                                      DNAT → 10.244.1.2:80<br>  │         ├─ statistic mode random prob 0.500 → KUBE-SEP-P2<br>  │         │                                      DNAT → 10.244.1.3:80<br>  │         └─ (remaining)                       → KUBE-SEP-P3<br>  │                                                DNAT → 10.244.2.4:80<br>  │<br>  ▼ (<span class="hljs-type">DNAT</span> 完成，目标 <span class="hljs-type">IP</span> 已改写为真实 <span class="hljs-type">Pod</span> <span class="hljs-type">IP</span>)<br>路由决策 → 本地或跨节点发送<br>  │<br>  ▼<br>目标 Pod (真实 <span class="hljs-type">Pod</span> <span class="hljs-type">IP</span>:port)<br><br>IPVS 模式对比:<br>  ip_vs virtual server: 10.96.0.10:80<br>  → hash table 查找 O(1)<br>  → real server 选择 (rr/lc/wrr/sh)<br>  → 包转发（内核 ip_vs 模块）<br><br>kube-proxy 控制循环:<br>  Service 变化     → 创建/删除 KUBE-SVC 链 / IPVS virtual server<br>  EndpointSlice 变化 → 增删 KUBE-SEP 规则 / IPVS real server<br>  readinessProbe 失败 → EndpointSlice ready:false → 规则摘除 → 新连接不再路由到该 Pod<br></code></pre></td></tr></table></figure>
+<h2 id="service-的本质：稳定的虚拟入口">Service 的本质：稳定的虚拟入口</h2>
+<p>Service 是 Kubernetes 对&quot;服务发现 + 负载均衡&quot;这个经典问题的声明式解答。Pod IP 不稳定（重建即变），一组 Pod 需要负载均衡访问，Service 同时解决这两个问题：用一个固定的 ClusterIP 作为稳定的访问入口，用 kube-proxy 维护的内核规则把流量分发到当前健康的 Pod 集合。</p>
+<p>ClusterIP 由 kube-apiserver 在 Service 创建时从 <code>--service-cluster-ip-range</code>（通常是 <code>10.96.0.0/12</code>）中分配，写入 etcd 的 Service 对象。只要 Service 不被删除，这个 IP 就不会变更——即使后端 Pod 全部重建、迁移到不同节点，ClusterIP 保持不变，调用方的配置无需更新。这正是 Service 提供的核心抽象价值：把不稳定的 Pod 集合封装在一个稳定的虚拟地址后面。</p>
+<p>ClusterIP 没有绑定到任何网络接口，它不是一个真实存在的 IP 地址，而是 iptables/IPVS 规则里的一个匹配键。<code>ping</code> 之所以不通，是因为 ICMP echo 不经过 iptables nat 表的 DNAT 规则（DNAT 只处理 TCP/UDP 的有连接协议），ping 包到达&quot;ClusterIP&quot;这个地址时，没有任何接口应答，包被内核丢弃。<code>curl</code> 发起 TCP SYN 包，经过 PREROUTING 链，被 DNAT 改写到真实 Pod IP，SYN 包成功到达 Pod，连接建立。这是最常见的&quot;Service 可用但不可 ping&quot;的根本原因，理解这一点可以避免很多无谓的网络排查。</p>
+<p>ClusterIP 的地址范围不能与 Pod 网络（PodCIDR）或节点网络重叠，三个地址空间必须互相独立。规划集群网络时，需要提前确定这三个 CIDR 范围：节点 IP 段（物理网络决定）、PodCIDR（由 <code>--pod-cidr</code> 配置）、ServiceCIDR（由 <code>--service-cluster-ip-range</code> 配置）。一个常见的规划方案是节点用 <code>192.168.0.0/16</code>，PodCIDR 用 <code>10.244.0.0/16</code>，ServiceCIDR 用 <code>10.96.0.0/12</code>，三者完全不重叠。</p>
+<h2 id="service-的五种类型">Service 的五种类型</h2>
+<p>ClusterIP 是所有 Service 类型的基础，其他类型都是在 ClusterIP 之上叠加额外能力。</p>
+<p>ClusterIP 分配集群内部虚拟 IP，只在集群内可访问。这是绝大多数内部服务（数据库、缓存、内部 API）的标准形态。外部流量无法直接访问 ClusterIP，需要通过 Ingress 或 LoadBalancer 转发进来。可以在 Service 的 spec 里通过 <code>sessionAffinity: ClientIP</code> 开启基于客户端 IP 的会话亲和性——kube-proxy 会在 iptables 里写入 recent 模块规则（或 IPVS 的 sh 调度算法），让同一客户端 IP 的请求始终路由到同一后端 Pod。会话亲和性的有效期由 <code>sessionAffinityConfig.clientIP.timeoutSeconds</code> 控制，默认 10800 秒（3小时）。</p>
+<p>NodePort 在每个节点上开放一个固定端口（默认范围 <code>30000-32767</code>，由 <code>--service-node-port-range</code> 配置），外部请求打到任意节点 IP:NodePort，被 iptables 规则 DNAT 到 ClusterIP，再路由到 Pod。NodePort 包含 ClusterIP 的全部能力，集群内部仍然可以用 ClusterIP 访问。</p>
+<p>外部访问时，<code>externalTrafficPolicy</code> 的取值决定了流量行为。<code>externalTrafficPolicy: Cluster</code>（默认值）：即使请求打到一个没有对应 Pod 的节点，规则也会把流量转发到有 Pod 的节点（跨节点转发），但这个过程需要 SNAT——因为跨节点转发后，如果目标 Pod 直接回包给原始客户端 IP，回包不会经过入口节点，连接无法建立（非对称路由）。SNAT 解决了路由对称性，但掩盖了真实客户端 IP。<code>externalTrafficPolicy: Local</code>：只有本节点有 Pod 时才接受并处理请求，没有 Pod 的节点会直接丢弃该端口的流量；因为流量不需要跨节点转发，不需要 SNAT，Pod 看到的来源 IP 就是真实客户端 IP。代价是流量分布不均——如果某个节点有 3 个 Pod，某个节点有 1 个 Pod，前者实际承受的是后者的 3 倍流量。</p>
+<p>LoadBalancer 在 NodePort 之上，向云厂商申请一个外部负载均衡器（AWS NLB/ALB、GCP Cloud LB、Azure LB 等），把集群节点的 NodePort 注册为后端，外部 IP 绑定到 Service 的 <code>status.loadBalancer.ingress</code>。这个过程由 cloud-controller-manager 中的 cloud provider 实现完成——它 watch LoadBalancer 类型的 Service，调用云 API 创建 LB，把节点 IP:NodePort 注册为健康检查目标。云 LB 的健康检查探测 NodePort，只有健康的节点才会接收来自云 LB 的流量。在裸金属集群上没有云厂商支持时，可以用 MetalLB 或 Cilium 的 LB-IPAM 提供类似能力：MetalLB 通过 ARP（L2 模式）或 BGP（L3 模式）把 Service 的外部 IP 通告给网络，实现外部流量的接入。</p>
+<p>ExternalName 不分配 ClusterIP，也不使用 kube-proxy 规则。CoreDNS 把该 Service 的 DNS 查询做 CNAME 解析到 <code>spec.externalName</code> 指定的外部域名。应用代码访问 <code>db.default.svc.cluster.local</code>，CoreDNS 返回一个 CNAME 指向 <code>my-rds-instance.xxxxx.rds.amazonaws.com</code>，应用实际连接的是 RDS 实例。迁移时只需修改 Service 的 <code>externalName</code> 字段，不需要改应用代码。ExternalName 的使用场景是把集群外部的服务（RDS、ElastiCache、第三方 API 端点）包装成集群内的 Service 名，统一应用的寻址方式，方便在 staging 和 production 环境切换不同的外部服务，而应用代码始终用同一个 Service DNS 名。</p>
+<p>Headless Service（<code>clusterIP: None</code>）不分配 ClusterIP，CoreDNS 直接返回所有就绪 Pod 的 IP 列表（多条 A 记录），不经过任何 DNAT。StatefulSet 的 Pod 通过 Headless Service 实现 Pod 级别的 DNS 名（<code>web-0.web.default.svc.cluster.local</code> → Pod <code>web-0</code> 的 IP），使有状态应用可以直接寻址到特定实例，是 Kafka broker 相互通信、MySQL replica 配置主从、Elasticsearch 集群自发现的标准解决方案。Headless Service 在创建时不会触发 kube-proxy 写任何 iptables 规则，因为它不需要负载均衡转发。</p>
+<h2 id="endpoints-与-endpointslice">Endpoints 与 EndpointSlice</h2>
+<p>Endpoints 是 Service 后端的第一代表示，每个 Service 对应一个同名的 Endpoints 对象，包含所有就绪后端 Pod 的 IP 和端口列表。endpoints-controller（kube-controller-manager 的一部分）持续监控 Pod 的就绪状态：readinessProbe 通过的 Pod 被加入 Endpoints，readinessProbe 失败的 Pod 被从 Endpoints 移除。kube-proxy watch 到 Endpoints 变化后立即更新内核规则，新连接就不会再路由到不健康的 Pod。</p>
+<p>Endpoints 在大规模集群下暴露了一个严重的扩展性问题：单个 Endpoints 对象包含所有后端 Pod，任何一个 Pod 变化（哪怕是后端有 1000 个 Pod 的 Service 里只有 1 个 Pod 重启），整个 Endpoints 对象都需要全量更新、序列化、写入 etcd、推送给所有节点的 kube-proxy。在 1000 个节点、每个节点都有 kube-proxy 的集群里，一次 Endpoints 更新可能产生 1000 次全量对象推送，对 apiserver、etcd、网络带宽都是压力。</p>
+<p>EndpointSlice（GA 自 Kubernetes 1.21）把后端 Pod 分片存储，每片默认最多 100 个端点（由 <code>maxEndpointsPerSlice</code> 控制）。当 1 个 Pod 在 1000 个后端里发生变化，只有包含它的那一个 Slice 对象需要更新，其他 Slice 不受影响，kube-proxy 的 watch 事件量从 O(total_pods) 降到 O(changed_slice_size)。更少的数据传输、更低的 etcd 写压力、更快的规则同步速度，在后端 Pod 数量大时效果非常显著。kube-proxy 1.19 版本开始默认使用 EndpointSlice，1.21 版本 EndpointSlice GA 后成为生产推荐。</p>
+<p>EndpointSlice 的数据结构比 Endpoints 更丰富。每个端点（endpoint）字段包含：<code>addresses</code>（Pod IP 列表，通常是一个）、<code>conditions</code>（<code>ready</code>、<code>serving</code>、<code>terminating</code> 三个布尔值）、<code>targetRef</code>（对应的 Pod 对象引用）、<code>nodeName</code>（Pod 所在节点）、<code>zone</code>（可用区）。<code>conditions.serving</code> 和 <code>conditions.terminating</code> 的引入解决了 Pod 优雅退出期间的流量处理问题——Pod 进入 Terminating 状态后，<code>terminating: true</code>，kube-proxy 可以根据这个字段决定是否继续向该 Pod 转发（配合 <code>preStop</code> hook 等优雅退出机制）。</p>
+<p>EndpointSlice 还引入了 topology 字段支持拓扑感知路由（Topology Aware Routing，1.27 GA）：kube-proxy 优先把流量路由到与请求方在同一可用区的后端 Pod，减少跨区流量，降低延迟和跨区数据传输费用。这个能力在多 AZ 部署的云环境里价值显著，Endpoints 对象没有这个字段。拓扑感知路由通过在 Service 上设置 <code>spec.trafficDistribution: PreferClose</code> 启用（1.31 GA），kube-proxy 根据 EndpointSlice 里的 zone 字段和节点的 zone 标签，优先选择同 zone 的端点。</p>
+<h2 id="kube-proxy-iptables-模式详解">kube-proxy iptables 模式详解</h2>
+<p>iptables 模式在 kube-proxy 启动时（或 Service/EndpointSlice 变化时）把 Service 的转发规则写入 Linux netfilter 的 nat 表。规则结构采用链式组织，有几个关键的自定义链：</p>
+<p><code>KUBE-SERVICES</code> 链是所有 Service 规则的入口，在系统的 PREROUTING 和 OUTPUT 链里都有跳转到 KUBE-SERVICES 的规则（前者处理从外部进来的包，后者处理本地发出的包）。每个 Service 在这里有一条跳转规则，匹配条件是目标 IP（ClusterIP）和端口，动作是跳转到该 Service 专属的 <code>KUBE-SVC-XXXXXXXX</code> 链（XXXXXXXX 是 Service ClusterIP+port 的哈希）。KUBE-SERVICES 链还在末尾有一个 <code>KUBE-NODEPORTS</code> 规则，处理 NodePort 流量。</p>
+<p><code>KUBE-SVC-XXXXXXXX</code> 链是某个 Service 的负载均衡规则链，包含 N 条规则（N 是就绪后端 Pod 数量）。规则使用 iptables 的 <code>statistic</code> 模块做概率分配：第 1 条规则匹配概率是 <code>1/N</code>，第 2 条是 <code>1/(N-1)</code>，以此类推，最后一条是 1（兜底）。这种链式概率设计使每个 Pod 被选中的期望概率相等（均为 1/N）——虽然每条规则的写法看起来不同，但组合起来是均匀分布。以 3 个后端为例：第一条规则有 1/3 的概率命中并跳转到 KUBE-SEP-P1；不命中（2/3 概率）的流量进入第二条规则，第二条有 1/2 的概率命中 KUBE-SEP-P2（即总概率 2/3 × 1/2 = 1/3）；剩余流量（1/3）全部走 KUBE-SEP-P3。三个 Pod 期望被选中概率均等。</p>
+<p><code>KUBE-SEP-YYYYYYYY</code> 链（SEP = Service EndPoint）对应一个具体的后端 Pod，包含一条 DNAT 规则把 ClusterIP:port 改写为 Pod IP:port，以及一条 MASQUERADE 规则处理 hairpin 场景（Pod 访问自身所属 Service 的 ClusterIP 时，需要 MASQUERADE 确保回包能正确路由）。MASQUERADE 是 SNAT 的动态版本，自动把源 IP 改写为出口网卡的 IP，不需要指定具体的 SNAT 地址。</p>
+<p>iptables 模式的两个已知扩展性瓶颈值得理解清楚。第一，规则遍历是线性的：每个新 TCP 连接的 SYN 包（以及每个无连接 UDP 包）都从 KUBE-SERVICES 链头开始遍历，匹配到对应 Service 的链；Service 数量增加意味着平均遍历长度增加，10 个 Service 时每次遍历约 10 条规则，1000 个 Service 时平均约 500 条规则。第二，规则同步是全量的：kube-proxy 调用 <code>iptables-restore</code> 写入整个规则集，任何 Service 或 Pod 变化都触发这个全量操作；在 Service 数量多时，一次同步可能需要锁住 iptables 锁（<code>/run/xtables.lock</code>）数秒，期间其他 iptables 操作会被阻塞。在 5000 个 Service 的集群里，一次 <code>iptables-restore</code> 可能写入数万条规则，耗时 10 秒以上，这期间内核态的 iptables 锁被持有，任何需要修改 iptables 的操作都会排队等待。</p>
+<p>已建立的 TCP 连接不受 iptables 规则变化影响，因为 conntrack（连接追踪）模块缓存了第一个 SYN 包的 DNAT 结果，后续同一连接的包直接命中 conntrack 缓存，跳过整个 iptables 链路。这个特性既是性能优化（避免每个包都遍历规则链），也是会话一致性的保证（同一连接的所有包到达同一后端 Pod）。</p>
+<h2 id="kube-proxy-ipvs-模式详解">kube-proxy IPVS 模式详解</h2>
+<p>IPVS（IP Virtual Server）是 Linux 内核的四层负载均衡模块，由章文嵩博士主导开发，是 LVS（Linux Virtual Server）项目的核心组件。kube-proxy 的 IPVS 模式把 Service 映射为 IPVS 虚拟服务器（virtual server），把每个后端 Pod 注册为对应的真实服务器（real server），由内核的 <code>ip_vs</code> 模块完成包转发。</p>
+<p>IPVS 用哈希表存储 virtual server 和 real server 的映射，规则查找时间 O(1)，不随 Service 数量增长。规则同步是增量的：Service 变化时用 <code>netlink</code> 接口（<code>ipvs.UpdateService</code>）只更新对应的 virtual server，不触及其他 Service 的规则；EndpointSlice 变化时只增减对应的 real server。这两点使 IPVS 在 Service 数量超过 1000 时性能明显优于 iptables。</p>
+<p>IPVS 支持多种负载均衡调度算法，通过 kube-proxy 的 <code>--ipvs-scheduler</code> 参数或 KubeProxyConfiguration ConfigMap 配置：</p>
+<ul>
+<li><code>rr</code>（round robin）：轮询，逐个分配，默认值，适合后端处理能力相近的场景</li>
+<li><code>lc</code>（least connection）：最少活跃连接优先，把新连接路由到当前活跃连接数最少的后端，适合长连接或处理时间差异大的场景</li>
+<li><code>wrr</code>（weighted round robin）：加权轮询，可以给不同 Pod 设置不同权重，适合 Pod 配置不均等的场景</li>
+<li><code>dh</code>（destination hashing）：目标地址哈希，相同目标 IP 的请求路由到同一后端，适合反向代理缓存场景</li>
+<li><code>sh</code>（source hashing）：源地址哈希，相同源 IP 的请求路由到同一后端，提供会话亲和性（Session Affinity）</li>
+</ul>
+<p>Kubernetes 的 Service 里设置 <code>sessionAffinity: ClientIP</code> 时，kube-proxy IPVS 模式会自动选择 <code>sh</code> 调度算法，使同一客户端 IP 的请求始终被路由到同一后端 Pod，比 iptables 模式的 recent 模块实现更高效。</p>
+<p>IPVS 模式还需要节点上预装对应的内核模块（<code>ip_vs</code>、<code>ip_vs_rr</code>、<code>ip_vs_wrr</code>、<code>ip_vs_sh</code>）以及 <code>nf_conntrack</code> 模块用于连接追踪。在现代 Linux 发行版（CentOS 7.4+、Ubuntu 16.04+）上，这些模块通常已经包含在内核里，只需要 <code>modprobe ip_vs</code> 加载即可。kube-proxy 在启动时会检查这些模块是否存在，如果缺失则回退到 iptables 模式并打出警告日志。</p>
+<p>IPVS 模式要求 ClusterIP 绑定到一个虚拟网络接口（通常是 <code>kube-ipvs0</code>，一个 dummy 接口），这样内核才能接受发往 ClusterIP 的流量而不丢包。kube-proxy 在 IPVS 模式启动时会创建这个 dummy 接口，并把所有 Service 的 ClusterIP 以 <code>/32</code> 地址的形式 assign 到这个接口上。</p>
+<p>值得注意的是：IPVS 模式仍然使用少量 iptables 规则处理 IPVS 本身覆盖不到的场景（如 NodePort 流量的 MASQUERADE、hairpin 流量的 SNAT、ClusterIP 的 localhost 访问）。切换到 IPVS 模式并不意味着完全不用 iptables，但 iptables 规则数量从数百/数千条降到数十条，开销大幅减少。</p>
+<h2 id="cilium-kube-proxy-完全替代">Cilium kube-proxy 完全替代</h2>
+<p>Cilium 提供了一种彻底不同的 Service 实现路径：用 eBPF 程序在 socket 层（<code>connect()</code> 系统调用时）拦截流量，在内核数据路径中直接完成 Service 到 Pod IP 的映射，完全绕过 iptables 和 netfilter，也不需要 conntrack 做连接追踪。</p>
+<p>iptables/IPVS 在 IP 包转发层（L3/L4）拦截：每个数据包，包括同一 TCP 连接的第 N 个包，都经过 netfilter 处理（虽然 conntrack 缓存使已建立连接的处理很快）；新建连接的 SYN 包需要经过完整的规则匹配。Cilium 的 socket 级负载均衡在 <code>connect()</code> 系统调用时拦截：应用调用 <code>connect(ClusterIP, port)</code> 时，eBPF 程序把目标 IP 改写为某个 Pod IP，后续该连接的所有包直接发往 Pod IP，无需任何 netfilter 处理。把每个连接的 DNAT 开销从&quot;每个包一次 conntrack 查找&quot;降到&quot;建立连接时一次 eBPF Map 查找&quot;。</p>
+<p>socket 级负载均衡的实现利用了 <code>BPF_CGROUP_INET4_CONNECT</code> 这个 cgroup eBPF 钩子。内核在执行 <code>connect()</code> 系统调用时，会触发这个钩子，Cilium 挂载的 eBPF 程序读取目标地址，在 Service Map 里查找对应的后端 Pod IP，并在内核里修改 sockaddr 结构。整个过程对用户态应用完全透明，getsockname() 仍然返回 ClusterIP，但实际的内核 socket 已经连接到 Pod IP。</p>
+<p>在每秒数万次新建连接的高并发短连接场景（如微服务的 HTTP/1.1 短连接、HTTP/2 多路复用下的大量流），Cilium 的 socket 级负载均衡延迟优势最为显著。conntrack 表的锁竞争在高并发下会成为瓶颈，Cilium 绕过 conntrack 的设计从根本上避免了这个问题。但 Cilium kube-proxy 替代需要 Linux 5.4+ 内核（socket 级 DNAT 需要 <code>BPF_CGROUP_INET4_CONNECT</code> 钩子），且 Cilium 自身的运维复杂度远高于 kube-proxy。</p>
+<h2 id="dns-服务发现：coredns-的角色">DNS 服务发现：CoreDNS 的角色</h2>
+<p>Service 的 IP 固定，但调用方如何知道这个 IP？硬编码 IP 违背了 Service 的设计意图（如果 Service 被重建，IP 可能变化），也不利于跨环境部署（不同集群的 ClusterIP 不同）。CoreDNS 提供了名称到 IP 的稳定映射。</p>
+<p>CoreDNS 以 Deployment 形式部署在 <code>kube-system</code> 命名空间，由 <code>--dns-service-ip</code> 参数（通常是 <code>10.96.0.10</code>）指定其 Service ClusterIP。每个 Service 自动获得一条 DNS A 记录：<code>{service-name}.{namespace}.svc.cluster.local</code> → ClusterIP。同命名空间内的调用可以省略命名空间和域后缀，直接用服务名访问（<code>curl http://nginx</code>，CoreDNS 的 search 域自动补全）。</p>
+<p>Pod 的 <code>/etc/resolv.conf</code> 由 kubelet 在创建时注入，<code>nameserver</code> 字段指向 CoreDNS 的 ClusterIP，<code>search</code> 字段列出搜索域（<code>default.svc.cluster.local svc.cluster.local cluster.local</code>），<code>options ndots:5</code> 控制短域名查询的搜索行为。</p>
+<p><code>ndots:5</code> 的语义：如果查询的域名里点的数量少于 5 个，先依次在 search 域列表里重试，全部失败后才尝试根域名。<code>github.com</code> 只有 1 个点，少于 5，所以会先尝试 <code>github.com.default.svc.cluster.local</code>（失败）→ <code>github.com.svc.cluster.local</code>（失败）→ <code>github.com.cluster.local</code>（失败）→ 再尝试根域名 <code>github.com.</code>。这个机制在访问公网域名时产生额外的 DNS 查询开销（通常是 3 次额外查询），在 DNS 密集场景（每次 HTTP 请求前都做 DNS 解析）里可以用 <code>ndots:2</code> 或在域名末尾加 <code>.</code>（强制根域名查询）来优化。</p>
+<p>CoreDNS 的 SRV 记录也是服务发现的一部分，格式是 <code>_port-name._proto.{service-name}.{namespace}.svc.cluster.local</code>，包含 Service 的端口号和协议类型。部分服务发现框架（如 etcd 的成员发现）依赖 SRV 记录获取端口信息，不需要客户端提前知道端口号。</p>
+<p>Headless Service 的 DNS 行为不同：CoreDNS 直接返回 Pod IP 列表（多条 A 记录），客户端可以用 DNS 轮询或自定义负载均衡。StatefulSet 的 Pod 还额外获得 <code>{pod-name}.{headless-svc}.{namespace}.svc.cluster.local</code> 格式的 DNS 记录，指向该 Pod 的具体 IP，是有状态集群内部通信的标准寻址方式。</p>
+<p>CoreDNS 本身是一个插件化的 DNS 服务器，核心功能由 Corefile 配置文件里的插件声明。Kubernetes 集群里常用的插件有：<code>kubernetes</code>（从 kube-apiserver 同步 Service/Pod 的 DNS 记录）、<code>forward</code>（把非集群域名的查询转发给上游 DNS）、<code>cache</code>（DNS 响应缓存，默认 30 秒 TTL）、<code>health</code>（健康检查端点）。CoreDNS 通过 watch apiserver 的 Service 和 Pod 对象实时更新 DNS 记录，Service 创建后几秒内 DNS 就可以解析，删除后同样快速失效。</p>
+<h2 id="可运行实验">可运行实验</h2>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-comment"># 创建测试用的 Deployment 和 ClusterIP Service</span><br>kubectl create deployment nginx --image=nginx --replicas=3<br>kubectl expose deployment nginx --port=80 --<span class="hljs-built_in">type</span>=ClusterIP<br><br><span class="hljs-comment"># 查看 Service 的 ClusterIP 和 Endpoints</span><br>kubectl get svc nginx<br>kubectl get endpoints nginx<br>kubectl get endpointslices -l kubernetes.io/service-name=nginx<br><br><span class="hljs-comment"># 获取 ClusterIP</span><br>CLUSTER_IP=$(kubectl get svc nginx -o jsonpath=<span class="hljs-string">&#x27;&#123;.spec.clusterIP&#125;&#x27;</span>)<br><span class="hljs-built_in">echo</span> <span class="hljs-string">&quot;ClusterIP: <span class="hljs-variable">$CLUSTER_IP</span>&quot;</span><br><br><span class="hljs-comment"># 验证 ClusterIP 不可 ping（icmp 不走 DNAT 规则）</span><br>docker <span class="hljs-built_in">exec</span> kind-control-plane ping -c 2 <span class="hljs-string">&quot;<span class="hljs-variable">$CLUSTER_IP</span>&quot;</span> 2&gt;&amp;1 || <span class="hljs-built_in">echo</span> <span class="hljs-string">&quot;ping 失败（预期行为）&quot;</span><br><br><span class="hljs-comment"># 但 TCP 连接可以成功</span><br>kubectl run curl-test --image=curlimages/curl --restart=Never --<span class="hljs-built_in">rm</span> -it -- \<br>  curl -s <span class="hljs-string">&quot;http://<span class="hljs-variable">$&#123;CLUSTER_IP&#125;</span>/&quot;</span> | <span class="hljs-built_in">head</span> -3<br><br><span class="hljs-comment"># 观察 iptables KUBE-SERVICES 链（找到 nginx Service 的规则）</span><br>docker <span class="hljs-built_in">exec</span> kind-control-plane iptables -t nat -L KUBE-SERVICES -n --line-numbers | \<br>  grep -i nginx<br><br><span class="hljs-comment"># 查看 KUBE-SVC 链内的概率分配规则（3 个后端，概率 0.333 / 0.500 / 1.0）</span><br>SVC_CHAIN=$(docker <span class="hljs-built_in">exec</span> kind-control-plane iptables -t nat -S | \<br>  grep <span class="hljs-string">&quot;KUBE-SERVICES&quot;</span> | grep <span class="hljs-string">&quot;<span class="hljs-variable">$CLUSTER_IP</span>&quot;</span> | grep -o <span class="hljs-string">&quot;KUBE-SVC-[A-Z0-9]*&quot;</span>)<br><span class="hljs-built_in">echo</span> <span class="hljs-string">&quot;Service chain: <span class="hljs-variable">$SVC_CHAIN</span>&quot;</span><br>docker <span class="hljs-built_in">exec</span> kind-control-plane iptables -t nat -L <span class="hljs-string">&quot;<span class="hljs-variable">$SVC_CHAIN</span>&quot;</span> -n 2&gt;/dev/null<br><br><span class="hljs-comment"># 观察 conntrack 表（TCP 连接建立后的 DNAT 记录）</span><br>docker <span class="hljs-built_in">exec</span> kind-control-plane conntrack -L -p tcp 2&gt;/dev/null | grep <span class="hljs-string">&quot;<span class="hljs-variable">$CLUSTER_IP</span>&quot;</span> | <span class="hljs-built_in">head</span> -5<br><br><span class="hljs-comment"># DNS 解析验证</span><br>kubectl run dnstest --image=busybox --restart=Never --<span class="hljs-built_in">rm</span> -it -- \<br>  nslookup nginx.default.svc.cluster.local<br><br><span class="hljs-comment"># 查看 resolv.conf 注入</span><br>kubectl run dnstest2 --image=busybox --restart=Never --<span class="hljs-built_in">rm</span> -it -- \<br>  <span class="hljs-built_in">cat</span> /etc/resolv.conf<br><br><span class="hljs-comment"># 验证 readinessProbe 联动：scale down 后观察 Endpoints 变化</span><br>kubectl scale deployment nginx --replicas=1<br>kubectl get endpoints nginx  <span class="hljs-comment"># 应该只有 1 个端点</span><br><br><span class="hljs-comment"># NodePort 测试</span><br>kubectl patch svc nginx -p <span class="hljs-string">&#x27;&#123;&quot;spec&quot;:&#123;&quot;type&quot;:&quot;NodePort&quot;&#125;&#125;&#x27;</span><br>NODE_PORT=$(kubectl get svc nginx -o jsonpath=<span class="hljs-string">&#x27;&#123;.spec.ports[0].nodePort&#125;&#x27;</span>)<br><span class="hljs-built_in">echo</span> <span class="hljs-string">&quot;NodePort: <span class="hljs-variable">$NODE_PORT</span>&quot;</span><br>curl -s <span class="hljs-string">&quot;http://localhost:<span class="hljs-variable">$&#123;NODE_PORT&#125;</span>/&quot;</span> | <span class="hljs-built_in">head</span> -3<br><br><span class="hljs-comment"># 清理</span><br>kubectl delete deployment nginx<br>kubectl delete svc nginx<br></code></pre></td></tr></table></figure>
+<h2 id="实验结果映射">实验结果映射</h2>
+<p><code>iptables -t nat -L KUBE-SERVICES -n</code> 里，每个 Service 对应一条匹配规则，目标是 ClusterIP:port，动作是跳转到 KUBE-SVC-XXX 链。Service 越多，这条链越长，遍历开销越大。100 个 Service 时平均需要遍历约 50 条规则，1000 个 Service 时约 500 条，这是 iptables 模式线性开销的直接体现。</p>
+<p>KUBE-SVC-XXX 链里看到的 <code>statistic mode random probability 0.33333...</code> 是 iptables 概率分配的直接体现。三个 Pod 对应三条规则，概率依次是 1/3、1/2（剩余两个里选一个）、1（兜底）。把副本数改为 5，可以观察到五条规则，概率依次是 0.2、0.25、0.333、0.5、1.0。理解这个&quot;递减分母&quot;设计是理解 iptables 负载均衡随机性的关键。</p>
+<p><code>conntrack -L</code> 显示内核的连接追踪表。对 ClusterIP 建立 TCP 连接后，conntrack 表里会有一条 <code>DNAT</code> 类型的记录，原始目标是 ClusterIP，DNAT 后目标是某个 Pod IP。同一连接的所有后续包通过 conntrack 命中缓存，直接发往 Pod IP，不再经过 KUBE-SVC 链的 statistic 规则——这保证了同一 TCP 连接的所有包始终到达同一个 Pod（连接级别的会话亲和性），而不会在连接中途被路由到不同 Pod。</p>
+<p>EndpointSlice 的 <code>conditions.ready: false</code> 状态变化（Pod 缩容后触发）被 kube-proxy watch 到后，触发对应 KUBE-SEP 规则的删除。时序是：Pod 变为 Terminating → kubelet 停止 readinessProbe → controller 标记 EndpointSlice 端点为 <code>ready: false</code> → kube-proxy watch 到变化 → 删除 KUBE-SEP 规则。这个链路总延迟约为几秒到十几秒，期间新连接可能仍被路由到正在终止的 Pod。</p>
+<h2 id="模式提炼">模式提炼</h2>
+<p>Service 是&quot;稳定虚拟入口 + 动态后端集合&quot;的组合，三层各司其职：DNS（CoreDNS）提供名称到 ClusterIP 的映射，ClusterIP 提供稳定不变的虚拟地址，kube-proxy 维护的内核规则提供动态的流量分发。三层各自可以独立演进：DNS 层可以替换 CoreDNS 实现，规则层可以从 iptables 迁移到 IPVS 或 eBPF，后端管理层从 Endpoints 演进到 EndpointSlice，任何一层的变化不影响其他层。</p>
+<p>kube-proxy 的核心价值不是&quot;代理&quot;（它不代理任何数据包），而是&quot;规则同步器&quot;——持续地把 Kubernetes 的声明式 Service 状态翻译成内核的命令式规则，是控制面与内核数据面之间的桥梁。这个角色模式在 Kubernetes 里反复出现：kubelet 是 Pod 规范到容器的转译器，cloud-controller-manager 是 Service/Node 状态到云资源的转译器，kube-proxy 是 Service/EndpointSlice 到内核规则的转译器。</p>
+<p>iptables 还是 IPVS，不是功能差异，是扩展性差异：Service 数量小于几百时几乎无差别，超过 1000 时 IPVS 的 O(1) 查找和增量同步优势开始显现，超过 5000 时 iptables 同步延迟可能成为集群稳定性风险。生产集群规模到一定程度时，从 iptables 切换到 IPVS 是低风险、高收益的优化操作。</p>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>传统技术</th>
+<th>Kubernetes Service 对应物</th>
+<th>差异说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Nginx upstream 块</td>
+<td>Service + EndpointSlice</td>
+<td>Nginx 手动配置，K8s 自动从 readinessProbe 维护端点列表</td>
+</tr>
+<tr>
+<td>HAProxy backend</td>
+<td>Service + kube-proxy 规则</td>
+<td>HAProxy 用户态代理，K8s 用内核 DNAT，无用户态数据路径开销</td>
+</tr>
+<tr>
+<td>LVS 四层负载均衡</td>
+<td>IPVS 模式 Service</td>
+<td>技术完全相同，kube-proxy 把 K8s Service 模型翻译为 LVS 配置</td>
+</tr>
+<tr>
+<td>DNS round-robin</td>
+<td>Headless Service</td>
+<td>语义相近，K8s 额外支持 Pod 级 DNS 名（StatefulSet 用途）</td>
+</tr>
+<tr>
+<td>手动 iptables DNAT</td>
+<td>iptables 模式 kube-proxy</td>
+<td>手动规则无法自动感知后端变化，kube-proxy 实现声明式自动同步</td>
+</tr>
+<tr>
+<td>Consul 服务注册与发现</td>
+<td>Service + CoreDNS</td>
+<td>Consul 主动注册，K8s 由 controller 根据 Pod 就绪状态自动维护</td>
+</tr>
+<tr>
+<td>VIP（F5 BigIP 虚拟服务器）</td>
+<td>ClusterIP</td>
+<td>概念相同，K8s 的 VIP 在内核规则里，F5 的 VIP 在专用硬件上</td>
+</tr>
+<tr>
+<td>主动健康检查 → 流量摘除</td>
+<td>readinessProbe → EndpointSlice</td>
+<td>机制完全对应，K8s 把健康检查集成进 Pod 生命周期</td>
+</tr>
+</tbody>
+</table>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：ClusterIP 可以用 ping 测试连通性。</p>
+<p>ClusterIP 不绑定任何网络接口，没有任何进程监听它，ICMP echo 不经过 iptables nat 表的 DNAT 规则（DNAT 只处理 TCP/UDP），ping 包抵达&quot;ClusterIP&quot;时没有接口应答，被内核丢弃。正确的测试方式是用 <code>curl</code> 或 <code>nc</code> 发起 TCP 连接，或者用 <code>kubectl run</code> 临时启动一个 Pod 在集群内测试。从节点外（宿主机网络）也 ping 不通，因为 ClusterIP 的路由规则只存在于集群节点内部（iptables/IPVS 规则），外部网络完全不知道这个 IP 的存在。</p>
+<p>误解二：kube-proxy 是流量代理，所有数据包经过 kube-proxy 进程处理。</p>
+<p>kube-proxy 从不处理用户数据包。它的工作是 watch API Server 的变化，维护 iptables/IPVS 规则，然后等待下一次变化。数据面由内核的 netfilter/IPVS 子系统完全承担，不经过任何用户态进程。kube-proxy 进程崩溃后，已有的规则继续存在于内核，已建立的 TCP 连接完全不受影响，只有新的 Service/Pod 变更不再被同步到规则里，存量规则逐渐与实际状态偏离。这与 Nginx/HAProxy 等用户态代理的工作模式有根本区别——用户态代理进程崩溃即服务中断，kube-proxy 崩溃只影响规则同步，不影响已有转发。</p>
+<p>误解三：iptables 模式和 IPVS 模式的负载均衡效果完全相同，只是性能不同。</p>
+<p>两者的负载均衡算法能力有本质差异。iptables 只有 <code>statistic random</code> 概率分配，是纯随机 round-robin 的近似，不感知后端实际负载，也不跟踪后端连接数。IPVS 支持 lc（least connection）等感知后端连接数的算法：在后端 Pod 处理时间差异大的场景（比如部分请求是计算密集型任务、部分是轻量查询），lc 算法能更均衡地分配负载，避免某个 Pod 因为连接积压而成为瓶颈，而 iptables 的纯随机分配在这种场景下可能让重负载 Pod 继续接收新连接。</p>
+<h2 id="练习">练习</h2>
+<p>练习一：在 kind 集群里创建 5 个副本的 Deployment，用 <code>iptables -t nat -L KUBE-SVC-XXXX -n</code> 查看五条概率规则（0.2、0.25、0.333、0.5、1.0），验证链式概率的数学原理——每条规则匹配到时，剩余请求的概率按比例分配给后续规则，保证每个 Pod 期望被选中的概率均等。用 <code>hey -n 1000 -c 20 http://&lt;ClusterIP&gt;</code> 发请求，统计每个 Pod 的日志访问次数，验证实际分布接近均等。</p>
+<p>练习二：模拟 readinessProbe 失败的流量摘除过程。创建一个 Deployment，进入某个 Pod 并在其 80 端口返回 503，触发 readinessProbe 失败；用 <code>watch kubectl get endpointslices -l kubernetes.io/service-name=nginx</code> 和 <code>watch iptables -t nat -L KUBE-SVC-XXXX -n</code> 同时观察。记录从 readinessProbe 首次失败，到 EndpointSlice 端点变为 <code>ready: false</code>，到 KUBE-SEP 规则被删除的三个时间点，分析各阶段的延迟来源。</p>
+<p>练习三：对比 iptables 模式和 IPVS 模式的规则同步速度。在集群里快速创建 200 个 Service，用 <code>time</code> 记录 kube-proxy 完成全部规则同步的耗时（观察 kube-proxy 日志里的 sync 时间）。切换到 IPVS 模式重复相同测试，对比&quot;全量重写 iptables&quot;和&quot;增量更新 IPVS hash table&quot;的耗时差异。</p>
+<p>练习四：创建一个 Headless Service，部署 StatefulSet（3 个副本），用 <code>nslookup nginx.default.svc.cluster.local</code>（返回三个 Pod IP）和 <code>nslookup nginx-0.nginx.default.svc.cluster.local</code>（返回单个 Pod IP），理解 Headless Service 如何绕过 DNAT 支持 Pod 级别的直接寻址。再用 <code>tcpdump</code> 在某个 StatefulSet Pod 上抓包，验证来自其他 Pod 的直连请求源 IP 是发送方 Pod IP，而不是 ClusterIP 或节点 IP。</p>
+<h2 id="service-的高级特性">Service 的高级特性</h2>
+<p>Service 规范里有几个不常用但在特定场景极具价值的字段，值得单独说明。</p>
+<p><code>spec.publishNotReadyAddresses</code>：默认 false，意味着 Pod 的 readinessProbe 失败时，该 Pod 不出现在 EndpointSlice 的就绪列表里，kube-proxy 不会把流量路由过去。设为 true 时，即使 readinessProbe 失败，Pod IP 也出现在 EndpointSlice 里，流量仍然路由过来。这个字段的典型用途是 StatefulSet 里的主从数据库集群：主库在启动时需要连接其他节点做 leader election 或数据同步，如果其他节点的 readinessProbe 还没通过、Pod 不出现在 Endpoints 里，集群内部的互连无法建立，永远无法完成启动。<code>publishNotReadyAddresses: true</code> 允许 Pod 在 readiness 通过前就被其他 Pod 找到，专门用于有状态集群的自举（bootstrap）阶段。</p>
+<p><code>spec.topologyKeys</code>（已废弃，被 <code>trafficDistribution</code> 替代）用于拓扑感知路由的早期实现。现代 Kubernetes（1.31 GA）通过 <code>spec.trafficDistribution: PreferClose</code> 启用拓扑感知路由：kube-proxy 在计算转发权重时，优先增大与请求方同一可用区的后端 Pod 的权重，同时保证每个 Pod 至少有一定的基础权重（避免某个 AZ 的 Pod 完全不收到流量）。这个特性需要节点有 <code>topology.kubernetes.io/zone</code> 标签，EndpointSlice 的端点有 <code>zone</code> 字段，kube-proxy 版本在 1.27+。</p>
+<p><code>spec.allocateLoadBalancerNodePorts</code>：对 LoadBalancer 类型的 Service，默认 true，cloud-controller-manager 会同时分配 NodePort（云 LB 的健康检查和流量都通过 NodePort 进入节点）。设为 false 时跳过 NodePort 分配，适用于支持直接路由到 Pod IP 的云 LB（如 AWS NLB 的 IP 目标组模式），流量不经过 NodePort，减少一跳，客户端 IP 保留更可靠。</p>
+<p><code>spec.externalTrafficPolicy</code> 与 <code>spec.internalTrafficPolicy</code> 分别控制外部流量和集群内部流量的路由策略。<code>internalTrafficPolicy: Local</code>（1.26 GA）让集群内部的 Pod 在访问 Service 时也优先选择本节点的后端 Pod（如果本节点有就绪 Pod 的话），没有本地 Pod 时回退到正常路由。这对同节点通信特别有价值——节点内的 Pod 间通信不需要离开节点，延迟最低，也避免了跨节点的带宽消耗。</p>
+<h2 id="kube-proxy-模式切换与调优">kube-proxy 模式切换与调优</h2>
+<p>生产环境从 iptables 模式切换到 IPVS 模式的操作步骤相对简单，但有几个细节需要注意。</p>
+<p>切换前提：确认内核模块已加载（<code>lsmod | grep ip_vs</code>），未加载则执行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs bash">modprobe ip_vs<br>modprobe ip_vs_rr<br>modprobe ip_vs_wrr<br>modprobe ip_vs_sh<br>modprobe nf_conntrack<br></code></pre></td></tr></table></figure>
+<p>切换方式：修改 kube-proxy 的 ConfigMap（<code>kubectl edit cm kube-proxy -n kube-system</code>），把 <code>mode: &quot;&quot;</code> 改为 <code>mode: &quot;ipvs&quot;</code>，同时可以设置 <code>ipvs.scheduler: &quot;lc&quot;</code>（最少连接）。改完后 <code>kubectl rollout restart daemonset kube-proxy -n kube-system</code> 触发重启。</p>
+<p>切换后验证：<code>ipvsadm -L -n</code> 查看 IPVS 虚拟服务器列表，每个 Service 对应一个 virtual server，每个就绪 Pod 对应一个 real server。<code>ipvsadm -L -n --stats</code> 查看每个 real server 的连接数和流量统计，验证负载均衡的实际分布。</p>
+<p>调优参数：<code>ipvs.tcpTimeout</code>（TCP 连接的 IPVS 超时，默认 900 秒，长连接场景可适当调大）、<code>ipvs.tcpFinTimeout</code>（TCP FIN 后的超时，默认 16 秒）、<code>ipvs.udpTimeout</code>（UDP 超时，默认 300 秒）。这些超时控制 IPVS 连接追踪表的老化时间，设置过小会导致长连接被意外断开，设置过大会占用内核内存。</p>
+<p>conntrack 调优：IPVS 模式仍然使用 nf_conntrack 做连接追踪。高并发场景下 conntrack 表可能耗尽（<code>nf_conntrack: table full, dropping packet</code> 错误），需要调整 <code>nf_conntrack_max</code>（<code>sysctl -w net.netfilter.nf_conntrack_max=1000000</code>）和 <code>nf_conntrack_buckets</code>（哈希桶数量，通常设为 max/4）。conntrack 满载是 Kubernetes 集群网络问题中最难排查的根因之一，因为它以&quot;随机丢包&quot;的形式出现，没有明显的错误日志。</p>
+<h2 id="service-网络故障排查">Service 网络故障排查</h2>
+<p>Service 网络问题有一套固定的分层排查路径，从最外层开始逐层向内缩小范围。</p>
+<p>第一层，确认 Service 对象本身配置正确。<code>kubectl get svc &lt;name&gt; -o yaml</code> 查看完整配置：<code>spec.selector</code> 是否与 Pod 的标签匹配（标签不匹配是最常见的&quot;Service 创建成功但无后端&quot;原因）、<code>spec.ports</code> 里的 <code>targetPort</code> 是否与 Pod 监听的端口一致（容器端口名或号码）、<code>spec.type</code> 是否符合预期。<code>kubectl get endpoints &lt;name&gt;</code> 直接看后端 IP 列表，如果 ENDPOINTS 列是 <code>&lt;none&gt;</code>，说明没有 Pod 通过了 selector + readinessProbe 双重过滤。</p>
+<p>第二层，确认后端 Pod 健康。<code>kubectl get pod -l &lt;selector&gt;</code> 列出被 Service 选中的 Pod，检查 <code>STATUS</code> 和 <code>READY</code> 列。<code>kubectl describe pod &lt;name&gt;</code> 查看 Events，readinessProbe 失败会在这里显示（<code>Readiness probe failed: ...</code>）。进入 Pod 内部 <code>curl localhost:&lt;port&gt;</code> 直接测试应用是否在监听。</p>
+<p>第三层，确认 kube-proxy 规则已同步。在任意节点上 <code>iptables -t nat -L KUBE-SERVICES -n | grep &lt;clusterIP&gt;</code> 确认 KUBE-SERVICES 链里有对应 Service 的规则。如果规则缺失，检查 kube-proxy 日志（<code>kubectl logs -n kube-system -l k8s-app=kube-proxy</code>）是否有同步错误。IPVS 模式下用 <code>ipvsadm -L -n | grep &lt;clusterIP&gt;</code> 验证 virtual server 存在。</p>
+<p>第四层，测试 DNS 解析。<code>kubectl run tmp --image=busybox --restart=Never --rm -it -- nslookup &lt;service-name&gt;</code> 临时启动一个 Pod 测试 DNS。如果解析失败，先确认 CoreDNS Pod 运行正常（<code>kubectl get pod -n kube-system -l k8s-app=kube-dns</code>），再检查 Pod 的 <code>/etc/resolv.conf</code> 是否正确注入了 CoreDNS ClusterIP。</p>
+<p>第五层，抓包验证。如果前四层都正常但连接仍然失败，在相关节点上 <code>tcpdump -i any -n host &lt;clusterIP&gt;</code> 抓包。能看到 SYN 包到达说明请求发出来了；能看到 SYN 包被 DNAT 改写后的目标 IP 说明 iptables 规则生效；如果 SYN 包到达 Pod 但没有 SYN-ACK，问题在 Pod 内部（应用未监听、防火墙拦截）；如果 SYN-ACK 发出但发起方收不到，问题在回包路由（通常是 SNAT 配置问题）。</p>
+<h2 id="service-拓扑与多集群">Service 拓扑与多集群</h2>
+<p>Kubernetes 的 Service 设计默认是单集群的，但大型系统往往需要跨集群的服务发现和流量路由。</p>
+<p>单集群内，Service 的 ClusterIP 只在该集群内可达。两个集群的 Pod 之间通信不能直接用对方集群的 ClusterIP（IP 段可能冲突，即使不冲突也没有路由），需要借助专门的多集群方案。</p>
+<p>多集群 DNS（如 Admiralty、Liqo）：在每个集群里为远端服务创建镜像 Service，DNS 解析到本集群的镜像 Service，再通过隧道或 BGP 转发到远端集群。应用代码不需要感知多集群，访问 <code>svc-name.namespace.svc.cluster.local</code> 即可，底层处理跨集群转发。</p>
+<p>Submariner：用 IPsec 或 WireGuard 隧道打通多个集群的 Pod 网络，集群间的 Pod IP 直接可路由，跨集群 Service 通过 <code>serviceExport</code> 和 <code>serviceImport</code> CRD 声明。不需要修改 CoreDNS 或 kube-proxy，但需要管理隧道的建立和维护。</p>
+<p>Istio 多集群（Primary-Remote 或 Multi-Primary）：服务网格层面的多集群，通过 Istio control plane 同步服务注册表，sidecar 代理拦截流量并路由到跨集群的端点。适合已经引入 Istio 的场景，运维复杂度较高，但服务发现、流量管理、mTLS 等能力最完整。</p>
+<p>这些方案各有适用场景，Service 在单集群内的工作方式不受影响，多集群层是叠加在 Service 之上的额外抽象层。选型时优先考虑是否已有 Istio（有则 Istio 多集群）、是否需要 Pod IP 直通（需则 Submariner）、还是只需要 DNS 级别的透明感知（DNS 镜像方案）。</p>
+<p>CNCF 的 MultiCluster SIG 正在推进跨集群服务发现的标准化。<code>serviceExport</code>（<code>multicluster.x-k8s.io/v1alpha1</code>）允许在一个集群里把 Service 导出，<code>serviceImport</code> 在另一个集群里声明要使用对方导出的服务，两者配合完成跨集群的服务注册与发现。CoreDNS 的 multicluster 插件负责把跨集群的 DNS 查询路由到正确的 serviceImport，使应用代码仍然使用标准的 <code>svc.cluster.local</code> 域名，感知不到多集群的存在。这个标准还处于成熟期，但已有多个实现（Submariner、Liqo、Cilium Cluster Mesh）开始支持。</p>
+<p>Cilium Cluster Mesh 是多集群方案里技术栈最统一的选择：如果所有集群都使用 Cilium，Cluster Mesh 可以直接打通多个集群的 Pod 网络，跨集群 Service 通过 annotation 标记为全局（<code>service.cilium.io/global: &quot;true&quot;</code>），Cilium 自动把请求路由到任意集群里的健康后端。跨集群流量走 Cilium 的加密隧道（WireGuard 或 IPsec），不需要单独的隧道管理工具。</p>
+<h2 id="conntrack-与连接跟踪调优">conntrack 与连接跟踪调优</h2>
+<p>kube-proxy 的 iptables 模式依赖 Linux 内核的 conntrack（连接跟踪）模块，conntrack 表有容量上限，大规模集群下 conntrack 表满是一类真实的生产故障。</p>
+<p>conntrack 表满的症状：<code>dmesg</code> 里出现 <code>nf_conntrack: table full, dropping packet</code>，同时节点上的新建连接开始被丢弃，但已有连接不受影响（已有条目不需要新建跟踪项）。<code>conntrack -L | wc -l</code> 查看当前条目数，<code>/proc/sys/net/netfilter/nf_conntrack_max</code> 查看上限，当前条目数超过上限的 80% 就应该考虑扩容。</p>
+<p>调整方法：<code>sysctl -w net.netfilter.nf_conntrack_max=1048576</code>（根据节点内存调整，每条条目约 320 字节，100 万条约 320MB）、<code>sysctl -w net.netfilter.nf_conntrack_buckets=262144</code>（哈希表桶数，建议为 max 的 1/4）。conntrack 的 ESTABLISHED 状态超时默认 5 天，对短连接场景可适当缩短（<code>net.netfilter.nf_conntrack_tcp_timeout_established=86400</code>），减少表中废旧条目的占用。</p>
+<p>IPVS 模式同样使用 conntrack，但 IPVS 本身有独立的连接表（<code>ipvsadm -L --stats</code>），IPVS 连接超时参数通过 <code>ipvsadm --set &lt;tcp&gt; &lt;tcp-fin&gt; &lt;udp&gt;</code> 配置，与 conntrack 超时是两套独立的机制，都需要根据业务流量特征调整。</p>
+<p>高并发短连接场景（如 HTTP 长轮询、gRPC streaming 降级为短连接）下，conntrack 表消耗速度极快。此时可以考虑切换到 Cilium kube-proxy 替代模式——Cilium 的 socket 级别 DNAT 在 connect() 阶段完成地址转换，绕过了 conntrack，对短连接场景的性能提升显著。</p>
+<h2 id="service-滚动发布与零停机更新">Service 滚动发布与零停机更新</h2>
+<p>Service 与 Deployment 协同工作时，零停机更新依赖几个机制的配合，理解这些机制有助于在滚动发布时避免连接中断。</p>
+<p>Deployment 的滚动更新策略（<code>RollingUpdate</code>）控制新旧 Pod 的替换节奏：<code>maxUnavailable</code> 决定允许同时不可用的 Pod 数量（通常设为 0，确保全程有足够副本），<code>maxSurge</code> 决定允许额外启动的 Pod 数量（通常设为 1，先起新 Pod 再删旧 Pod）。新 Pod 通过 readinessProbe 后，kubelet 更新 Pod 条件（<code>Ready: true</code>），EndpointSlice controller 把新 Pod IP 加入 EndpointSlice，kube-proxy 同步新规则，流量才开始路由到新 Pod。</p>
+<p>旧 Pod 删除时，Kubernetes 先从 EndpointSlice 摘除该 Pod IP（EndpointSlice controller 监听 Pod 删除事件，把 <code>conditions.terminating</code> 置为 <code>true</code>，kube-proxy 停止向该端点发送新连接），然后发送 SIGTERM，等待 <code>terminationGracePeriodSeconds</code>（默认 30 秒），最后强制 SIGKILL。这个序列的关键点：摘除端点和发送 SIGTERM 几乎同时发生，但 kube-proxy 同步规则有延迟（通常 1-3 秒），在这个窗口期可能有新连接仍被路由到正在终止的 Pod。应用需要在 SIGTERM 处理里继续处理正在进行的请求，不能立即关闭 listener。<code>preStop</code> hook（在 SIGTERM 前执行）里加一个短暂的 <code>sleep 5</code> 可以给 kube-proxy 足够时间完成规则同步，是一个简单有效的零停机实践。</p>
+<p>headless Service（<code>clusterIP: None</code>）与有状态应用的结合值得单独说明。StatefulSet 通常配合 headless Service 使用，原因是 StatefulSet 的 Pod 需要稳定的网络标识（<code>pod-name.headless-svc.namespace.svc.cluster.local</code>），而不是随机路由到某个副本。headless Service 不分配 ClusterIP，CoreDNS 为其生成多条 A 记录（每个就绪 Pod 一条），客户端通过 DNS 轮询或客户端负载均衡选择 Pod。Kafka、Elasticsearch、ZooKeeper 这类有状态集群，每个节点都有独立标识，节点间通过 Pod DNS 名称互相寻址，headless Service 是实现这一模式的标准 Kubernetes 原语。</p>
+<p>Service 的 <code>sessionAffinity: ClientIP</code> 会话亲和性把同一客户端 IP 的请求固定路由到同一个后端 Pod，由 iptables 的 <code>recent</code> 模块（iptables 模式）或 IPVS 的 <code>sh</code>（source hash）调度算法实现。会话亲和性的有效期由 <code>sessionAffinityConfig.clientIP.timeoutSeconds</code>（默认 10800 秒，即 3 小时）控制。注意：来自同一客户端 IP 的请求在亲和性超时后会被重新分配到随机后端，不适合对会话极度敏感的场景；对于需要严格会话粘性的应用，应在应用层（如 JWT 携带会话 ID）或 Ingress 层（<code>nginx.ingress.kubernetes.io/affinity: cookie</code>）实现更可靠的会话管理。</p>
+<p>NodePort Service 在使用 <code>externalTrafficPolicy: Cluster</code>（默认值）时，流量会被 SNAT 成节点 IP，后端 Pod 看到的源 IP 是节点 IP 而不是真实客户端 IP。这在需要记录客户端真实 IP（日志、限流、地理路由）的场景下是个问题。解决方案有两种：改为 <code>externalTrafficPolicy: Local</code>（保留源 IP，但只转发到本节点 Pod，其他节点必须通过云 LB 均衡流量）；或者使用 Ingress/Gateway API，在 L7 层通过 <code>X-Forwarded-For</code> 头部传递真实 IP。LoadBalancer Service 配合 <code>externalTrafficPolicy: Local</code> 和云 LB 的健康检查端口（NodePort 33x-400 范围）一起使用，可以实现流量只进入有本地 Pod 的节点，同时保留源 IP。</p>
+<p>Kubernetes 1.30 引入的 <code>ClusterLoadBalancer</code> 功能（当前 alpha）计划允许集群内部的客户端也能通过 LoadBalancer VIP 访问 Service，目前 LoadBalancer 的 ExternalIP 从集群内部访问行为是实现相关的（有些云提供商支持，有些不支持）。这是 Kubernetes 网络模型的一个长期遗留问题，<code>ClusterLoadBalancer</code> 是标准化尝试之一。</p>
+<p>dual-stack（IPv4/IPv6 双栈）支持在 Kubernetes 1.21 升为 stable。双栈集群里，Service 可以同时有 IPv4 ClusterIP 和 IPv6 ClusterIP（<code>spec.ipFamilyPolicy: RequireDualStack</code>），Pod 同时分配 IPv4 和 IPv6 地址。kube-proxy 在双栈模式下同时维护 IPv4 和 IPv6 的 iptables/IPVS 规则。CoreDNS 为双栈 Service 同时返回 A 记录（IPv4）和 AAAA 记录（IPv6）。从单栈迁移到双栈需要 CNI 插件、kube-proxy、CoreDNS 同步升级配置，且集群 CIDR 需要同时指定 IPv4 和 IPv6 段——这是双栈最大的运维负担，建议在集群初始化时就规划好是否需要双栈，而不是事后迁移。</p>
+<p>Service 对象的变更不会触发 Pod 重启，这是 Kubernetes 控制平面设计中的一个重要特性。修改 Service 的 selector、ports、type 等字段后，kube-proxy 异步同步规则，已有连接不受影响，新连接按新规则路由。这意味着 Service 配置变更是低风险操作，可以在不影响已有流量的前提下调整路由策略。但 ClusterIP 一旦分配就不能修改（需要删除重建），因为 ClusterIP 可能已经硬编码在应用配置或 DNS 缓存里，变更会导致找不到服务。</p>
+<p>kube-proxy 本身的可观测性在新版本里有所改善。<code>kube-proxy</code> 在 10249 端口（<code>--metrics-bind-address</code>）暴露 Prometheus 指标，关键指标包括：<code>kubeproxy_sync_proxy_rules_duration_seconds</code>（规则同步耗时，高延迟说明 iptables 规则量过大或节点负载过高）、<code>kubeproxy_sync_proxy_rules_last_timestamp_seconds</code>（上次同步时间，用于告警规则同步是否卡住）、<code>kubeproxy_network_programming_duration_seconds</code>（从 EndpointSlice 变化到规则生效的端到端延迟）。将这些指标接入告警，可以提前发现 kube-proxy 积压导致的服务发现延迟问题，而不是等到应用层出现超时后才开始排查。</p>
+<h2 id="系列导航">系列导航</h2>
+<ul>
+<li><a href="/2026/02/07/Kubernetes-%E6%A0%B8%E5%BF%83%E6%A6%82%E5%BF%B5/">00 核心概念导读</a></li>
+<li><a href="/2026/06/20/API-Server-%E4%B8%8E%E5%A3%B0%E6%98%8E%E5%BC%8F-API-%E4%B8%80%E5%88%87%E7%9A%86%E8%B5%84%E6%BA%90/">01 API Server 与声明式 API</a></li>
+<li><a href="/2026/06/20/etcd-%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96-%E9%9B%86%E7%BE%A4%E7%8A%B6%E6%80%81%E7%9A%84%E5%94%AF%E4%B8%80%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90/">02 etcd 与持久化</a></li>
+<li><a href="/2026/06/20/%E6%8E%A7%E5%88%B6%E5%99%A8%E6%A8%A1%E5%BC%8F%E4%B8%8E-Informer-%E6%9C%BA%E5%88%B6-%E8%B0%83%E8%B0%90%E5%BE%AA%E7%8E%AF%E7%9A%84%E5%B7%A5%E7%A8%8B%E5%AE%9E%E7%8E%B0/">03 控制器模式与 Informer 机制</a></li>
+<li><a href="/2026/06/20/Pod-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-%E4%BB%8E-Pending-%E5%88%B0-Running-%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B7%AF%E5%BE%84/">04 Pod 生命周期</a></li>
+<li><a href="/2026/06/20/%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%85%A5-%E6%89%93%E5%88%86-%E6%8A%A2%E5%8D%A0%E4%B8%8E%E6%8B%93%E6%89%91%E7%BA%A6%E6%9D%9F/">05 调度器深入</a></li>
+<li><a href="/2026/06/20/kubelet-%E4%B8%8E%E5%AE%B9%E5%99%A8%E8%BF%90%E8%A1%8C%E6%97%B6-%E8%8A%82%E7%82%B9%E4%B8%8A%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88/">06 kubelet 与容器运行时</a></li>
+<li><a href="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/">07 网络模型与 CNI</a></li>
+<li><a href="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/">08 Service 与 kube-proxy</a></li>
+<li><a href="/2026/06/20/Ingress-%E4%B8%8E-Gateway-API-%E4%B8%83%E5%B1%82%E6%B5%81%E9%87%8F%E7%9A%84%E5%85%A5%E5%8F%A3%E6%BC%94%E8%BF%9B/">09 Ingress 与 Gateway API</a></li>
+<li><a href="/2026/06/20/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-PV-PVC-StorageClass-%E4%B8%8E-CSI/">10 存储体系</a></li>
+<li><a href="/2026/06/20/%E9%85%8D%E7%BD%AE%E4%B8%8E%E5%AF%86%E9%92%A5%E7%AE%A1%E7%90%86-ConfigMap-Secret-%E4%B8%8E%E5%A4%96%E9%83%A8%E9%9B%86%E6%88%90/">11 配置与密钥管理</a></li>
+<li><a href="/2026/06/20/RBAC-%E4%B8%8E%E5%AE%89%E5%85%A8%E6%A8%A1%E5%9E%8B-%E8%AE%A4%E8%AF%81-%E6%8E%88%E6%9D%83%E4%B8%8E%E5%87%86%E5%85%A5%E6%8E%A7%E5%88%B6/">12 RBAC 与安全模型</a></li>
+<li><a href="/2026/06/20/%E8%B5%84%E6%BA%90%E7%AE%A1%E7%90%86%E4%B8%8E%E8%87%AA%E5%8A%A8%E4%BC%B8%E7%BC%A9-requests-limits-HPA-%E4%B8%8E-VPA/">13 资源管理与自动伸缩</a></li>
+<li><a href="/2026/06/20/CRD-%E4%B8%8E-Operator-%E6%A8%A1%E5%BC%8F-%E6%89%A9%E5%B1%95-Kubernetes-%E7%9A%84%E6%A0%87%E5%87%86%E8%B7%AF%E5%BE%84/">14 CRD 与 Operator 模式</a></li>
+<li><a href="/2026/06/20/Helm-%E4%B8%8E%E5%BA%94%E7%94%A8%E6%89%93%E5%8C%85-%E4%BB%8E-YAML-%E5%88%B0%E5%8F%AF%E5%A4%8D%E7%94%A8%E5%88%B6%E5%93%81/">15 Helm 与应用打包</a></li>
+<li><a href="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/">16 可观测性</a></li>
+<li><a href="/2026/06/20/%E7%94%9F%E4%BA%A7%E9%9B%86%E7%BE%A4%E8%BF%90%E7%BB%B4-%E5%8D%87%E7%BA%A7-%E5%A4%87%E4%BB%BD-%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5%E4%B8%8E%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92/">17 生产集群运维</a></li>
+</ul>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/docs/concepts/services-networking/service/">Kubernetes Services</a> — Service 对象完整规范，包含四种类型、会话亲和性、topology 路由的官方说明</li>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/docs/reference/command-line-tools-reference/kube-proxy/">kube-proxy</a> — kube-proxy 命令行参数参考，包含 <code>--proxy-mode</code>、<code>--ipvs-scheduler</code> 等关键配置</li>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/">EndpointSlices</a> — EndpointSlice 设计动机、分片机制和拓扑感知路由说明</li>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/blog/2018/07/09/ipvs-based-in-cluster-load-balancing-deep-dive/">IPVS-Based In-Cluster Load Balancing Deep Dive</a> — Kubernetes 官方博客对 IPVS 模式的深入分析，包含性能对比数据</li>
+<li><a target="_blank" rel="noopener" href="https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/">Cilium kube-proxy Replacement</a> — Cilium 完整替换 kube-proxy 的配置方式和 eBPF socket 负载均衡原理</li>
+<li><a target="_blank" rel="noopener" href="http://www.linuxvirtualserver.org/software/ipvs.html">Linux IPVS</a> — LVS 项目官方文档，各调度算法的原始定义和适用场景</li>
+<li><a target="_blank" rel="noopener" href="https://www.netfilter.org/">netfilter/iptables</a> — iptables 和 netfilter 框架官方资料，了解 PREROUTING/OUTPUT 链和 nat 表的工作机制</li>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/docs/reference/instrumentation/metrics/">kube-proxy Metrics</a> — kube-proxy 暴露的 Prometheus 指标列表，包含规则同步延迟和网络编程耗时</li>
+<li><a target="_blank" rel="noopener" href="https://kubernetes.io/docs/concepts/services-networking/dual-stack/">Kubernetes Dual-Stack</a> — IPv4/IPv6 双栈配置指南，包含 Service ipFamilyPolicy 和集群 CIDR 配置方式</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/">https://magicliang.github.io/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E4%BA%91%E5%8E%9F%E7%94%9F/">云原生</a><a class="post-meta__tags" href="/tags/Kubernetes/">Kubernetes</a><a class="post-meta__tags" href="/tags/%E5%AE%B9%E5%99%A8/">容器</a><a class="post-meta__tags" href="/tags/%E7%BD%91%E7%BB%9C/">网络</a></div><div class="post-share"><div class="social-share" data-image="/2026/06/20/Service-%E4%B8%8E-kube-proxy-%E8%99%9A%E6%8B%9F-IP-iptables-%E4%B8%8E-IPVS/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/20/Ingress-%E4%B8%8E-Gateway-API-%E4%B8%83%E5%B1%82%E6%B5%81%E9%87%8F%E7%9A%84%E5%85%A5%E5%8F%A3%E6%BC%94%E8%BF%9B/" title="Ingress 与 Gateway API：七层流量的入口演进"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Ingress-%E4%B8%8E-Gateway-API-%E4%B8%83%E5%B1%82%E6%B5%81%E9%87%8F%E7%9A%84%E5%85%A5%E5%8F%A3%E6%BC%94%E8%BF%9B/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Ingress 与 Gateway API：七层流量的入口演进</div></div><div class="info-2"><div class="info-item-1">Service 把集群内部的流量调度问题解决了，但把服务暴露到集群外部的 HTTP/HTTPS 流量需要另一层抽象。NodePort 和 LoadBalancer 都在四层工作——它们能把外部 TCP 流量转发进来，但无法根据 HTTP 的 Host 头或 URL 路径做路由决策，也无法终止 TLS、做 URL 重写、实现金丝雀发布。Ingress 就是 Kubernetes 为七层 HTTP 路由设计的原生对象，它在 1.1 版本进入 alpha，1.19 版本 GA，至今仍是绝大多数集群的 HTTP 入口方案。 Ingress 的设计在简单场景里非常直观：声明哪个 host + 哪个路径对应哪个 Service，TLS 证书放在 Secret 里引用，一个 Controller（Nginx、Traefik、HAProxy 等）负责把这些规则翻译成实际的反向代理配置。这套模型在业务不复杂时运作良好，但当需要金丝雀发布、基于请求头的路由、跨命名空间的服务暴露、gRPC 原生路由时，规范本身的表达能力不够，各家 Controller 用 annotation 扩展——结果是注解的命...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/" title="网络模型与 CNI：每个 Pod 一个 IP 背后的实现"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B%E4%B8%8E-CNI-%E6%AF%8F%E4%B8%AA-Pod-%E4%B8%80%E4%B8%AA-IP-%E8%83%8C%E5%90%8E%E7%9A%84%E5%AE%9E%E7%8E%B0/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">网络模型与 CNI：每个 Pod 一个 IP 背后的实现</div></div><div class="info-2"><div class="info-item-1">Kubernetes 对网络做出了一个看似简单的承诺：每个 Pod 拥有一个集群范围内唯一的可路由 IP，Pod 之间无需 NAT 可直接通信，节点访问 Pod 也无需 NAT。三条规则，没有一条涉及实现细节。这种&quot;定义行为、不定义机制&quot;的风格与 Kubernetes 整体的设计哲学一致，但也意味着没有任何一行核心代码实现了这个承诺——它完全由 CNI 插件负责兑现。 理解 CNI 的切入点不是插件本身，而是 Linux 网络命名空间带来的问题。每个容器拥有独立的网络栈，包含独立的路由表、ARP 缓存、iptables 规则集。新建的命名空间里只有一个回环接口 lo，对外完全不可达——这正是容器隔离的本意。CNI 插件的全部工作就是在这种隔离性上凿出一条通道：创建 veth pair，把一端移入 Pod 命名空间，另一端挂到宿主机网桥，配置 IP 地址和路由，让 Pod 从完全隔离的孤岛变成集群网络里的一个节点。 跨节点通信是第二层复杂性。同节点内的 Pod 通过共享网桥即可互通，但当数据包需要离开宿主机的物理网卡，穿越真实的交换机和路由器，抵达另一台节点，再...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/" title="可观测性——Metrics、Logging、Tracing 的集群实践"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7-Metrics-Logging-Tracing-%E7%9A%84%E9%9B%86%E7%BE%A4%E5%AE%9E%E8%B7%B5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">可观测性——Metrics、Logging、Tracing 的集群实践</div></div><div class="info-2"><div class="info-item-1">一个运行在 Kubernetes 上的分布式系统，出问题时最难回答的问题是&quot;发生了什么&quot;。单机时代，登录服务器查看进程状态和日志文件，基本能还原现场。容器化之后，Pod 随时可能被调度到不同节点，崩溃后立即重启，原始日志消失，这套方法彻底失效。可观测性（Observability）是对这个问题的系统性回答：通过在系统内部埋点、采集、存储和展示三类信号——Metrics（指标）、Logging（日志）、Tracing（链路追踪）——让工程师在不登录服务器的情况下理解系统行为。 Kubernetes 本身对可观测性有明确的架构分工。采集点（kubelet 内嵌的 cAdvisor、node-exporter DaemonSet、应用 SDK）由各组件负责暴露，聚合层（Prometheus、metrics-server）负责拉取和存储，展示层（Grafana、Jaeger UI）负责查询和可视化。这种&quot;采集点内建、存储和展示留给生态&quot;的设计，让 Kubernetes 本身保持简洁，同时允许不同规模的集群选择不同的存储方案。 理解可观测性的关键区分...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Helm-%E4%B8%8E%E5%BA%94%E7%94%A8%E6%89%93%E5%8C%85-%E4%BB%8E-YAML-%E5%88%B0%E5%8F%AF%E5%A4%8D%E7%94%A8%E5%88%B6%E5%93%81/" title="Helm 与应用打包——从 YAML 到可复用制品"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Helm-%E4%B8%8E%E5%BA%94%E7%94%A8%E6%89%93%E5%8C%85-%E4%BB%8E-YAML-%E5%88%B0%E5%8F%AF%E5%A4%8D%E7%94%A8%E5%88%B6%E5%93%81/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Helm 与应用打包——从 YAML 到可复用制品</div></div><div class="info-2"><div class="info-item-1">在 Kubernetes 上部署一个生产级应用，往往需要几十个甚至上百个 YAML 文件：Deployment、Service、ConfigMap、Ingress、RBAC 规则、HorizontalPodAutoscaler……这些文件之间存在依赖关系，不同环境（开发、预发、生产）需要不同参数，手工管理极易出错。Helm 正是为了解决这个问题而生：把一组相关的 Kubernetes 资源打包成一个可版本化、可参数化、可共享的制品（Chart），并提供安装、升级、回滚、卸载的生命周期管理。 Helm 的本质是&quot;带版本历史的 YAML 打包器&quot;。它不追踪资源的真实运行状态（那是 Operator 的职责），只记录&quot;这次 install/upgrade 渲染出了哪些 manifest，交给 Kubernetes 执行&quot;。Release 状态存储在集群内的 Secret 对象中（key 为 helm.sh/release.v1），每次升级都新增一个版本，rollback 本质上是重新 apply 旧版本的 manifest 集合。 理解 Helm...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-PV-PVC-StorageClass-%E4%B8%8E-CSI/" title="存储体系：PV、PVC、StorageClass 与 CSI"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-PV-PVC-StorageClass-%E4%B8%8E-CSI/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">存储体系：PV、PVC、StorageClass 与 CSI</div></div><div class="info-2"><div class="info-item-1">前几篇建立了计算（Pod 调度和运行）和网络（Pod 间通信和服务发现）的模型。有状态应用（数据库、消息队列、对象存储）需要持久化存储，Pod 重启后数据不丢失。Kubernetes 通过 PV/PVC/StorageClass 三层抽象解耦了存储的供应和使用。 在虚拟机时代，存储通常由运维工程师手动挂载：NFS 目录、SAN LUN、本地磁盘，挂载路径硬编码在部署脚本里。容器化之后，Pod 随时可能漂移到不同节点，存储和计算的生命周期必须显式解耦。Kubernetes 的回答是引入三个层次：PV（实际存储的抽象）、PVC（应用的存储需求声明）、StorageClass（动态供应的策略工厂）。PV/PVC 的绑定机制和 CSI 驱动如何让外部存储系统成为 K8s 的一等公民，是本篇的核心内容。 CSI（Container Storage Interface）的出现解决了 in-tree 驱动的历史包袱。此前，每个云厂商、每个存储系统都要向 Kubernetes 主代码库提交驱动代码，升级路径混乱且周期漫长。CSI 定义了一套 gRPC 接口，任何存储厂商都可以编写独立的驱动程序，...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E6%8E%A7%E5%88%B6%E5%99%A8%E6%A8%A1%E5%BC%8F%E4%B8%8E-Informer-%E6%9C%BA%E5%88%B6-%E8%B0%83%E8%B0%90%E5%BE%AA%E7%8E%AF%E7%9A%84%E5%B7%A5%E7%A8%8B%E5%AE%9E%E7%8E%B0/" title="控制器模式与 Informer 机制：调谐循环的工程实现"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E6%8E%A7%E5%88%B6%E5%99%A8%E6%A8%A1%E5%BC%8F%E4%B8%8E-Informer-%E6%9C%BA%E5%88%B6-%E8%B0%83%E8%B0%90%E5%BE%AA%E7%8E%AF%E7%9A%84%E5%B7%A5%E7%A8%8B%E5%AE%9E%E7%8E%B0/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">控制器模式与 Informer 机制：调谐循环的工程实现</div></div><div class="info-2"><div class="info-item-1">Kubernetes 的控制平面由一批控制器组成，每个控制器负责把某种资源的实际状态收敛到期望状态。Deployment 控制器确保 ReplicaSet 数量正确，ReplicaSet 控制器确保 Pod 数量正确，StatefulSet 控制器维护有序 Pod 的标识和存储绑定。这些控制器全部运行在 kube-controller-manager 进程中，共享同一个 Go runtime，但逻辑上彼此独立。 控制器的核心模式是调谐循环（Reconcile Loop）：读取资源当前状态，与期望状态对比，对差异执行操作，然后等待下一次触发。这个循环不是基于轮询的——每隔几秒查一次 etcd 的方式在规模上不可持续。实际实现依赖 Informer 机制：Informer 在本地维护一份与 etcd 同步的缓存，用 Watch 接收增量变更，把变更转换成事件分发给控制器。控制器从工作队列取出事件，执行 Reconcile，写回 API Server。 这篇的核心问题是：从 etcd 的一次写入，到控制器的一次 Reconcile 调用，中间经历了哪些层次，每层解决什么问题？ Info...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%BD%AC%E5%8F%91%E8%B7%AF%E5%BE%84%E5%85%A8%E6%99%AF"><span class="toc-number">1.</span> <span class="toc-text">转发路径全景</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#service-%E7%9A%84%E6%9C%AC%E8%B4%A8%EF%BC%9A%E7%A8%B3%E5%AE%9A%E7%9A%84%E8%99%9A%E6%8B%9F%E5%85%A5%E5%8F%A3"><span class="toc-number">2.</span> <span class="toc-text">Service 的本质：稳定的虚拟入口</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#service-%E7%9A%84%E4%BA%94%E7%A7%8D%E7%B1%BB%E5%9E%8B"><span class="toc-number">3.</span> <span class="toc-text">Service 的五种类型</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#endpoints-%E4%B8%8E-endpointslice"><span class="toc-number">4.</span> <span class="toc-text">Endpoints 与 EndpointSlice</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#kube-proxy-iptables-%E6%A8%A1%E5%BC%8F%E8%AF%A6%E8%A7%A3"><span class="toc-number">5.</span> <span class="toc-text">kube-proxy iptables 模式详解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#kube-proxy-ipvs-%E6%A8%A1%E5%BC%8F%E8%AF%A6%E8%A7%A3"><span class="toc-number">6.</span> <span class="toc-text">kube-proxy IPVS 模式详解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#cilium-kube-proxy-%E5%AE%8C%E5%85%A8%E6%9B%BF%E4%BB%A3"><span class="toc-number">7.</span> <span class="toc-text">Cilium kube-proxy 完全替代</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#dns-%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0%EF%BC%9Acoredns-%E7%9A%84%E8%A7%92%E8%89%B2"><span class="toc-number">8.</span> <span class="toc-text">DNS 服务发现：CoreDNS 的角色</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%AF%E8%BF%90%E8%A1%8C%E5%AE%9E%E9%AA%8C"><span class="toc-number">9.</span> <span class="toc-text">可运行实验</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%E7%BB%93%E6%9E%9C%E6%98%A0%E5%B0%84"><span class="toc-number">10.</span> <span class="toc-text">实验结果映射</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">11.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">12.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">13.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">14.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#service-%E7%9A%84%E9%AB%98%E7%BA%A7%E7%89%B9%E6%80%A7"><span class="toc-number">15.</span> <span class="toc-text">Service 的高级特性</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#kube-proxy-%E6%A8%A1%E5%BC%8F%E5%88%87%E6%8D%A2%E4%B8%8E%E8%B0%83%E4%BC%98"><span class="toc-number">16.</span> <span class="toc-text">kube-proxy 模式切换与调优</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#service-%E7%BD%91%E7%BB%9C%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5"><span class="toc-number">17.</span> <span class="toc-text">Service 网络故障排查</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#service-%E6%8B%93%E6%89%91%E4%B8%8E%E5%A4%9A%E9%9B%86%E7%BE%A4"><span class="toc-number">18.</span> <span class="toc-text">Service 拓扑与多集群</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#conntrack-%E4%B8%8E%E8%BF%9E%E6%8E%A5%E8%B7%9F%E8%B8%AA%E8%B0%83%E4%BC%98"><span class="toc-number">19.</span> <span class="toc-text">conntrack 与连接跟踪调优</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#service-%E6%BB%9A%E5%8A%A8%E5%8F%91%E5%B8%83%E4%B8%8E%E9%9B%B6%E5%81%9C%E6%9C%BA%E6%9B%B4%E6%96%B0"><span class="toc-number">20.</span> <span class="toc-text">Service 滚动发布与零停机更新</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">21.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">22.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.5</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.5"></script><script src="/js/main.js?v=5.5.5"></script><script src="/js/tw_cn.js?v=5.5.5"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || item.innerHTML || ""
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    if (e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : window.location.href = e.request.responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.5.5"></script></div></div></body></html>
