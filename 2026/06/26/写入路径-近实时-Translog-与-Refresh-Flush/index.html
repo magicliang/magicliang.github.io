@@ -1,0 +1,857 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Elasticsearch（05）：近实时、Translog 与 Refresh/Flush | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇解决了文本怎样变成词项——analysis pipeline 把原始文本标准化为可索引的 term。这一篇进入文档写入后怎样变成可搜索的。 一条文档经过 analysis 生成词项后，并不会立即对搜索可见。ES 的写入路径涉及内存缓冲、translog 持久化、refresh 生成新 segment、flush 提交到磁盘四个步骤。这套机制让 ES 在写入吞吐和搜索延迟之间取得平衡，也是&amp;q">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Elasticsearch（05）：近实时、Translog 与 Refresh&#x2F;Flush">
+<meta property="og:url" content="https://magicliang.github.io/2026/06/26/%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84-%E8%BF%91%E5%AE%9E%E6%97%B6-Translog-%E4%B8%8E-Refresh-Flush/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇解决了文本怎样变成词项——analysis pipeline 把原始文本标准化为可索引的 term。这一篇进入文档写入后怎样变成可搜索的。 一条文档经过 analysis 生成词项后，并不会立即对搜索可见。ES 的写入路径涉及内存缓冲、translog 持久化、refresh 生成新 segment、flush 提交到磁盘四个步骤。这套机制让 ES 在写入吞吐和搜索延迟之间取得平衡，也是&amp;q">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/06/26/%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84-%E8%BF%91%E5%AE%9E%E6%97%B6-Translog-%E4%B8%8E-Refresh-Flush/cover.svg">
+<meta property="article:published_time" content="2026-06-26T04:30:00.000Z">
+<meta property="article:modified_time" content="2026-06-27T06:23:41.207Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Elasticsearch">
+<meta property="article:tag" content="Translog">
+<meta property="article:tag" content="写入">
+<meta property="article:tag" content="分布式系统">
+<meta property="article:tag" content="搜索引擎">
+<meta property="article:tag" content="近实时">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/06/26/%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84-%E8%BF%91%E5%AE%9E%E6%97%B6-Translog-%E4%B8%8E-Refresh-Flush/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Elasticsearch（05）：近实时、Translog 与 Refresh/Flush",
+  "url": "https://magicliang.github.io/2026/06/26/%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84-%E8%BF%91%E5%AE%9E%E6%97%B6-Translog-%E4%B8%8E-Refresh-Flush/",
+  "image": "https://magicliang.github.io/2026/06/26/%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84-%E8%BF%91%E5%AE%9E%E6%97%B6-Translog-%E4%B8%8E-Refresh-Flush/cover.svg",
+  "datePublished": "2026-06-26T04:30:00.000Z",
+  "dateModified": "2026-06-27T06:23:41.207Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/06/26/%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84-%E8%BF%91%E5%AE%9E%E6%97%B6-Translog-%E4%B8%8E-Refresh-Flush/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.5"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.2.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Elasticsearch（05）：近实时、Translog 与 Refresh/Flush',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">510</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">571</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">9</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/06/26/%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84-%E8%BF%91%E5%AE%9E%E6%97%B6-Translog-%E4%B8%8E-Refresh-Flush/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Elasticsearch（05）：近实时、Translog 与 Refresh/Flush</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Elasticsearch（05）：近实时、Translog 与 Refresh/Flush</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-06-26T04:30:00.000Z" title="Created 2026-06-26 12:30:00">2026-06-26</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-06-27T06:23:41.207Z" title="Updated 2026-06-27 14:23:41">2026-06-27</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.1k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>7mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-06-27 14:23:41&quot;}" hidden></div><p>上一篇解决了文本怎样变成词项——analysis pipeline 把原始文本标准化为可索引的 term。这一篇进入文档写入后怎样变成可搜索的。</p>
+<p>一条文档经过 analysis 生成词项后，并不会立即对搜索可见。ES 的写入路径涉及内存缓冲、translog 持久化、refresh 生成新 segment、flush 提交到磁盘四个步骤。这套机制让 ES 在写入吞吐和搜索延迟之间取得平衡，也是&quot;近实时搜索&quot;（near-real-time, NRT）这个名字的由来。</p>
+<p>本文只抓一个问题：ES 的近实时搜索是怎么实现的，refresh 和 flush 的区别在哪里。</p>
+<span id="more"></span>
+<h2 id="写入路径的完整流程">写入路径的完整流程</h2>
+<p>一条文档从客户端发出到最终持久化到磁盘，经过以下步骤：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><code class="hljs text">Document<br>  → Coordinating Node（路由到目标 shard 的 primary）<br>  → Primary Shard：<br>      1. 写入 in-memory buffer（indexing buffer）<br>      2. 追加到 translog（顺序写磁盘，提供持久化保障）<br>      3. 返回写入成功（同时转发给 replica）<br>  → [等待 refresh_interval，默认 1 秒]<br>  → Refresh：<br>      4. 把 in-memory buffer 中的数据生成一个新的 Lucene segment<br>      5. 新 segment 对搜索可见（但未 fsync 到磁盘）<br>      6. 清空 in-memory buffer<br>  → [等待 flush 条件触发]<br>  → Flush：<br>      7. 把所有未提交的 segment fsync 到磁盘（Lucene commit）<br>      8. 清空 translog<br></code></pre></td></tr></table></figure>
+<p>这个流程中有两个关键的时间点：refresh 之后文档可搜索，flush 之后文档持久化到磁盘。两者之间的间隔就是&quot;近实时&quot;中&quot;近&quot;的含义——不是真正的实时，而是有一个 refresh 间隔（默认 1 秒）。</p>
+<h2 id="refresh：从不可见到可搜索">Refresh：从不可见到可搜索</h2>
+<p>Refresh 的作用是把 in-memory buffer 中的数据转化为一个新的 Lucene segment。这个新 segment 被打开（open），立即对搜索可见——但尚未被 fsync 到磁盘。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">refresh 前：<br>  in-memory buffer: [doc1, doc2, doc3]  ← 不可搜索<br>  existing segments: [seg0, seg1]        ← 可搜索<br><br>refresh 后：<br>  in-memory buffer: []                   ← 已清空<br>  existing segments: [seg0, seg1, seg2]  ← seg2 是新生成的，可搜索<br></code></pre></td></tr></table></figure>
+<p>Refresh 的代价不高（相比 fsync），但也不是零成本。每次 refresh 都会产生一个新的 segment，segment 过多会增加搜索开销并触发后台 merge。</p>
+<p><code>refresh_interval</code> 控制自动 refresh 的间隔，默认 1 秒。可以根据场景调整：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>refresh_interval</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>默认</td>
+<td><code>1s</code></td>
+<td>近实时搜索，写入后约 1 秒可见</td>
+</tr>
+<tr>
+<td>批量导入</td>
+<td><code>&quot;-1&quot;</code>（禁用）</td>
+<td>写入完成后手动 refresh，避免频繁生成小 segment</td>
+</tr>
+<tr>
+<td>准实时要求</td>
+<td><code>200ms</code></td>
+<td>更快可见，但 merge 压力更大</td>
+</tr>
+<tr>
+<td>日志场景</td>
+<td><code>30s</code></td>
+<td>日志不需要秒级可见，减少 segment 数量</td>
+</tr>
+</tbody>
+</table>
+<p>手动触发 refresh：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">POST /my-index/_refresh<br></code></pre></td></tr></table></figure>
+<h2 id="translog：写入的持久化保障">Translog：写入的持久化保障</h2>
+<p>Refresh 让文档可搜索，但新 segment 还没有 fsync 到磁盘。如果这时候节点崩溃，in-memory buffer 和未提交的 segment 都会丢失。Translog（事务日志）就是为了解决这个问题。</p>
+<p>每次写入操作在进入 in-memory buffer 的同时，会追加到 translog。Translog 是一个顺序写的日志文件，默认在每次写入操作后 fsync 到磁盘（<code>index.translog.durability: request</code>）。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs text">写入流程：<br>  1. 写入 in-memory buffer  ← 内存中，不持久<br>  2. 追加到 translog        ← fsync 到磁盘，持久<br>  3. 返回写入成功<br><br>节点恢复：<br>  1. 重放 translog 中的操作<br>  2. 重建 in-memory buffer 和未提交的 segment<br></code></pre></td></tr></table></figure>
+<p>Translog 的角色等同于关系型数据库中的 WAL（Write-Ahead Log）。核心思想相同：在数据结构本身持久化之前，先把操作记录到一个顺序写的日志中，用日志保证持久性。</p>
+<p>Translog 的 durability 可以配置：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>行为</th>
+<th>持久性</th>
+<th>性能</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>request</code>（默认）</td>
+<td>每次写入后 fsync translog</td>
+<td>最高</td>
+<td>每次写入一次 fsync</td>
+</tr>
+<tr>
+<td><code>async</code></td>
+<td>每 <code>sync_interval</code>（默认 5s）fsync 一次</td>
+<td>可能丢失最近 5s 的数据</td>
+<td>更高吞吐</td>
+</tr>
+</tbody>
+</table>
+<h2 id="flush：lucene-commit">Flush：Lucene Commit</h2>
+<p>Flush 是把 Lucene 的状态持久化到磁盘的操作。它做三件事：</p>
+<ol>
+<li>把所有 in-memory buffer 中的数据生成 segment（等同于一次 refresh）</li>
+<li>对所有未提交的 segment 执行 fsync（Lucene commit point）</li>
+<li>清空 translog（因为 segment 已经持久化，不再需要 translog 来恢复）</li>
+</ol>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs text">flush 前：<br>  segments on disk (committed): [seg0, seg1]<br>  segments in memory (uncommitted): [seg2, seg3]<br>  translog: [op1, op2, op3, op4, ...]<br><br>flush 后：<br>  segments on disk (committed): [seg0, seg1, seg2, seg3]<br>  segments in memory: []<br>  translog: [] (cleared)<br></code></pre></td></tr></table></figure>
+<p>Flush 的触发条件：</p>
+<ul>
+<li>Translog 大小超过阈值（<code>index.translog.flush_threshold_size</code>，默认 512MB）</li>
+<li>距离上次 flush 时间超过阈值</li>
+<li>手动调用 <code>_flush</code> API</li>
+</ul>
+<p>手动触发 flush：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">POST /my-index/_flush<br></code></pre></td></tr></table></figure>
+<h2 id="refresh-vs-flush-对比">Refresh vs Flush 对比</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Refresh</th>
+<th>Flush</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>核心动作</td>
+<td>buffer → new segment（内存中）</td>
+<td>segment fsync to disk + clear translog</td>
+</tr>
+<tr>
+<td>效果</td>
+<td>文档变为可搜索</td>
+<td>文档持久化到磁盘</td>
+</tr>
+<tr>
+<td>默认间隔</td>
+<td>1 秒</td>
+<td>translog 达到 512MB 或手动触发</td>
+</tr>
+<tr>
+<td>成本</td>
+<td>低（不涉及磁盘 fsync）</td>
+<td>高（fsync 所有未提交 segment）</td>
+</tr>
+<tr>
+<td>数据安全</td>
+<td>无（新 segment 未持久化）</td>
+<td>有（segment 已在磁盘上）</td>
+</tr>
+<tr>
+<td>类比</td>
+<td>打开新文件供读取</td>
+<td>数据库 checkpoint</td>
+</tr>
+</tbody>
+</table>
+<h2 id="实验：观察近实时行为">实验：观察近实时行为</h2>
+<p>创建一个 index 并设置较长的 refresh_interval：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs bash">PUT /nrt-demo<br>&#123;<br>  <span class="hljs-string">&quot;settings&quot;</span>: &#123;<br>    <span class="hljs-string">&quot;refresh_interval&quot;</span>: <span class="hljs-string">&quot;-1&quot;</span>,<br>    <span class="hljs-string">&quot;number_of_shards&quot;</span>: 1,<br>    <span class="hljs-string">&quot;number_of_replicas&quot;</span>: 0<br>  &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>写入一条文档：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs bash">POST /nrt-demo/_doc/1<br>&#123;<br>  <span class="hljs-string">&quot;message&quot;</span>: <span class="hljs-string">&quot;this document is not yet searchable&quot;</span><br>&#125;<br></code></pre></td></tr></table></figure>
+<p>立即搜索——不会返回任何结果：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs bash">GET /nrt-demo/_search<br>&#123; <span class="hljs-string">&quot;query&quot;</span>: &#123; <span class="hljs-string">&quot;match_all&quot;</span>: &#123;&#125; &#125; &#125;<br><span class="hljs-comment"># hits.total.value = 0</span><br></code></pre></td></tr></table></figure>
+<p>手动 refresh：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">POST /nrt-demo/_refresh<br></code></pre></td></tr></table></figure>
+<p>再次搜索——文档出现：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs bash">GET /nrt-demo/_search<br>&#123; <span class="hljs-string">&quot;query&quot;</span>: &#123; <span class="hljs-string">&quot;match_all&quot;</span>: &#123;&#125; &#125; &#125;<br><span class="hljs-comment"># hits.total.value = 1</span><br></code></pre></td></tr></table></figure>
+<p>恢复默认 refresh_interval：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash">PUT /nrt-demo/_settings<br>&#123; <span class="hljs-string">&quot;index&quot;</span>: &#123; <span class="hljs-string">&quot;refresh_interval&quot;</span>: <span class="hljs-string">&quot;1s&quot;</span> &#125; &#125;<br></code></pre></td></tr></table></figure>
+<h3 id="模式提炼：wal-延迟可见性">模式提炼：WAL + 延迟可见性</h3>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">write → WAL (durable) → buffer (fast) → background materialize → visible<br></code></pre></td></tr></table></figure>
+<p>ES 的写入路径本质是&quot;先写日志保持久、再异步物化提供查询&quot;的模式。这个模式的核心 trade-off 是：牺牲即时可见性（延迟 1 秒），换取更高的写入吞吐（不需要每次写入都 fsync 索引文件）。</p>
+<table>
+<thead>
+<tr>
+<th>系统</th>
+<th>WAL</th>
+<th>物化操作</th>
+<th>可见性延迟</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Elasticsearch</td>
+<td>Translog</td>
+<td>Refresh（生成 segment）</td>
+<td>默认 1 秒</td>
+</tr>
+<tr>
+<td>MySQL (InnoDB)</td>
+<td>Redo log</td>
+<td>Checkpoint（写脏页）</td>
+<td>事务提交即可见</td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td>WAL</td>
+<td>Checkpoint</td>
+<td>事务提交即可见</td>
+</tr>
+<tr>
+<td>Apache Kafka</td>
+<td>Log segment</td>
+<td>本身就是日志存储</td>
+<td>取决于 ISR + acks</td>
+</tr>
+<tr>
+<td>SQLite</td>
+<td>WAL mode journal</td>
+<td>Checkpoint</td>
+<td>写入即可见</td>
+</tr>
+</tbody>
+</table>
+<p>ES 和传统数据库的关键区别在于：数据库的 WAL 用于崩溃恢复，可见性由事务控制，事务提交后立即可见。ES 的 translog 也用于崩溃恢复，但可见性由 refresh 控制，refresh 之前文档不可搜索。</p>
+<h3 id="工程迁移表">工程迁移表</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>Elasticsearch</th>
+<th>MySQL (InnoDB)</th>
+<th>PostgreSQL</th>
+<th>Kafka</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>预写日志</td>
+<td>Translog</td>
+<td>Redo log</td>
+<td>WAL</td>
+<td>Log segment</td>
+</tr>
+<tr>
+<td>内存缓冲</td>
+<td>Indexing buffer</td>
+<td>Buffer pool</td>
+<td>Shared buffers</td>
+<td>Page cache</td>
+</tr>
+<tr>
+<td>可搜索时机</td>
+<td>Refresh 之后</td>
+<td>Commit 之后</td>
+<td>Commit 之后</td>
+<td>Consumer lag</td>
+</tr>
+<tr>
+<td>持久化时机</td>
+<td>Flush 之后</td>
+<td>Checkpoint 之后</td>
+<td>Checkpoint 之后</td>
+<td>fsync / flush</td>
+</tr>
+<tr>
+<td>默认持久化策略</td>
+<td>每次写入 fsync translog</td>
+<td>每次 commit fsync redo log</td>
+<td>每次 commit fsync WAL</td>
+<td>可配 acks</td>
+</tr>
+</tbody>
+</table>
+<h2 id="常见误解">常见误解</h2>
+<p><strong>误解一：写入返回成功就表示文档可以被搜索到。</strong> 写入返回成功只表示文档已经进入 in-memory buffer 和 translog。文档在下一次 refresh 之后才能被搜索到。如果需要写入后立即搜索，可以在写入请求中加 <code>?refresh=true</code>（但会影响性能）或 <code>?refresh=wait_for</code>（等待下一次自然 refresh）。</p>
+<p><strong>误解二：refresh 就是 flush。</strong> refresh 只是生成新 segment 并打开供搜索，不涉及磁盘 fsync。flush 才是把 segment fsync 到磁盘。refresh 频繁执行（默认每秒），flush 较少执行（translog 达到阈值时）。</p>
+<p><strong>误解三：禁用 translog 可以提高写入性能。</strong> ES 不支持完全禁用 translog。可以把 <code>index.translog.durability</code> 设为 <code>async</code> 减少 fsync 频率，但代价是节点崩溃时可能丢失最近几秒的数据。在数据可重放的场景（如从 Kafka 消费写入）中可以接受。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>
+<p>创建一个 <code>refresh_interval: -1</code> 的 index，写入 5 条文档，验证搜索不到。然后手动 <code>_refresh</code>，验证搜索可以返回结果。</p>
+</li>
+<li>
+<p>写入文档后，用 <code>_segments</code> API 观察 segment 变化。对比 refresh 前后和 flush 前后 segment 的 <code>committed</code> 状态。</p>
+</li>
+<li>
+<p>把 <code>index.translog.durability</code> 设为 <code>async</code>，用批量写入测试吞吐量差异。注意：这个实验要在测试环境进行，不要在生产数据上操作。</p>
+</li>
+</ol>
+<h2 id="系列导航">系列导航</h2>
+<table>
+<thead>
+<tr>
+<th>上一篇</th>
+<th>下一篇</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="/2026/06/26/Analysis-%E7%AE%A1%E9%81%93-%E4%BB%8E%E5%8E%9F%E5%A7%8B%E6%96%87%E6%9C%AC%E5%88%B0%E5%8F%AF%E6%90%9C%E7%B4%A2%E8%AF%8D%E9%A1%B9/">Analysis 管道：从原始文本到可搜索词项</a></td>
+<td><a href="/2026/06/26/%E6%90%9C%E7%B4%A2%E6%89%A7%E8%A1%8C%E6%A8%A1%E5%9E%8B-Query-Then-Fetch-%E7%9A%84%E4%B8%A4%E9%98%B6%E6%AE%B5%E6%B5%81%E7%A8%8B/">搜索执行模型：Query-Then-Fetch 的两阶段流程</a></td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://www.elastic.co/guide/en/elasticsearch/reference/current/near-real-time.html">Elasticsearch 官方文档：Near Real-Time Search</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules-translog.html">Elasticsearch 官方文档：Translog</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-refresh.html">Elasticsearch 官方文档：Refresh API</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.elastic.co/guide/en/elasticsearch/guide/current/translog.html">Elasticsearch: The Definitive Guide — Making Changes Persistent</a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/06/26/%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84-%E8%BF%91%E5%AE%9E%E6%97%B6-Translog-%E4%B8%8E-Refresh-Flush/">https://magicliang.github.io/2026/06/26/%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84-%E8%BF%91%E5%AE%9E%E6%97%B6-Translog-%E4%B8%8E-Refresh-Flush/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/Elasticsearch/">Elasticsearch</a><a class="post-meta__tags" href="/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/">搜索引擎</a><a class="post-meta__tags" href="/tags/%E8%BF%91%E5%AE%9E%E6%97%B6/">近实时</a><a class="post-meta__tags" href="/tags/Translog/">Translog</a><a class="post-meta__tags" href="/tags/%E5%86%99%E5%85%A5/">写入</a></div><div class="post-share"><div class="social-share" data-image="/2026/06/26/%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84-%E8%BF%91%E5%AE%9E%E6%97%B6-Translog-%E4%B8%8E-Refresh-Flush/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/26/Lucene-%E5%86%85%E9%83%A8-Segment-%E5%80%92%E6%8E%92%E7%B4%A2%E5%BC%95%E4%B8%8E-Doc-Values/" title="深入 Elasticsearch（02）：Segment、倒排索引与 Doc Values"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/Lucene-%E5%86%85%E9%83%A8-Segment-%E5%80%92%E6%8E%92%E7%B4%A2%E5%BC%95%E4%B8%8E-Doc-Values/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（02）：Segment、倒排索引与 Doc Values</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 ES 集群级架构——节点角色、集群状态和数据路径。这一篇进入单个 shard 内部的 Lucene 存储结构。 ES 的每个 shard 就是一个 Lucene index。Lucene index 不是一整块文件，而是由多个不可变的段（segment）组成。理解 segment 的内部结构，才能理解后续文章中 refresh、flush、merge、搜索延迟等机制为什么是那样设计的。 本文只抓一个问题：一个 Lucene segment 内部有哪些数据结构，它们各自承担什么角色。  Segment：不可变的存储单元 一个 Lucene index 由零个或多个 segment 组成。每个 segment 是一批文档的完整索引——包含这批文档的倒排索引、正排数据、字段信息等所有内容。 12345Lucene Index (= ES Shard)├── Segment 0  (committed, immutable)├── Segment 1  (committed, immutable)├── Segment 2  (committed, immutable)└─...</div></div></div></a><a class="pagination-related" href="/2026/06/26/Segment-Merge-%E4%B8%8E-Index-Lifecycle-Management/" title="深入 Elasticsearch（13）：Segment Merge 与 Index Lifecycle Management"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/Segment-Merge-%E4%B8%8E-Index-Lifecycle-Management/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（13）：Segment Merge 与 Index Lifecycle Management</div></div><div class="info-2"><div class="info-item-1">上一篇解决了集群协调——master 选举和 cluster state 同步。这一篇进入 segment 随时间增长后怎样管理。 第 02 篇介绍了 segment 是不可变的，写入产生新 segment。随着写入持续，segment 数量会不断增长。segment 太多搜索变慢，删除的文档占据的空间不会自动回收。Segment merge 和 ILM 分别在 Lucene 层和 index 层解决这个存储生命周期问题。 本文抓两个问题：为什么需要 segment merge，以及 ILM 怎样管理索引的生命周期。  Segment Merge 为什么需要 merge 每次 refresh 产生一个新 segment。持续写入的 index 会积累大量小 segment。问题有二：  搜索时需要遍历所有 segment。segment 越多，搜索越慢。 删除文档只是在 .liv 文件中打标记，物理空间不回收。只有 merge 时才真正删除标记文档、回收空间。  123456789101112写入阶段：  refresh → seg0(10 docs)  refresh → se...</div></div></div></a><a class="pagination-related" href="/2026/06/26/%E6%80%A7%E8%83%BD%E6%A8%A1%E5%9E%8B-%E6%90%9C%E7%B4%A2%E5%BB%B6%E8%BF%9F-%E5%86%99%E5%85%A5%E5%90%9E%E5%90%90%E4%B8%8E%E8%B0%83%E4%BC%98%E6%80%9D%E8%B7%AF/" title="深入 Elasticsearch（14）：搜索延迟、写入吞吐与调优思路"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/%E6%80%A7%E8%83%BD%E6%A8%A1%E5%9E%8B-%E6%90%9C%E7%B4%A2%E5%BB%B6%E8%BF%9F-%E5%86%99%E5%85%A5%E5%90%9E%E5%90%90%E4%B8%8E%E8%B0%83%E4%BC%98%E6%80%9D%E8%B7%AF/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（14）：搜索延迟、写入吞吐与调优思路</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 segment 和索引的生命周期管理——merge 控制 segment 数量，ILM 管理索引的存储分层。这一篇进入 ES 的性能瓶颈在哪里、调优的思维框架是什么。 性能调优不是背参数表。参数是工具，瓶颈定位才是方法。ES 的性能受搜索延迟和写入吞吐两个维度的独立因素影响，先确定瓶颈在哪个维度的哪个因素上，再针对性调整。 本文只抓一个问题：ES 的性能模型——搜索延迟和写入吞吐分别受什么因素影响，用什么工具定位瓶颈。  搜索延迟的关键因素 1搜索延迟 = f(segment数, query复杂度, shard数, cache命中率, 数据结构选择)    因素 影响机制 观察方式     Segment 数量 每个 segment 独立搜索，结果合并 _segments API   Query 复杂度 深层嵌套 bool、wildcard、regexp 代价高 _search?profile=true   Shard 数量 scatter-gather 开销随 shard 数线性增长 _cat/shards   Filesystem cache Lucene 文件...</div></div></div></a><a class="pagination-related" href="/2026/06/26/Mapping-%E4%B8%8E%E5%AD%97%E6%AE%B5%E7%B1%BB%E5%9E%8B-%E7%BB%99%E6%96%87%E6%A1%A3%E5%AE%9A%E4%B9%89%E7%BB%93%E6%9E%84/" title="深入 Elasticsearch（03）：Mapping 与字段类型"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/Mapping-%E4%B8%8E%E5%AD%97%E6%AE%B5%E7%B1%BB%E5%9E%8B-%E7%BB%99%E6%96%87%E6%A1%A3%E5%AE%9A%E4%B9%89%E7%BB%93%E6%9E%84/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（03）：Mapping 与字段类型</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 Lucene 内部的段和索引结构。这一篇进入 ES 如何把 JSON 文档映射到 Lucene 字段。 一个 JSON 文档写入 ES 后，每个字段会变成 Lucene 内部的某种数据结构——倒排索引、BKD-tree、Doc Values 或 Stored Fields。这个从&quot;JSON 字段&quot;到&quot;Lucene 数据结构&quot;的翻译规则，就是 mapping。 本文只抓一个问题：mapping 在 ES 中扮演什么角色，以及 dynamic mapping 和 explicit mapping 的差异会怎样影响搜索行为。  Mapping 是什么 Mapping 定义了一个 index 中文档的字段名、字段类型和索引方式。可以类比为关系型数据库的 DDL（CREATE TABLE），但有几个关键区别：  Mapping 允许动态推断。写入一个未知字段时，ES 可以自动猜测类型并添加到 mapping 中。 Mapping 一旦创建，字段类型不可修改。只能添加新字段，不能把一个 text 字段改成 keyword。要改变已有字段的...</div></div></div></a><a class="pagination-related" href="/2026/06/26/Query-DSL-%E6%B7%B1%E5%85%A5-%E4%BB%8E-match-%E5%88%B0-bool-%E7%9A%84%E6%9F%A5%E8%AF%A2%E4%BD%93%E7%B3%BB/" title="深入 Elasticsearch（08）：从 match 到 bool 的查询体系"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/Query-DSL-%E6%B7%B1%E5%85%A5-%E4%BB%8E-match-%E5%88%B0-bool-%E7%9A%84%E6%9F%A5%E8%AF%A2%E4%BD%93%E7%B3%BB/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（08）：从 match 到 bool 的查询体系</div></div><div class="info-2"><div class="info-item-1">上一篇解决了分数怎么算出来的——BM25 的三个因子决定了文档的相关性排序。这一篇进入 Query DSL 的查询类型体系和组合逻辑。 ES 的查询体系不是一个扁平的 API 列表。全文查询、精确查询、模糊查询、地理查询、复合查询分别对应不同的底层数据结构和匹配逻辑。理解这个分类，才能在具体场景中选对查询类型。 本文抓两个问题：ES 的查询类型怎样分类，以及 bool 查询怎样把不同类型的查询组合起来。  查询体系全景 123456789101112131415161718192021222324252627282930313233ES 查询体系├── 全文查询（走 analyzer，参与打分）│   ├── match              分词后多词项匹配│   ├── match_phrase        分词后要求位置相邻│   ├── multi_match         跨多个字段的 match│   └── match_phrase_prefix 短语前缀（输入补全）│├── 精确查询（不走 analyzer，通常用于 filter context）│   ...</div></div></div></a><a class="pagination-related" href="/2026/06/26/%E5%AF%BC%E8%AF%BB-%E4%B8%BA%E4%BB%80%E4%B9%88-Elasticsearch-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%98%AF%E4%B8%80%E5%BC%A0%E5%80%92%E6%8E%92%E7%B4%A2%E5%BC%95/" title="深入 Elasticsearch（00）：为什么 Elasticsearch 的核心是一张倒排索引"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/%E5%AF%BC%E8%AF%BB-%E4%B8%BA%E4%BB%80%E4%B9%88-Elasticsearch-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%98%AF%E4%B8%80%E5%BC%A0%E5%80%92%E6%8E%92%E7%B4%A2%E5%BC%95/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（00）：为什么 Elasticsearch 的核心是一张倒排索引</div></div><div class="info-2"><div class="info-item-1">Elasticsearch 容易被归类成&quot;分布式搜索引擎&quot;或&quot;日志分析平台&quot;。这些标签描述了它的用途，但没有说清楚它的内部结构。把 Elasticsearch 拆到最底层，剩下的核心数据结构只有一个：倒排索引（inverted index）。mapping、analysis、shard、replica、aggregation 五个机制围绕这个数据结构逐层展开。  Elasticsearch 是一个以倒排索引为核心数据结构的分布式搜索与分析引擎。  本篇是系列导读。核心任务只有一个：说清楚倒排索引是什么，以及它和关系型数据库里的 B+Tree 索引有什么本质区别。  倒排索引的基本结构 关系型数据库的 B+Tree 索引从行出发。给定一个索引键值，B+Tree 能定位到存储这行数据的磁盘页。查找路径是： 1索引键值 → B+Tree 内部节点 → 叶子节点 → 行指针 → 数据页 倒排索引从词项（term）出发。给定一个词项，倒排索引能定位到包含这个词项的所有文档。查找路径是： 1词项 → Term Dictionary → Posting ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E7%9A%84%E5%AE%8C%E6%95%B4%E6%B5%81%E7%A8%8B"><span class="toc-number">1.</span> <span class="toc-text">写入路径的完整流程</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#refresh%EF%BC%9A%E4%BB%8E%E4%B8%8D%E5%8F%AF%E8%A7%81%E5%88%B0%E5%8F%AF%E6%90%9C%E7%B4%A2"><span class="toc-number">2.</span> <span class="toc-text">Refresh：从不可见到可搜索</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#translog%EF%BC%9A%E5%86%99%E5%85%A5%E7%9A%84%E6%8C%81%E4%B9%85%E5%8C%96%E4%BF%9D%E9%9A%9C"><span class="toc-number">3.</span> <span class="toc-text">Translog：写入的持久化保障</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#flush%EF%BC%9Alucene-commit"><span class="toc-number">4.</span> <span class="toc-text">Flush：Lucene Commit</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#refresh-vs-flush-%E5%AF%B9%E6%AF%94"><span class="toc-number">5.</span> <span class="toc-text">Refresh vs Flush 对比</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%EF%BC%9A%E8%A7%82%E5%AF%9F%E8%BF%91%E5%AE%9E%E6%97%B6%E8%A1%8C%E4%B8%BA"><span class="toc-number">6.</span> <span class="toc-text">实验：观察近实时行为</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9Awal-%E5%BB%B6%E8%BF%9F%E5%8F%AF%E8%A7%81%E6%80%A7"><span class="toc-number">6.1.</span> <span class="toc-text">模式提炼：WAL + 延迟可见性</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">6.2.</span> <span class="toc-text">工程迁移表</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">7.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">8.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">9.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">10.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.5</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.5"></script><script src="/js/main.js?v=5.5.5"></script><script src="/js/tw_cn.js?v=5.5.5"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || item.innerHTML || ""
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    if (e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : window.location.href = e.request.responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.5.5"></script></div></div></body></html>
