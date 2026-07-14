@@ -1,0 +1,795 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>宽依赖与窄依赖：Stage 是怎样划分出来的 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇拆解了 RDD 的五大属性，其中 dependencies 决定了 RDD 之间的依赖类型。这一篇进入依赖类型的核心区分——宽依赖和窄依赖——以及它如何直接决定 Stage 的划分。 宽依赖和窄依赖容易被理解成&quot;一对一&quot;和&quot;多对多&quot;的分区关系。更准确的说法是：窄依赖意味着子 RDD 的每个分区只依赖父 RDD 的固定少数分区，可以在单个 Task 内完">
+<meta property="og:type" content="article">
+<meta property="og:title" content="宽依赖与窄依赖：Stage 是怎样划分出来的">
+<meta property="og:url" content="https://magicliang.github.io/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇拆解了 RDD 的五大属性，其中 dependencies 决定了 RDD 之间的依赖类型。这一篇进入依赖类型的核心区分——宽依赖和窄依赖——以及它如何直接决定 Stage 的划分。 宽依赖和窄依赖容易被理解成&quot;一对一&quot;和&quot;多对多&quot;的分区关系。更准确的说法是：窄依赖意味着子 RDD 的每个分区只依赖父 RDD 的固定少数分区，可以在单个 Task 内完">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/cover.svg">
+<meta property="article:published_time" content="2026-07-13T03:00:00.000Z">
+<meta property="article:modified_time" content="2026-07-14T02:55:19.077Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="DAG">
+<meta property="article:tag" content="Spark">
+<meta property="article:tag" content="Stage">
+<meta property="article:tag" content="分布式计算">
+<meta property="article:tag" content="大数据">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "宽依赖与窄依赖：Stage 是怎样划分出来的",
+  "url": "https://magicliang.github.io/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/",
+  "image": "https://magicliang.github.io/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/cover.svg",
+  "datePublished": "2026-07-13T03:00:00.000Z",
+  "dateModified": "2026-07-14T02:55:19.077Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.5"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.2.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '宽依赖与窄依赖：Stage 是怎样划分出来的',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">532</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">606</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">10</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">宽依赖与窄依赖：Stage 是怎样划分出来的</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">宽依赖与窄依赖：Stage 是怎样划分出来的</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-07-13T03:00:00.000Z" title="Created 2026-07-13 11:00:00">2026-07-13</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-07-14T02:55:19.077Z" title="Updated 2026-07-14 10:55:19">2026-07-14</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.9k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>10mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-07-14 10:55:19&quot;}" hidden></div><p>上一篇拆解了 RDD 的五大属性，其中 dependencies 决定了 RDD 之间的依赖类型。这一篇进入依赖类型的核心区分——宽依赖和窄依赖——以及它如何直接决定 Stage 的划分。</p>
+<p>宽依赖和窄依赖容易被理解成&quot;一对一&quot;和&quot;多对多&quot;的分区关系。更准确的说法是：窄依赖意味着子 RDD 的每个分区只依赖父 RDD 的固定少数分区，可以在单个 Task 内完成计算；宽依赖意味着子 RDD 的分区需要读取父 RDD 所有分区的数据，必须等待一次全量数据交换（Shuffle）。</p>
+<p>本文只抓一个问题：DAGScheduler 按什么规则把 RDD 依赖图切分成 Stage。</p>
+<h2 id="窄依赖的三种形态">窄依赖的三种形态</h2>
+<p>窄依赖（NarrowDependency）的定义是：父 RDD 的每个分区最多被子 RDD 的一个分区使用。在 Spark 源码中，NarrowDependency 有两个具体子类：</p>
+<p>OneToOneDependency：父子分区一一对应。map、filter、flatMap 产生这种依赖。父 RDD 的第 i 个分区只被子 RDD 的第 i 个分区使用。</p>
+<p>RangeDependency：父 RDD 的一段连续分区对应子 RDD 的一段连续分区。union 操作产生这种依赖——把多个 RDD 的分区拼接在一起，每个父分区仍然只被一个子分区使用。</p>
+<p>还有一种特殊情况：如果两个 RDD 有相同的 Partitioner（co-partitioned），它们的 join 也是窄依赖。因为相同 key 已经在相同的分区号中，不需要数据重分布。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><code class="hljs text">窄依赖示例：<br><br>  父 RDD                子 RDD<br>  ┌────┐               ┌────┐<br>  │ P0 │───────────────&gt;│ P0 │   OneToOne (map/filter)<br>  ├────┤               ├────┤<br>  │ P1 │───────────────&gt;│ P1 │<br>  ├────┤               ├────┤<br>  │ P2 │───────────────&gt;│ P2 │<br>  └────┘               └────┘<br><br>  父 RDD-A   父 RDD-B        子 RDD<br>  ┌────┐     ┌────┐         ┌────┐<br>  │ P0 │────────────────────&gt;│ P0 │   Range (union)<br>  ├────┤     │    │         ├────┤<br>  │ P1 │────────────────────&gt;│ P1 │<br>  └────┘     ├────┤         ├────┤<br>             │ P0 │────────&gt;│ P2 │<br>             └────┘         └────┘<br></code></pre></td></tr></table></figure>
+<p>窄依赖的核心特征是：计算子分区时只需要读取父 RDD 的一个（或固定少数个）分区的数据，不需要跨网络拉取其他节点上的数据。</p>
+<h2 id="宽依赖：shuffle-的入口">宽依赖：Shuffle 的入口</h2>
+<p>宽依赖（ShuffleDependency）的定义是：父 RDD 的每个分区可能被子 RDD 的多个分区使用。这意味着父 RDD 的数据需要按 key 重新分配到不同的分区，也就是 Shuffle。</p>
+<p>典型的宽依赖算子：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">groupByKey    → 按 key 分组，每个 key 的数据可能来自所有父分区<br>reduceByKey   → 先 map 端局部聚合，再 Shuffle 到 reduce 端全局聚合<br>join          → 如果两个 RDD 的 Partitioner 不同，需要重分布数据<br>repartition   → 显式重新分区，必然触发 Shuffle<br>sortByKey     → 全局排序需要 RangePartitioner，触发 Shuffle<br></code></pre></td></tr></table></figure>
+<p>宽依赖的数据流是全连接的：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs text">父 RDD                子 RDD<br>┌────┐     ┌─────&gt;   ┌────┐<br>│ P0 │─────┤         │ P0 │<br>├────┤     └─────&gt;   ├────┤<br>│ P1 │─────┬─────&gt;   │ P1 │<br>├────┤     └─────&gt;   ├────┤<br>│ P2 │───────────&gt;   │ P2 │<br>└────┘               └────┘<br><br>每个父分区的数据按 key 的 hash 值分散到所有子分区<br></code></pre></td></tr></table></figure>
+<p>宽依赖意味着子 RDD 的一个分区需要读取父 RDD 所有分区中属于自己的那部分数据。这个&quot;读取&quot;操作需要网络传输（Shuffle Read），而且必须等父 RDD 的所有分区都计算完毕并写出 Shuffle 文件（Shuffle Write）后才能开始。</p>
+<h2 id="stage-划分算法">Stage 划分算法</h2>
+<p>DAGScheduler 的 Stage 划分算法可以用一句话概括：从 action 触发的最终 RDD 开始，沿着依赖链向前回溯；遇到窄依赖就合并到当前 Stage，遇到宽依赖就切出一个新 Stage。</p>
+<p>具体流程：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs text">1. 从最终 RDD 开始，创建一个 ResultStage<br>2. 遍历该 RDD 的 dependencies：<br>   - 如果是 NarrowDependency，把父 RDD 加入当前 Stage<br>   - 如果是 ShuffleDependency，为父 RDD 创建一个新的 ShuffleMapStage<br>3. 对每个新创建的 ShuffleMapStage 递归执行步骤 2<br>4. 直到所有 RDD 都被分配到某个 Stage<br></code></pre></td></tr></table></figure>
+<p>这个算法的结果是：一个 Job 被切成一棵 Stage 树。叶子节点是读取数据源的 Stage，根节点是产出最终结果的 ResultStage。Stage 之间的边就是 Shuffle。</p>
+<p>举一个完整的例子：</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs scala"><span class="hljs-keyword">val</span> lines = sc.textFile(<span class="hljs-string">&quot;data.txt&quot;</span>)      <span class="hljs-comment">// RDD-0</span><br><span class="hljs-keyword">val</span> words = lines.flatMap(_.split(<span class="hljs-string">&quot; &quot;</span>))   <span class="hljs-comment">// RDD-1  (窄依赖)</span><br><span class="hljs-keyword">val</span> pairs = words.map(w =&gt; (w, <span class="hljs-number">1</span>))        <span class="hljs-comment">// RDD-2  (窄依赖)</span><br><span class="hljs-keyword">val</span> counts = pairs.reduceByKey(_ + _)     <span class="hljs-comment">// RDD-3  (宽依赖 ← Shuffle 边界)</span><br><span class="hljs-keyword">val</span> filtered = counts.filter(_._2 &gt; <span class="hljs-number">10</span>)  <span class="hljs-comment">// RDD-4  (窄依赖)</span><br>filtered.collect()                        <span class="hljs-comment">// Action，触发 Job</span><br></code></pre></td></tr></table></figure>
+<p>Stage 划分结果：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs text">Stage 0 (ShuffleMapStage):<br>  RDD-0 (textFile) → RDD-1 (flatMap) → RDD-2 (map)<br>  输出: Shuffle 文件<br><br>        ← Shuffle 边界 →<br><br>Stage 1 (ResultStage):<br>  RDD-3 (reduceByKey) → RDD-4 (filter)<br>  输出: collect 结果返回 Driver<br></code></pre></td></tr></table></figure>
+<p>Stage 0 包含了 textFile → flatMap → map 三个窄依赖变换，可以在同一个 Task 内 pipeline 执行。Stage 1 包含了 reduceByKey → filter 两个操作。Stage 1 必须等 Stage 0 所有 Task 完成并写出 Shuffle 文件后才能启动。</p>
+<h2 id="stage-内部的-pipeline-执行">Stage 内部的 Pipeline 执行</h2>
+<p>窄依赖被合并到同一个 Stage 的好处是可以 pipeline 执行。Stage 0 中的 textFile → flatMap → map 三个变换不会产生三轮独立的迭代。相反，每个 Task 把三个变换串成一个迭代器链：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><code class="hljs text">Task 处理一条记录的路径：<br><br>  从 HDFS 读一行 (textFile)<br>      │<br>      ▼<br>  拆成单词数组 (flatMap)<br>      │<br>      ▼ (对每个单词)<br>  变成 (word, 1) (map)<br>      │<br>      ▼<br>  写入 Shuffle 缓冲区<br></code></pre></td></tr></table></figure>
+<p>整个过程中，一条记录从读取到写入 Shuffle 缓冲区，中间数据不需要物化到磁盘或全量加载到内存。这就是 DAG 模型相对 MapReduce 减少 I/O 的关键机制。</p>
+<h2 id="实验：观察-stage-划分">实验：观察 Stage 划分</h2>
+<p>在 spark-shell 中构造不同依赖类型的计算链，观察 Stage 数量：</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br></pre></td><td class="code"><pre><code class="hljs scala"><span class="hljs-comment">// 纯窄依赖链：只有 1 个 Stage</span><br><span class="hljs-keyword">val</span> rdd1 = sc.textFile(<span class="hljs-string">&quot;README.md&quot;</span>)<br>  .flatMap(_.split(<span class="hljs-string">&quot; &quot;</span>))<br>  .map(_.toLowerCase)<br>  .filter(_.length &gt; <span class="hljs-number">3</span>)<br>rdd1.count()<br><span class="hljs-comment">// Spark UI: 1 个 Stage</span><br><br><span class="hljs-comment">// 一次 Shuffle：2 个 Stage</span><br><span class="hljs-keyword">val</span> rdd2 = sc.textFile(<span class="hljs-string">&quot;README.md&quot;</span>)<br>  .flatMap(_.split(<span class="hljs-string">&quot; &quot;</span>))<br>  .map(w =&gt; (w, <span class="hljs-number">1</span>))<br>  .reduceByKey(_ + _)<br>rdd2.count()<br><span class="hljs-comment">// Spark UI: 2 个 Stage</span><br><br><span class="hljs-comment">// 两次 Shuffle：3 个 Stage</span><br><span class="hljs-keyword">val</span> rdd3 = sc.textFile(<span class="hljs-string">&quot;README.md&quot;</span>)<br>  .flatMap(_.split(<span class="hljs-string">&quot; &quot;</span>))<br>  .map(w =&gt; (w, <span class="hljs-number">1</span>))<br>  .reduceByKey(_ + _)     <span class="hljs-comment">// Shuffle 1</span><br>  .map &#123; <span class="hljs-keyword">case</span> (w, c) =&gt; (c, w) &#125;<br>  .sortByKey()             <span class="hljs-comment">// Shuffle 2</span><br>rdd3.collect()<br><span class="hljs-comment">// Spark UI: 3 个 Stage</span><br></code></pre></td></tr></table></figure>
+<p>打开 Spark UI（默认 <a target="_blank" rel="noopener" href="http://localhost:4040">http://localhost:4040</a>），在 Jobs 页面点击某个 Job，可以看到 Stage 的 DAG 可视化。每个 Stage 显示为一个蓝色方框，Stage 之间的 Shuffle 显示为黑色箭头。</p>
+<h2 id="宽依赖的代价">宽依赖的代价</h2>
+<p>宽依赖引入的 Shuffle 有三个层面的代价：</p>
+<p>计算代价：Shuffle Write 阶段，每个 Map Task 需要把输出数据按 key 的 hash 值分成 R 份（R 是下游分区数），排序后写入磁盘。Shuffle Read 阶段，每个 Reduce Task 需要从所有 Map Task 的输出中拉取属于自己的那份数据。</p>
+<p>I/O 代价：Shuffle 数据必须写入本地磁盘（Shuffle Write 的输出是磁盘文件，不是内存缓冲区），然后通过网络传输到下游 Executor，再从磁盘读取。整个过程至少涉及一次磁盘写入、一次网络传输、一次磁盘读取。</p>
+<p>同步代价：Shuffle 是一个全局同步点。下游 Stage 的任何 Task 都不能在上游 Stage 的所有 Task 完成之前启动。如果上游某个 Task 特别慢（数据倾斜或硬件故障），整个下游 Stage 都被阻塞。</p>
+<p>这三个代价是 Spark 性能调优中最常需要关注的。后续第 04 篇会详细展开 Shuffle 的内部机制和优化手段。</p>
+<h2 id="模式提炼">模式提炼</h2>
+<p>Stage 划分体现了一个通用模式：在同步边界处切分执行计划。</p>
+<p>任何分布式计算系统都需要在某些点上进行全局数据交换（Shuffle/Exchange/Repartition）。这些点天然构成了执行计划的分界线：分界线内的操作可以本地执行、pipeline 串联；分界线处必须等待全局同步。</p>
+<p>数据库查询引擎中的 Exchange 算子扮演了相同的角色：它把查询计划切成可以在单个节点上独立执行的片段（Fragment），Fragment 之间通过 Exchange 交换数据。Flink 中的 Operator Chain 按同样的逻辑工作：可以 chain 在一起的算子合并到一个 Task 中执行，需要数据重分布的地方断开 chain。</p>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>Spark 概念</th>
+<th>MapReduce 对应</th>
+<th>Flink 对应</th>
+<th>数据库对应</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>窄依赖</td>
+<td>无显式概念（Map 内部的组合）</td>
+<td>Forward/Rescale 连接模式</td>
+<td>同一 Fragment 内的算子管道</td>
+</tr>
+<tr>
+<td>宽依赖（ShuffleDependency）</td>
+<td>Map 到 Reduce 之间的 Shuffle</td>
+<td>Keyby() 后的 Hash 分区</td>
+<td>Exchange 算子</td>
+</tr>
+<tr>
+<td>Stage</td>
+<td>Map 阶段 / Reduce 阶段（固定两个）</td>
+<td>Operator Chain（按 Shuffle 切分）</td>
+<td>查询计划的 Fragment</td>
+</tr>
+<tr>
+<td>Pipeline 执行</td>
+<td>无（Map 输出全部落盘后 Reduce 才开始）</td>
+<td>同一 Chain 内的算子融合</td>
+<td>同一 Fragment 内的 Volcano 迭代</td>
+</tr>
+<tr>
+<td>ShuffleMapStage</td>
+<td>Map 阶段</td>
+<td>需要做 Shuffle 的上游 SubTask</td>
+<td>产出 Exchange 数据的子计划</td>
+</tr>
+<tr>
+<td>ResultStage</td>
+<td>Reduce 阶段</td>
+<td>不需要下游 Shuffle 的末端 SubTask</td>
+<td>返回结果的顶层子计划</td>
+</tr>
+</tbody>
+</table>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：“Stage 数量等于 Shuffle 次数”。Stage 数量 = Shuffle 次数 + 1。一次 Shuffle 产生两个 Stage（上游 ShuffleMapStage 和下游 Stage），但多次 Shuffle 的中间 Stage 被复用。准确地说，N 次 Shuffle 产生 N+1 个 Stage。</p>
+<p>误解二：“窄依赖一定不需要网络传输”。窄依赖不需要 Shuffle，但如果父 RDD 的分区缓存在另一台机器上，读取缓存数据仍然需要网络传输。窄依赖避免的是全量数据重分布（Shuffle），不是所有网络通信。</p>
+<p>误解三：“repartition 和 coalesce 都是宽依赖”。repartition 是宽依赖（触发 Shuffle），但 coalesce 在减少分区数时使用窄依赖——它把多个父分区合并到一个子分区中，不需要数据重分布。只有增加分区数时 coalesce(n, shuffle=true) 才触发 Shuffle。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>
+<p>构造一个包含 join 的计算：两个 RDD 分别 reduceByKey 后 join。用 toDebugString 观察总共有几个 Stage。然后让两个 RDD 在 reduceByKey 时使用相同的 Partitioner（相同分区数），观察 Stage 数量是否变化。</p>
+</li>
+<li>
+<p>对一个 RDD 分别调用 repartition(10) 和 coalesce(10)（假设原始分区数大于 10），用 dependencies 检查产生的依赖类型。再对原始分区数小于 10 的 RDD 调用 coalesce(10)，观察行为变化。</p>
+</li>
+<li>
+<p>在 Spark UI 的 Stage 详情页面中，找到 “Shuffle Read” 和 “Shuffle Write” 指标。对比不同 Shuffle 算子（groupByKey vs reduceByKey）的 Shuffle Write 数据量差异，思考 map 端预聚合对 Shuffle 数据量的影响。</p>
+</li>
+</ol>
+<h2 id="系列导航">系列导航</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align:right">序号</th>
+<th>主题</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:right">00</td>
+<td>导读：为什么 Spark 的核心是一张 DAG</td>
+<td>已完成</td>
+</tr>
+<tr>
+<td style="text-align:right">01</td>
+<td>RDD：弹性分布式数据集的五大属性</td>
+<td>已完成</td>
+</tr>
+<tr>
+<td style="text-align:right"><strong>02</strong></td>
+<td><strong>宽依赖与窄依赖：Stage 是怎样划分出来的</strong></td>
+<td><strong>本篇</strong></td>
+</tr>
+<tr>
+<td style="text-align:right">03</td>
+<td>DAG Scheduler 与 Task Scheduler：从逻辑计划到物理执行</td>
+<td>下一篇</td>
+</tr>
+<tr>
+<td style="text-align:right">04</td>
+<td>Shuffle 机制：数据跨分区交换的代价与优化</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">05</td>
+<td>内存管理与 Tungsten：堆外内存、序列化与代码生成</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">06</td>
+<td>存储体系：Block Manager、广播变量与累加器</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">07</td>
+<td>容错机制：Lineage、Checkpoint 与推测执行</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">08</td>
+<td>Spark SQL 与 Catalyst：从 SQL 文本到物理算子树</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">09</td>
+<td>DataFrame 与 Dataset：类型安全与性能的折中</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">10</td>
+<td>Adaptive Query Execution：运行时改写执行计划</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">11</td>
+<td>数据源 API 与谓词下推：让存储层帮忙过滤</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">12</td>
+<td>Structured Streaming：把流当成无界表</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">13</td>
+<td>水位线与状态管理：流处理的时间语义</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">14</td>
+<td>Spark on YARN / K8s：资源管理与部署模式</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">15</td>
+<td>动态资源分配与作业调度：多租户集群的资源博弈</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">16</td>
+<td>性能诊断：Spark UI、Event Log 与调优思路</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">17</td>
+<td>Spark 与 Flink：两种计算引擎的设计选择</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Matei Zaharia et al. <em>Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing.</em> NSDI 2012. Section 4: Stage 划分与调度。</li>
+<li>Apache Spark 源码：<code>core/src/main/scala/org/apache/spark/scheduler/DAGScheduler.scala</code> <a target="_blank" rel="noopener" href="https://github.com/apache/spark">https://github.com/apache/spark</a></li>
+<li>Apache Spark 源码：<code>core/src/main/scala/org/apache/spark/Dependency.scala</code></li>
+<li>Apache Spark 官方文档：Cluster Mode Overview. <a target="_blank" rel="noopener" href="https://spark.apache.org/docs/latest/cluster-overview.html">https://spark.apache.org/docs/latest/cluster-overview.html</a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/">https://magicliang.github.io/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%A4%A7%E6%95%B0%E6%8D%AE/">大数据</a><a class="post-meta__tags" href="/tags/Spark/">Spark</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E8%AE%A1%E7%AE%97/">分布式计算</a><a class="post-meta__tags" href="/tags/Stage/">Stage</a><a class="post-meta__tags" href="/tags/DAG/">DAG</a></div><div class="post-share"><div class="social-share" data-image="/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/13/%E5%AF%BC%E8%AF%BB-%E4%B8%BA%E4%BB%80%E4%B9%88-Spark-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%98%AF%E4%B8%80%E5%BC%A0-DAG/" title="导读：为什么 Spark 的核心是一张 DAG"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/%E5%AF%BC%E8%AF%BB-%E4%B8%BA%E4%BB%80%E4%B9%88-Spark-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%98%AF%E4%B8%80%E5%BC%A0-DAG/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">导读：为什么 Spark 的核心是一张 DAG</div></div><div class="info-2"><div class="info-item-1">Spark 常被介绍为&quot;比 MapReduce 快 100 倍的计算引擎&quot;。这个说法把重点放错了地方。速度差异只是结果，不是原因。真正的区别在于执行模型：MapReduce 是一条固定的 Map-Shuffle-Reduce 三段流水线，而 Spark 是一个可以表达任意有向无环图（DAG）的执行引擎。 本篇只抓一个问题：Spark 的 DAG 执行模型到底和 MapReduce 的线性管道有什么本质区别，以及这个区别如何贯穿整个系列。 MapReduce 的线性管道 MapReduce 的执行模型可以用一句话概括：读数据 → Map → 写磁盘 → Shuffle → 写磁盘 → Reduce → 写数据。 1HDFS → Map Task → Local Disk → Shuffle → Local Disk → Reduce Task → HDFS 这条管道有两个结构性约束： 第一，每个 MapReduce 作业只有一轮 Map 和一轮 Reduce。如果业务逻辑需要多轮聚合（比如先按用户分组，再按地区汇总），就必须把逻辑拆成多个 MapReduce 作...</div></div></div></a><a class="pagination-related" href="/2026/07/13/DAG-Scheduler-%E4%B8%8E-Task-Scheduler-%E4%BB%8E%E9%80%BB%E8%BE%91%E8%AE%A1%E5%88%92%E5%88%B0%E7%89%A9%E7%90%86%E6%89%A7%E8%A1%8C/" title="DAG Scheduler 与 Task Scheduler：从逻辑计划到物理执行"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/DAG-Scheduler-%E4%B8%8E-Task-Scheduler-%E4%BB%8E%E9%80%BB%E8%BE%91%E8%AE%A1%E5%88%92%E5%88%B0%E7%89%A9%E7%90%86%E6%89%A7%E8%A1%8C/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">DAG Scheduler 与 Task Scheduler：从逻辑计划到物理执行</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 Stage 的划分规则——遇到 ShuffleDependency 就切一刀。这一篇进入调度器内部。 Stage 划分出来之后，谁来决定 Stage 的提交顺序？谁来把 Stage 拆成 Task 发给 Executor？Spark 用两层调度器分工完成这件事：DAGScheduler 负责 Stage 级别的依赖分析和提交顺序，TaskScheduler 负责 Task 级别的资源分配和执行调度。 本文只抓一个问题：一个 action 触发之后，从 Job 到 Stage 到 Task 再到 Executor，调度链路上每一步发生了什么。 调度全景 12345678910111213141516171819202122232425用户代码: rdd.count()      │      ▼  SparkContext.runJob()      │      ▼  DAGScheduler.submitJob()      │ 构建 Stage DAG，按依赖顺序提交      ▼  DAGScheduler.submitStage()      │ 检查父 S...</div></div></div></a><a class="pagination-related" href="/2026/07/13/Adaptive-Query-Execution-%E8%BF%90%E8%A1%8C%E6%97%B6%E6%94%B9%E5%86%99%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92/" title="Adaptive Query Execution：运行时改写执行计划"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/Adaptive-Query-Execution-%E8%BF%90%E8%A1%8C%E6%97%B6%E6%94%B9%E5%86%99%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">Adaptive Query Execution：运行时改写执行计划</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 DataFrame 和 Dataset 的 API 演进。这一篇进入运行时优化——Adaptive Query Execution（AQE）。 传统查询优化器的一个根本问题是：优化发生在执行之前，依赖的统计信息可能不准确或完全缺失。AQE 把优化推迟到执行过程中——在每个 Shuffle 边界，收集实际的数据统计信息，然后用这些精确的统计重新优化后续 Stage 的执行计划。 本文只抓一个问题：AQE 的三个核心优化分别解决什么问题，以及运行时优化的反馈循环如何工作。 运行时反馈循环 AQE 的工作方式可以用一句话概括：执行一个 Stage → 收集 Shuffle 输出的统计信息 → 用统计信息重新优化下一个 Stage 的计划 → 执行下一个 Stage。 123456789101112传统执行:  编译期确定完整计划 → Stage 0 → Stage 1 → Stage 2  (统计信息可能不准，计划一旦确定不可修改)AQE 执行:  编译期确定初始计划 → 执行 Stage 0      → 收集 Stage 0 的 Shuffle 输出统计      →...</div></div></div></a><a class="pagination-related" href="/2026/07/13/%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E-Tungsten-%E5%A0%86%E5%A4%96%E5%86%85%E5%AD%98-%E5%BA%8F%E5%88%97%E5%8C%96%E4%B8%8E%E4%BB%A3%E7%A0%81%E7%94%9F%E6%88%90/" title="内存管理与 Tungsten：堆外内存、序列化与代码生成"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86%E4%B8%8E-Tungsten-%E5%A0%86%E5%A4%96%E5%86%85%E5%AD%98-%E5%BA%8F%E5%88%97%E5%8C%96%E4%B8%8E%E4%BB%A3%E7%A0%81%E7%94%9F%E6%88%90/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">内存管理与 Tungsten：堆外内存、序列化与代码生成</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 Shuffle 的物理机制。这一篇进入内存管理——Spark 如何突破 JVM 的内存瓶颈。 Spark 是一个 JVM 应用，天然受制于 Java 的内存模型：对象头开销大、GC 停顿不可控、序列化效率低。Project Tungsten 是 Spark 为解决这三个问题发起的底层优化计划，它从三条线同时推进——堆外内存管理、二进制数据格式、全阶段代码生成。 本文只抓一个问题：Tungsten 的三条优化线分别解决了什么问题，以及 Spark 的统一内存管理模型如何在执行内存和存储内存之间做动态调配。 Java 对象的内存开销 一个 Java 字符串 “abcd” 在堆内占多少字节？ 12345678910111213java.lang.String 对象:  对象头:    12 bytes (64-bit JVM, 压缩指针)  hash:      4 bytes (int)  value[]:   4 bytes (引用)  对齐填充:  4 bytes  → 小计:   24 byteschar[] 数组:  对象头:    16 bytes (数组比普...</div></div></div></a><a class="pagination-related" href="/2026/07/13/Spark-%E4%B8%8E-Flink-%E4%B8%A4%E7%A7%8D%E8%AE%A1%E7%AE%97%E5%BC%95%E6%93%8E%E7%9A%84%E8%AE%BE%E8%AE%A1%E9%80%89%E6%8B%A9/" title="Spark 与 Flink：两种计算引擎的设计选择"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/Spark-%E4%B8%8E-Flink-%E4%B8%A4%E7%A7%8D%E8%AE%A1%E7%AE%97%E5%BC%95%E6%93%8E%E7%9A%84%E8%AE%BE%E8%AE%A1%E9%80%89%E6%8B%A9/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">Spark 与 Flink：两种计算引擎的设计选择</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 Spark 的性能诊断方法。这一篇进入设计对比——Spark 和 Flink 两种计算引擎的架构选择。 这不是一个&quot;谁更好&quot;的问题。Spark 和 Flink 从不同的起点出发，做了不同的设计取舍，各自在擅长的场景中有结构性优势。Spark 从批处理出发，用 micro-batch 扩展到流处理；Flink 从流处理出发，把批看作有界流。两条路线在功能上逐步趋同，但底层架构的差异导致了性能特性和适用场景的持久分化。 本文只抓一个问题：两个引擎在执行模型、状态管理、容错机制和延迟特性上的具体差异及其设计原因。 执行模型对比 Spark 的执行模型是 Stage-based DAG：把计算图按 Shuffle 边界切成 Stage，每个 Stage 包含一组可以 pipeline 执行的窄依赖变换。Stage 之间是全局同步点——上游 Stage 的所有 Task 必须全部完成后，下游 Stage 才能启动。 1234567891011Spark 执行模型:  Stage 0: [Task 0] [Task 1] [Task 2]  全部完成    ...</div></div></div></a><a class="pagination-related" href="/2026/07/13/%E6%B0%B4%E4%BD%8D%E7%BA%BF%E4%B8%8E%E7%8A%B6%E6%80%81%E7%AE%A1%E7%90%86-%E6%B5%81%E5%A4%84%E7%90%86%E7%9A%84%E6%97%B6%E9%97%B4%E8%AF%AD%E4%B9%89/" title="水位线与状态管理：流处理的时间语义"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/%E6%B0%B4%E4%BD%8D%E7%BA%BF%E4%B8%8E%E7%8A%B6%E6%80%81%E7%AE%A1%E7%90%86-%E6%B5%81%E5%A4%84%E7%90%86%E7%9A%84%E6%97%B6%E9%97%B4%E8%AF%AD%E4%B9%89/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">水位线与状态管理：流处理的时间语义</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 Structured Streaming 的基本模型。这一篇进入时间语义——事件时间、水位线和状态管理。 流处理中的&quot;时间&quot;不是一个简单的概念。一条消息有两个时间戳：事件时间（Event Time，事件实际发生的时间）和处理时间（Processing Time，Spark 收到消息的时间）。两者可能差距很大——网络延迟、消费积压、跨时区传输都会导致消息乱序到达。 本文只抓一个问题：Watermark 如何告诉 Spark “多晚的数据还值得等”，以及 State Store 如何持久化窗口状态。 事件时间 vs 处理时间 123456789101112事件发生                网络传输              Spark 收到  t=10:00:01          ~~~延迟 3s~~~          t=10:00:04  (Processing Time)  t=10:00:02          ~~~延迟 1s~~~          t=10:00:03  t=10:00:03          ~~~延迟 8s...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%AA%84%E4%BE%9D%E8%B5%96%E7%9A%84%E4%B8%89%E7%A7%8D%E5%BD%A2%E6%80%81"><span class="toc-number">1.</span> <span class="toc-text">窄依赖的三种形态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%BD%E4%BE%9D%E8%B5%96%EF%BC%9Ashuffle-%E7%9A%84%E5%85%A5%E5%8F%A3"><span class="toc-number">2.</span> <span class="toc-text">宽依赖：Shuffle 的入口</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#stage-%E5%88%92%E5%88%86%E7%AE%97%E6%B3%95"><span class="toc-number">3.</span> <span class="toc-text">Stage 划分算法</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#stage-%E5%86%85%E9%83%A8%E7%9A%84-pipeline-%E6%89%A7%E8%A1%8C"><span class="toc-number">4.</span> <span class="toc-text">Stage 内部的 Pipeline 执行</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%EF%BC%9A%E8%A7%82%E5%AF%9F-stage-%E5%88%92%E5%88%86"><span class="toc-number">5.</span> <span class="toc-text">实验：观察 Stage 划分</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%BD%E4%BE%9D%E8%B5%96%E7%9A%84%E4%BB%A3%E4%BB%B7"><span class="toc-number">6.</span> <span class="toc-text">宽依赖的代价</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">7.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">8.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">9.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">10.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">11.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">12.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.5</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.5"></script><script src="/js/main.js?v=5.5.5"></script><script src="/js/tw_cn.js?v=5.5.5"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || item.innerHTML || ""
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    if (e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : window.location.href = e.request.responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.5.5"></script></div></div></body></html>

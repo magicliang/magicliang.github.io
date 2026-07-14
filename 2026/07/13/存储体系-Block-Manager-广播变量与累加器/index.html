@@ -1,0 +1,785 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>存储体系：Block Manager、广播变量与累加器 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇解决了 Tungsten 的内存管理和代码生成优化。这一篇进入存储体系——Spark 如何管理分布在集群中的数据块。 BlockManager 容易被忽略，因为用户代码很少直接和它打交道。但 RDD 的 persist&#x2F;cache、Shuffle 的中间文件、广播变量的分发、累加器的聚合，底层全部通过 BlockManager 完成。它是 Spark 存储层的统一入口。 本文只抓一个问题：B">
+<meta property="og:type" content="article">
+<meta property="og:title" content="存储体系：Block Manager、广播变量与累加器">
+<meta property="og:url" content="https://magicliang.github.io/2026/07/13/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-Block-Manager-%E5%B9%BF%E6%92%AD%E5%8F%98%E9%87%8F%E4%B8%8E%E7%B4%AF%E5%8A%A0%E5%99%A8/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇解决了 Tungsten 的内存管理和代码生成优化。这一篇进入存储体系——Spark 如何管理分布在集群中的数据块。 BlockManager 容易被忽略，因为用户代码很少直接和它打交道。但 RDD 的 persist&#x2F;cache、Shuffle 的中间文件、广播变量的分发、累加器的聚合，底层全部通过 BlockManager 完成。它是 Spark 存储层的统一入口。 本文只抓一个问题：B">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/07/13/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-Block-Manager-%E5%B9%BF%E6%92%AD%E5%8F%98%E9%87%8F%E4%B8%8E%E7%B4%AF%E5%8A%A0%E5%99%A8/cover.svg">
+<meta property="article:published_time" content="2026-07-13T05:00:00.000Z">
+<meta property="article:modified_time" content="2026-07-14T02:55:19.077Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Spark">
+<meta property="article:tag" content="分布式计算">
+<meta property="article:tag" content="大数据">
+<meta property="article:tag" content="存储">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/07/13/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-Block-Manager-%E5%B9%BF%E6%92%AD%E5%8F%98%E9%87%8F%E4%B8%8E%E7%B4%AF%E5%8A%A0%E5%99%A8/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "存储体系：Block Manager、广播变量与累加器",
+  "url": "https://magicliang.github.io/2026/07/13/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-Block-Manager-%E5%B9%BF%E6%92%AD%E5%8F%98%E9%87%8F%E4%B8%8E%E7%B4%AF%E5%8A%A0%E5%99%A8/",
+  "image": "https://magicliang.github.io/2026/07/13/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-Block-Manager-%E5%B9%BF%E6%92%AD%E5%8F%98%E9%87%8F%E4%B8%8E%E7%B4%AF%E5%8A%A0%E5%99%A8/cover.svg",
+  "datePublished": "2026-07-13T05:00:00.000Z",
+  "dateModified": "2026-07-14T02:55:19.077Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/07/13/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-Block-Manager-%E5%B9%BF%E6%92%AD%E5%8F%98%E9%87%8F%E4%B8%8E%E7%B4%AF%E5%8A%A0%E5%99%A8/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.5.5"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.2.0/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        if (!ttl) return
+        const expiry = Date.now() + ttl * 86400000
+        localStorage.setItem(key, JSON.stringify({ value, expiry }))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return undefined
+        const { value, expiry } = JSON.parse(itemStr)
+        if (Date.now() > expiry) {
+          localStorage.removeItem(key)
+          return undefined
+        }
+        return value
+      }
+    }
+
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = url
+        script.async = true
+        Object.entries(attr).forEach(([key, val]) => script.setAttribute(key, val))
+        script.onload = script.onreadystatechange = () => {
+          if (!script.readyState || /loaded|complete/.test(script.readyState)) resolve()
+        }
+        script.onerror = reject
+        document.head.appendChild(script)
+      }),
+      getCSS: (url, id) => new Promise((resolve, reject) => {
+        const link = document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = url
+        if (id) link.id = id
+        link.onload = link.onreadystatechange = () => {
+          if (!link.readyState || /loaded|complete/.test(link.readyState)) resolve()
+        }
+        link.onerror = reject
+        document.head.appendChild(link)
+      }),
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const activateDarkMode = () => {
+        document.documentElement.setAttribute('data-theme', 'dark')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.setAttribute('data-theme', 'light')
+        if (document.querySelector('meta[name="theme-color"]') !== null) {
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '存储体系：Block Manager、广播变量与累加器',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">532</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">606</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">10</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/07/13/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-Block-Manager-%E5%B9%BF%E6%92%AD%E5%8F%98%E9%87%8F%E4%B8%8E%E7%B4%AF%E5%8A%A0%E5%99%A8/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">存储体系：Block Manager、广播变量与累加器</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">存储体系：Block Manager、广播变量与累加器</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-07-13T05:00:00.000Z" title="Created 2026-07-13 13:00:00">2026-07-13</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-07-14T02:55:19.077Z" title="Updated 2026-07-14 10:55:19">2026-07-14</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.5k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>9mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-07-14 10:55:19&quot;}" hidden></div><p>上一篇解决了 Tungsten 的内存管理和代码生成优化。这一篇进入存储体系——Spark 如何管理分布在集群中的数据块。</p>
+<p>BlockManager 容易被忽略，因为用户代码很少直接和它打交道。但 RDD 的 persist/cache、Shuffle 的中间文件、广播变量的分发、累加器的聚合，底层全部通过 BlockManager 完成。它是 Spark 存储层的统一入口。</p>
+<p>本文只抓一个问题：BlockManager 如何在内存和磁盘之间管理数据块，以及广播变量和累加器在这个体系中的位置。</p>
+<h2 id="blockmanager-架构">BlockManager 架构</h2>
+<p>每个 Executor 上运行一个 BlockManager 实例，Driver 上也有一个（主要用于接收广播变量和累加器结果）。BlockManager 内部包含三个核心组件：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">BlockManager<br>├── MemoryStore     内存存储（堆内/堆外）<br>├── DiskStore       磁盘存储（本地目录）<br>└── BlockTransferService  网络传输（Netty）<br></code></pre></td></tr></table></figure>
+<p>MemoryStore 负责在 JVM 堆内或堆外内存中存储数据块。DiskStore 负责把数据块序列化后写入本地磁盘目录（spark.local.dir 配置的路径）。BlockTransferService 负责从远程 Executor 拉取数据块。</p>
+<p>每个数据块有一个全局唯一的 BlockId，格式取决于数据类型：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">rdd_&lt;rddId&gt;_&lt;partitionIndex&gt;      RDD 分区缓存<br>shuffle_&lt;shuffleId&gt;_&lt;mapId&gt;_&lt;reduceId&gt;   Shuffle 数据<br>broadcast_&lt;broadcastId&gt;_&lt;piece&gt;   广播变量分片<br></code></pre></td></tr></table></figure>
+<p>Driver 上的 BlockManagerMaster 维护所有 BlockId 到位置（哪个 Executor）的映射。当一个 Task 需要读取远程 Block 时，先向 BlockManagerMaster 查询位置，再从目标 Executor 的 BlockTransferService 拉取。</p>
+<h2 id="rdd-缓存机制">RDD 缓存机制</h2>
+<p>调用 rdd.persist(storageLevel) 或 rdd.cache()（等价于 persist(MEMORY_ONLY)）时，Spark 并不立即缓存数据。它只是在 RDD 上打一个标记。当 action 触发计算时，每个 Task 计算完分区数据后，检查该 RDD 是否有 persist 标记。如果有，把计算结果交给 BlockManager 存储。</p>
+<p>StorageLevel 控制存储行为：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">MEMORY_ONLY          只存内存，放不下就不存<br>MEMORY_AND_DISK      先存内存，内存不够溢写到磁盘<br>MEMORY_ONLY_SER      序列化后存内存（更紧凑，但读取需要反序列化）<br>MEMORY_AND_DISK_SER  序列化后存内存+磁盘<br>DISK_ONLY            只存磁盘<br>*_2                  以上任一级别 + 副本（存两份在不同节点）<br>OFF_HEAP             堆外内存（不受 GC 影响）<br></code></pre></td></tr></table></figure>
+<p>MEMORY_ONLY 和 MEMORY_AND_DISK 的差别在于淘汰策略：MEMORY_ONLY 在内存不足时直接丢弃最早缓存的分区（下次用到时通过 Lineage 重算），MEMORY_AND_DISK 在内存不足时把最早的分区溢写到磁盘（下次读取从磁盘加载，比重算快）。</p>
+<p>实际选择的经验法则：如果数据量能放进内存，用 MEMORY_ONLY。如果放不进但重算代价大（长 Lineage 或外部数据源），用 MEMORY_AND_DISK。如果 GC 压力大，用 MEMORY_ONLY_SER（序列化后一个分区就是一个字节数组，比散装 Java 对象对 GC 友好得多）。</p>
+<h2 id="广播变量：torrent-分发">广播变量：Torrent 分发</h2>
+<p>广播变量（Broadcast Variable）用于把一份只读数据高效地分发到所有 Executor。典型场景是 Map-Side Join——把小表广播到所有节点，避免 Shuffle。</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs scala"><span class="hljs-keyword">val</span> lookupTable = <span class="hljs-type">Map</span>(<span class="hljs-string">&quot;a&quot;</span> -&gt; <span class="hljs-number">1</span>, <span class="hljs-string">&quot;b&quot;</span> -&gt; <span class="hljs-number">2</span>, <span class="hljs-string">&quot;c&quot;</span> -&gt; <span class="hljs-number">3</span>)<br><span class="hljs-keyword">val</span> bc = sc.broadcast(lookupTable)<br><br>rdd.map(key =&gt; (key, bc.value.getOrElse(key, <span class="hljs-number">0</span>)))<br></code></pre></td></tr></table></figure>
+<p>如果不用广播变量，lookupTable 会随每个 Task 序列化发送一次。如果有 1000 个 Task，同一份数据就传输 1000 次。广播变量只传输一次到每个 Executor，然后所有 Task 共享同一份内存中的副本。</p>
+<p>Spark 使用类似 BitTorrent 的 Torrent 分发协议来广播数据：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><code class="hljs text">传统方式（Driver → 每个 Executor）:<br>  Driver ──→ Executor 0<br>  Driver ──→ Executor 1<br>  Driver ──→ Executor 2<br>  Driver ──→ ...<br>  瓶颈: Driver 的网络带宽<br><br>Torrent 方式:<br>  Driver ──→ Executor 0<br>  Driver ──→ Executor 1    Executor 0 ──→ Executor 3<br>  Driver ──→ Executor 2    Executor 1 ──→ Executor 4<br>                            Executor 2 ──→ Executor 5<br>  已收到数据的 Executor 也成为数据源<br></code></pre></td></tr></table></figure>
+<p>广播数据被切成若干个 4MB 的分片（spark.broadcast.blockSize）。每个 Executor 接收到一个分片后，立即成为该分片的数据源，其他 Executor 可以从它那里拉取。这样 Driver 的网络带宽不再是瓶颈，整个集群的聚合带宽被充分利用。</p>
+<h2 id="累加器：driver-端聚合">累加器：Driver 端聚合</h2>
+<p>累加器（Accumulator）是从 Executor 向 Driver 单向聚合数据的机制。典型用途是计数器和求和器。</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs scala"><span class="hljs-keyword">val</span> errorCount = sc.longAccumulator(<span class="hljs-string">&quot;errors&quot;</span>)<br><br>rdd.foreach &#123; record =&gt;<br>  <span class="hljs-keyword">if</span> (record.contains(<span class="hljs-string">&quot;ERROR&quot;</span>)) &#123;<br>    errorCount.add(<span class="hljs-number">1</span>)<br>  &#125;<br>&#125;<br><br>println(<span class="hljs-string">s&quot;Error count: <span class="hljs-subst">$&#123;errorCount.value&#125;</span>&quot;</span>)<br></code></pre></td></tr></table></figure>
+<p>累加器的语义有一个关键陷阱：在 transformation 中使用累加器时，如果 Task 重试或 Stage 重算，累加器的值可能被重复累加。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs text">安全：在 action 内部使用（如 foreach、reduce）<br>  └→ 每个 Task 只执行一次，结果准确<br><br>不安全：在 transformation 内部使用（如 map、filter）<br>  └→ Task 重试时同一条记录可能被累加多次<br>  └→ Stage 重算时整个分区的累加值重复<br></code></pre></td></tr></table></figure>
+<p>Spark 只保证在 action 中累加器值的准确性。在 transformation 中使用累加器的结果是&quot;尽力而为&quot;的近似值，不能作为精确计数。</p>
+<h2 id="实验：观察存储行为">实验：观察存储行为</h2>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><code class="hljs scala"><span class="hljs-comment">// 缓存一个 RDD 并观察 Storage 页面</span><br><span class="hljs-keyword">val</span> rdd = sc.parallelize(<span class="hljs-number">1</span> to <span class="hljs-number">1000000</span>, <span class="hljs-number">10</span>).map(i =&gt; (i, i * i))<br>rdd.persist(org.apache.spark.storage.<span class="hljs-type">StorageLevel</span>.<span class="hljs-type">MEMORY_AND_DISK</span>)<br>rdd.count()  <span class="hljs-comment">// 触发缓存</span><br><br><span class="hljs-comment">// Spark UI → Storage 页面</span><br><span class="hljs-comment">// 可以看到 RDD 的缓存大小、分区数、内存/磁盘占用</span><br><br><span class="hljs-comment">// 广播变量</span><br><span class="hljs-keyword">val</span> bigMap = (<span class="hljs-number">1</span> to <span class="hljs-number">100000</span>).map(i =&gt; (i, <span class="hljs-string">s&quot;value_<span class="hljs-subst">$i</span>&quot;</span>)).toMap<br><span class="hljs-keyword">val</span> bc = sc.broadcast(bigMap)<br>println(<span class="hljs-string">s&quot;Broadcast size: ~<span class="hljs-subst">$&#123;bigMap.size * 20 / 1024&#125;</span>KB&quot;</span>)<br><br><span class="hljs-comment">// 累加器</span><br><span class="hljs-keyword">val</span> counter = sc.longAccumulator(<span class="hljs-string">&quot;myCounter&quot;</span>)<br>rdd.foreach &#123; <span class="hljs-keyword">case</span> (k, v) =&gt; <span class="hljs-keyword">if</span> (k % <span class="hljs-number">2</span> == <span class="hljs-number">0</span>) counter.add(<span class="hljs-number">1</span>) &#125;<br>println(<span class="hljs-string">s&quot;Even count: <span class="hljs-subst">$&#123;counter.value&#125;</span>&quot;</span>)<br></code></pre></td></tr></table></figure>
+<p>在 Spark UI 的 Storage 页面可以看到缓存的 RDD，包括每个分区在哪个 Executor 上、占用了多少内存和磁盘空间。Environment 页面可以查看 spark.storage.memoryFraction 等存储相关配置。</p>
+<h2 id="模式提炼">模式提炼</h2>
+<p>BlockManager 体现了统一存储抽象模式：把不同类型的数据（缓存、Shuffle、广播）统一到同一个存储接口下，用 BlockId 作为寻址键，用 StorageLevel 控制存储策略。</p>
+<p>这个模式在分布式存储系统中很常见。HDFS 的 NameNode 维护文件到 Block 的映射和 Block 到 DataNode 的映射，角色类似 BlockManagerMaster。对象存储（S3/OSS）用 key 寻址对象，不区分数据类型。</p>
+<p>广播变量的 Torrent 分发体现了另一个模式：P2P 数据分发。已经拥有数据的节点成为新的数据源，避免单点瓶颈。CDN 的回源策略和 Docker 镜像的 P2P 分发（如 Dragonfly）使用同样的思路。</p>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>Spark 概念</th>
+<th>MapReduce 对应</th>
+<th>Flink 对应</th>
+<th>数据库对应</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BlockManager</td>
+<td>无统一存储层</td>
+<td>TaskManager 的 MemoryManager</td>
+<td>Buffer Pool Manager</td>
+</tr>
+<tr>
+<td>MemoryStore / DiskStore</td>
+<td>Map 输出写本地磁盘</td>
+<td>Network Buffer + Spill</td>
+<td>内存页 + 磁盘页</td>
+</tr>
+<tr>
+<td>BlockManagerMaster</td>
+<td>无（Job 间不共享存储元数据）</td>
+<td>无直接对应</td>
+<td>元数据服务（Catalog）</td>
+</tr>
+<tr>
+<td>广播变量</td>
+<td>DistributedCache</td>
+<td>Broadcast State</td>
+<td>物化视图分发</td>
+</tr>
+<tr>
+<td>累加器</td>
+<td>Counter（MapReduce Counter）</td>
+<td>Accumulator（Flink Accumulator）</td>
+<td>聚合函数的分布式部分聚合</td>
+</tr>
+<tr>
+<td>StorageLevel</td>
+<td>无（总是磁盘）</td>
+<td>无（由 State Backend 决定）</td>
+<td>缓冲区淘汰策略（LRU/Clock）</td>
+</tr>
+</tbody>
+</table>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：“cache() 之后数据一定在内存中”。cache() 等价于 persist(MEMORY_ONLY)。如果 Executor 内存不足以存储所有分区，多余的分区不会被缓存——下次用到时通过 Lineage 重算。只有 MEMORY_AND_DISK 才保证所有分区都被持久化（放不进内存的写磁盘）。</p>
+<p>误解二：“广播变量可以修改”。广播变量在 Executor 端是只读的。如果需要在 Executor 上修改共享状态并回传给 Driver，应该用累加器。但累加器只支持加法语义（或自定义的 AccumulatorV2 的 merge 语义），不支持任意修改。</p>
+<p>误解三：“unpersist() 会立即释放内存”。unpersist(blocking=false)（默认）是异步的，不保证立即释放。如果需要确保释放后再执行后续操作，用 unpersist(blocking=true)。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>
+<p>对同一个 RDD 分别用 MEMORY_ONLY 和 MEMORY_ONLY_SER 缓存，在 Spark UI 的 Storage 页面对比两者的 Size in Memory。序列化存储通常占用更少内存，但计算时需要反序列化。</p>
+</li>
+<li>
+<p>创建一个广播变量（如一个 100MB 的 Map），在有 4 个 Executor 的集群上执行作业。在 Spark UI 的 Executors 页面观察每个 Executor 的 Storage Memory 增量是否都是约 100MB。</p>
+</li>
+<li>
+<p>在一个 map transformation 中使用累加器，然后对同一个 RDD 调用两次不同的 action。观察累加器的值是否是预期的两倍。思考为什么 Spark 官方文档建议只在 action 中使用累加器。</p>
+</li>
+</ol>
+<h2 id="系列导航">系列导航</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align:right">序号</th>
+<th>主题</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:right">00</td>
+<td>导读：为什么 Spark 的核心是一张 DAG</td>
+<td>已完成</td>
+</tr>
+<tr>
+<td style="text-align:right">01</td>
+<td>RDD：弹性分布式数据集的五大属性</td>
+<td>已完成</td>
+</tr>
+<tr>
+<td style="text-align:right">02</td>
+<td>宽依赖与窄依赖：Stage 是怎样划分出来的</td>
+<td>已完成</td>
+</tr>
+<tr>
+<td style="text-align:right">03</td>
+<td>DAG Scheduler 与 Task Scheduler：从逻辑计划到物理执行</td>
+<td>已完成</td>
+</tr>
+<tr>
+<td style="text-align:right">04</td>
+<td>Shuffle 机制：数据跨分区交换的代价与优化</td>
+<td>已完成</td>
+</tr>
+<tr>
+<td style="text-align:right">05</td>
+<td>内存管理与 Tungsten：堆外内存、序列化与代码生成</td>
+<td>已完成</td>
+</tr>
+<tr>
+<td style="text-align:right"><strong>06</strong></td>
+<td><strong>存储体系：Block Manager、广播变量与累加器</strong></td>
+<td><strong>本篇</strong></td>
+</tr>
+<tr>
+<td style="text-align:right">07</td>
+<td>容错机制：Lineage、Checkpoint 与推测执行</td>
+<td>下一篇</td>
+</tr>
+<tr>
+<td style="text-align:right">08</td>
+<td>Spark SQL 与 Catalyst：从 SQL 文本到物理算子树</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">09</td>
+<td>DataFrame 与 Dataset：类型安全与性能的折中</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">10</td>
+<td>Adaptive Query Execution：运行时改写执行计划</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">11</td>
+<td>数据源 API 与谓词下推：让存储层帮忙过滤</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">12</td>
+<td>Structured Streaming：把流当成无界表</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">13</td>
+<td>水位线与状态管理：流处理的时间语义</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">14</td>
+<td>Spark on YARN / K8s：资源管理与部署模式</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">15</td>
+<td>动态资源分配与作业调度：多租户集群的资源博弈</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">16</td>
+<td>性能诊断：Spark UI、Event Log 与调优思路</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">17</td>
+<td>Spark 与 Flink：两种计算引擎的设计选择</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Apache Spark 源码：<code>core/src/main/scala/org/apache/spark/storage/BlockManager.scala</code> <a target="_blank" rel="noopener" href="https://github.com/apache/spark">https://github.com/apache/spark</a></li>
+<li>Apache Spark 官方文档：RDD Persistence. <a target="_blank" rel="noopener" href="https://spark.apache.org/docs/latest/rdd-programming-guide.html#rdd-persistence">https://spark.apache.org/docs/latest/rdd-programming-guide.html#rdd-persistence</a></li>
+<li>Apache Spark 官方文档：Shared Variables. <a target="_blank" rel="noopener" href="https://spark.apache.org/docs/latest/rdd-programming-guide.html#shared-variables">https://spark.apache.org/docs/latest/rdd-programming-guide.html#shared-variables</a></li>
+<li>Holden Karau et al. <em>Learning Spark.</em> O’Reilly. Chapter 6: Advanced Spark Programming.</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/07/13/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-Block-Manager-%E5%B9%BF%E6%92%AD%E5%8F%98%E9%87%8F%E4%B8%8E%E7%B4%AF%E5%8A%A0%E5%99%A8/">https://magicliang.github.io/2026/07/13/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-Block-Manager-%E5%B9%BF%E6%92%AD%E5%8F%98%E9%87%8F%E4%B8%8E%E7%B4%AF%E5%8A%A0%E5%99%A8/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%A4%A7%E6%95%B0%E6%8D%AE/">大数据</a><a class="post-meta__tags" href="/tags/Spark/">Spark</a><a class="post-meta__tags" href="/tags/%E5%AD%98%E5%82%A8/">存储</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E8%AE%A1%E7%AE%97/">分布式计算</a></div><div class="post-share"><div class="social-share" data-image="/2026/07/13/%E5%AD%98%E5%82%A8%E4%BD%93%E7%B3%BB-Block-Manager-%E5%B9%BF%E6%92%AD%E5%8F%98%E9%87%8F%E4%B8%8E%E7%B4%AF%E5%8A%A0%E5%99%A8/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/13/%E5%AE%B9%E9%94%99%E6%9C%BA%E5%88%B6-Lineage-Checkpoint-%E4%B8%8E%E6%8E%A8%E6%B5%8B%E6%89%A7%E8%A1%8C/" title="容错机制：Lineage、Checkpoint 与推测执行"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/%E5%AE%B9%E9%94%99%E6%9C%BA%E5%88%B6-Lineage-Checkpoint-%E4%B8%8E%E6%8E%A8%E6%B5%8B%E6%89%A7%E8%A1%8C/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">容错机制：Lineage、Checkpoint 与推测执行</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 BlockManager 的存储管理。这一篇进入容错机制——Spark 如何在节点故障时恢复计算。 分布式系统的容错通常有两条路线：数据副本（每份数据存多份，一份丢了从副本恢复）和计算重放（不存副本，丢了从头重算）。Spark 选择了第二条路线——通过 RDD 的 Lineage（血统）记录计算路径，丢失的分区沿着 Lineage 重算。 本文只抓一个问题：Lineage 容错的优势和代价，以及 Checkpoint 和推测执行如何补充 Lineage 的不足。 Lineage 容错原理 每个 RDD 记录了自己的 dependencies——从哪些父 RDD 经过什么变换得来。当一个分区丢失时（Executor 故障、磁盘损坏），Spark 不需要从副本恢复，只需要找到该分区的父 RDD 分区，重新执行 compute 函数。 12345678910RDD-0 (HDFS) → RDD-1 (map) → RDD-2 (filter) → RDD-3 (reduceByKey)                                            ...</div></div></div></a><a class="pagination-related" href="/2026/07/13/DataFrame-%E4%B8%8E-Dataset-%E7%B1%BB%E5%9E%8B%E5%AE%89%E5%85%A8%E4%B8%8E%E6%80%A7%E8%83%BD%E7%9A%84%E6%8A%98%E4%B8%AD/" title="DataFrame 与 Dataset：类型安全与性能的折中"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/DataFrame-%E4%B8%8E-Dataset-%E7%B1%BB%E5%9E%8B%E5%AE%89%E5%85%A8%E4%B8%8E%E6%80%A7%E8%83%BD%E7%9A%84%E6%8A%98%E4%B8%AD/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">DataFrame 与 Dataset：类型安全与性能的折中</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 Catalyst 优化器的四阶段流水线。这一篇进入用户 API 层——RDD、DataFrame、Dataset 三代 API 的演进逻辑。 三者的区别容易被简化为&quot;RDD 是低级 API，DataFrame 是高级 API&quot;。更准确的说法是：三代 API 在类型安全和执行优化之间做了不同的取舍。RDD 完全类型安全但无法被 Catalyst 优化；DataFrame 完全被 Catalyst 优化但放弃了编译期类型检查；Dataset 试图兼顾两者，但付出了 Encoder 序列化/反序列化的代价。 本文只抓一个问题：三代 API 在内部表示、优化路径和序列化机制上的具体差异。 三代 API 的内部表示 1234567891011121314RDD[Person]  └─ 内部存储: JVM 堆上的 Java/Scala 对象  └─ 优化路径: 无（用户代码是黑盒，Spark 无法查看函数内部）  └─ 类型信息: 编译期完整保留（泛型参数 T = Person）DataFrame (= Dataset[Row])  └─ 内部存储: Uns...</div></div></div></a><a class="pagination-related" href="/2026/07/13/%E6%80%A7%E8%83%BD%E8%AF%8A%E6%96%AD-Spark-UI-Event-Log-%E4%B8%8E%E8%B0%83%E4%BC%98%E6%80%9D%E8%B7%AF/" title="性能诊断：Spark UI、Event Log 与调优思路"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/%E6%80%A7%E8%83%BD%E8%AF%8A%E6%96%AD-Spark-UI-Event-Log-%E4%B8%8E%E8%B0%83%E4%BC%98%E6%80%9D%E8%B7%AF/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">性能诊断：Spark UI、Event Log 与调优思路</div></div><div class="info-2"><div class="info-item-1">上一篇解决了动态资源分配和调度策略。这一篇进入性能诊断——当 Spark 作业慢了，怎么找到瓶颈。 性能调优的第一步不是改配置，是定位问题。Spark UI 提供了五个关键页面（Jobs、Stages、Storage、Environment、Executors），每个页面指向不同类型的性能问题。Event Log 提供了离线分析的完整数据。 本文只抓一个问题：面对一个慢作业，如何从 Spark UI 的指标出发，沿着诊断路径找到根因。 Spark UI 五个页面 1234567891011121314151617181920212223Jobs 页面  → 每个 Action 对应一个 Job  → 关注: Job Duration、Failed Tasks 数量  → 入口: 找到最慢的 Job，点击进入 Stage 详情Stages 页面  → 每个 Stage 的 Task 统计  → 关注: Task Duration 分布、Shuffle Read/Write、GC Time  → 核心: 这里是定位性能问题的主战场Storage 页面  → 缓存的 RDD/DataF...</div></div></div></a><a class="pagination-related" href="/2026/07/13/%E6%B0%B4%E4%BD%8D%E7%BA%BF%E4%B8%8E%E7%8A%B6%E6%80%81%E7%AE%A1%E7%90%86-%E6%B5%81%E5%A4%84%E7%90%86%E7%9A%84%E6%97%B6%E9%97%B4%E8%AF%AD%E4%B9%89/" title="水位线与状态管理：流处理的时间语义"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/%E6%B0%B4%E4%BD%8D%E7%BA%BF%E4%B8%8E%E7%8A%B6%E6%80%81%E7%AE%A1%E7%90%86-%E6%B5%81%E5%A4%84%E7%90%86%E7%9A%84%E6%97%B6%E9%97%B4%E8%AF%AD%E4%B9%89/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">水位线与状态管理：流处理的时间语义</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 Structured Streaming 的基本模型。这一篇进入时间语义——事件时间、水位线和状态管理。 流处理中的&quot;时间&quot;不是一个简单的概念。一条消息有两个时间戳：事件时间（Event Time，事件实际发生的时间）和处理时间（Processing Time，Spark 收到消息的时间）。两者可能差距很大——网络延迟、消费积压、跨时区传输都会导致消息乱序到达。 本文只抓一个问题：Watermark 如何告诉 Spark “多晚的数据还值得等”，以及 State Store 如何持久化窗口状态。 事件时间 vs 处理时间 123456789101112事件发生                网络传输              Spark 收到  t=10:00:01          ~~~延迟 3s~~~          t=10:00:04  (Processing Time)  t=10:00:02          ~~~延迟 1s~~~          t=10:00:03  t=10:00:03          ~~~延迟 8s...</div></div></div></a><a class="pagination-related" href="/2026/07/13/Adaptive-Query-Execution-%E8%BF%90%E8%A1%8C%E6%97%B6%E6%94%B9%E5%86%99%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92/" title="Adaptive Query Execution：运行时改写执行计划"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/Adaptive-Query-Execution-%E8%BF%90%E8%A1%8C%E6%97%B6%E6%94%B9%E5%86%99%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">Adaptive Query Execution：运行时改写执行计划</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 DataFrame 和 Dataset 的 API 演进。这一篇进入运行时优化——Adaptive Query Execution（AQE）。 传统查询优化器的一个根本问题是：优化发生在执行之前，依赖的统计信息可能不准确或完全缺失。AQE 把优化推迟到执行过程中——在每个 Shuffle 边界，收集实际的数据统计信息，然后用这些精确的统计重新优化后续 Stage 的执行计划。 本文只抓一个问题：AQE 的三个核心优化分别解决什么问题，以及运行时优化的反馈循环如何工作。 运行时反馈循环 AQE 的工作方式可以用一句话概括：执行一个 Stage → 收集 Shuffle 输出的统计信息 → 用统计信息重新优化下一个 Stage 的计划 → 执行下一个 Stage。 123456789101112传统执行:  编译期确定完整计划 → Stage 0 → Stage 1 → Stage 2  (统计信息可能不准，计划一旦确定不可修改)AQE 执行:  编译期确定初始计划 → 执行 Stage 0      → 收集 Stage 0 的 Shuffle 输出统计      →...</div></div></div></a><a class="pagination-related" href="/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/" title="宽依赖与窄依赖：Stage 是怎样划分出来的"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">宽依赖与窄依赖：Stage 是怎样划分出来的</div></div><div class="info-2"><div class="info-item-1">上一篇拆解了 RDD 的五大属性，其中 dependencies 决定了 RDD 之间的依赖类型。这一篇进入依赖类型的核心区分——宽依赖和窄依赖——以及它如何直接决定 Stage 的划分。 宽依赖和窄依赖容易被理解成&quot;一对一&quot;和&quot;多对多&quot;的分区关系。更准确的说法是：窄依赖意味着子 RDD 的每个分区只依赖父 RDD 的固定少数分区，可以在单个 Task 内完成计算；宽依赖意味着子 RDD 的分区需要读取父 RDD 所有分区的数据，必须等待一次全量数据交换（Shuffle）。 本文只抓一个问题：DAGScheduler 按什么规则把 RDD 依赖图切分成 Stage。 窄依赖的三种形态 窄依赖（NarrowDependency）的定义是：父 RDD 的每个分区最多被子 RDD 的一个分区使用。在 Spark 源码中，NarrowDependency 有两个具体子类： OneToOneDependency：父子分区一一对应。map、filter、flatMap 产生这种依赖。父 RDD 的第 i 个分区只被子 RDD 的第 i 个分区使用。 R...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#blockmanager-%E6%9E%B6%E6%9E%84"><span class="toc-number">1.</span> <span class="toc-text">BlockManager 架构</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#rdd-%E7%BC%93%E5%AD%98%E6%9C%BA%E5%88%B6"><span class="toc-number">2.</span> <span class="toc-text">RDD 缓存机制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B9%BF%E6%92%AD%E5%8F%98%E9%87%8F%EF%BC%9Atorrent-%E5%88%86%E5%8F%91"><span class="toc-number">3.</span> <span class="toc-text">广播变量：Torrent 分发</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B4%AF%E5%8A%A0%E5%99%A8%EF%BC%9Adriver-%E7%AB%AF%E8%81%9A%E5%90%88"><span class="toc-number">4.</span> <span class="toc-text">累加器：Driver 端聚合</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%EF%BC%9A%E8%A7%82%E5%AF%9F%E5%AD%98%E5%82%A8%E8%A1%8C%E4%B8%BA"><span class="toc-number">5.</span> <span class="toc-text">实验：观察存储行为</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">6.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">7.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">8.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">9.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">10.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">11.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.5.5</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.5.5"></script><script src="/js/main.js?v=5.5.5"></script><script src="/js/tw_cn.js?v=5.5.5"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.outerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        if (typeof svg === 'string') {
+          openSvgInNewTab({ source: svg, initViewBox })
+          return
+        }
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+
+    // Avoid binding multiple times on themeChange/pjax
+    if (wrap.__mermaidGestureBound) return
+    wrap.__mermaidGestureBound = true
+
+    // Helper: map client (viewport) coordinate -> viewBox coordinate
+    const clientToViewBox = (clientX, clientY) => {
+      const rect = svg.getBoundingClientRect()
+      const vb = wrap.__mermaidCurViewBox || getSvgViewBox(svg)
+      const x = vb[0] + (clientX - rect.left) * (vb[2] / rect.width)
+      const y = vb[1] + (clientY - rect.top) * (vb[3] / rect.height)
+      return { x, y, rect, vb }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      startCenter: null
+    }
+
+    const clampVb = vb => {
+      const init = wrap.__mermaidInitViewBox || vb
+      const minW = init[2] * 0.1
+      const maxW = init[2] * 10
+      const minH = init[3] * 0.1
+      const maxH = init[3] * 10
+      vb[2] = clamp(vb[2], minW, maxW)
+      vb[3] = clamp(vb[3], minH, maxH)
+      return vb
+    }
+
+    const setCurVb = vb => {
+      vb = clampVb(vb)
+      wrap.__mermaidCurViewBox = vb
+      setSvgViewBox(svg, vb)
+    }
+
+    const onPointerDown = e => {
+      // Allow only primary button for mouse
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      if (state.pointers.size === 1) {
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        state.startCenter = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+
+      // Pan with 1 pointer
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = [...state.pointers.values()][0]
+        const prev = { x: e.clientX - e.movementX, y: e.clientY - e.movementY }
+        // movementX/Y unreliable on touch, compute from stored last position
+        const last = wrap.__mermaidLastSinglePointer || p
+        const dxClient = p.x - last.x
+        const dyClient = p.y - last.y
+        wrap.__mermaidLastSinglePointer = p
+
+        const { rect } = clientToViewBox(p.x, p.y)
+        const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+        const dx = dxClient * (vb[2] / rect.width)
+        const dy = dyClient * (vb[3] / rect.height)
+        setCurVb([vb[0] - dx, vb[1] - dy, vb[2], vb[3]])
+        return
+      }
+
+      // Pinch zoom with 2 pointers
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist // dist bigger => zoom in (viewBox smaller)
+
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const centerClient = { x: cx, y: cy }
+
+        const pxy = clientToViewBox(centerClient.x, centerClient.y)
+        const cpx = pxy.x
+        const cpy = pxy.y
+
+        const vb = zoomAtPoint(state.startVb, factor, cpx, cpy)
+        setCurVb(vb)
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+        state.startCenter = null
+        wrap.__mermaidLastSinglePointer = null
+      } else if (state.pointers.size === 1) {
+        // reset single pointer baseline to avoid jump
+        wrap.__mermaidLastSinglePointer = [...state.pointers.values()][0]
+      }
+    }
+
+    // Wheel zoom (mouse/trackpad)
+    const onWheel = e => {
+      // ctrlKey on mac trackpad pinch; we treat both as zoom
+      e.preventDefault()
+      const delta = e.deltaY
+      const zoomFactor = delta > 0 ? 1.1 : 0.9
+      const { x, y } = clientToViewBox(e.clientX, e.clientY)
+      const vb = (wrap.__mermaidCurViewBox || getSvgViewBox(svg)).slice()
+      setCurVb(zoomAtPoint(vb, zoomFactor, x, y))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (!init) return
+      wrap.__mermaidCurViewBox = init.slice()
+      setSvgViewBox(svg, init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown)
+    svg.addEventListener('pointermove', onPointerMove)
+    svg.addEventListener('pointerup', onPointerUpOrCancel)
+    svg.addEventListener('pointercancel', onPointerUpOrCancel)
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    svg.addEventListener('dblclick', onDblClick)
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+
+      // Clear old render (themeChange/pjax will rerun)
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      item.__mermaidGestureBound = false
+
+      const config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+
+      // mermaid v9 and v10 compatibility
+      typeof renderFn === 'string' ? renderMermaid(renderFn) : renderFn.then(({ svg }) => renderMermaid(svg))
+    })
+  }
+
+  const codeToMermaid = () => {
+    const codeMermaidEle = document.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    if (true) codeToMermaid()
+    const $mermaid = document.querySelectorAll('#article-container .mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || item.innerHTML || ""
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    if (e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : window.location.href = e.request.responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.5.5"></script></div></div></body></html>
