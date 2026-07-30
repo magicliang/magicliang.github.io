@@ -1,0 +1,862 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Hadoop 14 - MapReduce Shuffle 全流程 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇讲了 MapReduce 编程模型。本篇展开 MapReduce 性能代价最重的环节——Shuffle。 Shuffle 常被介绍成&quot;Map 到 Reduce 之间的数据传输&quot;。这个描述对应了功能但完全没解释 Shuffle 为什么慢。准确的说法是：Shuffle 是 Map 端的 Spill-Sort-Merge 流水线、Reduce 端的 Fetch-Merge 流水">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Hadoop 14 - MapReduce Shuffle 全流程">
+<meta property="og:url" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇讲了 MapReduce 编程模型。本篇展开 MapReduce 性能代价最重的环节——Shuffle。 Shuffle 常被介绍成&quot;Map 到 Reduce 之间的数据传输&quot;。这个描述对应了功能但完全没解释 Shuffle 为什么慢。准确的说法是：Shuffle 是 Map 端的 Spill-Sort-Merge 流水线、Reduce 端的 Fetch-Merge 流水">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/cover.svg">
+<meta property="article:published_time" content="2026-07-26T15:30:00.000Z">
+<meta property="article:modified_time" content="2026-07-30T08:58:09.854Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Combiner">
+<meta property="article:tag" content="Hadoop">
+<meta property="article:tag" content="MapReduce">
+<meta property="article:tag" content="Shuffle">
+<meta property="article:tag" content="Spill">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Hadoop 14 - MapReduce Shuffle 全流程",
+  "url": "https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/",
+  "image": "https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/cover.svg",
+  "datePublished": "2026-07-26T15:30:00.000Z",
+  "dateModified": "2026-07-30T08:58:09.854Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Hadoop 14 - MapReduce Shuffle 全流程',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">567</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">680</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">10</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Hadoop 14 - MapReduce Shuffle 全流程</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Hadoop 14 - MapReduce Shuffle 全流程</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-07-26T15:30:00.000Z" title="Created 2026-07-26 23:30:00">2026-07-26</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-07-30T08:58:09.854Z" title="Updated 2026-07-30 16:58:09">2026-07-30</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.8k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>14mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-07-30 16:58:09&quot;}" hidden></div><p>上一篇讲了 MapReduce 编程模型。本篇展开 MapReduce 性能代价最重的环节——Shuffle。</p>
+<p>Shuffle 常被介绍成&quot;Map 到 Reduce 之间的数据传输&quot;。这个描述对应了功能但完全没解释 Shuffle 为什么慢。准确的说法是：Shuffle 是 Map 端的 Spill-Sort-Merge 流水线、Reduce 端的 Fetch-Merge 流水线、中间的网络 HTTP 传输共同组成的复杂流程，涉及磁盘 I/O、网络 I/O、内存缓冲、排序算法等多个层。Shuffle 是 MapReduce 作业 50%+ 延迟的来源，调优 Shuffle 几乎等同于调优 MapReduce。</p>
+<p>本篇只抓一个问题：Map 端 Shuffle 怎么从内存缓冲流到本地磁盘分区文件、Reduce 端怎么从所有 Map 拉取并合并、CombineFileInputFormat 在什么场景下能减少 Map 数。</p>
+<h2 id="map-端-shuffle-的五个步骤">Map 端 Shuffle 的五个步骤</h2>
+<p>Map Task 输出的 key-value 对不是直接发给 Reduce，而是经过一个五步骤的本地流水线：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs text">1. map() 输出进入环形缓冲区（默认 100MB）<br>2. 缓冲区使用率达到阈值（默认 80%）时触发 Spill<br>3. Spill 时按 Partition 排序，每个 Partition 内按 key 排序<br>4.（可选）对每个 Partition 跑 Combiner<br>5. Spill 输出为本地磁盘文件<br>6. Map 完成时合并所有 Spill 文件为单个分区输出文件<br></code></pre></td></tr></table></figure>
+<p>详细展开每一步：</p>
+<p>环形缓冲区（Circular Buffer）是 Map 输出的临时存放地。MapReduce 用一个固定大小的 byte 数组（默认 <code>io.sort.mb</code> = 100MB）作为缓冲，map() 输出的 key-value 对序列化后写入这个数组。数组是环形——写到尾部后绕回头部继续写。</p>
+<p>缓冲区同时维护一个索引数组，记录每个 Partition 的起始位置和数据长度。索引数组让 Spill 时能快速按 Partition 切分。</p>
+<p>Spill 在缓冲区使用率达到 <code>io.sort.spill.percent</code>（默认 0.80）时触发。Spill 不是阻塞 map() 的——Spill 在后台线程做，map() 继续往缓冲区另一半写。如果缓冲区另一半也满了（map() 比 Spill 快），map() 阻塞等待 Spill 完成。</p>
+<p>Spill 的核心动作是排序。Spill 线程把缓冲区里的数据按 Partition 排序（先按 Partition 编号分桶，每个桶内按 key 排序）。排序使用快速排序，时间复杂度 O(n log n)。这就是为什么 MapReduce 输出最终是按 key 排序的——不是用户要求，是 Spill 排序的副产物。</p>
+<p>排序完成后，Spill 线程把每个 Partition 的数据写入本地磁盘的临时文件（spillN.out，N 是 Spill 序号）。如果配置了 Combiner，Spill 在写盘前会对每个 Partition 跑一次 Combiner。如果配置了压缩（<code>mapreduce.map.output.compress=true</code>），Spill 写盘前会压缩数据。</p>
+<p>Map Task 完成时，所有 Spill 文件被合并成单个分区输出文件（output 文件）。合并使用归并排序——同时打开多个 Spill 文件（默认 <code>io.sort.factor</code> = 10 个），按 key 归并。如果 Spill 文件数超过 factor，合并是分多轮做的（每轮合并 10 个文件，最终合并到 1 个）。</p>
+<p>合并完成后，Map Task 把单个 output 文件的元数据（每个 Partition 的偏移、长度）发给 ApplicationMaster，AM 把这些信息转给 Reduce Task。Reduce Task 用这些元数据从 Map Task HTTP 拉取自己负责的 Partition。</p>
+<h2 id="reduce-端-shuffle-的三个步骤">Reduce 端 Shuffle 的三个步骤</h2>
+<p>Reduce Task 启动后开始从所有 Map Task 拉取自己负责的 Partition。这个流程可以拆成三步：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">1. Fetch：并发 HTTP 请求所有 Map Task，拉取 Partition 数据<br>2. Merge：归并排序所有拉取的数据，按 key 全局有序<br>3. Group：把同一个 key 的所有 value 收集成 Iterable 传给 reduce()<br></code></pre></td></tr></table></figure>
+<p>Fetch 是 Reduce 端最重的操作。Reduce Task 默认用 <code>mapreduce.reduce.shuffle.parallelcopies</code>（默认 5）个线程并发拉取。每次拉取是 HTTP 请求到 Map Task 的 Shuffle 服务（Netty HTTP server，默认端口 8080+随机）。</p>
+<p>Reduce Task 怎么知道哪些 Map Task 持有自己需要的 Partition？通过 ApplicationMaster。AM 收集所有 Map Task 的完成状态（output 文件元数据 + HTTP 地址），Reduce Task 周期性向 AM 询问 “已完成的 Map 列表”。Reduce Task 拿到列表后立即开始拉取，不等所有 Map 完成——这是为什么 Reduce Task 可以与 Map Task 重叠执行（前面讲的 slowstart.completedmaps）。</p>
+<p>Merge 是把多个有序的小文件合并成有序的大文件。Reduce Task 维护一个 in-memory buffer（<code>mapreduce.reduce.shuffle.input.buffer.percent</code>，默认 0.70 × JVM heap），Fetch 来的数据先进内存。内存满后写本地磁盘。</p>
+<p>最终 reduce() 调用时，Reduce Task 把所有数据（内存 + 磁盘）按 key 归并排序，按 key 分组形成 Iterable。reduce() 处理完一个 key 后立即处理下一个，不需要等所有数据齐——这是流式归并，内存里同时持有的只是当前正在处理的 key 的所有 value。</p>
+<h2 id="shuffle-的网络代价">Shuffle 的网络代价</h2>
+<p>Shuffle 涉及大量网络传输。一个 100 个 Map Task + 100 个 Reduce Task 的作业，Shuffle 网络连接数是 100 × 100 = 10000 个 HTTP 请求。如果每个 Partition 平均 100MB，总网络流量是 10TB。</p>
+<p>MapReduce 的 Shuffle 是 “all-to-all” 模式——每个 Reduce 都要从每个 Map 拉数据。这与 Spark 的 Shuffle 类似，但与 Flink 的 streaming shuffle 不同（Flink 是 key-based 路由，不是 all-to-all）。</p>
+<p>网络 Shuffle 的优化方向：</p>
+<p>数据压缩：Map 输出在 Spill 时压缩（Snappy / LZO / Zstd），网络传输的字节数减少 50-90%。代价是 CPU 开销。</p>
+<p>数据本地化：如果 Map 输出的 Partition 与 Reduce 在同一节点，Shuffle 走 loopback，避开网络。这是 MapReduce 的默认优化——Reduce Task 优先从本地 Map Task 拉取。但 Reduce Task 数通常远少于 Map Task 数，每个 Reduce 必须从大部分 Map 拉取，本地化命中率有限。</p>
+<p>Combiner 减少 Map 输出量：前面讲过，Combiner 在 Map 端本地聚合，减少 Spill 数据量。Spill 减少 = Shuffle 网络流量减少。</p>
+<p>CombineFileInputFormat 合并小文件：如果输入是大量小文件，每个文件一个 Map Task，Map 数过多导致 Shuffle 网络连接数爆炸。CombineFileInputFormat 把多个小文件合并成一个 InputSplit，减少 Map 数。</p>
+<h2 id="combinefileinputformat：减少-map-数">CombineFileInputFormat：减少 Map 数</h2>
+<p>默认的 FileInputFormat 按每个文件单独切 InputSplit。一个目录里有 10000 个 1MB 小文件，会创建 10000 个 Map Task。每个 Map Task 启动开销（JVM 启动 + 初始化）几秒，10000 个 Map Task 的启动开销是几小时。</p>
+<p>CombineFileInputFormat（Hadoop 0.21+ 引入）把多个小文件合并成一个 InputSplit，每个 InputSplit 可以达到 block 大小（128MB）。10000 个 1MB 文件用 CombineFileInputFormat 切成约 80 个 InputSplit，Map 数从 10000 降到 80，启动开销减少 100 倍。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs java">job.setInputFormatClass(CombineFileInputFormat.class);<br>CombineFileInputFormat.setMaxInputSplitSize(job, <span class="hljs-number">128</span> * <span class="hljs-number">1024</span> * <span class="hljs-number">1024</span>);    <span class="hljs-comment">// 128MB</span><br>CombineFileInputFormat.setMinInputSplitSizeNode(job, <span class="hljs-number">10</span> * <span class="hljs-number">1024</span> * <span class="hljs-number">1024</span>);  <span class="hljs-comment">// 节点级最小 10MB</span><br>CombineFileInputFormat.setMinInputSplitSizeRack(job, <span class="hljs-number">40</span> * <span class="hljs-number">1024</span> * <span class="hljs-number">1024</span>);  <span class="hljs-comment">// 机架级最小 40MB</span><br></code></pre></td></tr></table></figure>
+<p>这三个参数控制 InputSplit 的边界。最大 split 大小决定合并上限，节点级最小决定同节点内合并的下限，机架级最小决定跨节点合并的下限。</p>
+<p>CombineFileInputFormat 还考虑数据本地化——优先合并同节点的文件，再合并同机架的文件。这让 Map Task 的数据本地化率（在持有数据的节点上跑的比例）仍然保持高。</p>
+<p>小文件问题在 Hadoop 生态里普遍存在——日志归档、爬虫结果、传感器数据等都产生大量小文件。CombineFileInputFormat 是处理这类输入的标准工具，生产环境的小文件作业几乎都用它。</p>
+<h2 id="shuffle-handler-的-http-协议">Shuffle Handler 的 HTTP 协议</h2>
+<p>Reduce Task 与 Map Task 之间的 Shuffle 走 HTTP。MapReduce 框架在每个 Map Task 内嵌一个 HTTP server（Shuffle Handler），监听一个端口接受 Reduce 的拉取请求。</p>
+<p>Shuffle Handler 的实现（Hadoop 2.x+）基于 Netty，支持 NIO 和 keep-alive。每次拉取是一个 HTTP GET 请求，URL 形如：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">http://map-task-host:13562/mapOutput?job=job_1721900000000_0001&amp;reduce=5&amp;map=attempt_1721900000000_0001_m_000003<br></code></pre></td></tr></table></figure>
+<p>这个请求让 Map Task 把 job_…0001 作业里、Map Task attempt_…m_000003 输出的、Partition 5 的数据返回给 Reduce。</p>
+<p>Shuffle Handler 的关键性能参数：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs text">mapreduce.shuffle.max.threads（默认 0 = 2 × CPU 核数）<br>  - 每个 Map Task 的 Shuffle HTTP server 最大并发线程数<br>  - 限制 Map Task 能同时服务多少 Reduce 请求<br><br>mapreduce.shuffle.max.connections（默认 0 = 2 × max.threads）<br>  - 单个 Map Task 最大 TCP 连接数<br>  <br>mapreduce.shuffle.connection.keep.timeout（默认 30s）<br>  - keep-alive 连接超时<br></code></pre></td></tr></table></figure>
+<p>这些参数在大集群很重要。一个 Map Task 可能被几百个 Reduce Task 同时请求，Shuffle Handler 配置不当会让 Map Task 网卡打满，其他 Reduce 拉不动。</p>
+<p>Shuffle Handler 默认不加密。如果集群启用了安全（第十八篇），Shuffle Handler 配置 SSL/TLS 加密，但加密会增加 CPU 开销和延迟。</p>
+<h2 id="实验：观察-shuffle-性能">实验：观察 Shuffle 性能</h2>
+<p>提交一个 MapReduce 作业后，在 ApplicationMaster Web UI 的 Counters 标签页可以看到大量 Shuffle 相关 counter：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><code class="hljs text">Map-Reduce Framework Counter (per Task):<br>        Map input records:                   1000000<br>        Map output records:                  5000000<br>        Map output bytes:                    500000000<br>        Combine input records:               5000000<br>        Combine output records:              500000       ← Combiner 输入 5M，输出 500K，节省 90%<br>        Spilled records:                     500000       ← Spill 记录数 = Combiner 输出<br>        BytesWritten (local disk):           50000000     ← 本地磁盘写入字节<br>        <br>Shuffle Metrics (per Reduce Task):<br>        Combine input records:               0           (Reduce 端也有 Combine，通常为 0)<br>        Combine output records:              0<br>        Reduce input records:                500000      ← Reduce 处理的记录数<br>        Reduce input groups:                 50000       ← distinct key 数<br>        Reduce output records:               50000<br>        Reduce shuffle bytes:                60000000    ← 网络拉取字节<br>        Reduce shuffle records:              500000<br>        Failed shuffle:                      0           ← 拉取失败次数（应该为 0）<br>        Merged map outputs:                  100         ← 合并了多少 Map 输出<br></code></pre></td></tr></table></figure>
+<p>这些 counter 是 Shuffle 性能调优的关键观测点。几个判断标准：</p>
+<p>Spilled records / Map output records 接近 1 是正常。如果远大于 1（例如 3 倍），说明 Spill 太频繁，需要增大 <code>io.sort.mb</code>。</p>
+<p>Combine output records / Combine input records 应该是减少比例（例如 10%）。如果接近 100%，说明 Combiner 没起到合并作用（key 全部 distinct），Combiner 应该去掉。</p>
+<p>Failed shuffle 必须接近 0。如果非 0，说明 Reduce 拉取失败重试，可能是网络问题或 Map Task 的 Shuffle Handler 配置不足。</p>
+<p>Reduce shuffle bytes 是 Shuffle 网络流量。配合 Map output bytes 看压缩比——开启 Map 输出压缩后，shuffle bytes 应该显著小于 map output bytes。</p>
+<p>通过修改 <code>io.sort.mb</code>、<code>io.sort.factor</code>、<code>mapreduce.reduce.shuffle.parallelcopies</code> 等参数，重新跑作业，对比 counter 变化，可以直观看到 Shuffle 调优的效果。</p>
+<h2 id="模式提炼">模式提炼</h2>
+<p>MapReduce Shuffle 体现的设计模式：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs text">模式：环形缓冲 + Spill 排序 + 网络拉取 + 归并合并<br><br>- 数据生产端用固定大小缓冲，满了就落盘（避免 OOM）<br>- 落盘前按 Partition + key 排序（让下游合并简单）<br>- 数据消费端并发拉取所有生产端数据<br>- 归并合并保持流式（不全量入内存）<br>- 中间走网络 HTTP（标准化协议）<br>- 调优靠调整缓冲大小、并发数、合并因子<br></code></pre></td></tr></table></figure>
+<p>这个模式不只是 MapReduce。Spark Shuffle 几乎是同构——SortShuffleManager 的内部数据流与 MapReduce 几乎相同。Flink 的 Batch Shuffle 也用类似流程（差异在 Flink 支持流式 shuffle）。Presto / Hive 的 Exchange operator 也是同一思路——上游落盘排序，下游拉取合并。</p>
+<p>数据库的 parallel hash join 也是类似模式——build 端按 hash bucket 分桶落盘，probe 端按相同 hash 拉。差别在数据库按 hash 分桶，MapReduce 按 key 排序（hash 是 sort 的特殊情况）。</p>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>MapReduce Shuffle 概念</th>
+<th>Spark Shuffle</th>
+<th>Flink Shuffle</th>
+<th>Hive Exchange</th>
+<th>DB Parallel Join</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>环形缓冲</td>
+<td>Serializer buffer</td>
+<td>network buffer</td>
+<td>sort buffer</td>
+<td>work_mem</td>
+</tr>
+<tr>
+<td>Spill 排序</td>
+<td>SortShuffleWriter</td>
+<td>sort-shuffle</td>
+<td>external sort</td>
+<td>external sort</td>
+</tr>
+<tr>
+<td>Partition 文件</td>
+<td>data file + index</td>
+<td>partitioned file</td>
+<td>bucket file</td>
+<td>hash bucket</td>
+</tr>
+<tr>
+<td>Shuffle HTTP</td>
+<td>netty / transport</td>
+<td>netty</td>
+<td>jetty</td>
+<td>proprietary</td>
+</tr>
+<tr>
+<td>Combiner</td>
+<td>map-side aggregation</td>
+<td>combiner</td>
+<td>map-side aggregation</td>
+<td>partial aggregation</td>
+</tr>
+<tr>
+<td>Merge</td>
+<td>memory + disk merge</td>
+<td>chained merge</td>
+<td>merge join</td>
+<td>merge join</td>
+</tr>
+<tr>
+<td>CombineFileInputFormat</td>
+<td>CombineFileInputFormat</td>
+<td>file source</td>
+<td>Combine input</td>
+<td>partition prune</td>
+</tr>
+</tbody>
+</table>
+<p>注意 Spark 这一列。Spark 2.x 起默认用 SortShuffleManager，与 MapReduce 的 Shuffle 流程几乎相同。Spark 的优势是 Stage 内的窄依赖不需要 Shuffle（窄依赖在内存中 pipeline），只有宽依赖（Shuffle 边界）才走 Shuffle——这与 MapReduce 的&quot;每个作业强制 Map-Reduce 两阶段&quot;形成对比，是 Spark 性能优势的核心来源。</p>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：“Shuffle 在内存里做很快”。MapReduce Shuffle 强制落盘——Map 端 Spill 落本地磁盘，Reduce 端 Fetch 后内存满也落盘。这是 MapReduce 设计的容错要求（落盘才能让 Task 失败重试不需要重跑 Shuffle）。Spark 在 Stage 内可以不落盘（窄依赖），但 Shuffle 边界仍然落盘。</p>
+<p>误解二：“Shuffle 网络是 MapReduce 性能瓶颈”。网络确实是瓶颈之一，但磁盘 I/O 也是。Spill + Merge 涉及多次本地磁盘读写，磁盘带宽不够时 Spill 排队，整个 Map Task 变慢。生产环境 MapReduce 集群通常用 SSD 加速 Shuffle——相比 HDD，SSD 让 Shuffle 吞吐提升数倍。</p>
+<p>误解三：“CombineFileInputFormat 总是好的”。CombineFileInputFormat 适合小文件场景。如果输入本来是大文件（128MB+），CombineFileInputFormat 不会改变 InputSplit 数。错误配置 CombineFileInputFormat 的 maxInputSplitSize（例如设为 1GB）可能让单个 InputSplit 跨多个 block，破坏数据本地化。</p>
+<p>误解四：“Combiner 是 Reducer 的简化版本”。Combiner 和 Reducer 用同一个类（在 word count 场景），但它们的运行时机和输入不同。Combiner 在 Map 端 Spill 前跑，输入是单个 Map Task 的输出。Reducer 在 Reduce 端跑，输入是所有 Map Task 的对应 Partition 拉取后合并的结果。Combiner 是本地聚合优化，Reducer 是最终聚合。</p>
+<p>误解五：“Reduce 数越多越好（并行度高）”。Reduce 数过多让每个 Reduce 拉取的 Partition 很小（例如 1MB），但每次 HTTP 请求的固定开销（连接握手、Shuffle Handler 处理）几乎与拉取大小无关。1MB 的拉取可能 50% 时间是 HTTP 开销。每个 Reduce 处理 1-5 GB 才能让网络有效利用。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>
+<p>提交一个 word count 作业，在 ApplicationMaster Web UI 的 Counters 标签页观察 Map output records、Spilled records、Reduce shuffle bytes。修改 <code>io.sort.mb</code> 从 100MB 改到 512MB，重新跑，对比 Spilled records 变化。</p>
+</li>
+<li>
+<p>在 <code>apache/hadoop</code> 源码里找到 <code>MapTask.java</code>、<code>ReduceTask.java</code>、<code>Shuffle.java</code>、<code>ShuffleHandler.java</code>（hadoop-mapreduce-client-core / hadoop-mapreduce-client-shuffle 模块），观察 Spill、Fetch、Shuffle Handler 的核心实现。</p>
+</li>
+<li>
+<p>准备一个目录里放 1000 个小文件（每个 1MB），分别用 FileInputFormat 和 CombineFileInputFormat 提交 MapReduce 作业，对比 Map Task 数和作业总执行时间。</p>
+</li>
+<li>
+<p>思考题：如果让 MapReduce Shuffle 走 RDMA（Remote Direct Memory Access）替代 HTTP，Shuffle 性能会怎么变化？哪些环节是 RDMA 也无法加速的？</p>
+</li>
+</ol>
+<h2 id="系列导航">系列导航</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align:right">序号</th>
+<th>主题</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:right">00-06</td>
+<td>HDFS 存储层（00 导读 / 01-06 HDFS 各主题）</td>
+<td>第一阶段（已完成）</td>
+</tr>
+<tr>
+<td style="text-align:right">07-12</td>
+<td>YARN 资源管理层</td>
+<td>第二阶段（已完成）</td>
+</tr>
+<tr>
+<td style="text-align:right">13</td>
+<td>MapReduce 编程模型：分而治之的工程化表达</td>
+<td>上一篇</td>
+</tr>
+<tr>
+<td style="text-align:right"><strong>14</strong></td>
+<td><strong>Shuffle 全流程：Map 端、Reduce 端与磁盘 I/O 的代价</strong></td>
+<td><strong>本篇</strong></td>
+</tr>
+<tr>
+<td style="text-align:right">15</td>
+<td>MRv2 on YARN：ApplicationMaster 与 Task Attempt</td>
+<td>下一篇</td>
+</tr>
+<tr>
+<td style="text-align:right">16-19</td>
+<td>HA、安全与 Common 基础设施</td>
+<td>第四阶段，待开始</td>
+</tr>
+<tr>
+<td style="text-align:right">20-22</td>
+<td>演进、生态与对比</td>
+<td>第五阶段，待开始</td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Jeffrey Dean, Sanjay Ghemawat. <em>MapReduce: Simplified Data Processing on Large Clusters.</em> OSDI 2004. Section 4 “Refinements” 描述了 Combiner、局部聚合等优化。</li>
+<li>Apache Hadoop 官方文档：Shuffle / Sort. <a target="_blank" rel="noopener" href="https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html#ShuffleSort">https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-core/MapReduceTutorial.html#ShuffleSort</a></li>
+<li>Apache Hadoop 源码：<code>MapTask.java</code>、<code>ReduceTask.java</code>、<code>Shuffle.java</code>、<code>ShuffleHandler.java</code>. <a target="_blank" rel="noopener" href="https://github.com/apache/hadoop">https://github.com/apache/hadoop</a></li>
+<li>Tom White. <em>Hadoop: The Definitive Guide.</em> O’Reilly, 4th Edition 2015. Chapter 6 详述了 Shuffle 内部机制和调优参数。</li>
+<li>Siddharth Suri. <em>On the Performance of MapReduce Shuffle.</em>（UC Berkeley 关于 Shuffle 性能模型的学术分析）</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/">https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/MapReduce/">MapReduce</a><a class="post-meta__tags" href="/tags/Shuffle/">Shuffle</a><a class="post-meta__tags" href="/tags/Hadoop/">Hadoop</a><a class="post-meta__tags" href="/tags/Spill/">Spill</a><a class="post-meta__tags" href="/tags/Combiner/">Combiner</a></div><div class="post-share"><div class="social-share" data-image="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-13-MapReduce-%E7%BC%96%E7%A8%8B%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%88%86%E8%80%8C%E6%B2%BB%E4%B9%8B/" title="深入 Hadoop 13 - MapReduce 编程模型与分而治之"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-13-MapReduce-%E7%BC%96%E7%A8%8B%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%88%86%E8%80%8C%E6%B2%BB%E4%B9%8B/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 13 - MapReduce 编程模型与分而治之</div></div><div class="info-2"><div class="info-item-1">第一、第二阶段把 HDFS 和 YARN 讲完了。从这一篇起进入 MapReduce——Hadoop 三大子系统的最后一个，也是历史最久的一个。 MapReduce 常被介绍成&quot;Hadoop 的计算引擎&quot;。这个描述对应了功能但漏了 MapReduce 的本质。准确的说法是：MapReduce 是把&quot;分而治之&quot;这个通用算法思路工程化为可运行框架的产物——把大输入切成 InputSplit 给 Map 并行处理，用 Partitioner 把 Map 输出按 key 分发到 Reduce，Reduce 聚合后写 HDFS。三阶段切分（Map / Shuffle / Reduce）和三个用户钩子（Mapper / Combiner / Reducer）是 MapReduce 全部抽象的核心。 本篇只抓一个问题：MapReduce 为什么把计算切成 Map → Shuffle → Reduce 三阶段、Combiner 在什么场景下能省 Shuffle 流量、Partitioner 与 Reduce 个数的关系。 三个阶段的本质 一次 MapRed...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-00-%E5%AF%BC%E8%AF%BB-%E8%8A%82%E7%82%B9%E6%80%BB%E4%BC%9A%E5%A4%B1%E8%B4%A5/" title="深入 Hadoop 00 - 导读：节点总会失败"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-00-%E5%AF%BC%E8%AF%BB-%E8%8A%82%E7%82%B9%E6%80%BB%E4%BC%9A%E5%A4%B1%E8%B4%A5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 00 - 导读：节点总会失败</div></div><div class="info-2"><div class="info-item-1">Hadoop 常被介绍为&quot;HDFS + YARN + MapReduce 三驾马车&quot;。这个分类把重点放错了位置。把存储、调度、计算切成三件独立的事情，读者很难回答下面这个问题：为什么这三个子系统会一起出现在同一个项目里，而不是像 Spark、Flink、Kafka 那样作为独立组件存在？ 更准确的说法是：Hadoop 是一组关于&quot;如何构建运行在大量廉价节点上的分布式系统&quot;的前提假设在三个不同层面的具体化。这组前提把整个项目串成一条主线——节点总会失败、数据总是巨大、廉价比专用更重要。HDFS、YARN、MapReduce 各自处理这组前提下的一个子问题：HDFS 把大文件切成块并多副本放置，YARN 把集群资源切成容器并按策略分配，MapReduce 把大计算切成任务并按失败重试执行。 本系列只抓一个问题：Hadoop 这套以&quot;节点总会失败&quot;为前提假设的工程化方案，在 HDFS、YARN、MapReduce 三个层面是如何具体实现的，每个实现里有哪些可以迁移到其他分布式系统的设计模式。 GFS 论文留下的设计遗产 要理解...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/" title="深入 Hadoop 15 - MRv2 on YARN ApplicationMaster 与 Task Attempt"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 15 - MRv2 on YARN ApplicationMaster 与 Task Attempt</div></div><div class="info-2"><div class="info-item-1">上一篇讲了 Shuffle。本篇讲 MapReduce 在 YARN 上的具体实现——MRv2。这是 MapReduce 计算模型篇的最后一篇。 MRv2 常被介绍成&quot;MapReduce 在 YARN 上的版本&quot;。这个描述对应了部署形态但漏了内部架构。准确的说法是：MRv2 把 Hadoop 1.x 的 JobTracker 拆成 ResourceManager（资源管理）和 MRAppMaster（作业编排）两部分，MRAppMaster 是一个普通的 YARN ApplicationMaster，运行在 container 里。每个 Task 也是一个 container（YarnChild），通过 umbilical RPC 与 MRAppMaster 通信。MRv2 的 Speculative Execution、Counter、Task Recovery 等机制都是 MRAppMaster 实现的，与 YARN 基础设施解耦。 本篇只抓一个问题：MRAppMaster 内部是怎么编排 Map / Reduce Task 的、Task Attempt ...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-11-YARN-HA-%E4%B8%8E-Federation/" title="深入 Hadoop 11 - YARN HA 与 Federation"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-11-YARN-HA-%E4%B8%8E-Federation/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 11 - YARN HA 与 Federation</div></div><div class="info-2"><div class="info-item-1">上一篇讲了应用程序生命周期。本篇讲 ResourceManager 怎么解决单点问题和集群规模上限问题——YARN HA 和 YARN Federation。 YARN HA 常被介绍成&quot;两个 ResourceManager 互为热备&quot;。这个描述对应了部署形态但漏了几个关键点：RM State Store 怎么持久化作业元数据、Standby RM 怎么与 Active 同步、Active 切换时 NM 和 AM 怎么重连。YARN Federation 常被简化成&quot;多个 YARN 集群&quot;，但漏了 Router、AMRMProxy、SubCluster 这些核心抽象。准确的说法是：YARN HA 通过 ZooKeeper 选主 + RM State Store 共享状态实现 Active/Standby 切换；YARN Federation 通过无状态 Router + AMRMProxy 让多个独立子集群对客户端表现为单一集群，每个子集群内部仍然有自己的 HA。 本篇只抓一个问题：YARN RM HA 的切换流程是怎么工作的、RM Sta...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-07-YARN-%E6%9E%B6%E6%9E%84%E4%B8%8E%E4%B8%89%E6%96%B9%E5%A5%91%E7%BA%A6/" title="深入 Hadoop 07 - YARN 架构与三方契约"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-07-YARN-%E6%9E%B6%E6%9E%84%E4%B8%8E%E4%B8%89%E6%96%B9%E5%A5%91%E7%BA%A6/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 07 - YARN 架构与三方契约</div></div><div class="info-2"><div class="info-item-1">第一阶段把 HDFS 切完了。从这一篇起进入 YARN，先讲架构。 YARN 常被介绍成&quot;Hadoop 的资源管理器&quot;。这个描述对应了职责但漏了关键点。准确的说法是：YARN 是一个把&quot;全局调度&quot;和&quot;作业内调度&quot;拆开的双层调度系统，引入了 ApplicationMaster 这个新角色承担作业级编排，把 Hadoop 1.x 的 JobTracker 单体拆成 ResourceManager + ApplicationMaster + NodeManager 三个独立契约。Container 抽象是这个拆分的基础——它把&quot;一段资源 + 一段进程&quot;打包成统一的调度单位，让同一套基础设施能同时承载 MapReduce、Spark、Flink、Tez、Storm 等不同计算模型。 本篇只抓一个问题：YARN 的三方契约（ResourceManager、NodeManager、ApplicationMaster）是怎么切开的，Container 抽象的本质是什么，为什么 Hadoop 2.x 必须从 JobT...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-06-HDFS-3-x-%E6%BC%94%E8%BF%9B%E4%B8%8E%E7%BA%A0%E5%88%A0%E7%A0%81/" title="深入 Hadoop 06 - HDFS 3.x 演进与纠删码"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-06-HDFS-3-x-%E6%BC%94%E8%BF%9B%E4%B8%8E%E7%BA%A0%E5%88%A0%E7%A0%81/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 06 - HDFS 3.x 演进与纠删码</div></div><div class="info-2"><div class="info-item-1">上一篇讲了 HA 怎么解决 NameNode 单点问题。本篇讲 HDFS 在 Hadoop 3.x 时代的三个核心演进：纠删码（Erasure Coding）、路由联邦（Router-Based Federation）、Observer NameNode。这三个特性分别解决三个不同的瓶颈：存储成本、NameNode 元数据上限、读吞吐上限。 HDFS 3.x 常被描述成&quot;HDFS 的现代化版本&quot;。这个描述对应了发布节奏但没解释演进逻辑。准确的说法是：HDFS 在 2.x 解决了 HA 和 YARN 之后，3.x 时代面对的核心问题是 PB 级集群的存储成本和元数据瓶颈，所以引入纠删码降存储、引入路由联邦解决元数据上限、引入 Observer NameNode 拆分读写流量。三个特性的设计动机都是&quot;假设集群规模已经超过单 NameNode 上限&quot;。 本篇只抓一个问题：HDFS 3.x 引入的三个主要特性各自解决什么瓶颈、用什么代价、适合什么场景。 纠删码：用 CPU 换存储 HDFS 默认三副本意味着每存 1TB 用户数据要占 3TB 物理存...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#map-%E7%AB%AF-shuffle-%E7%9A%84%E4%BA%94%E4%B8%AA%E6%AD%A5%E9%AA%A4"><span class="toc-number">1.</span> <span class="toc-text">Map 端 Shuffle 的五个步骤</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#reduce-%E7%AB%AF-shuffle-%E7%9A%84%E4%B8%89%E4%B8%AA%E6%AD%A5%E9%AA%A4"><span class="toc-number">2.</span> <span class="toc-text">Reduce 端 Shuffle 的三个步骤</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#shuffle-%E7%9A%84%E7%BD%91%E7%BB%9C%E4%BB%A3%E4%BB%B7"><span class="toc-number">3.</span> <span class="toc-text">Shuffle 的网络代价</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#combinefileinputformat%EF%BC%9A%E5%87%8F%E5%B0%91-map-%E6%95%B0"><span class="toc-number">4.</span> <span class="toc-text">CombineFileInputFormat：减少 Map 数</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#shuffle-handler-%E7%9A%84-http-%E5%8D%8F%E8%AE%AE"><span class="toc-number">5.</span> <span class="toc-text">Shuffle Handler 的 HTTP 协议</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%EF%BC%9A%E8%A7%82%E5%AF%9F-shuffle-%E6%80%A7%E8%83%BD"><span class="toc-number">6.</span> <span class="toc-text">实验：观察 Shuffle 性能</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">7.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">8.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">9.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">10.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">11.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">12.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

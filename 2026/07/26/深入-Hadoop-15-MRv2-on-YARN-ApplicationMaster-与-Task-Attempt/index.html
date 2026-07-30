@@ -1,0 +1,880 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Hadoop 15 - MRv2 on YARN ApplicationMaster 与 Task Attempt | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇讲了 Shuffle。本篇讲 MapReduce 在 YARN 上的具体实现——MRv2。这是 MapReduce 计算模型篇的最后一篇。 MRv2 常被介绍成&quot;MapReduce 在 YARN 上的版本&quot;。这个描述对应了部署形态但漏了内部架构。准确的说法是：MRv2 把 Hadoop 1.x 的 JobTracker 拆成 ResourceManager（资源管理）和">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Hadoop 15 - MRv2 on YARN ApplicationMaster 与 Task Attempt">
+<meta property="og:url" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇讲了 Shuffle。本篇讲 MapReduce 在 YARN 上的具体实现——MRv2。这是 MapReduce 计算模型篇的最后一篇。 MRv2 常被介绍成&quot;MapReduce 在 YARN 上的版本&quot;。这个描述对应了部署形态但漏了内部架构。准确的说法是：MRv2 把 Hadoop 1.x 的 JobTracker 拆成 ResourceManager（资源管理）和">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/cover.svg">
+<meta property="article:published_time" content="2026-07-26T15:45:00.000Z">
+<meta property="article:modified_time" content="2026-07-30T08:58:09.854Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="ApplicationMaster">
+<meta property="article:tag" content="Hadoop">
+<meta property="article:tag" content="MRv2">
+<meta property="article:tag" content="MapReduce">
+<meta property="article:tag" content="Speculative Execution">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Hadoop 15 - MRv2 on YARN ApplicationMaster 与 Task Attempt",
+  "url": "https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/",
+  "image": "https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/cover.svg",
+  "datePublished": "2026-07-26T15:45:00.000Z",
+  "dateModified": "2026-07-30T08:58:09.854Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Hadoop 15 - MRv2 on YARN ApplicationMaster 与 Task Attempt',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">567</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">680</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">10</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Hadoop 15 - MRv2 on YARN ApplicationMaster 与 Task Attempt</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Hadoop 15 - MRv2 on YARN ApplicationMaster 与 Task Attempt</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-07-26T15:45:00.000Z" title="Created 2026-07-26 23:45:00">2026-07-26</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-07-30T08:58:09.854Z" title="Updated 2026-07-30 16:58:09">2026-07-30</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>15mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-07-30 16:58:09&quot;}" hidden></div><p>上一篇讲了 Shuffle。本篇讲 MapReduce 在 YARN 上的具体实现——MRv2。这是 MapReduce 计算模型篇的最后一篇。</p>
+<p>MRv2 常被介绍成&quot;MapReduce 在 YARN 上的版本&quot;。这个描述对应了部署形态但漏了内部架构。准确的说法是：MRv2 把 Hadoop 1.x 的 JobTracker 拆成 ResourceManager（资源管理）和 MRAppMaster（作业编排）两部分，MRAppMaster 是一个普通的 YARN ApplicationMaster，运行在 container 里。每个 Task 也是一个 container（YarnChild），通过 umbilical RPC 与 MRAppMaster 通信。MRv2 的 Speculative Execution、Counter、Task Recovery 等机制都是 MRAppMaster 实现的，与 YARN 基础设施解耦。</p>
+<p>本篇只抓一个问题：MRAppMaster 内部是怎么编排 Map / Reduce Task 的、Task Attempt 怎么向 AM 报告进度、Speculative Execution 的触发条件和代价、AM 重启时怎么恢复 Task 状态。</p>
+<h2 id="mrappmaster-的内部结构">MRAppMaster 的内部结构</h2>
+<p>MRAppMaster 是 MapReduce 框架的 ApplicationMaster 实现。它本身是一个普通 Java 进程，跑在 YARN 分配的 container 里（container-0）。内部结构可以拆成几个核心组件：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs text">MRAppMaster<br>├─ Job Init：从 HDFS 加载作业配置和 InputSplit 元数据<br>├─ Job Tracker（internal）：作业内 task 调度<br>├─ Speculative Executor：慢任务检测与备份启动<br>├─ Recovery Manager：AM 重启时恢复 Task 状态<br>├─ Container Launcher：与 NM 通信启动 / 停止 container<br>├─ Task Clean-up：清理完成的 task 工作目录<br>└─ TaskAttemptListener：接收 Task 的进度报告<br></code></pre></td></tr></table></figure>
+<p>Job Init 阶段做几件事：</p>
+<p>读取作业配置文件（job.xml，从 HDFS 加载）。配置包含所有 MapReduce 参数——Mapper 类、Reducer 类、InputFormat、OutputFormat、Reduce 数、Combiner 等。</p>
+<p>调用 InputFormat.getSSplit() 计算所有 InputSplit 列表。每个 InputSplit 包含数据位置（哪些 block 在哪些 DataNode）和长度。这个列表会分发给后续 Map Task，让 MRAppMaster 可以做数据本地化调度（优先在持有数据的节点上启动 Map Task）。</p>
+<p>初始化作业状态机——作业进入 RUNNING 状态，准备启动 task。</p>
+<p>Job Tracker（internal）是 MRAppMaster 内部的 task 调度器。它决定哪个 task 在哪个节点上跑、什么时候启动 Reduce Task、什么时候触发 Speculative Execution。注意这个 Job Tracker 与 Hadoop 1.x 的 JobTracker 完全不同——前者是作业内调度（一个 MRAppMaster 一个），后者是集群级调度（一个集群一个）。命名巧合，不是同一个东西。</p>
+<p>Job Tracker（internal）的调度逻辑：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs text">1. 优先调度 Map Task<br>   - 按&quot;数据本地化优先&quot;原则，选择持有 InputSplit 数据的 NM<br>   - 如果本地 NM 资源不足，扩展到同机架 NM<br>   - 最后扩展到任意 NM<br>2. 当 Map Task 完成比例达到 slowstart（默认 5%），启动 Reduce Task<br>   - Reduce Task 数由用户配置（mapreduce.job.reduces）<br>   - Reduce 提前启动让它可以一边等 Map 完成一边 Fetch 数据<br>3. 所有 Map 完成后，全部 Reduce 已就位，作业进入纯 Reduce 阶段<br>4. 所有 Reduce 完成，作业 FINISHED<br></code></pre></td></tr></table></figure>
+<p>这种&quot;Map 优先 + Reduce 提前启动&quot;的策略是 MapReduce 性能调优的关键维度之一。slowstart 设得低（例如 0.05）让 Reduce 提前启动，可以隐藏 Reduce Task 的启动开销；设得高（例如 0.5）让 Reduce 等更久但避免浪费资源。</p>
+<h2 id="task-attempt-的生命周期">Task Attempt 的生命周期</h2>
+<p>每个 Task（例如某个具体的 Map Task “task_…_m_000000”）在执行过程中可能有多次 Attempt。第一次 Attempt 失败时 AM 会启动新 Attempt，直到达到最大重试次数（默认 4，<code>mapreduce.map.max.attempts</code> / <code>mapreduce.reduce.max.attempts</code>）。</p>
+<p>Task Attempt 的状态机：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">NEW → UNASSIGNED → ASSIGNED → RUNNING → COMMIT_PENDING → SUCCEEDED<br>                                                  ↓<br>                                                FAILED<br>                                                  ↓<br>                                            KILLED (if too many)<br></code></pre></td></tr></table></figure>
+<p>NEW：刚创建，未分配 container。<br>
+UNASSIGNED：已分配 container，AM 准备启动。<br>
+ASSIGNED：container 已分配到某个 NM，AM 已通过 RPC 让 NM 启动。<br>
+RUNNING：container 进程已启动，开始执行 MapTask 或 ReduceTask。<br>
+COMMIT_PENDING：Task 完成，请求 AM 提交输出（防止多个 Attempt 同时写 OutputFormat）。<br>
+SUCCEEDED：Task 输出已提交，Task 成功完成。<br>
+FAILED：Task 失败，AM 决定是否启动新 Attempt。<br>
+KILLED：Task 被强制终止（Speculative、用户 kill、抢占）。</p>
+<p>每次 Attempt 启动都创建一个全局唯一的 AttemptId（例如 attempt_1721900000000_0001_m_000000_0）。这个 ID 后缀 _0、_1、_2 表示第几次 Attempt。</p>
+<p>Attempt 失败的常见原因：</p>
+<p>container 进程崩溃（OOM、JVM crash、被 cgroups 杀）。<br>
+container 与 AM 心跳超时（默认 <code>mapreduce.task.timeout</code> = 600000ms 即 10 分钟）。这种&quot;挂起的 Task&quot;AM 没收到心跳，标记为 FAILED。Task 实际可能还在跑，但 AM 已经启动新 Attempt。<br>
+Task 主动抛出未捕获异常（用户 Mapper/Reducer 代码 bug）。<br>
+NM 故障（节点宕机），AM 通过 RM 知道该 NM dead，把该 NM 上所有 Task Attempt 标记 FAILED。</p>
+<h2 id="umbilical-rpc：task-与-am-的通信">Umbilical RPC：Task 与 AM 的通信</h2>
+<p>Task 进程（YarnChild）启动后通过 umbilical RPC 与 MRAppMaster 通信。这是一个简单的 RPC 协议，承担三类信息：</p>
+<p>进度报告：Task 周期性向 AM 报告当前进度（0.0 - 1.0 浮点数）。AM 用这个进度判断 Task 健康度（长时间没进度更新可能是 Task 挂起）。</p>
+<p>Counter 上报：Task 把 Counter（Map 输入记录数、Spilled records 等）实时上报给 AM。AM 聚合所有 Task 的 Counter，在 Web UI 展示。</p>
+<p>完成通知：Task 完成后通过 umbilical RPC 调用 AM 的 done() 方法，告诉 AM 自己的输出可以提交。</p>
+<p>umbilical RPC 的默认心跳间隔 1 秒（<code>mapreduce.task.progress.report.interval</code>），超时 10 分钟（<code>mapreduce.task.timeout</code>）。</p>
+<p>注意 umbilical 是 Task 主动调用 AM 的 RPC，不是 AM 拉取 Task——这与 NM 与 RM 的关系（NM 主动 RPC RM）一致。Task 是 RPC client，AM 是 RPC server。</p>
+<p>如果 Task 不报告进度超过 timeout，AM 标记该 Task 为挂起并启动新 Attempt。这个机制防止 Task 死循环或 GC 停顿导致的无限等待。代价是误判——长时间 GC 停顿的 Task 可能被错误标记 FAILED。处理这种场景的方法是调大 timeout（<code>mapreduce.task.timeout</code>），或者让用户代码在长时间操作前调用 <code>context.progress()</code> 报告进度。</p>
+<h2 id="speculative-execution：对抗慢节点">Speculative Execution：对抗慢节点</h2>
+<p>集群里某些节点比平均慢——磁盘老化、网络抖动、CPU 负载高。如果一个 MapReduce 作业有 1000 个 Map Task，999 个在 10 分钟内完成，1 个慢节点上的 Map Task 跑了 1 小时，整个作业延迟被这个慢 Task 拖到 1 小时。</p>
+<p>Speculative Execution（推测执行）是 MapReduce 对抗慢节点的机制。AM 检测哪些 Task 比平均慢，启动备份 Attempt。哪个 Attempt 先完成就用哪个，另一个被 kill。</p>
+<p>具体检测算法（DefaultSpeculator）：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs text">1. 对每个 Task，计算其 progress rate（progress / 已运行时间）<br>2. 计算所有 Task 的平均 progress rate<br>3. 如果某 Task 的 progress rate 显著低于平均<br>   (avg - x) / stddev &gt; threshold（默认 1.0 stddev）<br>   并且该 Task 已运行时间超过 60 秒<br>   并且作业还有空闲资源（队列里没排队的 Task）<br>   → 启动该 Task 的 Speculative Attempt<br>4. Speculative Attempt 与原 Attempt 同时跑，谁先完成用谁<br></code></pre></td></tr></table></figure>
+<p>Speculative Execution 的配置：</p>
+<figure class="highlight xml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><code class="hljs xml"><span class="hljs-tag">&lt;<span class="hljs-name">property</span>&gt;</span><br>  <span class="hljs-tag">&lt;<span class="hljs-name">name</span>&gt;</span>mapreduce.map.speculative<span class="hljs-tag">&lt;/<span class="hljs-name">name</span>&gt;</span><br>  <span class="hljs-tag">&lt;<span class="hljs-name">value</span>&gt;</span>true<span class="hljs-tag">&lt;/<span class="hljs-name">value</span>&gt;</span>     <span class="hljs-comment">&lt;!-- 默认开启 Map Speculative --&gt;</span><br><span class="hljs-tag">&lt;/<span class="hljs-name">property</span>&gt;</span><br><span class="hljs-tag">&lt;<span class="hljs-name">property</span>&gt;</span><br>  <span class="hljs-tag">&lt;<span class="hljs-name">name</span>&gt;</span>mapreduce.reduce.speculative<span class="hljs-tag">&lt;/<span class="hljs-name">name</span>&gt;</span><br>  <span class="hljs-tag">&lt;<span class="hljs-name">value</span>&gt;</span>false<span class="hljs-tag">&lt;/<span class="hljs-name">value</span>&gt;</span>    <span class="hljs-comment">&lt;!-- 默认关闭 Reduce Speculative（Reduce 输出大，备份代价高） --&gt;</span><br><span class="hljs-tag">&lt;/<span class="hljs-name">property</span>&gt;</span><br><span class="hljs-tag">&lt;<span class="hljs-name">property</span>&gt;</span><br>  <span class="hljs-tag">&lt;<span class="hljs-name">name</span>&gt;</span>mapreduce.job.speculative.slowtaskthreshold<span class="hljs-tag">&lt;/<span class="hljs-name">name</span>&gt;</span><br>  <span class="hljs-tag">&lt;<span class="hljs-name">value</span>&gt;</span>1.0<span class="hljs-tag">&lt;/<span class="hljs-name">value</span>&gt;</span>      <span class="hljs-comment">&lt;!-- 慢 task 检测阈值（ stddev 数） --&gt;</span><br><span class="hljs-tag">&lt;/<span class="hljs-name">property</span>&gt;</span><br></code></pre></td></tr></table></figure>
+<p>Speculative Execution 的代价是资源浪费——备份 Attempt 占用额外 container。如果集群资源紧张，Speculative 抢占其他作业的资源。生产环境通常在 Map 阶段开启（Map 输出中间结果，备份代价小），Reduce 阶段关闭（Reduce 输出大文件，备份代价大）。</p>
+<p>注意 Speculative 与 Combiner、Pipeline 容错的差异。Combiner 是数据优化（减少 Shuffle 流量），Pipeline 容错是传输层重试，Speculative 是 Task 层重试。三者独立，可以同时启用。</p>
+<h2 id="counter：性能观测的核心">Counter：性能观测的核心</h2>
+<p>MapReduce 提供 Counter 机制让 Task 上报指标。Counter 是 (group, name, value) 三元组，Task 通过 context.getCounter(group, name).increment(1) 上报。AM 聚合所有 Task 的 Counter 在 Web UI 展示。</p>
+<p>Hadoop 内置的 Counter 分几类：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><code class="hljs text">Filesystem Counters<br>  FILE_BYTES_READ / FILE_BYTES_WRITTEN     （本地磁盘读写）<br>  HDFS_BYTES_READ / HDFS_BYTES_WRITTEN     （HDFS 读写）<br><br>Map-Reduce Framework<br>  MAP_INPUT_RECORDS / MAP_OUTPUT_RECORDS<br>  MAP_OUTPUT_BYTES<br>  COMBINE_INPUT_RECORDS / COMBINE_OUTPUT_RECORDS<br>  REDUCE_INPUT_RECORDS / REDUCE_OUTPUT_RECORDS<br>  SPILLED_RECORDS                          （Spill 总记录数）<br>  SHUFFLED_MAPS                           （Shuffle 完成的 Map 数）<br><br>Shuffle Errors<br>  BAD_ID / CONNECTION / IO_ERROR / WRONG_LENGTH / WRONG_MAP / WRONG_REDUCE<br>  （各种 Shuffle 错误）<br><br>Task Counters<br>  CPU_MILLISECONDS<br>  GC_TIME_MILLIS<br>  PHYSICAL_MEMORY_BYTES<br>  VIRTUAL_MEMORY_BYTES<br>  COMMITTED_HEAP_BYTES<br></code></pre></td></tr></table></figure>
+<p>用户也可以定义自定义 Counter。在 Mapper 或 Reducer 里调用 <code>context.getCounter(&quot;MyGroup&quot;, &quot;MyCounter&quot;).increment(1)</code>。这些 Counter 自动上报给 AM，在 Web UI 可见。</p>
+<p>Counter 是 MapReduce 性能调优的核心观测点。每个 Counter 反映一个具体维度，通过对比 baseline 和调优后的 Counter 数值，可以判断调优是否有效。</p>
+<p>例如调 <code>io.sort.mb</code>：调优前 Spilled records = 5M，调优后 = 1M，说明 Spill 减少 80%。配合 Filesystem Counter 的本地磁盘字节变化，可以确认 I/O 优化效果。</p>
+<h2 id="am-重启时的-task-recovery">AM 重启时的 Task Recovery</h2>
+<p>MRAppMaster 自己是一个 YARN ApplicationAttempt。如果 AM 进程崩溃，RM 会启动新 Attempt（默认 max-attempts = 2，可配置更高）。新 Attempt 必须恢复作业状态，否则已完成的 Task 全部丢失。</p>
+<p>MRv2 的 Recovery Manager 负责这个过程：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">1. 新 AM 启动，从 HDFS 读取作业历史<br>   - /tmp/hadoop-yarn/staging/&lt;user&gt;/.staging/job_xxx/ 里有 job.xml、job.split、job.jar<br>2. 从作业历史里读取已完成的 Task Attempt 列表<br>   - 历史 file 是 AM 持久化的，每次 Task 状态变化 AM 都 append 一条记录<br>3. 已 SUCCEEDED 的 Task 不重跑（输出已写 HDFS）<br>4. RUNNING 或 FAILED 的 Task 在新 AM 上重新调度<br>5. 新 AM 继续编排未完成的 Task<br></code></pre></td></tr></table></figure>
+<p>Recovery 的具体行为取决于 <code>yarn.mapreduce.am.job.recovery.enable</code>（默认 true）和 <code>yarn.mapreduce.am.job.recovery.task-state-limiting</code>（默认 2000，超过这个数量 Task 的作业不做 recovery，直接重跑所有 Task）。</p>
+<p>Recovery 的代价：</p>
+<p>OutputFormat 必须是幂等的。Map Task 的输出在本地磁盘，AM 崩溃后这些输出可能丢失（节点没崩但 AM 进程崩了，输出还在；如果节点也崩了，输出丢失）。Recovery 时已 SUCCEEDED 的 Map Task 被认为输出已持久化（OutputCommitter.commitTask 已调用），不重跑。</p>
+<p>Reduce Task 的输出在 HDFS。COMMIT_PENDING 但未 COMMITTED 的 Reduce Task 在 Recovery 时被重新调度（输出未提交）。</p>
+<p>Recovery 不是完美的——某些 Task 可能重跑，造成额外开销。但相比&quot;AM 崩溃作业失败需要重新提交&quot;，Recovery 的代价可以接受。</p>
+<h2 id="实验：观察-mrv2-行为">实验：观察 MRv2 行为</h2>
+<p>提交一个 MapReduce 作业，在 ApplicationMaster Web UI（每个作业有独立 Web UI，URL 形如 <code>http://am-host:random-port</code>）观察：</p>
+<p>Job 页面展示作业整体进度、Map/Reduce 完成度、作业 Counter。Tasks 标签页列出所有 Task Attempt，每个 Attempt 显示状态、所在节点、进度、运行时间、Counter。</p>
+<p>故意 kill 某个 Task 进程（找到 Task 所在 NM，<code>kill -9</code> YarnChild 进程），观察 AM 是否在几秒内检测到并启动新 Attempt。新 Attempt 的 AttemptId 后缀 _1、_2 等。</p>
+<p>提交一个故意慢的作业（Mapper 里加 <code>Thread.sleep</code>），让一个 Task 显著慢于其他 Task，观察 AM 是否启动 Speculative Attempt。Speculative Attempt 在 Web UI 显示为同一 Task ID 的两个 Attempt 并行跑。</p>
+<p>调小 <code>mapreduce.task.timeout</code> 到 30 秒，提交一个 Mapper 里 <code>Thread.sleep(60)</code> 的作业，观察 AM 是否把 Task 标记为 FAILED（心跳超时），然后启动新 Attempt。</p>
+<h2 id="模式提炼">模式提炼</h2>
+<p>MRv2 on YARN 体现的设计模式：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs text">模式：编排器与执行器分离 + 心跳监控 + 备份对抗慢节点 + 持久化恢复<br><br>- 编排器（AM）跑在 container 里，不享有特权<br>- 执行器（YarnChild）也是 container，通过 RPC 上报给 AM<br>- 心跳超时检测挂起 Task，启动新 Attempt<br>- Speculative Execution 启动备份对抗慢节点，先到先得<br>- 持久化历史让 AM 重启时恢复 Task 状态<br>- Counter 是性能观测的核心<br></code></pre></td></tr></table></figure>
+<p>这个模式不只是 MRv2。Spark on YARN 的 Driver / Executor 结构是同构——Driver 跑在 AM container，Executor 跑在 task container，通过 RPC 通信。Spark 的 Speculative 机制（<code>spark.speculation</code>）与 MapReduce 的 Speculative 几乎相同。Flink on YARN 的 JobManager / TaskManager 也是同构。</p>
+<p>差异在持久化策略。MapReduce 用 HDFS 文件做 Recovery，Spark 用 Event Log，Flink 用 Checkpoint。具体机制各不相同，但&quot;AM 重启后从持久化状态恢复&quot;这个模式是一致的。</p>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>MRv2 概念</th>
+<th>Spark on YARN</th>
+<th>Flink on YARN</th>
+<th>Tez on YARN</th>
+<th>Hadoop 1.x JobTracker</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MRAppMaster</td>
+<td>Driver</td>
+<td>JobManager</td>
+<td>DAG AppMaster</td>
+<td>JobTracker（部分）</td>
+</tr>
+<tr>
+<td>YarnChild</td>
+<td>Executor</td>
+<td>TaskManager</td>
+<td>Task</td>
+<td>TaskTracker + Task</td>
+</tr>
+<tr>
+<td>Umbilical RPC</td>
+<td>Driver ↔ Executor</td>
+<td>JM ↔ TM RPC</td>
+<td>Tez RPC</td>
+<td>TaskUmbilicalProtocol</td>
+</tr>
+<tr>
+<td>Speculative Execution</td>
+<td>spark.speculation</td>
+<td>restart strategy</td>
+<td>DAG spec</td>
+<td>是</td>
+</tr>
+<tr>
+<td>Counter</td>
+<td>accumulator</td>
+<td>metric</td>
+<td>counter</td>
+<td>counter</td>
+</tr>
+<tr>
+<td>Recovery Manager</td>
+<td>Event Log</td>
+<td>checkpoint</td>
+<td>DAG recovery</td>
+<td>job history</td>
+</tr>
+<tr>
+<td>数据本地化</td>
+<td>preferred location</td>
+<td>-</td>
+<td>input locality</td>
+<td>data-local slot</td>
+</tr>
+</tbody>
+</table>
+<p>注意 Spark on YARN 这一列。Spark 的 Driver 跑在 AM container（cluster 模式）或 Client 进程（client 模式）。Executor 跑在 task container，与 MapReduce 的 YarnChild 同构。差异在 Spark 的 Executor 是长期存活（Driver 与 Executor 保持长连接），MapReduce 的 YarnChild 是 Task 级别（Task 完成 YarnChild 退出）。这让 Spark 的 Executor 启动开销可以分摊到多个 Task，是 Spark 比 MapReduce 快的另一个原因。</p>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：“MRAppMaster 是 Hadoop 1.x JobTracker 的简单移植”。MRAppMaster 与 JobTracker 是不同的代码——JobTracker 是单体进程管理集群所有作业，MRAppMaster 是每作业一个进程。共享的只是部分调度逻辑（task 分配、数据本地化）。</p>
+<p>误解二：“Speculative Execution 总是让作业变快”。Speculative 启动备份 Attempt 占用资源，如果集群资源紧张，备份抢其他作业资源。Speculative 适合&quot;作业里个别 Task 慢&quot;场景，不适合&quot;所有 Task 都慢&quot;场景（所有 Task 都慢说明作业本身设计有问题，不是慢节点问题）。</p>
+<p>误解三：“AM 重启会自动恢复所有 Task”。Recovery 有上限（默认 2000 Task）。超过这个数量 AM 重启时所有 Task 重跑。另外 Recovery 要求 OutputFormat 幂等，自定义 OutputFormat 必须保证多次 commit 不产生不一致。</p>
+<p>误解四：“Task 心跳超时就是 Task 死了”。Task 可能因为长时间 GC 或长时间同步 IO（HBase scan）不报告进度，被 AM 误判 FAILED。处理方法是调大 timeout 或者用户代码主动调用 <code>context.progress()</code> 报告进度。</p>
+<p>误解五：“MapReduce 的 Counter 是只读的统计信息”。Counter 不仅可以读，还可以用作控制——用户代码可以读 Counter 判断&quot;已处理多少记录&quot;，达到阈值时主动跳出 map/reduce 循环。这种&quot;用 Counter 做控制流&quot;在某些场景有用（例如采样作业处理 N 条记录就停）。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>
+<p>提交一个 MapReduce 作业，在 ApplicationMaster Web UI 上找到 Tasks 标签页。每个 Task 显示 Attempt 数——故意 kill 某个 Task 进程，观察 AM 是否启动新 Attempt（Attempt 数变 2）。</p>
+</li>
+<li>
+<p>修改作业配置 <code>mapreduce.map.speculative=true</code>，提交一个故意让某个 Mapper 慢的作业（Mapper 里 Thread.sleep），观察 Speculative Attempt 是否启动，最终作业完成时间是否被慢 Mapper 拖累。</p>
+</li>
+<li>
+<p>在 <code>apache/hadoop</code> 源码里找到 <code>MRAppMaster.java</code>、<code>YarnChild.java</code>、<code>TaskAttemptListener.java</code>、<code>DefaultSpeculator.java</code>（hadoop-mapreduce-client-app 模块），观察 AM 内部组件的实现。</p>
+</li>
+<li>
+<p>思考题：如果让 MapReduce 的 Speculative 不仅对抗慢节点，还对抗&quot;用户代码 bug 导致 Task 偶发失败&quot;（例如某些记录触发 NPE），Speculative 的设计需要怎么改造？这种&quot;备份对抗正确性问题&quot;的思路在分布式系统里是否有先例？</p>
+</li>
+</ol>
+<h2 id="系列导航">系列导航</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align:right">序号</th>
+<th>主题</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:right">00-06</td>
+<td>HDFS 存储层（00 导读 / 01-06 HDFS 各主题）</td>
+<td>第一阶段（已完成）</td>
+</tr>
+<tr>
+<td style="text-align:right">07-12</td>
+<td>YARN 资源管理层</td>
+<td>第二阶段（已完成）</td>
+</tr>
+<tr>
+<td style="text-align:right">13</td>
+<td>MapReduce 编程模型：分而治之的工程化表达</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">14</td>
+<td>Shuffle 全流程：Map 端、Reduce 端与磁盘 I/O 的代价</td>
+<td>上一篇</td>
+</tr>
+<tr>
+<td style="text-align:right"><strong>15</strong></td>
+<td><strong>MRv2 on YARN：ApplicationMaster 与 Task Attempt</strong></td>
+<td><strong>本篇（MapReduce 篇完结）</strong></td>
+</tr>
+<tr>
+<td style="text-align:right">16-19</td>
+<td>HA、安全与 Common 基础设施（RPC / 序列化 / 安全 / 监控）</td>
+<td>第四阶段，下一篇开始</td>
+</tr>
+<tr>
+<td style="text-align:right">20-22</td>
+<td>演进、生态与对比（Hadoop 生态 / 对象存储 + K8s / 设计遗产）</td>
+<td>第五阶段，待开始</td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Jeffrey Dean, Sanjay Ghemawat. <em>MapReduce: Simplified Data Processing on Large Clusters.</em> OSDI 2004. Section 4 “Backup Tasks” 描述了 Speculative Execution 的早期设计。</li>
+<li>Vinod Kumar Vavilapalli et al. <em>Apache Hadoop YARN: Yet Another Resource Negotiator.</em> SOCC 2013. Section 6 “MapReduce on YARN” 描述了 MRv2 的具体实现。</li>
+<li>Apache Hadoop 官方文档：MapReduce on YARN. <a target="_blank" rel="noopener" href="https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-app/MapReduceAppMaster.html">https://hadoop.apache.org/docs/current/hadoop-mapreduce-client/hadoop-mapreduce-client-app/MapReduceAppMaster.html</a></li>
+<li>Apache Hadoop 源码：<code>MRAppMaster.java</code>、<code>YarnChild.java</code>、<code>TaskAttemptListener.java</code>、<code>DefaultSpeculator.java</code>. <a target="_blank" rel="noopener" href="https://github.com/apache/hadoop">https://github.com/apache/hadoop</a></li>
+<li>Tom White. <em>Hadoop: The Definitive Guide.</em> O’Reilly, 4th Edition 2015. Chapter 7 详细描述了 MRv2 在 YARN 上的运行机制。</li>
+<li>Maysam Yabandeh et al. <em>Speculative Execution in MapReduce.</em>（Microsoft Research 关于 Speculative Execution 算法的改进研究）</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/">https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/MapReduce/">MapReduce</a><a class="post-meta__tags" href="/tags/Hadoop/">Hadoop</a><a class="post-meta__tags" href="/tags/ApplicationMaster/">ApplicationMaster</a><a class="post-meta__tags" href="/tags/MRv2/">MRv2</a><a class="post-meta__tags" href="/tags/Speculative-Execution/">Speculative Execution</a></div><div class="post-share"><div class="social-share" data-image="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-15-MRv2-on-YARN-ApplicationMaster-%E4%B8%8E-Task-Attempt/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-13-MapReduce-%E7%BC%96%E7%A8%8B%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%88%86%E8%80%8C%E6%B2%BB%E4%B9%8B/" title="深入 Hadoop 13 - MapReduce 编程模型与分而治之"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-13-MapReduce-%E7%BC%96%E7%A8%8B%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%88%86%E8%80%8C%E6%B2%BB%E4%B9%8B/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 13 - MapReduce 编程模型与分而治之</div></div><div class="info-2"><div class="info-item-1">第一、第二阶段把 HDFS 和 YARN 讲完了。从这一篇起进入 MapReduce——Hadoop 三大子系统的最后一个，也是历史最久的一个。 MapReduce 常被介绍成&quot;Hadoop 的计算引擎&quot;。这个描述对应了功能但漏了 MapReduce 的本质。准确的说法是：MapReduce 是把&quot;分而治之&quot;这个通用算法思路工程化为可运行框架的产物——把大输入切成 InputSplit 给 Map 并行处理，用 Partitioner 把 Map 输出按 key 分发到 Reduce，Reduce 聚合后写 HDFS。三阶段切分（Map / Shuffle / Reduce）和三个用户钩子（Mapper / Combiner / Reducer）是 MapReduce 全部抽象的核心。 本篇只抓一个问题：MapReduce 为什么把计算切成 Map → Shuffle → Reduce 三阶段、Combiner 在什么场景下能省 Shuffle 流量、Partitioner 与 Reduce 个数的关系。 三个阶段的本质 一次 MapRed...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/" title="深入 Hadoop 14 - MapReduce Shuffle 全流程"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-14-MapReduce-Shuffle-%E5%85%A8%E6%B5%81%E7%A8%8B/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 14 - MapReduce Shuffle 全流程</div></div><div class="info-2"><div class="info-item-1">上一篇讲了 MapReduce 编程模型。本篇展开 MapReduce 性能代价最重的环节——Shuffle。 Shuffle 常被介绍成&quot;Map 到 Reduce 之间的数据传输&quot;。这个描述对应了功能但完全没解释 Shuffle 为什么慢。准确的说法是：Shuffle 是 Map 端的 Spill-Sort-Merge 流水线、Reduce 端的 Fetch-Merge 流水线、中间的网络 HTTP 传输共同组成的复杂流程，涉及磁盘 I/O、网络 I/O、内存缓冲、排序算法等多个层。Shuffle 是 MapReduce 作业 50%+ 延迟的来源，调优 Shuffle 几乎等同于调优 MapReduce。 本篇只抓一个问题：Map 端 Shuffle 怎么从内存缓冲流到本地磁盘分区文件、Reduce 端怎么从所有 Map 拉取并合并、CombineFileInputFormat 在什么场景下能减少 Map 数。 Map 端 Shuffle 的五个步骤 Map Task 输出的 key-value 对不是直接发给 Reduce，而是经过一个五步骤的本地流水线...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-00-%E5%AF%BC%E8%AF%BB-%E8%8A%82%E7%82%B9%E6%80%BB%E4%BC%9A%E5%A4%B1%E8%B4%A5/" title="深入 Hadoop 00 - 导读：节点总会失败"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-00-%E5%AF%BC%E8%AF%BB-%E8%8A%82%E7%82%B9%E6%80%BB%E4%BC%9A%E5%A4%B1%E8%B4%A5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 00 - 导读：节点总会失败</div></div><div class="info-2"><div class="info-item-1">Hadoop 常被介绍为&quot;HDFS + YARN + MapReduce 三驾马车&quot;。这个分类把重点放错了位置。把存储、调度、计算切成三件独立的事情，读者很难回答下面这个问题：为什么这三个子系统会一起出现在同一个项目里，而不是像 Spark、Flink、Kafka 那样作为独立组件存在？ 更准确的说法是：Hadoop 是一组关于&quot;如何构建运行在大量廉价节点上的分布式系统&quot;的前提假设在三个不同层面的具体化。这组前提把整个项目串成一条主线——节点总会失败、数据总是巨大、廉价比专用更重要。HDFS、YARN、MapReduce 各自处理这组前提下的一个子问题：HDFS 把大文件切成块并多副本放置，YARN 把集群资源切成容器并按策略分配，MapReduce 把大计算切成任务并按失败重试执行。 本系列只抓一个问题：Hadoop 这套以&quot;节点总会失败&quot;为前提假设的工程化方案，在 HDFS、YARN、MapReduce 三个层面是如何具体实现的，每个实现里有哪些可以迁移到其他分布式系统的设计模式。 GFS 论文留下的设计遗产 要理解...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-07-YARN-%E6%9E%B6%E6%9E%84%E4%B8%8E%E4%B8%89%E6%96%B9%E5%A5%91%E7%BA%A6/" title="深入 Hadoop 07 - YARN 架构与三方契约"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-07-YARN-%E6%9E%B6%E6%9E%84%E4%B8%8E%E4%B8%89%E6%96%B9%E5%A5%91%E7%BA%A6/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 07 - YARN 架构与三方契约</div></div><div class="info-2"><div class="info-item-1">第一阶段把 HDFS 切完了。从这一篇起进入 YARN，先讲架构。 YARN 常被介绍成&quot;Hadoop 的资源管理器&quot;。这个描述对应了职责但漏了关键点。准确的说法是：YARN 是一个把&quot;全局调度&quot;和&quot;作业内调度&quot;拆开的双层调度系统，引入了 ApplicationMaster 这个新角色承担作业级编排，把 Hadoop 1.x 的 JobTracker 单体拆成 ResourceManager + ApplicationMaster + NodeManager 三个独立契约。Container 抽象是这个拆分的基础——它把&quot;一段资源 + 一段进程&quot;打包成统一的调度单位，让同一套基础设施能同时承载 MapReduce、Spark、Flink、Tez、Storm 等不同计算模型。 本篇只抓一个问题：YARN 的三方契约（ResourceManager、NodeManager、ApplicationMaster）是怎么切开的，Container 抽象的本质是什么，为什么 Hadoop 2.x 必须从 JobT...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-22-Hadoop-%E8%AE%BE%E8%AE%A1%E9%81%97%E4%BA%A7-%E4%BB%8E-GFS-MapReduce-%E5%88%B0%E4%BA%91%E5%8E%9F%E7%94%9F/" title="深入 Hadoop 22 - Hadoop 设计遗产从 GFS MapReduce 到云原生"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-22-Hadoop-%E8%AE%BE%E8%AE%A1%E9%81%97%E4%BA%A7-%E4%BB%8E-GFS-MapReduce-%E5%88%B0%E4%BA%91%E5%8E%9F%E7%94%9F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 22 - Hadoop 设计遗产从 GFS MapReduce 到云原生</div></div><div class="info-2"><div class="info-item-1">上一篇讲了现代大数据栈的演进。本篇是系列最后一篇——总结 Hadoop 留下的设计遗产。 Hadoop 项目本身在某些场景被云原生 stack 取代，但 Hadoop 沉淀的设计思想已经成为后续所有大数据、云原生系统的默认起点。本篇把全系列 22 篇文章压成一组&quot;可迁移的设计模式&quot;，看 Hadoop 的哪些核心思想被后续系统继承。 Hadoop 的设计遗产不是&quot;代码&quot;，而是&quot;前提假设 + 工程对策&quot;——节点失败是常态、大对象切块、副本放在一起、心跳监控、自动重做、双层调度、分而治之、Append-Only Journal、Snapshot + Checkpoint。这些模式已经成为现代分布式系统的标准设计语言，被 Kafka、Cassandra、Kubernetes、Spark、Flink、Ray 等系统以不同方式继承。 本篇只抓一个问题：Hadoop 的哪些设计模式被后续系统继承、各自如何变体、为什么这些模式有跨时代的生命力。 三条核心前提的传承 本系列 00 篇把 Hadoop 的主线压成一句话——以&quot;节点...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-09-YARN-%E8%B0%83%E5%BA%A6%E5%99%A8%E5%AF%B9%E6%AF%94-FIFO-Capacity-Fair/" title="深入 Hadoop 09 - YARN 调度器对比：FIFO、Capacity、Fair"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-09-YARN-%E8%B0%83%E5%BA%A6%E5%99%A8%E5%AF%B9%E6%AF%94-FIFO-Capacity-Fair/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 09 - YARN 调度器对比：FIFO、Capacity、Fair</div></div><div class="info-2"><div class="info-item-1">上一篇讲了资源模型。本篇讲 ResourceManager 怎么把资源分给作业——也就是调度器的选择。 YARN 调度器常被介绍成&quot;Hadoop 集群的资源分配策略&quot;。这个描述对应了功能但没解释设计差异。准确的说法是：YARN 提供三种调度器——FIFO（单队列先进先出）、Capacity（层级队列，每队列有容量保证）、Fair（按权重公平分享），三种调度器在公平性、隔离性、吞吐、抢占代价上各有取舍。生产集群几乎都用 Capacity 或 Fair，FIFO 只在小集群或测试场景出现。 本篇只抓一个问题：三种调度器各自的设计取舍、什么场景应该选哪种、抢占机制是怎么工作的。 FIFO Scheduler：最简单的策略 FIFO 是 YARN 默认调度器里最简单的版本。所有作业排成一个队列，按提交顺序依次获得资源： 12345678910111213141516队列：[App-A (running), App-B (waiting), App-C (waiting)]集群资源：100 GB 内存t=0  App-A 提交，需要 60 GB     App-A 拿到...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#mrappmaster-%E7%9A%84%E5%86%85%E9%83%A8%E7%BB%93%E6%9E%84"><span class="toc-number">1.</span> <span class="toc-text">MRAppMaster 的内部结构</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#task-attempt-%E7%9A%84%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F"><span class="toc-number">2.</span> <span class="toc-text">Task Attempt 的生命周期</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#umbilical-rpc%EF%BC%9Atask-%E4%B8%8E-am-%E7%9A%84%E9%80%9A%E4%BF%A1"><span class="toc-number">3.</span> <span class="toc-text">Umbilical RPC：Task 与 AM 的通信</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#speculative-execution%EF%BC%9A%E5%AF%B9%E6%8A%97%E6%85%A2%E8%8A%82%E7%82%B9"><span class="toc-number">4.</span> <span class="toc-text">Speculative Execution：对抗慢节点</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#counter%EF%BC%9A%E6%80%A7%E8%83%BD%E8%A7%82%E6%B5%8B%E7%9A%84%E6%A0%B8%E5%BF%83"><span class="toc-number">5.</span> <span class="toc-text">Counter：性能观测的核心</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#am-%E9%87%8D%E5%90%AF%E6%97%B6%E7%9A%84-task-recovery"><span class="toc-number">6.</span> <span class="toc-text">AM 重启时的 Task Recovery</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%EF%BC%9A%E8%A7%82%E5%AF%9F-mrv2-%E8%A1%8C%E4%B8%BA"><span class="toc-number">7.</span> <span class="toc-text">实验：观察 MRv2 行为</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">8.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">9.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">10.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">11.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">12.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">13.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

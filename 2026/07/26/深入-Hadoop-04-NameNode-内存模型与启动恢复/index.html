@@ -1,0 +1,868 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Hadoop 04 - NameNode 内存模型与启动恢复 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇讲了读写路径。本篇展开 NameNode 内存里的元数据结构，以及 NameNode 启动时怎么把磁盘上的元数据恢复成内存镜像。 NameNode 常被描述成&quot;HDFS 的元数据节点&quot;。这个描述对应了职责但没解释机制。准确的说法是：NameNode 是一个把全部元数据驻留内存的进程，磁盘上同时维护两份互补的持久化文件——FSImage 是元数据镜像快照，EditLog 是">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Hadoop 04 - NameNode 内存模型与启动恢复">
+<meta property="og:url" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇讲了读写路径。本篇展开 NameNode 内存里的元数据结构，以及 NameNode 启动时怎么把磁盘上的元数据恢复成内存镜像。 NameNode 常被描述成&quot;HDFS 的元数据节点&quot;。这个描述对应了职责但没解释机制。准确的说法是：NameNode 是一个把全部元数据驻留内存的进程，磁盘上同时维护两份互补的持久化文件——FSImage 是元数据镜像快照，EditLog 是">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/cover.svg">
+<meta property="article:published_time" content="2026-07-26T06:00:00.000Z">
+<meta property="article:modified_time" content="2026-07-30T08:58:09.852Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="EditLog">
+<meta property="article:tag" content="FSImage">
+<meta property="article:tag" content="HDFS">
+<meta property="article:tag" content="Hadoop">
+<meta property="article:tag" content="NameNode">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Hadoop 04 - NameNode 内存模型与启动恢复",
+  "url": "https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/",
+  "image": "https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/cover.svg",
+  "datePublished": "2026-07-26T06:00:00.000Z",
+  "dateModified": "2026-07-30T08:58:09.852Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Hadoop 04 - NameNode 内存模型与启动恢复',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">567</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">680</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">10</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Hadoop 04 - NameNode 内存模型与启动恢复</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Hadoop 04 - NameNode 内存模型与启动恢复</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-07-26T06:00:00.000Z" title="Created 2026-07-26 14:00:00">2026-07-26</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-07-30T08:58:09.852Z" title="Updated 2026-07-30 16:58:09">2026-07-30</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>15mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-07-30 16:58:09&quot;}" hidden></div><p>上一篇讲了读写路径。本篇展开 NameNode 内存里的元数据结构，以及 NameNode 启动时怎么把磁盘上的元数据恢复成内存镜像。</p>
+<p>NameNode 常被描述成&quot;HDFS 的元数据节点&quot;。这个描述对应了职责但没解释机制。准确的说法是：NameNode 是一个把全部元数据驻留内存的进程，磁盘上同时维护两份互补的持久化文件——FSImage 是元数据镜像快照，EditLog 是镜像之后的增量操作日志，启动时把 FSImage 加载进内存、重放 EditLog，恢复到宕机前的最终状态。</p>
+<p>本篇只抓一个问题：NameNode 内存里到底有哪些数据结构、FSImage 和 EditLog 是怎么配合的、为什么 NameNode 启动要进入 Safe Mode 等待块报告。</p>
+<h2 id="namenode-内存里的六大数据结构">NameNode 内存里的六大数据结构</h2>
+<p>打开 NameNode 进程的内存，主要元数据可以分成六块：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br></pre></td><td class="code"><pre><code class="hljs text">┌──────────────────────────────────────────────────────────┐<br>│ NameNode JVM Heap                                        │<br>├──────────────────────────────────────────────────────────┤<br>│ 1. FSDirectory（命名空间树）                              │<br>│    - INode 树（INodeDirectory + INodeFile）              │<br>│    - 路径 → INode 的快速查找                             │<br>│                                                          │<br>│ 2. BlocksMap（block → DataNode 映射）                    │<br>│    - BlockInfo 对象，每个 block 一条                     │<br>│    - 三副本对应三个 DatanodeStorageInfo 引用              │<br>│                                                          │<br>│ 3. DatanodeManager（DataNode 注册表）                    │<br>│    - datanodeId → DatanodeDescriptor                     │<br>│    - 每个 DataNode 的容量、最近心跳、块列表                │<br>│                                                          │<br>│ 4. LeaseManager（写入租约）                              │<br>│    - clientName → 持有写租约的文件列表                    │<br>│    - 防止两个客户端同时写同一个文件                       │<br>│                                                          │<br>│ 5. PendingReplicationBlocks（待复制 block 队列）          │<br>│    - 副本数不足的 block 等待补齐                          │<br>│                                                          │<br>│ 6. InvalidateBlocks（待删除 block 队列）                  │<br>│    - 副本数过多的 block 等待删除多余副本                   │<br>└──────────────────────────────────────────────────────────┘<br></code></pre></td></tr></table></figure>
+<p>这六块里前三块是核心元数据，决定 NameNode 内存占用的 90%+。后三块是衍生状态——从 BlocksMap 计算得出，主要用于副本数管理。</p>
+<p>FSDirectory 是路径树。每个目录是 INodeDirectory，每个文件是 INodeFile。INodeFile 内部记录这个文件被切成哪些 block（一个 BlockInfo 数组）。整个树用 ConcurrentHashMap 或者类似结构支持并发读写。</p>
+<p>BlocksMap 是 HDFS 元数据的核心索引。给定一个 block ID，能立刻查到这个 block 的三个副本所在 DataNode。BlockInfo 对象里维护一个 Triple（三个 DatanodeStorageInfo 引用），任何副本变化都更新这里。</p>
+<p>DatanodeManager 是 DataNode 注册表。每个 DataNode 第一次连接 NameNode 时被分配一个 datanodeId，NameNode 在内存里建一个 DatanodeDescriptor 跟踪这个 DataNode 的容量、最近心跳时间、当前持有 block 数等。</p>
+<p>LeaseManager 是 HDFS 写并发控制的核心。客户端要写一个文件前必须从 NameNode 拿到这个文件的&quot;软租约&quot;（soft lease，默认 60 秒）。租约保证同一时间只有一个客户端能写这个文件——其他客户端的 create 请求会被拒绝。租约到期后 NameNode 自动释放，允许其他客户端接管。</p>
+<h2 id="元数据大小的精确估算">元数据大小的精确估算</h2>
+<p>NameNode 内存占用大致可以用一组经验公式估算（Hadoop 3.3.x）：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><code class="hljs text">INode（每个文件或目录）           ≈ 150 字节<br>BlockInfo（每个 block）            ≈ 150 字节（含三个 DatanodeStorageInfo 引用）<br>DatanodeDescriptor（每个 DataNode）≈ 几 KB（与该节点上 block 数有关）<br><br>一个 1GB 文件（切成 8 个 128MB block）：<br>  1 × 150 + 8 × 150 = 1.35 KB<br><br>一亿个 1GB 文件：<br>  1 亿 × 1.35 KB ≈ 135 GB（NameNode 堆内存）<br><br>一亿个 1KB 小文件：<br>  1 亿 × 150（INode）+ 1 亿 × 150（BlockInfo） ≈ 30 GB（但是数据本身只有 100GB）<br></code></pre></td></tr></table></figure>
+<p>这两组对比清楚展示了 HDFS 小文件问题的本质：元数据占用与文件大小无关，只与文件数 + block 数有关。1KB 小文件和 1GB 文件的元数据占用大致相同（如果 1GB 文件切成 8 个 block，元数据占用比单个 1KB 文件多 8 倍）。</p>
+<p>这就是为什么 HDFS 设计假设文件尺寸巨大——大文件让元数据开销分摊到大量数据上，单字节元数据开销可以忽略。小文件场景下元数据开销甚至超过数据本身，NameNode 内存成为整个集群的瓶颈。</p>
+<p>生产集群控制小文件数量是运维的核心主题。常见做法包括：</p>
+<ul>
+<li>用 HAR（Hadoop Archive）把大量小文件打包成一个大文件</li>
+<li>用 Sequence File 把大量小 KV 序列化成一个大文件</li>
+<li>用 Hadoop 3.x 的 EC 把存储效率从 3x 提升到 1.5x（不解决元数据问题但缓解总存储压力）</li>
+<li>在应用层做小文件合并（Hive 的小文件合并 job、Spark 的 coalesce 算子）</li>
+</ul>
+<h2 id="fsimage-与-editlog-的分工">FSImage 与 EditLog 的分工</h2>
+<p>NameNode 把元数据持久化到磁盘时分两个文件：</p>
+<p>FSImage 是元数据镜像快照。文件名形如 <code>fsimage_0000000123</code>，数字是事务 ID（txid）。这个文件包含截至某个 txid 的全部命名空间 + BlocksMap 状态。FSImage 是二进制格式（Hadoop 3.x 起可以选 PROTOBUF 格式），加载到内存后可以快速重建元数据镜像。</p>
+<p>EditLog 是 FSImage 之后的增量操作日志。文件名形如 <code>edits_inprogress_0000000124</code>，记录从 txid 124 开始的所有元数据变更（创建文件、删除文件、添加 block 等）。EditLog 是 append-only 顺序写，性能极高。</p>
+<p>NameNode 处理元数据变更的标准流程：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">1. 客户端 RPC 调用 createFile(/path)<br>2. NameNode 把这条变更写入 EditLog（fsync 到磁盘）<br>3. NameNode 更新内存里的 FSDirectory 和 BlocksMap<br>4. NameNode 返回客户端成功<br></code></pre></td></tr></table></figure>
+<p>步骤 2 是关键——必须先写 EditLog 再更新内存。如果顺序反了（先更新内存再写 EditLog），NameNode 在两步之间宕机会丢数据。EditLog 是 NameNode 持久化的唯一保证。</p>
+<p>这个顺序决定了 HDFS 元数据操作的延迟下限。每次 create / mkdir / addBlock 都要 fsync 一次 EditLog 文件。fsync 在 SSD 上大约 100μs，HDD 上 1-10ms。如果集群每秒处理 10000 次元数据操作，EditLog fsync 是瓶颈。</p>
+<p>Hadoop 2.x 引入了 EditLog 批量写优化——多个元数据操作可以批量 fsync，把 fsync 开销分摊到多个操作上。这个优化让 HDFS 元数据吞吐提升数倍，代价是单次操作延迟略有上升。</p>
+<h2 id="checkpoint：合并-fsimage-与-editlog">Checkpoint：合并 FSImage 与 EditLog</h2>
+<p>如果只追加 EditLog 不合并，时间久了 EditLog 会无限增长，NameNode 重启时重放 EditLog 耗时数小时。所以 HDFS 周期性把当前 FSImage + 当前 EditLog 合并成新的 FSImage，并把 EditLog 清空。这个操作叫 Checkpoint。</p>
+<p>Checkpoint 的触发条件（Hadoop 默认值）：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">1. 距离上次 Checkpoint 超过 1 小时（dfs.namenode.checkpoint.period）<br>2. 自上次 Checkpoint 后 EditLog 累积超过 100 万条事务<br>   （dfs.namenode.checkpoint.txns）<br>两者满足任一即触发。<br></code></pre></td></tr></table></figure>
+<p>执行 Checkpoint 的角色取决于部署模式：</p>
+<p>非 HA 部署：Secondary NameNode。这不是 NameNode 的备用节点，而是一个独立进程，定期从 Active NameNode 拉 FSImage + EditLog，在本地合并，把新 FSImage 推回 Active NameNode。Secondary NameNode 不参与客户端请求，只做后台 Checkpoint。</p>
+<p>HA 部署：Standby NameNode。Standby NameNode 同时承担&quot;热备&quot;和&quot;Checkpoint&quot;两个职责——它持续从 JournalNode 同步 EditLog、在内存里重放保持与 Active 同步，定期合并 FSImage 推回 Active。</p>
+<p>Checkpoint 操作的标准流程：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs text">1. 触发条件满足<br>2. Active NameNode 滚动 EditLog：当前 in-progress 文件关闭，<br>   新建一个 in-progress 文件继续写<br>3. Checkpoint 节点（SNN 或 Standby）从 Active 拉取：<br>   - 当前 FSImage<br>   - 已关闭的 EditLog 段（若干个文件）<br>4. Checkpoint 节点在内存里加载 FSImage + 顺序重放 EditLog<br>5. 重放完成后导出新 FSImage 文件<br>6. Checkpoint 节点把新 FSImage 上传给 Active NameNode<br>7. Active NameNode 替换旧 FSImage，清理已合并的 EditLog<br></code></pre></td></tr></table></figure>
+<p>这个流程的关键是 Active NameNode 不参与合并计算（合并要重放 EditLog 是 CPU 密集型操作），由独立的 Checkpoint 节点承担。这是为什么 Secondary NameNode 在非 HA 部署里是标配——即使 NameNode 内存够大，没有 Secondary NameNode 做后台 Checkpoint，NameNode 重启时重放 EditLog 会非常慢。</p>
+<h2 id="safe-mode：namenode-启动的特殊状态">Safe Mode：NameNode 启动的特殊状态</h2>
+<p>NameNode 启动时不能立刻接受写请求。它需要经过一个 Safe Mode 阶段，等集群块状态稳定后才能正常服务。</p>
+<p>启动流程：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs text">1. NameNode 进程启动<br>2. 从磁盘加载最新 FSImage 到内存（几分钟到几十分钟，取决于元数据规模）<br>3. 重放 FSImage 之后的所有 EditLog 段（增量恢复）<br>4. 此时内存里的元数据恢复到宕机前状态<br>5. 进入 Safe Mode<br>   - 不接受写请求（创建文件、删除文件、修改文件等 RPC 都被拒绝）<br>   - 接受读请求<br>   - 等待 DataNode 上报块报告<br>6. 当上报的 block 副本数达到阈值（默认 99.9% block 已上报）<br>7. 自动离开 Safe Mode，正常服务<br></code></pre></td></tr></table></figure>
+<p>为什么需要 Safe Mode？因为 NameNode 启动时内存里的 block → DataNode 映射表是 FSImage + EditLog 重放后的快照，但这个快照里记录的 DataNode 状态可能已经过时——某些 DataNode 在 NameNode 宕机期间自己也宕机了，某些 block 副本丢失了。Safe Mode 等待所有 DataNode 上报最新块报告，让 NameNode 重新计算每个 block 的实际副本数。</p>
+<p>Safe Mode 离开条件（Hadoop 默认值）：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">dfs.safemode.threshold.pct = 0.999   (99.9% block 已达最小副本数)<br>dfs.safemode.min.datanodes = 0       (最少等待 DataNode 数，0 表示不强制)<br>dfs.safemode.extension = 30000       (满足条件后再等 30 秒)<br></code></pre></td></tr></table></figure>
+<p>这三个参数控制 Safe Mode 的离开门槛。99.9% 看似很严格，但实际集群因为副本数 3 + 机架感知，绝大多数 block 在 DataNode 启动后立刻满足&quot;最小副本数&quot;条件，几分钟内就能达标。</p>
+<p>Safe Mode 期间可以手动执行一些操作。<code>hdfs dfsadmin -safemode get</code> 查看当前状态。<code>hdfs dfsadmin -safemode wait</code> 阻塞等待 Safe Mode 离开（脚本常用）。<code>hdfs dfsadmin -safemode enter</code> 强制进入（运维场景，禁止写入）。<code>hdfs dfsadmin -safemode leave</code> 强制离开（慎用——可能让 NameNode 在副本数不足时就接受写入）。</p>
+<h2 id="实验：观察-fsimage-与-editlog">实验：观察 FSImage 与 EditLog</h2>
+<p>在 NameNode 节点上找到 <code>dfs.namenode.name.dir</code> 配置的目录（通常 <code>/var/lib/hadoop-hdfs/name</code>），里面是 FSImage 和 EditLog 的实际文件：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">ls</span> -lh /var/lib/hadoop-hdfs/name/current/<br></code></pre></td></tr></table></figure>
+<p>典型输出：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">fsimage_0000000123       500M    (最近一次 Checkpoint 的镜像)<br>fsimage_0000000123.md5   32B     (镜像的 MD5，用于校验)<br>edits_0000000000000124-0000000000000150   20M  (一段已关闭的 edit log)<br>edits_0000000000000151-0000000000000200   30M<br>edits_inprogress_0000000000000201         5M   (当前正在写的 edit log)<br>seen_txid                                8B   (NameNode 已知的最大 txid)<br>VERSION                                  100B (集群 ID、storage ID 等元信息)<br></code></pre></td></tr></table></figure>
+<p>文件名里的数字是 txid。<code>fsimage_0000000123</code> 表示截至 txid 123 的镜像，之后的元数据变更全部记录在 <code>edits_124-150</code>、<code>edits_151-200</code>、<code>edits_inprogress_201</code> 这些 EditLog 段里。</p>
+<p>用 <code>hdfs oiv</code>（offline image viewer）可以解析 FSImage 内容：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash">hdfs oiv -i fsimage_0000000123 -o fsimage.txt -p Delimited<br><span class="hljs-built_in">head</span> fsimage.txt<br></code></pre></td></tr></table></figure>
+<p>输出按行展示 FSImage 里的每个 INode（路径、所有者、副本数、修改时间等）。可以用 wc -l 粗略估算集群文件数。</p>
+<p>用 <code>hdfs oev</code>（offline edits viewer）可以解析 EditLog 内容：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash">hdfs oev -i edits_inprogress_0000000000000201 -o edits.xml<br><span class="hljs-built_in">head</span> edits.xml<br></code></pre></td></tr></table></figure>
+<p>输出 XML 格式的操作记录，每条记录是一个事务（OP_ADD、OP_RENAME、OP_CLOSE 等）。</p>
+<p><code>seen_txid</code> 文件记录 NameNode 已知的最大事务 ID。NameNode 启动时用这个数字判断 EditLog 是否完整——如果 fsimage_0000000123 之后没有 edits_124 开始的文件，说明 EditLog 丢失，启动失败。</p>
+<h2 id="模式提炼">模式提炼</h2>
+<p>NameNode 的元数据管理体现的设计模式：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs text">模式：内存镜像 + Append-Only Journal + 周期性 Checkpoint<br><br>- 全部元数据驻留内存以追求访问性能<br>- 元数据修改时先 append 到顺序写的 journal（保证持久化）<br>- journal 写完后才更新内存（保证一致性）<br>- 周期性把内存镜像导出为 snapshot<br>- snapshot 之前的 journal 可以丢弃<br>- 启动时加载 snapshot + 重放 journal，恢复到最终状态<br></code></pre></td></tr></table></figure>
+<p>这个模式不只是 HDFS。数据库的事务日志（WAL）是同一思路——InnoDB 的 redo log、PostgreSQL 的 WAL、SQLite 的 rollback journal 都是 append-only journal + 周期性 checkpoint。Kafka 的 KRaft log 也是 append-only + snapshot。Redis 的 AOF + RDB 是混合模式。</p>
+<p>这种模式的核心权衡是&quot;内存访问速度 vs 持久化开销&quot;。把全部状态放内存牺牲了持久化（宕机会丢），但通过 append-only journal 把每次修改持久化到磁盘，再通过 checkpoint 把 journal 收敛回镜像，达到了内存访问速度 + 持久化保证的平衡。</p>
+<p>代价是单点写入——append-only journal 必须由一个节点顺序写，否则事务顺序无法保证。这是 HDFS NameNode 单点的根本原因。第五篇会展开 HDFS HA 怎么用 JournalNode 集群替代单点 journal。</p>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>NameNode 概念</th>
+<th>数据库 WAL</th>
+<th>Kafka KRaft</th>
+<th>Redis AOF</th>
+<th>etcd raft log</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>元数据内存镜像</td>
+<td>Buffer Pool</td>
+<td>Controller 内存</td>
+<td>dict 字典</td>
+<td>kv 存储</td>
+</tr>
+<tr>
+<td>Append-Only Journal</td>
+<td>redo log / binlog</td>
+<td>metadata log</td>
+<td>AOF 文件</td>
+<td>raft log</td>
+</tr>
+<tr>
+<td>周期性 Checkpoint</td>
+<td>sharp checkpoint</td>
+<td>snapshot</td>
+<td>RDB</td>
+<td>snapshot</td>
+</tr>
+<tr>
+<td>启动重放</td>
+<td>redo log replay</td>
+<td>log replay</td>
+<td>AOF replay</td>
+<td>raft log replay</td>
+</tr>
+<tr>
+<td>Safe Mode</td>
+<td>crash recovery</td>
+<td>unset controller</td>
+<td>loading</td>
+<td>leader election</td>
+</tr>
+<tr>
+<td>单点写入限制</td>
+<td>master</td>
+<td>controller leader</td>
+<td>master</td>
+<td>raft leader</td>
+</tr>
+</tbody>
+</table>
+<p>注意 etcd 这一列的差异。etcd 的 raft log 也是 append-only + 周期性 snapshot，但 raft log 是多节点复制的（每个 raft 节点都有一份完整 log）。这让 etcd 没有单点问题——任何节点宕机其他节点有完整 log 可以恢复。代价是每次 append 要走 raft 共识（多数派确认），写入延迟高于单点 journal。</p>
+<p>HDFS HA（第五篇）借鉴了同样的思路——Active NameNode 把 EditLog 写到 3 个 JournalNode 组成的多数派集群，相当于在 HDFS 这层引入了类似 raft 的复制机制。</p>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：“FSImage 是 NameNode 实时写的”。FSImage 是 Checkpoint 时一次性导出的快照，不是实时写的。实时写的是 EditLog。NameNode 处理元数据修改时不写 FSImage，只追加 EditLog。</p>
+<p>误解二：“Secondary NameNode 是 NameNode 的备用节点”。Secondary NameNode（SNN）不是热备，它是一个独立进程专门做后台 Checkpoint。Active NameNode 宕机后 SNN 不能接管服务，需要人工把 SNN 上的最新 FSImage 拷贝到新 NameNode 节点再启动。SNN 这个名字误导了很多人。Hadoop 2.x 引入 HA（Standby NameNode）之后，HA 部署不再需要 SNN——Standby NameNode 同时承担热备和 Checkpoint。</p>
+<p>误解三：“Safe Mode 期间集群完全不可用”。Safe Mode 期间只是不接受写请求（create、delete、append 等 RPC 被拒绝），读请求（open、read、list）正常工作。集群仍然可以读，只是不能写。这个特性让 Safe Mode 期间集群可以做读请求限流，但写入必须等待。</p>
+<p>误解四：“NameNode 重启时 EditLog 重放很快”。重放速度取决于 EditLog 大小。如果 Checkpoint 没有及时合并，EditLog 累积到几亿条事务，重放时间可以长达几十分钟。生产集群必须保证 Checkpoint 周期合理（默认 1 小时 / 100 万事务），并把 NameNode 内存配足（让 Checkpoint 不至于被元数据规模拖慢）。</p>
+<p>误解五：“NameNode 启动失败等于数据丢失”。NameNode 启动失败通常是 FSImage 损坏或 EditLog 不完整。这种情况下 DataNode 上的 block 数据仍然完整（数据在 DataNode 磁盘上），只是元数据无法恢复。运维层面可以从 Secondary NameNode 或 Standby NameNode 上的备份 FSImage 恢复，可能丢失最近几个小时的元数据变更。这就是为什么生产集群必须有 SNN 或 HA 部署——单 NameNode 没有 FSImage 备份，启动失败就是数据丢失事件。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>
+<p>在 NameNode 节点上找到 <code>dfs.namenode.name.dir</code> 目录，列出里面的 FSImage 和 EditLog 文件。用 <code>hdfs oiv -p Delimited</code> 解析最近的 FSImage，统计集群里的文件数和目录数。</p>
+</li>
+<li>
+<p>在 <code>apache/hadoop</code> 源码里找到 <code>FSDirectory.java</code>、<code>FSEditLog.java</code>、<code>FSImage.java</code>（hadoop-hdfs-server 模块），观察元数据写入时 EditLog 与内存更新的顺序。</p>
+</li>
+<li>
+<p>故意在测试集群上 <code>hdfs dfsadmin -safemode enter</code> 进入 Safe Mode，尝试 <code>hdfs dfs -put</code> 上传文件，观察被拒绝的报错。然后 <code>hdfs dfsadmin -safemode leave</code> 离开，再次上传成功。</p>
+</li>
+<li>
+<p>思考题：如果让 NameNode 元数据也分布式存储（每个 NameNode 节点只存一部分元数据），FSImage + EditLog 这套机制需要怎么改造？引入什么新的复杂性？</p>
+</li>
+</ol>
+<h2 id="系列导航">系列导航</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align:right">序号</th>
+<th>主题</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:right">00</td>
+<td>导读：Hadoop 的核心前提是节点总会失败</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">01</td>
+<td>HDFS 架构：NameNode、DataNode 与元数据的三层切分</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">02</td>
+<td>文件写入路径：从客户端到 DataNode 的流水线</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">03</td>
+<td>文件读取路径：副本选择与短路读</td>
+<td>上一篇</td>
+</tr>
+<tr>
+<td style="text-align:right"><strong>04</strong></td>
+<td><strong>NameNode 内存模型：FSImage、EditLog 与启动恢复</strong></td>
+<td><strong>本篇</strong></td>
+</tr>
+<tr>
+<td style="text-align:right">05</td>
+<td>HDFS HA：Quorum Journal Manager、ZKFC 与脑裂防御</td>
+<td>下一篇</td>
+</tr>
+<tr>
+<td style="text-align:right">06</td>
+<td>HDFS 3.x 演进：纠删码、路由联邦与 Observer NameNode</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Konstantin V. Shvachko. <em>The Hadoop Distributed File System.</em> MSST 2010.（描述了 FSImage + EditLog 的早期设计）</li>
+<li>Apache Hadoop 官方文档：HDFS Architecture. <a target="_blank" rel="noopener" href="https://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html">https://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html</a></li>
+<li>Apache Hadoop 官方文档：NameNode Startup / Checkpoint. <a target="_blank" rel="noopener" href="https://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-hdfs/HdfsUserGuide.html">https://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-hdfs/HdfsUserGuide.html</a></li>
+<li>Apache Hadoop 源码：<code>FSDirectory.java</code>、<code>FSImage.java</code>、<code>FSEditLogLoader.java</code>. <a target="_blank" rel="noopener" href="https://github.com/apache/hadoop">https://github.com/apache/hadoop</a></li>
+<li>Konstantin Shvachko, Hairong Kuang. <em>A Snapshot of the Accumulo NameNode.</em>（Facebook 关于十亿文件 HDFS 集群 NameNode 内存占用的实战报告）</li>
+<li>Tom White. <em>Hadoop: The Definitive Guide.</em> O’Reilly, 4th Edition 2015. Chapter 3 详述了 NameNode 启动恢复和 Checkpoint 流程。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/">https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Hadoop/">Hadoop</a><a class="post-meta__tags" href="/tags/HDFS/">HDFS</a><a class="post-meta__tags" href="/tags/NameNode/">NameNode</a><a class="post-meta__tags" href="/tags/FSImage/">FSImage</a><a class="post-meta__tags" href="/tags/EditLog/">EditLog</a></div><div class="post-share"><div class="social-share" data-image="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-01-HDFS-%E6%9E%B6%E6%9E%84%E4%B8%8E%E4%B8%89%E5%B1%82%E5%88%87%E5%88%86/" title="深入 Hadoop 01 - HDFS 架构与三层切分"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-01-HDFS-%E6%9E%B6%E6%9E%84%E4%B8%8E%E4%B8%89%E5%B1%82%E5%88%87%E5%88%86/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 01 - HDFS 架构与三层切分</div></div><div class="info-2"><div class="info-item-1">上一篇把 Hadoop 整体压成一句话：以&quot;节点总会失败&quot;为前提，HDFS 切大文件、YARN 切资源、MapReduce 切计算。本篇进入 HDFS。 HDFS 常被介绍为&quot;分布式文件系统&quot;。这个说法没错但不够准确。准确的说法是：HDFS 是一个把元数据、数据块、节点监控切成三层独立职责的分布式文件系统。三层职责分离是 HDFS 设计的核心抽象，决定了 HDFS 的所有后续行为——为什么元数据全内存、为什么写文件要 Pipeline、为什么读文件可以就近选副本、为什么 NameNode 是单点。 本篇只抓一个问题：NameNode、DataNode、客户端这三层职责是怎么切开的，以及这种切法为什么会让 HDFS 长成现在的样子。 三层职责切分 HDFS 的架构可以用一张三层图概括： 1234567891011121314151617181920212223┌─────────────────────────────────────────────────────────────────┐│                  NameNod...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-03-%E6%96%87%E4%BB%B6%E8%AF%BB%E5%8F%96%E8%B7%AF%E5%BE%84%E4%B8%8E%E5%89%AF%E6%9C%AC%E9%80%89%E6%8B%A9/" title="深入 Hadoop 03 - 文件读取路径与副本选择"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-03-%E6%96%87%E4%BB%B6%E8%AF%BB%E5%8F%96%E8%B7%AF%E5%BE%84%E4%B8%8E%E5%89%AF%E6%9C%AC%E9%80%89%E6%8B%A9/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 03 - 文件读取路径与副本选择</div></div><div class="info-2"><div class="info-item-1">上一篇讲了写入路径——客户端通过 Pipeline 把字节推到三个 DataNode。本篇讲读取路径。 HDFS 读文件常被描述成&quot;客户端从 HDFS 把数据读出来&quot;。这个描述和写路径一样把机制掩盖了。准确的说法是：客户端先问 NameNode 拿 block 列表 + 每个 block 的副本所在 DataNode 列表（按距离排序），然后按距离顺序直连 DataNode 拉取数据，读完后切到下一个 block。任何 DataNode 慢或失败时，客户端透明切换到该 block 的下一个副本。 本篇只抓一个问题：客户端怎么挑副本、本地短路与零拷贝怎么工作、Hedged Read 在什么场景下值得打开。 读取路径的五个步骤 一次完整的 HDFS 读展开成五步： 12345671. open(/path) 客户端调用 NameNode 打开文件2. NameNode 返回：[blk-1 副本列表, blk-2 副本列表, ...] 每个 block 的副本按距离客户端由近到远排序3. 客户端按 block 顺序处理：   3a. 取 blk-N 的副本列表第一个...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-00-%E5%AF%BC%E8%AF%BB-%E8%8A%82%E7%82%B9%E6%80%BB%E4%BC%9A%E5%A4%B1%E8%B4%A5/" title="深入 Hadoop 00 - 导读：节点总会失败"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-00-%E5%AF%BC%E8%AF%BB-%E8%8A%82%E7%82%B9%E6%80%BB%E4%BC%9A%E5%A4%B1%E8%B4%A5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 00 - 导读：节点总会失败</div></div><div class="info-2"><div class="info-item-1">Hadoop 常被介绍为&quot;HDFS + YARN + MapReduce 三驾马车&quot;。这个分类把重点放错了位置。把存储、调度、计算切成三件独立的事情，读者很难回答下面这个问题：为什么这三个子系统会一起出现在同一个项目里，而不是像 Spark、Flink、Kafka 那样作为独立组件存在？ 更准确的说法是：Hadoop 是一组关于&quot;如何构建运行在大量廉价节点上的分布式系统&quot;的前提假设在三个不同层面的具体化。这组前提把整个项目串成一条主线——节点总会失败、数据总是巨大、廉价比专用更重要。HDFS、YARN、MapReduce 各自处理这组前提下的一个子问题：HDFS 把大文件切成块并多副本放置，YARN 把集群资源切成容器并按策略分配，MapReduce 把大计算切成任务并按失败重试执行。 本系列只抓一个问题：Hadoop 这套以&quot;节点总会失败&quot;为前提假设的工程化方案，在 HDFS、YARN、MapReduce 三个层面是如何具体实现的，每个实现里有哪些可以迁移到其他分布式系统的设计模式。 GFS 论文留下的设计遗产 要理解...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-05-HDFS-HA-%E4%B8%8E%E8%84%91%E8%A3%82%E9%98%B2%E5%BE%A1/" title="深入 Hadoop 05 - HDFS HA 与脑裂防御"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-05-HDFS-HA-%E4%B8%8E%E8%84%91%E8%A3%82%E9%98%B2%E5%BE%A1/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 05 - HDFS HA 与脑裂防御</div></div><div class="info-2"><div class="info-item-1">上一篇讲了 NameNode 单点的元数据持久化机制——FSImage + EditLog。本篇展开 HDFS HA 怎么解决 NameNode 单点问题。 HDFS HA 常被介绍成&quot;两个 NameNode 互为热备&quot;。这个描述对应了部署形态但掩盖了关键机制。准确的说法是：HDFS HA 把原来由 Active NameNode 独占写的 EditLog 拆出来放到 3 个 JournalNode 组成的多数派集群上，Active NameNode 每次写 EditLog 都要等多数派 JournalNode 确认。Standby NameNode 实时 tail 这个共享 EditLog，与 Active 保持内存同步。Active NameNode 宕机时，Standby NameNode 接管前必须先确保旧的 Active 被隔离，防止两个 NameNode 同时声称自己是 Active（脑裂）。 本篇只抓一个问题：Quorum Journal Manager 怎么工作、ZKFC 怎么检测 NameNode 健康、为什么脑裂是 HA 系统的头号敌人以及...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-06-HDFS-3-x-%E6%BC%94%E8%BF%9B%E4%B8%8E%E7%BA%A0%E5%88%A0%E7%A0%81/" title="深入 Hadoop 06 - HDFS 3.x 演进与纠删码"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-06-HDFS-3-x-%E6%BC%94%E8%BF%9B%E4%B8%8E%E7%BA%A0%E5%88%A0%E7%A0%81/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 06 - HDFS 3.x 演进与纠删码</div></div><div class="info-2"><div class="info-item-1">上一篇讲了 HA 怎么解决 NameNode 单点问题。本篇讲 HDFS 在 Hadoop 3.x 时代的三个核心演进：纠删码（Erasure Coding）、路由联邦（Router-Based Federation）、Observer NameNode。这三个特性分别解决三个不同的瓶颈：存储成本、NameNode 元数据上限、读吞吐上限。 HDFS 3.x 常被描述成&quot;HDFS 的现代化版本&quot;。这个描述对应了发布节奏但没解释演进逻辑。准确的说法是：HDFS 在 2.x 解决了 HA 和 YARN 之后，3.x 时代面对的核心问题是 PB 级集群的存储成本和元数据瓶颈，所以引入纠删码降存储、引入路由联邦解决元数据上限、引入 Observer NameNode 拆分读写流量。三个特性的设计动机都是&quot;假设集群规模已经超过单 NameNode 上限&quot;。 本篇只抓一个问题：HDFS 3.x 引入的三个主要特性各自解决什么瓶颈、用什么代价、适合什么场景。 纠删码：用 CPU 换存储 HDFS 默认三副本意味着每存 1TB 用户数据要占 3TB 物理存...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/" title="深入 Hadoop 02 - 文件写入路径与流水线"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 02 - 文件写入路径与流水线</div></div><div class="info-2"><div class="info-item-1">上一篇把 HDFS 切成 NameNode、DataNode、Client 三层职责。本篇展开 Client 写文件时的具体路径。 HDFS 写文件常被描述成&quot;客户端把数据写到 HDFS&quot;。这个描述把数据传输机制掩盖了。准确的说法是：客户端通过一个由 NameNode 提前挑选的 DataNode 链（Pipeline）以流水线方式逐包写入数据，每个包从链头流到链尾再返回 ACK，写完一个 block 后客户端向 NameNode 申请新 block。这种 Pipeline + ACK 队列的设计是 HDFS 写入路径的核心抽象，决定了 HDFS 写入吞吐、副本一致性和写入失败恢复的全部行为。 本篇只抓一个问题：客户端写到 HDFS 的字节是怎么一步步落到三个 DataNode 磁盘上的，以及为什么 HDFS 选择 Pipeline 而不是客户端并行写三份。 写入路径的六个步骤 把一次完整的 HDFS 写入展开，可以拆成六个步骤： 1234561. create() 客户端调用 NameNode 创建文件元数据2. addBlock() 客户端向 NameNo...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#namenode-%E5%86%85%E5%AD%98%E9%87%8C%E7%9A%84%E5%85%AD%E5%A4%A7%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84"><span class="toc-number">1.</span> <span class="toc-text">NameNode 内存里的六大数据结构</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%83%E6%95%B0%E6%8D%AE%E5%A4%A7%E5%B0%8F%E7%9A%84%E7%B2%BE%E7%A1%AE%E4%BC%B0%E7%AE%97"><span class="toc-number">2.</span> <span class="toc-text">元数据大小的精确估算</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#fsimage-%E4%B8%8E-editlog-%E7%9A%84%E5%88%86%E5%B7%A5"><span class="toc-number">3.</span> <span class="toc-text">FSImage 与 EditLog 的分工</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#checkpoint%EF%BC%9A%E5%90%88%E5%B9%B6-fsimage-%E4%B8%8E-editlog"><span class="toc-number">4.</span> <span class="toc-text">Checkpoint：合并 FSImage 与 EditLog</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#safe-mode%EF%BC%9Anamenode-%E5%90%AF%E5%8A%A8%E7%9A%84%E7%89%B9%E6%AE%8A%E7%8A%B6%E6%80%81"><span class="toc-number">5.</span> <span class="toc-text">Safe Mode：NameNode 启动的特殊状态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%EF%BC%9A%E8%A7%82%E5%AF%9F-fsimage-%E4%B8%8E-editlog"><span class="toc-number">6.</span> <span class="toc-text">实验：观察 FSImage 与 EditLog</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">7.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">8.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">9.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">10.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">11.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">12.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

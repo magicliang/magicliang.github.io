@@ -1,0 +1,870 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Hadoop 02 - 文件写入路径与流水线 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上一篇把 HDFS 切成 NameNode、DataNode、Client 三层职责。本篇展开 Client 写文件时的具体路径。 HDFS 写文件常被描述成&quot;客户端把数据写到 HDFS&quot;。这个描述把数据传输机制掩盖了。准确的说法是：客户端通过一个由 NameNode 提前挑选的 DataNode 链（Pipeline）以流水线方式逐包写入数据，每个包从链头流到链尾再返回 AC">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Hadoop 02 - 文件写入路径与流水线">
+<meta property="og:url" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上一篇把 HDFS 切成 NameNode、DataNode、Client 三层职责。本篇展开 Client 写文件时的具体路径。 HDFS 写文件常被描述成&quot;客户端把数据写到 HDFS&quot;。这个描述把数据传输机制掩盖了。准确的说法是：客户端通过一个由 NameNode 提前挑选的 DataNode 链（Pipeline）以流水线方式逐包写入数据，每个包从链头流到链尾再返回 AC">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/cover.svg">
+<meta property="article:published_time" content="2026-07-26T04:00:00.000Z">
+<meta property="article:modified_time" content="2026-07-30T08:58:09.851Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="HDFS">
+<meta property="article:tag" content="Hadoop">
+<meta property="article:tag" content="Pipeline">
+<meta property="article:tag" content="副本放置">
+<meta property="article:tag" content="存储">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Hadoop 02 - 文件写入路径与流水线",
+  "url": "https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/",
+  "image": "https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/cover.svg",
+  "datePublished": "2026-07-26T04:00:00.000Z",
+  "dateModified": "2026-07-30T08:58:09.851Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Hadoop 02 - 文件写入路径与流水线',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">567</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">680</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">10</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Hadoop 02 - 文件写入路径与流水线</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Hadoop 02 - 文件写入路径与流水线</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-07-26T04:00:00.000Z" title="Created 2026-07-26 12:00:00">2026-07-26</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-07-30T08:58:09.851Z" title="Updated 2026-07-30 16:58:09">2026-07-30</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.3k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>15mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-07-30 16:58:09&quot;}" hidden></div><p>上一篇把 HDFS 切成 NameNode、DataNode、Client 三层职责。本篇展开 Client 写文件时的具体路径。</p>
+<p>HDFS 写文件常被描述成&quot;客户端把数据写到 HDFS&quot;。这个描述把数据传输机制掩盖了。准确的说法是：客户端通过一个由 NameNode 提前挑选的 DataNode 链（Pipeline）以流水线方式逐包写入数据，每个包从链头流到链尾再返回 ACK，写完一个 block 后客户端向 NameNode 申请新 block。这种 Pipeline + ACK 队列的设计是 HDFS 写入路径的核心抽象，决定了 HDFS 写入吞吐、副本一致性和写入失败恢复的全部行为。</p>
+<p>本篇只抓一个问题：客户端写到 HDFS 的字节是怎么一步步落到三个 DataNode 磁盘上的，以及为什么 HDFS 选择 Pipeline 而不是客户端并行写三份。</p>
+<h2 id="写入路径的六个步骤">写入路径的六个步骤</h2>
+<p>把一次完整的 HDFS 写入展开，可以拆成六个步骤：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs text">1. create() 客户端调用 NameNode 创建文件元数据<br>2. addBlock() 客户端向 NameNode 申请一个 block ID 和目标 DataNode 列表<br>3. Pipeline 建立：客户端连 DN-1，DN-1 连 DN-2，DN-2 连 DN-3<br>4. 数据分批发送：客户端把数据切成 64KB 的 packet，逐包发给 DN-1<br>5. ACK 回传：DN-3 收到后回 ACK 给 DN-2，DN-2 回给 DN-1，DN-1 回给客户端<br>6. close() 文件关闭时客户端通知 NameNode，NameNode 持久化文件<br></code></pre></td></tr></table></figure>
+<p>步骤 2 的细节最重要。NameNode 收到 addBlock 请求时，不是随便挑三个 DataNode 返回，而是按&quot;副本放置策略&quot;挑出最优的三个 DataNode。这个策略决定了写性能和数据可靠性，下文专门展开。</p>
+<p>步骤 3 的 Pipeline 建立是 HDFS 写入路径最有特色的部分。客户端拿到三个 DataNode 列表后，不是分别连三个 DataNode 并行写数据，而是只连第一个 DataNode，让第一个 DataNode 连第二个 DataNode，第二个连第三个。数据形成一条流水线。</p>
+<p>步骤 4 和 5 的 packet + ACK 队列机制让流水线既能压满带宽又不丢包。客户端把字节流切成 64KB 的 packet（默认 <code>io.file.buffer.size</code> 配置控制），每发一个 packet 就放进&quot;ack queue&quot;等待 ACK。ACK 返回后从 ack queue 移除，下一批发送。任何 packet 的 ACK 失败会触发 Pipeline 重构。</p>
+<h2 id="副本放置策略：为什么三个副本放两个机架">副本放置策略：为什么三个副本放两个机架</h2>
+<p>HDFS 默认副本数 3。NameNode 在 addBlock 时挑选三个 DataNode 的策略遵循一条经典规则（Hadoop 默认 BlockPlacementPolicyDefault）：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">第一个副本：放在写入客户端所在的 DataNode（&quot;本地写&quot;）<br>第二个副本：放在与第一个副本不同机架的某个 DataNode<br>第三个副本：放在与第二个副本相同机架、不同节点的某个 DataNode<br>后续副本（如果配置了副本数 &gt; 3）：随机放置<br></code></pre></td></tr></table></figure>
+<p>这条规则初看奇怪。三个副本只放在两个机架，第三个副本不放到第三个机架吗？</p>
+<p>答案是写入吞吐和数据可靠性的权衡。如果把三个副本放在三个不同机架，写入时第二个和第三个副本都要跨机架（机架间带宽通常比机架内低），写入延迟变高。放在两个机架（本地机架一个、远端机架两个）：</p>
+<ul>
+<li>第一个副本本地写（机架内，零跨机架带宽）</li>
+<li>第二个副本跨机架写一次（一次跨机架带宽）</li>
+<li>第三个副本在远端机架内写（机架内，零跨机架带宽）</li>
+</ul>
+<p>整体只消耗一次跨机架带宽。同时可靠性仍然够：任意一个机架挂掉，至少还有一个机架持有两个副本（数据不丢）。任意两个机架同时挂掉的概率极低，可以接受。</p>
+<p>机架感知策略依赖集群管理员在 <code>core-site.xml</code> 配置 <code>topology.node.switch.mapping.script</code>，提供一个脚本把 DataNode IP 映射到机架路径（例如 <code>/rack-A/rack-A1</code>）。NameNode 用这个映射计算&quot;距离&quot;，决定副本放置。如果没有配置脚本，所有 DataNode 都被当成在同一个默认机架（<code>/default-rack</code>），副本放置策略会退化为随机选三个节点——这种部署在数据可靠性上是有损的。</p>
+<p>副本放置策略是 HDFS 设计里少有的需要管理员配置的部分。生产集群必须配置机架脚本，否则任意一个机架故障可能丢数据。</p>
+<h2 id="pipeline-写入：流水线的具体机制">Pipeline 写入：流水线的具体机制</h2>
+<p>客户端拿到 DataNode 列表后开始建立 Pipeline。以默认三副本为例：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><code class="hljs text">Client                 DN-1                  DN-2                  DN-3<br>  │                     │                     │                     │<br>  │ 1. TCP connect      │                     │                     │<br>  ├────────────────────►│                     │                     │<br>  │                     │ 2. TCP connect      │                     │<br>  │                     ├────────────────────►│                     │<br>  │                     │                     │ 3. TCP connect      │<br>  │                     │                     ├────────────────────►│<br>  │                     │                     │                     │<br>  │ 4. data packet p1   │                     │                     │<br>  ├────────────────────►│ 5. forward p1       │                     │<br>  │                     ├────────────────────►│ 6. forward p1       │<br>  │                     │                     ├────────────────────►│<br>  │                     │                     │                     │<br>  │                     │                     │ 7. write to disk    │<br>  │                     │ 8. ack p1           │                     │<br>  │                     │◄────────────────────┤                     │<br>  │ 9. ack p1           │                     │                     │<br>  │◄────────────────────┤                     │                     │<br></code></pre></td></tr></table></figure>
+<p>注意步骤 4-9 之间，packet 是流水线方式转发的——DN-1 收到 p1 之后立刻把 p1 转发给 DN-2，自己继续接收客户端的 p2。整条链路在稳定状态下同时承载三个 packet（一个在 Client → DN-1 段、一个在 DN-1 → DN-2 段、一个在 DN-2 → DN-3 段），这就是 Pipeline 的吞吐优势。</p>
+<p>为什么 HDFS 选 Pipeline 而不是客户端并行写三份？两个原因：</p>
+<p>第一，客户端出网带宽。客户端如果把数据并行写到三个 DataNode，客户端出网带宽消耗三倍。Pipeline 模式下客户端只发一次，DN-1 转发给 DN-2，DN-2 转发给 DN-3——每个 DataNode 只承担一次出网带宽。在千兆网卡和 1000 节点集群里，这个差异决定客户端能不能压满网卡。</p>
+<p>第二，副本一致性。Pipeline 模式下 packet 顺序到达 DN-3 的顺序就是客户端发送顺序——DN-1 转发是 FIFO，DN-2 转发也是 FIFO。如果客户端并行写三份，三个 DataNode 上 packet 到达顺序可能不一致，需要额外的序号机制保证一致。Pipeline 把序号约束变成 TCP 字节流的天然属性，简化了一致性管理。</p>
+<h2 id="数据队列与-ack-队列">数据队列与 ACK 队列</h2>
+<p>客户端写数据时内部维护两个队列：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">data queue：待发送的 packet 队列（按生成顺序）<br>ack queue：已发送、等待 ACK 的 packet 队列（按发送顺序）<br></code></pre></td></tr></table></figure>
+<p>DFSOutputStream 的标准工作循环：</p>
+<ol>
+<li>应用层调用 <code>write(byte[])</code>，把字节攒到内部 buffer</li>
+<li>buffer 攒够一个 packet 大小（默认 64KB）后，DFSOutputStream 把 packet 入 data queue 尾部</li>
+<li>一个 Sender 线程从 data queue 头部取 packet，通过 Pipeline 发给 DN-1，packet 出 data queue 入 ack queue</li>
+<li>一个 ResponseProcessor 线程等待 Pipeline 返回的 ACK</li>
+<li>收到 ACK 后，ResponseProcessor 把对应 packet 从 ack queue 移除</li>
+<li>任意 packet 的 ACK 失败时，整个 Pipeline 进入恢复流程（下文展开）</li>
+</ol>
+<p>这种&quot;两个队列 + 两个线程&quot;的设计让客户端既能压满 Pipeline 带宽（Sender 持续发），又能保证可靠性（ResponseProcessor 持续确认）。任何 packet 失败时，ack queue 里所有未 ACK 的 packet 都要重发。</p>
+<p>注意一个细节：客户端的 write() 调用返回不代表数据已经持久化。在 ack queue 里的 packet 没收到 ACK 之前，对应字节都不算&quot;已写入 HDFS&quot;。如果客户端调用了 write() 但 Pipeline 出现故障导致 ack queue 里的 packet 没有成功写入，应用层会看到 IOException。这是 HDFS 写操作的可靠性语义。</p>
+<h2 id="pipeline-故障恢复">Pipeline 故障恢复</h2>
+<p>Pipeline 写入过程中任意一个 DataNode 故障（磁盘满、网络断、进程崩），Pipeline 必须恢复。HDFS 的恢复流程是这套写入路径设计里最精巧的部分。</p>
+<p>故障检测：客户端的 ResponseProcessor 在等待 ACK 时超时，或者 Pipeline socket 抛 IOException。客户端把 ack queue 里所有 packet 标记为待重发。</p>
+<p>故障定位：客户端通过 ACK 协议判断哪个 DataNode 故障。每个 DataNode 在转发 packet 时会附带自己的序号，如果某个 DataNode 序号停滞，客户端就知道是它出问题。客户端把这个 DataNode 从 Pipeline 里移除。</p>
+<p>Pipeline 重构：客户端用剩下的健康 DataNode 重新建立 Pipeline。例如三副本 Pipeline 中 DN-2 故障，新 Pipeline 是 Client → DN-1 → DN-3。</p>
+<p>同步块状态：客户端向 NameNode 报告&quot;DN-2 在写某个 block 时出问题&quot;，NameNode 在内存里把这个 block 的副本数从 3 标记为 2，安排后台任务在其他 DataNode 上补齐第三个副本。同时客户端继续往新 Pipeline 写剩余数据，block ID 不变。</p>
+<p>Block 完成与校验：block 写完后，客户端告诉 NameNode 这个 block 已经关闭。NameNode 等到该 block 的 blockReport 显示三个副本都到位（或者足够时间后）才认为 block 完全持久化。</p>
+<p>这种&quot;故障时丢弃坏节点、用健康节点继续写、后台补齐副本&quot;的恢复流程，是 HDFS 假设&quot;节点总会失败&quot;前提下的工程对策。整个流程对客户端应用透明——客户端只需要捕获 IOException 重试，不需要知道 Pipeline 是怎么重构的。</p>
+<h2 id="实验：观察-pipeline-写入">实验：观察 Pipeline 写入</h2>
+<p>可以用 <code>hdfs dfs -put</code> 上传一个本地文件，同时观察 DataNode 的日志或 jstack 来看到 Pipeline 的具体行为。</p>
+<p>准备一个本地大文件（100MB 左右，足以分成多个 128MB block 的话用一个就够，但跨多个 block 更有观察价值）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">dd</span> <span class="hljs-keyword">if</span>=/dev/urandom of=/tmp/test-200mb.bin bs=1M count=200<br>hdfs dfs -put /tmp/test-200mb.bin /test/<br></code></pre></td></tr></table></figure>
+<p>写入时打开 NameNode Web UI 的 Startup Progress 或者 Datanodes 标签页，可以看到写入过程中某些 DataNode 的 Block Pool Used 数字增长。这正是 Pipeline 数据落盘的证据。</p>
+<p>更直接的观察方式是用 <code>hdfs dfs -fsck /test/test-200mb.bin -files -blocks -locations</code>：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs text">/test/test-200mb.bin 209715200 bytes, 2 block(s), writing...<br>0. BP-1234567890-namenode-host:blk_1073741825_1001 \<br>     len=134217728 Live_repl=3 [DatanodeInfoWithStorage[10.0.0.1:9866,DS-...], \<br>                                DatanodeInfoWithStorage[10.0.0.2:9866,DS-...], \<br>                                DatanodeInfoWithStorage[10.0.0.3:9866,DS-...]]<br>1. BP-1234567890-namenode-host:blk_1073741826_1002 \<br>     len=75497472 Live_repl=3 [DatanodeInfoWithStorage[10.0.0.2:9866,DS-...], \<br>                                DatanodeInfoWithStorage[10.0.0.3:9866,DS-...], \<br>                                DatanodeInfoWithStorage[10.0.0.4:9866,DS-...]]<br></code></pre></td></tr></table></figure>
+<p>这个输出直接展示了三个事实：</p>
+<p>文件 200MB 被切成 2 个 block，第一个 128MB、第二个 72MB（剩余字节）。</p>
+<p>每个 block 有 3 个副本（Live_repl=3），分布在不同的 DataNode 上。</p>
+<p>两个 block 的副本放置遵循&quot;本地写 + 跨机架 + 跨机架同节点&quot;规则。如果配置了机架脚本，可以看到第一个副本所在 DataNode 与上传客户端所在节点是同一个。</p>
+<p>如果想让 Pipeline 故障恢复可见，可以故意杀掉 Pipeline 中间的 DataNode 进程，再上传文件。客户端日志里会出现 “Exception in createBlockOutputStream” + “Abandoning block” + “Connecting to datanode” 这类重试信息。NameNode Web UI 上对应 block 的 Under Replicated Blocks 会瞬间涨 1，几秒后系统调度新副本归零。</p>
+<h2 id="模式提炼">模式提炼</h2>
+<p>HDFS 写入路径体现的设计模式：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">模式：流水线写入 + ACK 队列 + 故障节点剔除<br><br>- 把数据切成定长 packet，让 packet 沿一条 DataNode 链流水转发<br>- 客户端只发一份，每个 DataNode 转发给下一个，避免客户端出网带宽放大<br>- 每发一个 packet 入 ACK 队列，收到链尾 ACK 后出队<br>- 任意节点失败时把它从链里剔除，用剩下的健康节点重新建链<br>- 故障节点上未完成的 block 由后台任务在其他节点补齐副本<br></code></pre></td></tr></table></figure>
+<p>这个模式不只在 HDFS 出现。Ceph 的 RBD 写入也用 Pipeline-like 链式复制（主 OSD 收到后转发给从 OSD）。MySQL 半同步复制是 Pipeline 的退化版（主从两节点）。Kafka 的 ISR 写入方式（leader 收到、follower 拉取）虽然不是严格 Pipeline，但同样遵循&quot;主节点统一接收、副本按序同步&quot;的思路，差别在 Kafka 用 pull 模型、HDFS 用 push 模型。</p>
+<h2 id="工程迁移表">工程迁移表</h2>
+<table>
+<thead>
+<tr>
+<th>HDFS 写入概念</th>
+<th>GFS</th>
+<th>Ceph</th>
+<th>Kafka</th>
+<th>MySQL 半同步</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>副本放置策略</td>
+<td>Master 选 ChunkServer</td>
+<td>MON 计算 PG → OSD 映射</td>
+<td>Controller 分配 Partition → Broker</td>
+<td>DBA 配置 replication</td>
+</tr>
+<tr>
+<td>Pipeline 链式转发</td>
+<td>是</td>
+<td>是（PG 主 → 从）</td>
+<td>否（leader 推 / follower 拉）</td>
+<td>否（binlog 单向复制）</td>
+</tr>
+<tr>
+<td>ACK 队列</td>
+<td>Operation Log</td>
+<td>PG journal</td>
+<td>ISR commit log</td>
+<td>binlog position</td>
+</tr>
+<tr>
+<td>packet 大小</td>
+<td>64KB</td>
+<td>4MB 默认</td>
+<td>message set</td>
+<td>binlog event</td>
+</tr>
+<tr>
+<td>故障节点剔除</td>
+<td>是</td>
+<td>是（PG peering）</td>
+<td>ISR 收缩</td>
+<td>master/slave 切换</td>
+</tr>
+<tr>
+<td>副本补齐</td>
+<td>Master 重备份</td>
+<td>MON peering</td>
+<td>ISR 扩展</td>
+<td>重建 slave</td>
+</tr>
+<tr>
+<td>顺序一致性</td>
+<td>Pipeline FIFO</td>
+<td>PG journal 顺序</td>
+<td>ISR offset</td>
+<td>binlog position</td>
+</tr>
+</tbody>
+</table>
+<p>注意 Kafka 这一列的差异。Kafka 的写入不是严格的 Pipeline——生产者写 leader，follower 主动从 leader 拉取。这种&quot;主写从拉&quot;模式让 Kafka 可以容忍 follower 慢（拉不动就暂时落后，不影响 leader 写入性能），代价是 follower 落后时一致性窗口扩大。HDFS 的 Pipeline 是同步模式——三个副本必须全部 ACK 才算成功，慢节点会拖慢整体写入，但一致性窗口几乎为零。</p>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：“HDFS 写入是同步等待三个副本落盘”。不完全是。Pipeline 在 packet 级别是同步的（每个 packet 必须三个副本 ACK 才算成功），但 packet 落盘到 DataNode 磁盘时是异步的——DataNode 收到 packet 后先入内存 buffer，定期刷盘。如果 DataNode 进程崩溃，buffer 里的 packet 可能丢。HDFS 通过 fsync 在 block 关闭时强制刷盘缓解这个问题，但写过程中仍存在数据丢失窗口。</p>
+<p>误解二：“HDFS 写入失败客户端要手动重试”。部分正确。Pipeline 中某个 DataNode 失败时客户端会自动剔除该节点继续写，不需要应用层重试。但如果整个 Pipeline 都失败（例如客户端到 NameNode 都连不通），应用层会收到 IOException，需要重试。这种&quot;局部失败自动恢复、整体失败抛异常&quot;是 HDFS 的标准错误语义。</p>
+<p>误解三：“副本数越高数据越安全”。副本数高确实降低数据丢失概率，但写入吞吐会成比例下降。三副本写一次的字节量是数据本身的 3 倍。如果副本数提到 5，写入吞吐大约降为 60%。生产环境通常用 3 副本配合机架感知，比单纯提高副本数更划算。Hadoop 3.x 引入纠删码（第六篇展开）是另一种思路——用计算换存储，副本开销从 3x 降到 1.5x。</p>
+<p>误解四：“Pipeline 写入顺序就是文件字节顺序”。在单个 block 内是对的——Pipeline 保证 packet 顺序到达 DN-3 与客户端发送顺序一致。但跨 block 时不一定：客户端可以并发申请多个 block 并发 Pipeline 写入（特别在大文件场景），不同 block 的字节落盘顺序可能与应用层调用顺序不完全一致。HDFS 通过客户端层面的单 DFSOutputStream 串行化缓解了这个问题。</p>
+<p>误解五：“NameNode 知道每个字节当前写到哪个 DataNode 了”。NameNode 不知道。NameNode 只在 addBlock 时返回 DataNode 列表，之后整个 Pipeline 的数据传输都不经过 NameNode。NameNode 知道 block 已经分配、知道 block 已经关闭、知道 block 当前在哪些 DataNode（通过 blockReport），但不知道 Pipeline 此刻传输的具体字节。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>
+<p>用 <code>hdfs dfs -put</code> 上传一个 300MB 的本地文件到 HDFS，再用 <code>hdfs fsck /path/to/file -files -blocks -locations</code> 查看 block 分布。验证每个 block 的三个副本是否符合&quot;本地写 + 跨机架 + 跨机架同节点&quot;放置规则（前提是集群配置了机架脚本）。</p>
+</li>
+<li>
+<p>在 <code>apache/hadoop</code> 源码里找到 <code>DataStreamer.java</code> 和 <code>ResponseProcessor.java</code>（hadoop-hdfs-client 模块下），观察 data queue 和 ack queue 的具体实现。这两个内部类是 HDFS Pipeline 写入的核心。</p>
+</li>
+<li>
+<p>在伪分布式集群上故意 kill 一个 DataNode 进程，立刻 <code>hdfs dfs -put</code> 上传文件，观察客户端日志里的 Pipeline 恢复过程。然后重启该 DataNode，用 <code>hdfs dfsadmin -report</code> 观察 Under Replicated Blocks 数字的变化（应该瞬间涨、几分钟后归零）。</p>
+</li>
+<li>
+<p>思考题：如果把 Pipeline 模式改成客户端并行写三个 DataNode（每个副本独立写），HDFS 写入吞吐会变好还是变差？数据一致性会发生什么变化？</p>
+</li>
+</ol>
+<h2 id="系列导航">系列导航</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align:right">序号</th>
+<th>主题</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:right">00</td>
+<td>导读：Hadoop 的核心前提是节点总会失败</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">01</td>
+<td>HDFS 架构：NameNode、DataNode 与元数据的三层切分</td>
+<td>上一篇</td>
+</tr>
+<tr>
+<td style="text-align:right"><strong>02</strong></td>
+<td><strong>文件写入路径：从客户端到 DataNode 的流水线</strong></td>
+<td><strong>本篇</strong></td>
+</tr>
+<tr>
+<td style="text-align:right">03</td>
+<td>文件读取路径：副本选择与短路读</td>
+<td>下一篇</td>
+</tr>
+<tr>
+<td style="text-align:right">04</td>
+<td>NameNode 内存模型：FSImage、EditLog 与启动恢复</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">05</td>
+<td>HDFS HA：Quorum Journal Manager、ZKFC 与脑裂防御</td>
+<td></td>
+</tr>
+<tr>
+<td style="text-align:right">06</td>
+<td>HDFS 3.x 演进：纠删码、路由联邦与 Observer NameNode</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Sanjay Ghemawat, Howard Gobioff, Shun-Tak Leung. <em>The Google File System.</em> SOSP 2003. Section 3.2 “System Interactions” 描述了 Pipeline 写入和 ack 队列机制。</li>
+<li>Apache Hadoop 官方文档：HDFS Architecture. <a target="_blank" rel="noopener" href="https://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html">https://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html</a></li>
+<li>Apache Hadoop 源码：<code>DataStreamer.java</code>、<code>DFSOutputStream.java</code>. <a target="_blank" rel="noopener" href="https://github.com/apache/hadoop">https://github.com/apache/hadoop</a></li>
+<li>Konstantin Shvachko. <em>Hadoop Swap Space: Block Placement.</em>（Hadoop Summit 演讲，详细解释了三副本放置策略的机架感知）</li>
+<li>Tom White. <em>Hadoop: The Definitive Guide.</em> O’Reilly, 4th Edition 2015. Chapter 3 详细描述了 Pipeline 写入的具体步骤和 packet 流转。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/">https://magicliang.github.io/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%AD%98%E5%82%A8/">存储</a><a class="post-meta__tags" href="/tags/Hadoop/">Hadoop</a><a class="post-meta__tags" href="/tags/HDFS/">HDFS</a><a class="post-meta__tags" href="/tags/Pipeline/">Pipeline</a><a class="post-meta__tags" href="/tags/%E5%89%AF%E6%9C%AC%E6%94%BE%E7%BD%AE/">副本放置</a></div><div class="post-share"><div class="social-share" data-image="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-02-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E6%B5%81%E6%B0%B4%E7%BA%BF/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-03-%E6%96%87%E4%BB%B6%E8%AF%BB%E5%8F%96%E8%B7%AF%E5%BE%84%E4%B8%8E%E5%89%AF%E6%9C%AC%E9%80%89%E6%8B%A9/" title="深入 Hadoop 03 - 文件读取路径与副本选择"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-03-%E6%96%87%E4%BB%B6%E8%AF%BB%E5%8F%96%E8%B7%AF%E5%BE%84%E4%B8%8E%E5%89%AF%E6%9C%AC%E9%80%89%E6%8B%A9/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 03 - 文件读取路径与副本选择</div></div><div class="info-2"><div class="info-item-1">上一篇讲了写入路径——客户端通过 Pipeline 把字节推到三个 DataNode。本篇讲读取路径。 HDFS 读文件常被描述成&quot;客户端从 HDFS 把数据读出来&quot;。这个描述和写路径一样把机制掩盖了。准确的说法是：客户端先问 NameNode 拿 block 列表 + 每个 block 的副本所在 DataNode 列表（按距离排序），然后按距离顺序直连 DataNode 拉取数据，读完后切到下一个 block。任何 DataNode 慢或失败时，客户端透明切换到该 block 的下一个副本。 本篇只抓一个问题：客户端怎么挑副本、本地短路与零拷贝怎么工作、Hedged Read 在什么场景下值得打开。 读取路径的五个步骤 一次完整的 HDFS 读展开成五步： 12345671. open(/path) 客户端调用 NameNode 打开文件2. NameNode 返回：[blk-1 副本列表, blk-2 副本列表, ...] 每个 block 的副本按距离客户端由近到远排序3. 客户端按 block 顺序处理：   3a. 取 blk-N 的副本列表第一个...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-01-HDFS-%E6%9E%B6%E6%9E%84%E4%B8%8E%E4%B8%89%E5%B1%82%E5%88%87%E5%88%86/" title="深入 Hadoop 01 - HDFS 架构与三层切分"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-01-HDFS-%E6%9E%B6%E6%9E%84%E4%B8%8E%E4%B8%89%E5%B1%82%E5%88%87%E5%88%86/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 01 - HDFS 架构与三层切分</div></div><div class="info-2"><div class="info-item-1">上一篇把 Hadoop 整体压成一句话：以&quot;节点总会失败&quot;为前提，HDFS 切大文件、YARN 切资源、MapReduce 切计算。本篇进入 HDFS。 HDFS 常被介绍为&quot;分布式文件系统&quot;。这个说法没错但不够准确。准确的说法是：HDFS 是一个把元数据、数据块、节点监控切成三层独立职责的分布式文件系统。三层职责分离是 HDFS 设计的核心抽象，决定了 HDFS 的所有后续行为——为什么元数据全内存、为什么写文件要 Pipeline、为什么读文件可以就近选副本、为什么 NameNode 是单点。 本篇只抓一个问题：NameNode、DataNode、客户端这三层职责是怎么切开的，以及这种切法为什么会让 HDFS 长成现在的样子。 三层职责切分 HDFS 的架构可以用一张三层图概括： 1234567891011121314151617181920212223┌─────────────────────────────────────────────────────────────────┐│                  NameNod...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/" title="深入 Hadoop 04 - NameNode 内存模型与启动恢复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-04-NameNode-%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%90%AF%E5%8A%A8%E6%81%A2%E5%A4%8D/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 04 - NameNode 内存模型与启动恢复</div></div><div class="info-2"><div class="info-item-1">上一篇讲了读写路径。本篇展开 NameNode 内存里的元数据结构，以及 NameNode 启动时怎么把磁盘上的元数据恢复成内存镜像。 NameNode 常被描述成&quot;HDFS 的元数据节点&quot;。这个描述对应了职责但没解释机制。准确的说法是：NameNode 是一个把全部元数据驻留内存的进程，磁盘上同时维护两份互补的持久化文件——FSImage 是元数据镜像快照，EditLog 是镜像之后的增量操作日志，启动时把 FSImage 加载进内存、重放 EditLog，恢复到宕机前的最终状态。 本篇只抓一个问题：NameNode 内存里到底有哪些数据结构、FSImage 和 EditLog 是怎么配合的、为什么 NameNode 启动要进入 Safe Mode 等待块报告。 NameNode 内存里的六大数据结构 打开 NameNode 进程的内存，主要元数据可以分成六块： 12345678910111213141516171819202122232425┌─────────────────────────────────────────────────────────...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-05-HDFS-HA-%E4%B8%8E%E8%84%91%E8%A3%82%E9%98%B2%E5%BE%A1/" title="深入 Hadoop 05 - HDFS HA 与脑裂防御"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-05-HDFS-HA-%E4%B8%8E%E8%84%91%E8%A3%82%E9%98%B2%E5%BE%A1/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 05 - HDFS HA 与脑裂防御</div></div><div class="info-2"><div class="info-item-1">上一篇讲了 NameNode 单点的元数据持久化机制——FSImage + EditLog。本篇展开 HDFS HA 怎么解决 NameNode 单点问题。 HDFS HA 常被介绍成&quot;两个 NameNode 互为热备&quot;。这个描述对应了部署形态但掩盖了关键机制。准确的说法是：HDFS HA 把原来由 Active NameNode 独占写的 EditLog 拆出来放到 3 个 JournalNode 组成的多数派集群上，Active NameNode 每次写 EditLog 都要等多数派 JournalNode 确认。Standby NameNode 实时 tail 这个共享 EditLog，与 Active 保持内存同步。Active NameNode 宕机时，Standby NameNode 接管前必须先确保旧的 Active 被隔离，防止两个 NameNode 同时声称自己是 Active（脑裂）。 本篇只抓一个问题：Quorum Journal Manager 怎么工作、ZKFC 怎么检测 NameNode 健康、为什么脑裂是 HA 系统的头号敌人以及...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-00-%E5%AF%BC%E8%AF%BB-%E8%8A%82%E7%82%B9%E6%80%BB%E4%BC%9A%E5%A4%B1%E8%B4%A5/" title="深入 Hadoop 00 - 导读：节点总会失败"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-00-%E5%AF%BC%E8%AF%BB-%E8%8A%82%E7%82%B9%E6%80%BB%E4%BC%9A%E5%A4%B1%E8%B4%A5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 00 - 导读：节点总会失败</div></div><div class="info-2"><div class="info-item-1">Hadoop 常被介绍为&quot;HDFS + YARN + MapReduce 三驾马车&quot;。这个分类把重点放错了位置。把存储、调度、计算切成三件独立的事情，读者很难回答下面这个问题：为什么这三个子系统会一起出现在同一个项目里，而不是像 Spark、Flink、Kafka 那样作为独立组件存在？ 更准确的说法是：Hadoop 是一组关于&quot;如何构建运行在大量廉价节点上的分布式系统&quot;的前提假设在三个不同层面的具体化。这组前提把整个项目串成一条主线——节点总会失败、数据总是巨大、廉价比专用更重要。HDFS、YARN、MapReduce 各自处理这组前提下的一个子问题：HDFS 把大文件切成块并多副本放置，YARN 把集群资源切成容器并按策略分配，MapReduce 把大计算切成任务并按失败重试执行。 本系列只抓一个问题：Hadoop 这套以&quot;节点总会失败&quot;为前提假设的工程化方案，在 HDFS、YARN、MapReduce 三个层面是如何具体实现的，每个实现里有哪些可以迁移到其他分布式系统的设计模式。 GFS 论文留下的设计遗产 要理解...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-06-HDFS-3-x-%E6%BC%94%E8%BF%9B%E4%B8%8E%E7%BA%A0%E5%88%A0%E7%A0%81/" title="深入 Hadoop 06 - HDFS 3.x 演进与纠删码"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-06-HDFS-3-x-%E6%BC%94%E8%BF%9B%E4%B8%8E%E7%BA%A0%E5%88%A0%E7%A0%81/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 06 - HDFS 3.x 演进与纠删码</div></div><div class="info-2"><div class="info-item-1">上一篇讲了 HA 怎么解决 NameNode 单点问题。本篇讲 HDFS 在 Hadoop 3.x 时代的三个核心演进：纠删码（Erasure Coding）、路由联邦（Router-Based Federation）、Observer NameNode。这三个特性分别解决三个不同的瓶颈：存储成本、NameNode 元数据上限、读吞吐上限。 HDFS 3.x 常被描述成&quot;HDFS 的现代化版本&quot;。这个描述对应了发布节奏但没解释演进逻辑。准确的说法是：HDFS 在 2.x 解决了 HA 和 YARN 之后，3.x 时代面对的核心问题是 PB 级集群的存储成本和元数据瓶颈，所以引入纠删码降存储、引入路由联邦解决元数据上限、引入 Observer NameNode 拆分读写流量。三个特性的设计动机都是&quot;假设集群规模已经超过单 NameNode 上限&quot;。 本篇只抓一个问题：HDFS 3.x 引入的三个主要特性各自解决什么瓶颈、用什么代价、适合什么场景。 纠删码：用 CPU 换存储 HDFS 默认三副本意味着每存 1TB 用户数据要占 3TB 物理存...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E7%9A%84%E5%85%AD%E4%B8%AA%E6%AD%A5%E9%AA%A4"><span class="toc-number">1.</span> <span class="toc-text">写入路径的六个步骤</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%AF%E6%9C%AC%E6%94%BE%E7%BD%AE%E7%AD%96%E7%95%A5%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%89%E4%B8%AA%E5%89%AF%E6%9C%AC%E6%94%BE%E4%B8%A4%E4%B8%AA%E6%9C%BA%E6%9E%B6"><span class="toc-number">2.</span> <span class="toc-text">副本放置策略：为什么三个副本放两个机架</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#pipeline-%E5%86%99%E5%85%A5%EF%BC%9A%E6%B5%81%E6%B0%B4%E7%BA%BF%E7%9A%84%E5%85%B7%E4%BD%93%E6%9C%BA%E5%88%B6"><span class="toc-number">3.</span> <span class="toc-text">Pipeline 写入：流水线的具体机制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%B0%E6%8D%AE%E9%98%9F%E5%88%97%E4%B8%8E-ack-%E9%98%9F%E5%88%97"><span class="toc-number">4.</span> <span class="toc-text">数据队列与 ACK 队列</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#pipeline-%E6%95%85%E9%9A%9C%E6%81%A2%E5%A4%8D"><span class="toc-number">5.</span> <span class="toc-text">Pipeline 故障恢复</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%EF%BC%9A%E8%A7%82%E5%AF%9F-pipeline-%E5%86%99%E5%85%A5"><span class="toc-number">6.</span> <span class="toc-text">实验：观察 Pipeline 写入</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC"><span class="toc-number">7.</span> <span class="toc-text">模式提炼</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB%E8%A1%A8"><span class="toc-number">8.</span> <span class="toc-text">工程迁移表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">9.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">10.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">11.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">12.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
