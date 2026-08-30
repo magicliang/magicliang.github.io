@@ -1,0 +1,949 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 HBase 03 - Schema 与 row key 设计 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="前置问题与边界 HBase schema 设计首先是 row key 设计，其次才是 column family 和 qualifier 的组织。row key 决定排序、Region 分布、范围 scan 和热点形态。column family 决定物理 Store、缓存、压缩、版本和 TTL 边界。qualifier 提供稀疏属性表达能力，但不替代 row key 的排序能力。 本篇回答一个核">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 HBase 03 - Schema 与 row key 设计">
+<meta property="og:url" content="https://magicliang.github.io/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-03-Schema-%E4%B8%8E-row-key-%E8%AE%BE%E8%AE%A1/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="前置问题与边界 HBase schema 设计首先是 row key 设计，其次才是 column family 和 qualifier 的组织。row key 决定排序、Region 分布、范围 scan 和热点形态。column family 决定物理 Store、缓存、压缩、版本和 TTL 边界。qualifier 提供稀疏属性表达能力，但不替代 row key 的排序能力。 本篇回答一个核">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-03-Schema-%E4%B8%8E-row-key-%E8%AE%BE%E8%AE%A1/cover.svg">
+<meta property="article:published_time" content="2026-08-29T02:03:00.000Z">
+<meta property="article:modified_time" content="2026-08-30T06:54:31.390Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="HBase">
+<meta property="article:tag" content="Hadoop">
+<meta property="article:tag" content="RowKey">
+<meta property="article:tag" content="Schema">
+<meta property="article:tag" content="分布式数据库">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-03-Schema-%E4%B8%8E-row-key-%E8%AE%BE%E8%AE%A1/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 HBase 03 - Schema 与 row key 设计",
+  "url": "https://magicliang.github.io/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-03-Schema-%E4%B8%8E-row-key-%E8%AE%BE%E8%AE%A1/",
+  "image": "https://magicliang.github.io/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-03-Schema-%E4%B8%8E-row-key-%E8%AE%BE%E8%AE%A1/cover.svg",
+  "datePublished": "2026-08-29T02:03:00.000Z",
+  "dateModified": "2026-08-30T06:54:31.390Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-03-Schema-%E4%B8%8E-row-key-%E8%AE%BE%E8%AE%A1/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 HBase 03 - Schema 与 row key 设计',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">665</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">778</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">14</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-03-Schema-%E4%B8%8E-row-key-%E8%AE%BE%E8%AE%A1/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 HBase 03 - Schema 与 row key 设计</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 HBase 03 - Schema 与 row key 设计</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-08-29T02:03:00.000Z" title="Created 2026-08-29 10:03:00">2026-08-29</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-08-30T06:54:31.390Z" title="Updated 2026-08-30 14:54:31">2026-08-30</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.5k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>9mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-08-30 14:54:31&quot;}" hidden></div><h2 id="前置问题与边界">前置问题与边界</h2>
+<p>HBase schema 设计首先是 row key 设计，其次才是 column family 和 qualifier 的组织。row key 决定排序、Region 分布、范围 scan 和热点形态。column family 决定物理 Store、缓存、压缩、版本和 TTL 边界。qualifier 提供稀疏属性表达能力，但不替代 row key 的排序能力。</p>
+<p>本篇回答一个核心问题：排序、前缀、salt、反转和时间桶如何影响热点与扫描。写入路径的 WAL/MemStore 状态放到第 04 篇；读取路径的 BlockCache、Bloom Filter 和 HFile block 放到第 05、06 篇；Region split 和 assignment 放到第 08 篇。</p>
+<p>schema-less 不是没有 schema。HBase 不强制预定义 qualifier，但 row key 编码、family 数量、版本数、TTL、压缩、Bloom Filter 和访问模式都属于 schema 决策。</p>
+<h2 id="rowkey-决策图">RowKey 决策图</h2>
+<pre><code class="hljs mermaid">flowchart TD
+  Q[主要查询问题] --&gt; A&#123;是否需要连续范围 scan&#125;
+  A --&gt;|是| R[把共同过滤维度放入 row key 前部]
+  A --&gt;|否| D[用散列或 salt 扩散写入]
+  R --&gt; H&#123;是否单调递增写入&#125;
+  H --&gt;|是| B[反转、salt 或时间桶]
+  H --&gt;|否| S[保持可读连续区间]
+  D --&gt; T[补二级索引或离线视图]
+  B --&gt; E[评估 scan fan-out]
+  S --&gt; E
+  T --&gt; E</code></pre>
+<p>这张图的核心不是某个具体格式，而是取舍：让一类查询变成连续 key range，通常会让另一类查询变成多段 scan 或外部索引。</p>
+<h2 id="排序决定局部性">排序决定局部性</h2>
+<p>HBase row key 是字节序排序。连续 key 会落在相邻 Region 中，也会被 scan 顺序访问。把用户 ID 放在前缀，会让单用户查询天然局部；把日期放在前缀，会让按日期扫描天然局部；把随机 salt 放在前缀，会让写入分散，但同一业务维度的查询需要 fan-out 到多个 salt 分区。</p>
+<p>局部性不是越强越好。如果所有新数据都带同一个日期前缀，局部性会变成热点。分散性也不是越强越好。如果完全随机，范围 scan 会失去连续性，读路径要承担更多 RPC 和合并成本。</p>
+<h2 id="前缀：把最常见的过滤条件放到前面">前缀：把最常见的过滤条件放到前面</h2>
+<p>前缀适合表达高频点查和范围查询。例如用户行为表常见查询是“按用户查最近 N 天”，row key 可以用 <code>userId#reverseTimestamp#eventId</code>。这样同一用户的数据聚在一起，近期数据按反向时间靠前，scan 可以从该用户前缀开始读一段。</p>
+<p>如果主要查询是“按城市和品类查今日订单”，row key 前缀可能变成 <code>city#category#date#orderId</code>。这个设计会牺牲按单个用户回查订单的连续性；用户维度查询需要另一张索引表或离线视图。</p>
+<h2 id="salt：扩散写入-代价是-fan-out">Salt：扩散写入，代价是 fan-out</h2>
+<p>salt 在 row key 前面加一个有限取值的散列前缀，例如 <code>03#userId#reverseTs</code>。它把原本会落入同一 range 的写入分散到多个 range，减少单 Region 写热点。salt 不是 HBase 自动给出的万能配置，而是 schema 编码策略。</p>
+<p>salt 的代价很具体：按 <code>userId</code> 查询时，需要计算或枚举 salt。如果 salt 只由 userId 决定，单用户仍落在固定 salt 下，可以保持点查；如果 salt 由事件或时间随机产生，查询同一用户的完整范围就要扫多个 salt 前缀。salt 数量越多，写入越分散，读取 fan-out 越大。</p>
+<h2 id="反转：改变单调增长方向">反转：改变单调增长方向</h2>
+<p>反转常见于域名、手机号、递增 ID 或时间戳。官方文档给过反转域名的例子：把 <code>www.apache.org</code> 变成 <code>org.apache.www</code>，让同一组织域名在排序上靠近。</p>
+<p>反转也可用于避免递增 ID 把写入推向末端 Region。将用户 ID 或时间戳的一部分反转，会打散前缀相同的写入。但反转后的 key 往往不再符合自然范围查询。例如按原始时间从小到大 scan，可能需要额外解码和多段查询。</p>
+<h2 id="时间桶：给时间局部性加上边界">时间桶：给时间局部性加上边界</h2>
+<p>时间桶把时间维度压成小时、天、周等离散段，例如 <code>userId#20260829#reverseTs</code> 或 <code>bucket#reverseTs#id</code>。它避免一个无限增长的时间序列集中在单个末端，同时给查询提供明确边界。</p>
+<p>桶太大，热点仍会集中；桶太小，查询跨桶时 RPC 和结果合并增加。桶宽需要由写入速率、Region 大小、查询窗口和保留周期共同决定。不能用“按天一定好”这类经验替代实际负载分析。</p>
+<h2 id="column-family-数量要克制">Column Family 数量要克制</h2>
+<p>HBase 的 column family 是物理组织边界。每个 Region 下每个 family 都有 Store 和 StoreFile。family 太多，会放大 flush、compaction 和打开文件数量。family 太少，又可能把冷热、大小差异和 TTL 差异巨大的数据绑在一起。</p>
+<p>一个实用原则是按访问模式和生命周期分 family，而不是按业务领域分 family。经常一起读、大小相近、TTL 相近的数据适合放在同一 family；大对象、低频字段、短 TTL 字段通常不该和高频小字段混在一个 family。</p>
+<h2 id="关键对象和状态">关键对象和状态</h2>
+<table>
+<thead>
+<tr>
+<th>设计项</th>
+<th>影响对象</th>
+<th>收益</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>业务前缀</td>
+<td>Region、Scan</td>
+<td>查询局部性</td>
+<td>前缀低基数会热点</td>
+</tr>
+<tr>
+<td>Salt</td>
+<td>Region 分布</td>
+<td>写入扩散</td>
+<td>查询 fan-out</td>
+</tr>
+<tr>
+<td>Reverse</td>
+<td>RowKey 排序</td>
+<td>打散单调增长</td>
+<td>自然范围顺序丢失</td>
+</tr>
+<tr>
+<td>Time bucket</td>
+<td>Region、TTL、Scan</td>
+<td>限定时间窗口</td>
+<td>跨桶合并</td>
+</tr>
+<tr>
+<td>Column family</td>
+<td>Store、HFile、Cache</td>
+<td>物理策略独立</td>
+<td>StoreFile 和 compaction 放大</td>
+</tr>
+<tr>
+<td>Qualifier</td>
+<td>Cell</td>
+<td>稀疏属性灵活</td>
+<td>列名进入存储成本</td>
+</tr>
+</tbody>
+</table>
+<h2 id="最小实验">最小实验</h2>
+<p>UNVERIFIED_RUNTIME：当前任务环境未运行目标集群。以下实验用于观察 row key 排序和 scan fan-out，不提供伪造输出。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">hbase shell<br></code></pre></td></tr></table></figure>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">create_namespace <span class="hljs-string">&#x27;lab&#x27;</span><br></code></pre></td></tr></table></figure>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">create <span class="hljs-string">&#x27;lab:t03_rowkey_design&#x27;</span>, <span class="hljs-string">&#x27;cf&#x27;</span><br></code></pre></td></tr></table></figure>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">put <span class="hljs-string">&#x27;lab:t03_rowkey_design&#x27;</span>, <span class="hljs-string">&#x27;u001#20260829#0003&#x27;</span>, <span class="hljs-string">&#x27;cf:v&#x27;</span>, <span class="hljs-string">&#x27;a&#x27;</span><br></code></pre></td></tr></table></figure>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">put <span class="hljs-string">&#x27;lab:t03_rowkey_design&#x27;</span>, <span class="hljs-string">&#x27;u001#20260829#0001&#x27;</span>, <span class="hljs-string">&#x27;cf:v&#x27;</span>, <span class="hljs-string">&#x27;b&#x27;</span><br></code></pre></td></tr></table></figure>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">put <span class="hljs-string">&#x27;lab:t03_rowkey_design&#x27;</span>, <span class="hljs-string">&#x27;00#u001#20260829#0002&#x27;</span>, <span class="hljs-string">&#x27;cf:v&#x27;</span>, <span class="hljs-string">&#x27;c&#x27;</span><br></code></pre></td></tr></table></figure>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">put <span class="hljs-string">&#x27;lab:t03_rowkey_design&#x27;</span>, <span class="hljs-string">&#x27;01#u001#20260829#0004&#x27;</span>, <span class="hljs-string">&#x27;cf:v&#x27;</span>, <span class="hljs-string">&#x27;d&#x27;</span><br></code></pre></td></tr></table></figure>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">scan <span class="hljs-string">&#x27;lab:t03_rowkey_design&#x27;</span>, &#123;<span class="hljs-variable constant_">STARTROW</span> =&gt; <span class="hljs-string">&#x27;u001#&#x27;</span>, <span class="hljs-variable constant_">STOPROW</span> =&gt; <span class="hljs-string">&#x27;u001$&#x27;</span>&#125;<br></code></pre></td></tr></table></figure>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">scan <span class="hljs-string">&#x27;lab:t03_rowkey_design&#x27;</span>, &#123;<span class="hljs-variable constant_">STARTROW</span> =&gt; <span class="hljs-string">&#x27;00#u001#&#x27;</span>, <span class="hljs-variable constant_">STOPROW</span> =&gt; <span class="hljs-string">&#x27;00#u001$&#x27;</span>&#125;<br></code></pre></td></tr></table></figure>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">scan <span class="hljs-string">&#x27;lab:t03_rowkey_design&#x27;</span>, &#123;<span class="hljs-variable constant_">STARTROW</span> =&gt; <span class="hljs-string">&#x27;01#u001#&#x27;</span>, <span class="hljs-variable constant_">STOPROW</span> =&gt; <span class="hljs-string">&#x27;01#u001$&#x27;</span>&#125;<br></code></pre></td></tr></table></figure>
+<p>第一条 scan 观察无 salt 的连续用户前缀。后两条 scan 观察 salt 后的 fan-out：同一用户的数据如果分散到 <code>00#</code> 和 <code>01#</code> 两个前缀，查询需要分别扫描再合并。</p>
+<p>清理命令：</p>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">disable <span class="hljs-string">&#x27;lab:t03_rowkey_design&#x27;</span><br></code></pre></td></tr></table></figure>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">drop <span class="hljs-string">&#x27;lab:t03_rowkey_design&#x27;</span><br></code></pre></td></tr></table></figure>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs ruby">drop_namespace <span class="hljs-string">&#x27;lab&#x27;</span><br></code></pre></td></tr></table></figure>
+<h2 id="失败恢复">失败恢复</h2>
+<p>row key 设计不直接改变 WAL 恢复协议，但会改变故障影响面。如果写入集中在一个热点 Region，该 RegionServer 崩溃会影响更大比例的新写入；WAL replay 也会集中处理同一个 Region 的 edit。分散良好的 row key 能把负载和恢复压力摊到更多 Region，但过度 salt 会让读请求在故障后同时命中更多 Region。</p>
+<p>Region split 之后，设计不良的递增 key 仍可能把新写入推向最后一个 Region。split 解决的是已有 key range 过大，不自动解决未来 key 的单调热点。</p>
+<h2 id="工程迁移">工程迁移</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>HBase 决策</th>
+<th>可迁移模式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>用户时间线</td>
+<td><code>userId#reverseTs</code></td>
+<td>查询维度前缀化</td>
+</tr>
+<tr>
+<td>高写入计数</td>
+<td><code>salt#entity#ts</code></td>
+<td>写扩散换读合并</td>
+</tr>
+<tr>
+<td>域名索引</td>
+<td><code>org.apache.www</code></td>
+<td>反转公共后缀</td>
+</tr>
+<tr>
+<td>日志保留</td>
+<td><code>bucket#service#reverseTs</code></td>
+<td>时间桶控制范围</td>
+</tr>
+<tr>
+<td>冷热字段</td>
+<td>多 family</td>
+<td>生命周期分组</td>
+</tr>
+</tbody>
+</table>
+<p>[PATTERN] 有序 key-value 系统的 schema 设计，本质是在“写入分布”和“读取连续性”之间选边界。每加一层打散，就要补一层读合并。</p>
+<h2 id="常见误解">常见误解</h2>
+<p>误解一：salt 越多越好。salt 扩散写入，但增加查询 fan-out 和结果合并。</p>
+<p>误解二：row key 可读性最重要。row key 先服务排序、定位和 scan，可读性只是在运维排查时有价值。</p>
+<p>误解三：column family 可以按业务模块随便拆。family 是物理 Store 边界，过多会放大文件与后台任务。</p>
+<p>误解四：动态 qualifier 等于任意字段都适合放 qualifier。访问路径如果需要排序和范围，字段可能应该进入 row key。</p>
+<p>误解五：Region split 能修复所有热点。单调写入会继续打到末端 Region，split 只能阶段性缓解。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>
+<p>为“按用户查最近 100 条订单”设计 row key，并说明是否需要反向时间戳。</p>
+</li>
+<li>
+<p>为“按城市、品类、日期查订单”设计 row key，并说明用户维度查询如何补。</p>
+</li>
+<li>
+<p>选一个 salt 数量，写出选择依据和读取 fan-out 成本。</p>
+</li>
+<li>
+<p>判断一个大字段是否应该从高频 family 拆出。</p>
+</li>
+<li>
+<p>解释为什么 <code>timestamp#userId</code> 和 <code>userId#timestamp</code> 的热点与 scan 行为不同。</p>
+</li>
+</ol>
+<h2 id="系列导航">系列导航</h2>
+<table>
+<thead>
+<tr>
+<th>篇号</th>
+<th>主题</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-00-%E5%AF%BC%E8%AF%BB-row-key-%E5%86%B3%E5%AE%9A%E6%95%B0%E6%8D%AE%E4%BD%8D%E7%BD%AE/">00</a></td>
+<td>导读：row key 决定数据位置</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-01-%E6%95%B0%E6%8D%AE%E6%A8%A1%E5%9E%8B-Cell-Column-Family-%E4%B8%8E%E7%89%88%E6%9C%AC/">01</a></td>
+<td>数据模型：Cell、Column Family 与版本</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-02-%E9%9B%86%E7%BE%A4%E6%9E%B6%E6%9E%84-HMaster-RegionServer-ZooKeeper-%E4%B8%8E-hbase-meta/">02</a></td>
+<td>集群架构：HMaster、RegionServer、ZooKeeper 与 hbase:meta</td>
+<td>上一篇</td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-03-Schema-%E4%B8%8E-row-key-%E8%AE%BE%E8%AE%A1/">03</a></td>
+<td>Schema 与 row key 设计</td>
+<td>本篇</td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-04-%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84-WAL-MVCC-MemStore-%E4%B8%8E-flush/">04</a></td>
+<td>写入路径：WAL、MVCC、MemStore 与 flush</td>
+<td>下一篇</td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-05-%E8%AF%BB%E5%8F%96%E8%B7%AF%E5%BE%84-BlockCache-Bloom-Filter-%E4%B8%8E-HFile-block/">05</a></td>
+<td>读取路径：BlockCache、Bloom Filter 与 HFile block</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-06-HFile-%E5%86%85%E9%83%A8%E7%BB%93%E6%9E%84/">06</a></td>
+<td>HFile 内部结构</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-07-Compaction-TTL-%E7%89%88%E6%9C%AC%E4%B8%8E-Delete/">07</a></td>
+<td>Compaction、TTL、版本与 Delete</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-08-Region-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-split-merge-%E4%B8%8E-assignment/">08</a></td>
+<td>Region 生命周期：split、merge 与 assignment</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-09-Client-%E8%B7%AF%E7%94%B1%E4%B8%8E%E9%87%8D%E8%AF%95/">09</a></td>
+<td>Client 路由与重试</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-10-%E8%A1%8C%E7%BA%A7%E5%8E%9F%E5%AD%90%E6%80%A7%E4%B8%8E%E4%B8%80%E8%87%B4%E6%80%A7%E8%BE%B9%E7%95%8C/">10</a></td>
+<td>行级原子性与一致性边界</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-11-RegionServer-%E5%B4%A9%E6%BA%83%E4%B8%8E-WAL-%E6%81%A2%E5%A4%8D/">11</a></td>
+<td>RegionServer 崩溃与 WAL 恢复</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-12-%E8%B7%A8%E9%9B%86%E7%BE%A4-Replication/">12</a></td>
+<td>跨集群 Replication</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-13-Snapshot-Backup-%E4%B8%8E%E6%81%A2%E5%A4%8D/">13</a></td>
+<td>Snapshot、Backup 与恢复</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-14-Get-Scan-Filter-%E4%B8%8E%E5%88%86%E9%A1%B5/">14</a></td>
+<td>Get、Scan、Filter 与分页</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-15-BufferedMutator-%E4%B8%8E-Bulk-Load/">15</a></td>
+<td>BufferedMutator 与 Bulk Load</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-16-Coprocessor-Endpoint-%E4%B8%8E-Phoenix-%E8%BE%B9%E7%95%8C/">16</a></td>
+<td>Coprocessor、Endpoint 与 Phoenix 边界</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-17-Kerberos-RPC-%E4%BF%9D%E6%8A%A4%E4%B8%8E-ACL/">17</a></td>
+<td>Kerberos、RPC 保护与 ACL</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-18-Metrics-hbtop-Compaction-%E4%B8%8E%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">18</a></td>
+<td>Metrics、hbtop、Compaction 与性能调优</td>
+<td></td>
+</tr>
+<tr>
+<td><a href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-19-HBase-3-0-%E4%B8%8E%E8%AE%BE%E8%AE%A1%E8%BE%B9%E7%95%8C/">19</a></td>
+<td>HBase 3.0 与设计边界</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Apache HBase Data Model：<a target="_blank" rel="noopener" href="https://hbase.apache.org/docs/datamodel/">https://hbase.apache.org/docs/datamodel/</a></li>
+<li>Apache HBase and Schema Design：<a target="_blank" rel="noopener" href="https://hbase.apache.org/docs/schema-design/">https://hbase.apache.org/docs/schema-design/</a></li>
+<li>Apache HBase Regions：<a target="_blank" rel="noopener" href="https://hbase.apache.org/docs/architecture/regions/">https://hbase.apache.org/docs/architecture/regions/</a></li>
+<li>Apache HBase Performance Tuning：<a target="_blank" rel="noopener" href="https://hbase.apache.org/docs/performance/">https://hbase.apache.org/docs/performance/</a></li>
+<li>Apache HBase 2.6 Client API：<a target="_blank" rel="noopener" href="https://hbase.apache.org/2.6/apidocs/org/apache/hadoop/hbase/client/package-summary.html">https://hbase.apache.org/2.6/apidocs/org/apache/hadoop/hbase/client/package-summary.html</a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-03-Schema-%E4%B8%8E-row-key-%E8%AE%BE%E8%AE%A1/">https://magicliang.github.io/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-03-Schema-%E4%B8%8E-row-key-%E8%AE%BE%E8%AE%A1/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Hadoop/">Hadoop</a><a class="post-meta__tags" href="/tags/HBase/">HBase</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E6%95%B0%E6%8D%AE%E5%BA%93/">分布式数据库</a><a class="post-meta__tags" href="/tags/RowKey/">RowKey</a><a class="post-meta__tags" href="/tags/Schema/">Schema</a></div><div class="post-share"><div class="social-share" data-image="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-03-Schema-%E4%B8%8E-row-key-%E8%AE%BE%E8%AE%A1/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-16-Coprocessor-Endpoint-%E4%B8%8E-Phoenix-%E8%BE%B9%E7%95%8C/" title="深入 HBase 16 - Coprocessor、Endpoint 与 Phoenix 边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-16-Coprocessor-Endpoint-%E4%B8%8E-Phoenix-%E8%BE%B9%E7%95%8C/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-29</div><div class="info-item-2">深入 HBase 16 - Coprocessor、Endpoint 与 Phoenix 边界</div></div><div class="info-2"><div class="info-item-1">Coprocessor 把一部分逻辑放进 HBase 服务端进程执行。这个能力很强，也很危险：代码和 RegionServer 在同一个 JVM、同一套权限、同一条请求路径里运行。Endpoint 能做局部聚合和自定义 RPC，但它不是分布式 SQL 引擎；Phoenix 提供 SQL 层，但 Phoenix 和 HBase 的升级边界也不能混写。 本篇只抓一个核心问题：计算下推能做什么，何时会破坏隔离、升级和运维边界。 Coprocessor 路径图 flowchart TD   Client[HBase Client] --&gt; RPC[RegionServer RPC]   RPC --&gt; Observer[Observer hooks]   Observer --&gt; Region[Region]   Region --&gt; Store[Store/MemStore/HFile]   Client --&gt; Endpoint[Endpoint service]   Endpoint --&gt; Region   Region --&gt; WAL[...</div></div></div></a><a class="pagination-related" href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-01-%E6%95%B0%E6%8D%AE%E6%A8%A1%E5%9E%8B-Cell-Column-Family-%E4%B8%8E%E7%89%88%E6%9C%AC/" title="深入 HBase 01 - 数据模型：Cell、Column Family 与版本"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-01-%E6%95%B0%E6%8D%AE%E6%A8%A1%E5%9E%8B-Cell-Column-Family-%E4%B8%8E%E7%89%88%E6%9C%AC/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-29</div><div class="info-item-2">深入 HBase 01 - 数据模型：Cell、Column Family 与版本</div></div><div class="info-2"><div class="info-item-1">前置问题与边界 HBase 的一个值不是由“第几行第几列”定位，而是由 (row, family, qualifier, timestamp) 这组坐标定位。row 是 uninterpreted bytes，按字典序排序；family 在建表时定义，是存储、压缩、缓存、版本数和 TTL 等配置的边界；qualifier 是 family 之内的列限定符，可以动态出现；timestamp 是版本维度。 本篇回答一个核心问题：(row, family, qualifier, timestamp) 如何唯一定位一个值。写入路径、MVCC、WAL 和 flush 放到第 04 篇；Delete tombstone 在 compaction 中真正清理的条件放到第 07 篇；行级原子性放到第 10 篇。 HBase 的“宽列”容易被误写成两种东西。它不是关系数据库里的稀疏宽表，因为 qualifier 不需要全表预定义，也不存在空列占位。它也不是分析型列存，因为物理按 column family 组织 Store，目标是按 row key 的在线读写和范围 scan。 Cell 坐标图 ...</div></div></div></a><a class="pagination-related" href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-07-Compaction-TTL-%E7%89%88%E6%9C%AC%E4%B8%8E-Delete/" title="深入 HBase 07 - Compaction、TTL、版本与 Delete"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-07-Compaction-TTL-%E7%89%88%E6%9C%AC%E4%B8%8E-Delete/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-29</div><div class="info-item-2">深入 HBase 07 - Compaction、TTL、版本与 Delete</div></div><div class="info-2"><div class="info-item-1">前置问题与边界 本篇回答一个核心问题：不可变 HFile 如何合并，旧值和 tombstone 何时真正消失。 HBase 的写入路径把 mutation 写入 WAL 和 MemStore，flush 后形成新的 HFile。HFile 不原地修改，因此旧版本、Delete 标记和过期数据会散落在多个 StoreFile 中。Compaction 通过重写新文件来减少 StoreFile 数量，并在可见性规则允许时丢弃不再需要的 Cell。 本篇不讨论跨行事务，也不把 Delete 写成“立即删除磁盘数据”。HBase 的 Delete 是写入一个或多个 tombstone；旧数据是否在物理文件里消失，取决于 compaction 类型、版本策略、TTL、快照引用、最小保留时间和扫描可见性。 对象路径图 flowchart TD     P[Put/Delete] --&gt; WAL[WAL]     P --&gt; MS[MemStore]     MS --&gt; FL[Flush]     FL --&gt; H1[HFile A]     FL --&gt; H2...</div></div></div></a><a class="pagination-related" href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-14-Get-Scan-Filter-%E4%B8%8E%E5%88%86%E9%A1%B5/" title="深入 HBase 14 - Get、Scan、Filter 与分页"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-14-Get-Scan-Filter-%E4%B8%8E%E5%88%86%E9%A1%B5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-29</div><div class="info-item-2">深入 HBase 14 - Get、Scan、Filter 与分页</div></div><div class="info-2"><div class="info-item-1">前置问题与边界 HBase 的读请求不是“把表读出来再过滤”。Get 直接定位单行；Scan 按 row-key range 顺序推进；Filter 可以减少返回给客户端的 Cell，也可能在服务端继续扫描大量数据。caching、batch、limit 和 reversed 影响 RPC 粒度、结果分片和遍历方向，但不会改变 HFile 的物理排序。 本篇回答一个核心问题：scan range、cache、batch、limit、reversed scan 如何影响 RPC 和结果语义。BlockCache、Bloom Filter 和 HFile block 在第 05、06 篇；row key 设计在第 03 篇；Coprocessor 和 Phoenix 边界在第 16 篇。 读取路径图 flowchart TD     C[Client] --&gt; O&#123;Operation&#125;     O --&gt;|Get row| G[Single row lookup]     O --&gt;|Scan range| S[Region scanner]  ...</div></div></div></a><a class="pagination-related" href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-08-Region-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-split-merge-%E4%B8%8E-assignment/" title="深入 HBase 08 - Region 生命周期：split、merge 与 assignment"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-08-Region-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F-split-merge-%E4%B8%8E-assignment/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-29</div><div class="info-item-2">深入 HBase 08 - Region 生命周期：split、merge 与 assignment</div></div><div class="info-2"><div class="info-item-1">前置问题与边界 本篇回答一个核心问题：表如何扩展，Region 如何迁移，状态由谁推进。 Region 是 HBase 表按 row-key range 切分后的服务单位。它决定数据由哪个 RegionServer 接收，也决定客户端定位和负载均衡的粒度。split、merge 和 assignment 都是在改变 Region 与 RegionServer 的映射，不能把这些动作写成简单的 HDFS 文件移动。 HBase 2.6.6 使用 Procedure v2 和 AssignmentManager 推进 Region assignment。Region 持久状态与位置信息写入 hbase:meta；hbase:meta 自身的位置信息和可用性还涉及 ZooKeeper 或 registry 相关路径。ZooKeeper 不保存所有 HBase 元数据。 生命周期图 stateDiagram-v2     [*] --&gt; CLOSED     CLOSED --&gt; OPENING: assign     OPENING --&gt; OPEN: RegionS...</div></div></div></a><a class="pagination-related" href="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-06-HFile-%E5%86%85%E9%83%A8%E7%BB%93%E6%9E%84/" title="深入 HBase 06 - HFile 内部结构"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/08/29/%E6%B7%B1%E5%85%A5-HBase-06-HFile-%E5%86%85%E9%83%A8%E7%BB%93%E6%9E%84/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-29</div><div class="info-item-2">深入 HBase 06 - HFile 内部结构</div></div><div class="info-2"><div class="info-item-1">前置问题与边界 本篇回答一个核心问题：data block、index、file info、Bloom metadata 如何支持 HBase 在不可变文件里做有序查找。 HFile 是 HBase flush 和 compaction 之后写到 HDFS 的 StoreFile 格式。它不是关系数据库页文件，也不是面向分析扫描的列存文件。它保存按 Cell key 排序的记录，并携带索引、元信息、Bloom 相关数据和 trailer，供 RegionServer 在读路径中缩小访问范围。 基线仍是 HBase 2.6.6。HBase 2.6.6 的代码支持 HFile format version 3，不能把当前实现误写成“只支持 HFile v2”。HFile v2 的文档解释了多级索引、Bloom 和 trailer 等关键结构；写作时要把格式演进和当前版本能力分开。 文件结构图 flowchart TD     H[HFile StoreFile] --&gt; DB[Data Blocks: sorted Cells]     H --&gt; LB[Leaf Ind...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E7%BD%AE%E9%97%AE%E9%A2%98%E4%B8%8E%E8%BE%B9%E7%95%8C"><span class="toc-number">1.</span> <span class="toc-text">前置问题与边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#rowkey-%E5%86%B3%E7%AD%96%E5%9B%BE"><span class="toc-number">2.</span> <span class="toc-text">RowKey 决策图</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%8E%92%E5%BA%8F%E5%86%B3%E5%AE%9A%E5%B1%80%E9%83%A8%E6%80%A7"><span class="toc-number">3.</span> <span class="toc-text">排序决定局部性</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E7%BC%80%EF%BC%9A%E6%8A%8A%E6%9C%80%E5%B8%B8%E8%A7%81%E7%9A%84%E8%BF%87%E6%BB%A4%E6%9D%A1%E4%BB%B6%E6%94%BE%E5%88%B0%E5%89%8D%E9%9D%A2"><span class="toc-number">4.</span> <span class="toc-text">前缀：把最常见的过滤条件放到前面</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#salt%EF%BC%9A%E6%89%A9%E6%95%A3%E5%86%99%E5%85%A5-%E4%BB%A3%E4%BB%B7%E6%98%AF-fan-out"><span class="toc-number">5.</span> <span class="toc-text">Salt：扩散写入，代价是 fan-out</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%8D%E8%BD%AC%EF%BC%9A%E6%94%B9%E5%8F%98%E5%8D%95%E8%B0%83%E5%A2%9E%E9%95%BF%E6%96%B9%E5%90%91"><span class="toc-number">6.</span> <span class="toc-text">反转：改变单调增长方向</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%97%B6%E9%97%B4%E6%A1%B6%EF%BC%9A%E7%BB%99%E6%97%B6%E9%97%B4%E5%B1%80%E9%83%A8%E6%80%A7%E5%8A%A0%E4%B8%8A%E8%BE%B9%E7%95%8C"><span class="toc-number">7.</span> <span class="toc-text">时间桶：给时间局部性加上边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#column-family-%E6%95%B0%E9%87%8F%E8%A6%81%E5%85%8B%E5%88%B6"><span class="toc-number">8.</span> <span class="toc-text">Column Family 数量要克制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%B3%E9%94%AE%E5%AF%B9%E8%B1%A1%E5%92%8C%E7%8A%B6%E6%80%81"><span class="toc-number">9.</span> <span class="toc-text">关键对象和状态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%80%E5%B0%8F%E5%AE%9E%E9%AA%8C"><span class="toc-number">10.</span> <span class="toc-text">最小实验</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%B1%E8%B4%A5%E6%81%A2%E5%A4%8D"><span class="toc-number">11.</span> <span class="toc-text">失败恢复</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E8%BF%81%E7%A7%BB"><span class="toc-number">12.</span> <span class="toc-text">工程迁移</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B8%B8%E8%A7%81%E8%AF%AF%E8%A7%A3"><span class="toc-number">13.</span> <span class="toc-text">常见误解</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">14.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">15.</span> <span class="toc-text">系列导航</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">16.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
