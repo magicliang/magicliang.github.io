@@ -1,0 +1,749 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>从零编写现代编译器 20 - 让错误回到源程序 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="运行时错误目前只能告诉你&quot;除零错误&quot;，然后进程就没了。调试器停在一个机器地址上，对照的是 LLVM IR 甚至汇编，读者必须自己倒推这条指令对应源文件的哪一行。编译器花了十几篇功夫把 Sprout 源码翻译成机器码，却在出错的时候把来路全丢了。这一篇补上这条回路：从词法器的 Span 开始，让位置信息穿透 AST、HIR、SSA、LLVM IR，最终写进目标文件的 DWARF">
+<meta property="og:type" content="article">
+<meta property="og:title" content="从零编写现代编译器 20 - 让错误回到源程序">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-20-%E8%AE%A9%E9%94%99%E8%AF%AF%E5%9B%9E%E5%88%B0%E6%BA%90%E7%A8%8B%E5%BA%8F/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="运行时错误目前只能告诉你&quot;除零错误&quot;，然后进程就没了。调试器停在一个机器地址上，对照的是 LLVM IR 甚至汇编，读者必须自己倒推这条指令对应源文件的哪一行。编译器花了十几篇功夫把 Sprout 源码翻译成机器码，却在出错的时候把来路全丢了。这一篇补上这条回路：从词法器的 Span 开始，让位置信息穿透 AST、HIR、SSA、LLVM IR，最终写进目标文件的 DWARF">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-20-%E8%AE%A9%E9%94%99%E8%AF%AF%E5%9B%9E%E5%88%B0%E6%BA%90%E7%A8%8B%E5%BA%8F/cover.svg">
+<meta property="article:published_time" content="2026-09-05T05:20:00.000Z">
+<meta property="article:modified_time" content="2026-09-05T12:42:02.244Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="DWARF">
+<meta property="article:tag" content="源码映射">
+<meta property="article:tag" content="编译器">
+<meta property="article:tag" content="调试信息">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-20-%E8%AE%A9%E9%94%99%E8%AF%AF%E5%9B%9E%E5%88%B0%E6%BA%90%E7%A8%8B%E5%BA%8F/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "从零编写现代编译器 20 - 让错误回到源程序",
+  "url": "https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-20-%E8%AE%A9%E9%94%99%E8%AF%AF%E5%9B%9E%E5%88%B0%E6%BA%90%E7%A8%8B%E5%BA%8F/",
+  "image": "https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-20-%E8%AE%A9%E9%94%99%E8%AF%AF%E5%9B%9E%E5%88%B0%E6%BA%90%E7%A8%8B%E5%BA%8F/cover.svg",
+  "datePublished": "2026-09-05T05:20:00.000Z",
+  "dateModified": "2026-09-05T12:42:02.244Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-20-%E8%AE%A9%E9%94%99%E8%AF%AF%E5%9B%9E%E5%88%B0%E6%BA%90%E7%A8%8B%E5%BA%8F/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '从零编写现代编译器 20 - 让错误回到源程序',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">712</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">866</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">15</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="not-top-img" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">从零编写现代编译器 20 - 让错误回到源程序</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav></header><main class="layout" id="content-inner"><div id="post"><div id="post-info"><h1 class="post-title">从零编写现代编译器 20 - 让错误回到源程序</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-05T05:20:00.000Z" title="Created 2026-09-05 13:20:00">2026-09-05</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-05T12:42:02.244Z" title="Updated 2026-09-05 20:42:02">2026-09-05</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%BC%96%E7%A8%8B/">编程</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>11mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-05 20:42:02&quot;}" hidden></div><p>运行时错误目前只能告诉你&quot;除零错误&quot;，然后进程就没了。调试器停在一个机器地址上，对照的是 LLVM IR 甚至汇编，读者必须自己倒推这条指令对应源文件的哪一行。编译器花了十几篇功夫把 Sprout 源码翻译成机器码，却在出错的时候把来路全丢了。这一篇补上这条回路：从词法器的 Span 开始，让位置信息穿透 AST、HIR、SSA、LLVM IR，最终写进目标文件的 DWARF 段，使调试器和运行时错误处理器都能把机器地址映射回 <code>sum.spr:5:12</code>。</p>
+<span id="more"></span>
+<h1>位置信息的传递链</h1>
+<p>词法器扫描源文件时，每个 Token 已经携带了 <code>Span</code>——文件 ID、起始字节偏移、结束字节偏移。解析器把 Token 组装成 AST 节点，每个节点继承或合并子节点的 Span。名称解析和类型检查产生 Typed HIR，Span 仍然挂在每个表达式和语句上。</p>
+<p>从 HIR 降低到 CFG/SSA 时，每条 SSA 指令也要保留原始 Span。一条 <code>add %1, %2 -&gt; %3</code> 可能来自 <code>sum = sum + i</code>，它的 Span 指向源文件中 <code>+</code> 运算符的位置。这个信息在 SSA 层面只是一个附带字段，不参与优化判断，但不能丢。</p>
+<p>到了 LLVM IR 生成阶段，Span 要转换成 LLVM 的调试元数据格式。LLVM 的做法是在每条指令上附加 <code>!dbg</code> 元数据引用，指向一个 <code>DILocation</code> 节点，节点里记录行号、列号和所属函数。LLVM 后端在生成目标文件时，把这些信息编码进 DWARF 格式的 <code>.debug_info</code> 和 <code>.debug_line</code> 段。调试器读取这些段，就能把任意机器地址翻译回源文件位置。</p>
+<p>整条链路：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">Span (lexer)<br>  → AST node span<br>    → HIR node span<br>      → SSA instruction span<br>        → LLVM IR !dbg metadata (DILocation)<br>          → DWARF .debug_line<br>            → debugger / runtime error handler<br></code></pre></td></tr></table></figure>
+<p>任何一层丢了位置，后面就断了。最常见的问题是 SSA 变换合并或移动了指令却没有保留原始 Span——常量折叠把两条指令合成一条时，应该保留其中一个的位置；死代码删除直接移除指令，不需要处理；指令移动（比如循环不变量外提）需要决定保留哪个位置。我们的策略是：合并时保留第一个操作数的位置，移动时保留原始位置。</p>
+<h1>LLVM 调试元数据</h1>
+<p>LLVM IR 的调试信息由三类主要节点组成。</p>
+<p><code>DICompileUnit</code> 描述整个编译单元——源文件名、语言标识、生产者字符串、优化级别。一个 <code>.ll</code> 文件通常对应一个 <code>DICompileUnit</code>。</p>
+<p><code>DISubprogram</code> 描述一个函数。它记录函数名、链接名、所在文件、起始行号、函数类型签名，以及是否为定义（<code>isDefinition</code>）。每个 LLVM <code>Function</code> 通过 <code>!dbg</code> 元数据引用自己的 <code>DISubprogram</code>。</p>
+<p><code>DILocation</code> 描述一个源码位置，包含行号、列号和所属的 <code>DISubprogram</code>。每条 LLVM 指令可以通过 <code>!dbg</code> 引用一个 <code>DILocation</code>。</p>
+<p>以 <code>sum_to</code> 函数为例，生成的 LLVM IR 片段大致如下：</p>
+<figure class="highlight llvm"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><code class="hljs llvm"><span class="hljs-keyword">define</span> <span class="hljs-type">i64</span> <span class="hljs-title">@sprout_sum_to</span>(<span class="hljs-type">i64</span> <span class="hljs-variable">%n</span>) <span class="hljs-title">!dbg</span> <span class="hljs-title">!5</span> &#123;<br><span class="hljs-symbol">entry:</span><br>  <span class="hljs-variable">%sum</span> <span class="hljs-operator">=</span> <span class="hljs-keyword">alloca</span> <span class="hljs-type">i64</span><span class="hljs-punctuation">,</span> <span class="hljs-title">!dbg</span> <span class="hljs-title">!10</span><br>  <span class="hljs-keyword">store</span> <span class="hljs-type">i64</span> <span class="hljs-number">0</span><span class="hljs-punctuation">,</span> <span class="hljs-type">ptr</span> <span class="hljs-variable">%sum</span><span class="hljs-punctuation">,</span> <span class="hljs-title">!dbg</span> <span class="hljs-title">!10</span><br>  <span class="hljs-comment">; ...</span><br>  <span class="hljs-variable">%add</span> <span class="hljs-operator">=</span> <span class="hljs-keyword">add</span> <span class="hljs-type">i64</span> <span class="hljs-variable">%sum.load</span><span class="hljs-punctuation">,</span> <span class="hljs-variable">%i.load</span><span class="hljs-punctuation">,</span> <span class="hljs-title">!dbg</span> <span class="hljs-title">!14</span><br>  <span class="hljs-comment">; ...</span><br>&#125;<br><br><span class="hljs-title">!5</span> <span class="hljs-operator">=</span> distinct <span class="hljs-title">!DISubprogram</span>(name: <span class="hljs-string">&quot;sum_to&quot;</span><span class="hljs-punctuation">,</span> file: <span class="hljs-title">!3</span><span class="hljs-punctuation">,</span><br><span class="hljs-symbol">       line:</span> <span class="hljs-number">1</span><span class="hljs-punctuation">,</span> <span class="hljs-keyword">type</span>: <span class="hljs-title">!6</span><span class="hljs-punctuation">,</span> isDefinition: <span class="hljs-keyword">true</span><span class="hljs-punctuation">,</span> unit: <span class="hljs-title">!0</span>)<br><span class="hljs-title">!10</span> <span class="hljs-operator">=</span> <span class="hljs-title">!DILocation</span>(line: <span class="hljs-number">2</span><span class="hljs-punctuation">,</span> column: <span class="hljs-number">5</span><span class="hljs-punctuation">,</span> scope: <span class="hljs-title">!5</span>)<br><span class="hljs-title">!14</span> <span class="hljs-operator">=</span> <span class="hljs-title">!DILocation</span>(line: <span class="hljs-number">5</span><span class="hljs-punctuation">,</span> column: <span class="hljs-number">16</span><span class="hljs-punctuation">,</span> scope: <span class="hljs-title">!5</span>)<br></code></pre></td></tr></table></figure>
+<p><code>!dbg !14</code> 表示这条 <code>add</code> 指令对应源文件第 5 行第 16 列。调试器在这条指令对应的机器地址处停下时，就能报出正确的源码位置。</p>
+<h1>从 SSA 到 LLVM IR 时附加调试信息</h1>
+<p>代码生成器在翻译每条 SSA 指令时，需要做两件额外的事。</p>
+<p>第一，在函数开头创建 <code>DISubprogram</code>。函数的 Span 提供了文件和起始行号，函数签名提供了参数类型。把这些信息填进 <code>DISubprogram</code>，再把它关联到 LLVM <code>Function</code>。</p>
+<p>第二，在翻译每条 SSA 指令时，把指令的 Span 转换成 <code>DILocation</code>。Span 里的字节偏移需要转换成行号和列号——这个转换依赖源文件的换行符位置表，词法器在扫描时已经建好了。拿到行号和列号后，构造 <code>DILocation</code> 并附加到 LLVM 指令上。</p>
+<p>用伪代码表示：</p>
+<figure class="highlight rust"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><code class="hljs rust"><span class="hljs-keyword">fn</span> <span class="hljs-title function_">emit_instruction</span>(&amp;<span class="hljs-keyword">mut</span> <span class="hljs-keyword">self</span>, inst: &amp;SsaInst) &#123;<br>    <span class="hljs-keyword">let</span> <span class="hljs-variable">llvm_inst</span> = <span class="hljs-keyword">match</span> inst.op &#123;<br>        SsaOp::<span class="hljs-title function_ invoke__">Add</span>(l, r) =&gt; <span class="hljs-keyword">self</span>.builder.<span class="hljs-title function_ invoke__">build_add</span>(l, r),<br>        SsaOp::<span class="hljs-title function_ invoke__">Sub</span>(l, r) =&gt; <span class="hljs-keyword">self</span>.builder.<span class="hljs-title function_ invoke__">build_sub</span>(l, r),<br>        <span class="hljs-comment">// ...</span><br>    &#125;;<br>    <span class="hljs-comment">// 附加调试位置</span><br>    <span class="hljs-keyword">if</span> <span class="hljs-keyword">let</span> <span class="hljs-variable">Some</span>(span) = inst.span &#123;<br>        <span class="hljs-keyword">let</span> (line, col) = <span class="hljs-keyword">self</span>.source_map.<span class="hljs-title function_ invoke__">line_col</span>(span.start);<br>        <span class="hljs-keyword">let</span> <span class="hljs-variable">loc</span> = <span class="hljs-keyword">self</span>.di_builder.<span class="hljs-title function_ invoke__">create_location</span>(<br>            line, col, <span class="hljs-keyword">self</span>.current_subprogram<br>        );<br>        llvm_inst.<span class="hljs-title function_ invoke__">set_debug_loc</span>(loc);<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>如果某条指令没有合理的源码位置（比如编译器自己插入的 phi 消解代码），可以不附加 <code>!dbg</code>，或者继承前一条指令的位置。LLVM 对缺少 <code>!dbg</code> 的指令不会报错，但调试器在这些位置会显示&quot;未知源码&quot;。</p>
+<p>还需要在模块级别创建 <code>DICompileUnit</code> 并设置 DWARF 版本。LLVM 默认生成 DWARF 4，如果目标平台的工具链支持 DWARF 5 也可以切换，但区别不影响这里的讨论。</p>
+<h1>DWARF 格式基础</h1>
+<p>DWARF 是 ELF 目标文件中存储调试信息的标准格式。它不是 LLVM 特有的，GCC、Clang 和其他编译器都用它。<a target="_blank" rel="noopener" href="https://dwarfstd.org/">DWARF 标准</a> 定义了一组段（section）和编码规则。</p>
+<p>对源码映射最重要的是两个段。</p>
+<p><code>.debug_info</code> 段包含编译单元、函数、变量、类型等条目的树形结构。每个函数条目（<code>DW_TAG_subprogram</code>）记录函数名、文件、行号、地址范围。每个局部变量条目（<code>DW_TAG_variable</code>）记录变量名、类型和存储位置（寄存器或栈偏移）。</p>
+<p><code>.debug_line</code> 段包含行号程序（line number program）。这是一个紧凑的字节码序列，描述机器地址和源码行号之间的对应关系。调试器执行这段字节码，就能建立一张&quot;地址 → 文件:行:列&quot;的映射表。当你在 GDB 里输入 <code>list</code> 看到源码，或者收到 segfault 时看到行号，背后都是这张表在工作。</p>
+<p>LLVM 后端负责把 <code>DILocation</code> 元数据编码成 <code>.debug_line</code> 中的行号程序条目。我们不需要手写 DWARF 字节码——这是 LLVM 的活。我们只需要确保 LLVM IR 中的 <code>!dbg</code> 元数据正确反映源码位置。</p>
+<p>用 <code>llvm-dwarfdump</code> 可以检查生成的 DWARF 内容：</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs sh">sproutc build programs/sum.spr -o <span class="hljs-built_in">sum</span> -O0<br>llvm-dwarfdump --debug-line <span class="hljs-built_in">sum</span><br></code></pre></td></tr></table></figure>
+<p>输出会列出地址和对应的文件、行号、列号。如果某一段地址没有对应的行号条目，说明那些指令缺少 <code>!dbg</code> 元数据。</p>
+<h1>运行时错误携带源码位置</h1>
+<p>第 15 篇实现了数组边界检查，第 07 篇约定了除零为运行时错误。这些检查在 SSA 层面会生成条件分支：如果除数为零，跳到错误处理块。错误处理块调用运行时函数终止程序。</p>
+<p>之前的做法可能是简单地调用 <code>abort()</code> 或者打印一个固定字符串。现在有了源码位置，可以做得更好。</p>
+<p>错误处理块知道触发错误的指令的 Span。在生成 LLVM IR 时，把文件名、行号、列号作为常量参数传给运行时错误函数：</p>
+<figure class="highlight llvm"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs llvm"><span class="hljs-comment">; 除零检查失败时跳到这里</span><br>div_by_zero:<br>  <span class="hljs-keyword">call</span> <span class="hljs-type">void</span> <span class="hljs-title">@sprout_runtime_error</span>(<br>    <span class="hljs-type">ptr</span> <span class="hljs-title">@.str.sum.spr</span><span class="hljs-punctuation">,</span>   <span class="hljs-comment">; 文件名</span><br>    <span class="hljs-type">i64</span> <span class="hljs-number">5</span><span class="hljs-punctuation">,</span>                <span class="hljs-comment">; 行号</span><br>    <span class="hljs-type">i64</span> <span class="hljs-number">12</span><span class="hljs-punctuation">,</span>               <span class="hljs-comment">; 列号</span><br>    <span class="hljs-type">ptr</span> <span class="hljs-title">@.str.div_zero</span>    <span class="hljs-comment">; 错误消息</span><br>  )<br>  <span class="hljs-keyword">unreachable</span><br></code></pre></td></tr></table></figure>
+<p>运行时函数的实现很直接：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">void</span> <span class="hljs-title function_">sprout_runtime_error</span><span class="hljs-params">(<span class="hljs-type">const</span> <span class="hljs-type">char</span> *file, <span class="hljs-type">int64_t</span> line,</span><br><span class="hljs-params">                          <span class="hljs-type">int64_t</span> col, <span class="hljs-type">const</span> <span class="hljs-type">char</span> *msg)</span> &#123;<br>    <span class="hljs-built_in">fprintf</span>(<span class="hljs-built_in">stderr</span>, <span class="hljs-string">&quot;runtime error: %s at %s:%ld:%ld\n&quot;</span>,<br>            msg, file, line, col);<br>    <span class="hljs-built_in">exit</span>(<span class="hljs-number">101</span>);<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>现在运行一个有除零错误的程序：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">$ ./sum_bad<br>runtime error: divide by zero at sum.spr:5:12<br></code></pre></td></tr></table></figure>
+<p>用户立刻知道去看 <code>sum.spr</code> 的第 5 行第 12 列。数组越界也一样：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">runtime error: index out of bounds at data.spr:12:8<br></code></pre></td></tr></table></figure>
+<p>这个方案和 DWARF 调试信息是互补的。DWARF 让调试器能映射地址，运行时错误消息让不使用调试器的用户也能定位问题。两者的数据来源相同——都是 SSA 指令上的 Span。</p>
+<p>有一个实现细节需要注意：错误消息中的文件名字符串。每个错误处理块需要引用文件名的全局常量，一个源文件只需要生成一个这样的常量。行号和列号是整数立即数，没有额外开销。如果担心二进制体积，可以用一个全局文件名表加索引的方式压缩，但对教学编译器来说，直接嵌入文件名字符串足够清晰。</p>
+<p>另一个设计选择是退出码。上面用了 <code>exit(101)</code> 而不是 <code>exit(1)</code>。把运行时错误的退出码和正常的非零返回区分开来，方便测试框架判断程序是正常失败还是运行时错误。具体数值可以约定，比如 101 表示除零，102 表示越界，103 表示整数溢出。测试用例可以同时检查 stderr 输出和退出码。</p>
+<h1>调试器实测</h1>
+<p>编译一个简单程序，关闭优化，然后用 GDB 或 LLDB 调试。</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs sh">sproutc build programs/sum.spr -o <span class="hljs-built_in">sum</span> -O0<br>gdb ./sum<br></code></pre></td></tr></table></figure>
+<p>在 GDB 中：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><code class="hljs text">(gdb) break sum_to<br>Breakpoint 1 at 0x401020: file sum.spr, line 1.<br>(gdb) run<br>Starting program: ./sum<br><br>Breakpoint 1, sum_to (n=10) at sum.spr:1<br>1       fn sum_to(n: i64) -&gt; i64 &#123;<br>(gdb) next<br>2           let mut sum: i64 = 0;<br>(gdb) next<br>3           let mut i: i64 = 1;<br>(gdb) print sum<br>$1 = 0<br>(gdb) continue<br>Continuing.<br>55<br>[Inferior 1 (process 12345) exited normally]<br></code></pre></td></tr></table></figure>
+<p>GDB 能够：</p>
+<ul>
+<li>在 Sprout 函数名上设断点，因为 <code>DISubprogram</code> 记录了函数名和地址范围</li>
+<li>显示当前停在源文件的哪一行，因为 <code>.debug_line</code> 提供了地址到行号的映射</li>
+<li>用 <code>next</code> 按源码行单步执行</li>
+<li>用 <code>print</code> 查看局部变量的值，因为 <code>.debug_info</code> 记录了变量的存储位置</li>
+</ul>
+<p>这要求 DWARF 信息里的变量位置描述正确。在 <code>-O0</code> 下，局部变量通常在栈上有固定位置，LLVM 会生成 <code>DW_AT_location</code> 属性指向栈帧中的偏移。调试器根据当前栈指针和这个偏移就能读出变量值。</p>
+<p>LLDB 的操作类似，命令稍有不同：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">(lldb) breakpoint set --name sum_to<br>(lldb) run<br>(lldb) frame variable sum<br>(int64_t) sum = 0<br></code></pre></td></tr></table></figure>
+<h1>优化对调试信息的影响</h1>
+<p>切换到 <code>-O2</code> 再试一次：</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs sh">sproutc build programs/sum.spr -o <span class="hljs-built_in">sum</span> -O2<br>gdb ./sum<br></code></pre></td></tr></table></figure>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs text">(gdb) break sum_to<br>Breakpoint 1 at 0x401010: file sum.spr, line 1.<br>(gdb) run<br>Breakpoint 1, sum_to (n=10) at sum.spr:1<br>(gdb) print sum<br>$1 = &lt;optimized out&gt;<br>(gdb) print i<br>$2 = &lt;optimized out&gt;<br></code></pre></td></tr></table></figure>
+<p>变量 <code>sum</code> 和 <code>i</code> 被优化掉了——它们可能只存在于寄存器中，而且循环可能被完全替换成了一个公式。调试器知道这些变量在源码中存在（DWARF 里有条目），但找不到它们当前的值，所以显示 <code>&lt;optimized out&gt;</code>。</p>
+<p>单步执行时，行号跳跃也会变得不连续。优化器重排了指令，一条机器指令可能对应多个源码行，或者多条机器指令对应同一行。<code>.debug_line</code> 尽力记录了这种对应关系，但从用户视角看，执行顺序不再符合源码的书写顺序。</p>
+<p>这是所有编译器的通用现象，不是 Sprout 的特殊问题。GCC 和 Clang 编译 C 代码在 <code>-O2</code> 下也会出现同样的情况。调试优化后的代码本身是一个复杂课题，DWARF 5 引入了一些改进（如 <code>DW_AT_location</code> 的范围列表可以描述变量在不同地址范围内的不同存储位置），但完美调试与高度优化之间始终存在张力。</p>
+<p>对 Sprout 编译器来说，保证 <code>-O0</code> 下调试体验正确是底线要求。<code>-O2</code> 下行号映射应该基本正确（能定位到正确的函数和大致的代码区域），变量可能不可见是预期行为。</p>
+<p>还有一种中间地带：<code>-O1</code> 或带 <code>-Og</code>（optimize for debugging）。Clang 和 GCC 支持 <code>-Og</code>，它会做一部分不影响调试体验的优化，比如简单的常量折叠和死代码删除，但不做寄存器重分配和循环变换。我们的编译器可以考虑类似策略：自制优化 pass 各自声明是否保持调试友好，<code>-Og</code> 只启用标记为安全的那些 pass。不过这是后续改进，当前先把 <code>-O0</code> 和 <code>-O2</code> 两个极端跑通。</p>
+<p>DWARF 信息对二进制体积的影响也需要了解。调试段不加载到运行时内存，但它们会显著增大磁盘上的文件大小——一个几 KB 的程序加上调试信息可能膨胀到几十 KB。<code>strip</code> 命令可以移除调试段，发布时通常会做这一步。也可以把调试信息分离到独立的 <code>.dSYM</code> 目录（macOS）或 <code>.debug</code> 文件（Linux），让可执行文件保持精简，调试器按需加载。</p>
+<h1>练习</h1>
+<ol>
+<li>
+<p>用 <code>-O0</code> 编译 <code>sum.spr</code>，在调试器中单步执行 <code>sum_to</code> 函数，打印循环中 <code>sum</code> 和 <code>i</code> 的值。确认每一步的值与手算一致。</p>
+</li>
+<li>
+<p>用 <code>-O2</code> 编译同一个文件，重复上述操作。记录哪些变量显示为 <code>&lt;optimized out&gt;</code>，单步执行时行号是否连续。对比两次的机器指令数量（用 <code>disassemble</code> 命令）。</p>
+</li>
+<li>
+<p>用 <code>llvm-dwarfdump --debug-line</code> 分别检查 <code>-O0</code> 和 <code>-O2</code> 产物的行号表。找出两个版本中同一源码行对应的机器地址范围有何不同。</p>
+</li>
+</ol>
+<p>上一篇：<a href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-19-%E5%A4%9A%E6%96%87%E4%BB%B6%E6%A8%A1%E5%9D%97-ABI-%E4%B8%8E%E9%93%BE%E6%8E%A5/">19 - 多文件模块、ABI 与链接</a><br>
+下一篇：<a href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-21-%E5%B7%AE%E5%88%86-%E5%B1%9E%E6%80%A7%E4%B8%8E%E6%A8%A1%E7%B3%8A%E6%B5%8B%E8%AF%95/">21 - 差分、属性与模糊测试</a></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-20-%E8%AE%A9%E9%94%99%E8%AF%AF%E5%9B%9E%E5%88%B0%E6%BA%90%E7%A8%8B%E5%BA%8F/">https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-20-%E8%AE%A9%E9%94%99%E8%AF%AF%E5%9B%9E%E5%88%B0%E6%BA%90%E7%A8%8B%E5%BA%8F/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%BC%96%E8%AF%91%E5%99%A8/">编译器</a><a class="post-meta__tags" href="/tags/DWARF/">DWARF</a><a class="post-meta__tags" href="/tags/%E8%B0%83%E8%AF%95%E4%BF%A1%E6%81%AF/">调试信息</a><a class="post-meta__tags" href="/tags/%E6%BA%90%E7%A0%81%E6%98%A0%E5%B0%84/">源码映射</a></div><div class="post-share"><div class="social-share" data-image="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-20-%E8%AE%A9%E9%94%99%E8%AF%AF%E5%9B%9E%E5%88%B0%E6%BA%90%E7%A8%8B%E5%BA%8F/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-18-%E6%B3%9B%E5%9E%8B%E5%A6%82%E4%BD%95%E5%8F%98%E6%88%90%E5%85%B7%E4%BD%93%E4%BB%A3%E7%A0%81/" title="从零编写现代编译器 18 - 泛型如何变成具体代码"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-18-%E6%B3%9B%E5%9E%8B%E5%A6%82%E4%BD%95%E5%8F%98%E6%88%90%E5%85%B7%E4%BD%93%E4%BB%A3%E7%A0%81/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写现代编译器 18 - 泛型如何变成具体代码</div></div><div class="info-2"><div class="info-item-1">第 17 篇给 Sprout 加上了结构体和枚举。字段类型在定义时写死：一个存放 i64 对的结构体和一个存放 bool 对的结构体需要分别声明，尽管它们的布局逻辑完全一样。泛型允许把类型当作参数，写一次定义，给不同类型复用。本篇实现显式类型参数和单态化（monomorphization）——编译器在编译期为每组具体类型生成一份专用代码，运行时不存在泛型。  泛型函数与泛型结构体 Sprout 的泛型语法把类型参数放在尖括号里。函数签名可以带一个或多个类型参数： 123fn identity&lt;T&gt;(x: T) -&gt; T &#123;    return x;&#125; 调用时用 turbofish 语法显式指定类型： 12let a: i64 = identity::&lt;i64&gt;(42);let b: bool = identity::&lt;bool&gt;(true); 结构体同理： 1234struct Pair&lt;A, B&gt; &#123;    first: A,    second: B,&#125; 使用时写出全部类型参数：Pa...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-04-%E8%A1%A8%E8%BE%BE%E5%BC%8F%E8%A7%A3%E6%9E%90%E4%B8%8E%E9%94%99%E8%AF%AF%E6%81%A2%E5%A4%8D/" title="从零编写现代编译器 04 - 表达式解析与错误恢复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-04-%E8%A1%A8%E8%BE%BE%E5%BC%8F%E8%A7%A3%E6%9E%90%E4%B8%8E%E9%94%99%E8%AF%AF%E6%81%A2%E5%A4%8D/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写现代编译器 04 - 表达式解析与错误恢复</div></div><div class="info-2"><div class="info-item-1">第 03 篇给了编译器完整的词法分析器和源码位置。解析器已经能识别函数定义和 return 语句，但 return 后面那个表达式还只能接受单个整数字面量。return 1 + 2 * 3; 在当前解析器面前会直接报错——它不知道运算符是什么，更不知道 * 应该比 + 先结合。这一篇要解决这个问题：用 Pratt 解析实现一个完整的表达式解析器，正确处理优先级和结合性，并在遇到语法错误时恢复到可继续解析的状态。  优先级表 表达式里运算符的优先级决定了 AST 的形状。1 + 2 * 3 应该解析为 1 + (2 * 3) 而不是 (1 + 2) * 3。Sprout 语言的优先级从低到高：    优先级 运算符 结合性 说明     1 || 左结合 逻辑或，短路   2 &amp;&amp; 左结合 逻辑与，短路   3 == != 左结合 相等比较   4 &lt; &gt; &lt;= &gt;= 左结合 大小比较   5 + - 左结合 加减   6 * / 左结合 乘除   7 一元 - ! 前缀 取负、逻辑非    所有二元运算符都是左结合。a + b + c 解析...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-05-%E5%90%8D%E5%AD%97%E3%80%81%E4%BD%9C%E7%94%A8%E5%9F%9F%E4%B8%8E%E5%8F%AF%E5%8F%98%E5%8F%98%E9%87%8F/" title="从零编写现代编译器 05 - 名字、作用域与可变变量"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-05-%E5%90%8D%E5%AD%97%E3%80%81%E4%BD%9C%E7%94%A8%E5%9F%9F%E4%B8%8E%E5%8F%AF%E5%8F%98%E5%8F%98%E9%87%8F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写现代编译器 05 - 名字、作用域与可变变量</div></div><div class="info-2"><div class="info-item-1">第 04 篇构建了 AST，表达式和语句有了树形结构。但 AST 中的名字只是字符串。两个不同作用域里都叫 x 的变量，在树上看起来完全一样——解析器不关心它们指向谁。如果直接把字符串传给后续阶段，类型检查器和代码生成器就必须各自重复&quot;这个 x 到底是哪个 x&quot;的查找逻辑。 本篇在 AST 之上增加一趟名称解析。遍历语法树，维护一个作用域栈，给每个声明分配唯一的定义 ID，把每个名字引用绑定到对应的定义。完成后，后续阶段只需要查 ID，不再处理裸字符串。  DefId 与符号表 每个变量声明得到一个编译期唯一编号 DefId。它是符号表的索引，整数类型，可以复制、比较、打印，不携带字符串。 123456789101112131415161718192021222324252627282930#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]pub struct DefId(pub u32);#[derive(Debug)]pub struct DefInfo &#123;    pub name: String...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-30-%E5%BC%A0%E9%87%8F%E6%96%B9%E8%A8%80%E4%B8%8E-Lowering-%E5%88%B0-LLVM/" title="从零编写现代编译器 30 - 张量方言与 Lowering 到 LLVM"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-30-%E5%BC%A0%E9%87%8F%E6%96%B9%E8%A8%80%E4%B8%8E-Lowering-%E5%88%B0-LLVM/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写现代编译器 30 - 张量方言与 Lowering 到 LLVM</div></div><div class="info-2"><div class="info-item-1">上一篇为 Sprout 定义了自己的 MLIR 方言——带形状检查的张量操作停留在高层表示里，没有进入真正的机器码。这一篇把它降下去：从张量方言出发，经过 linalg、scf、memref，一路到 LLVM IR，最后链接成本机可执行文件。这条路径正是 MLIR 最初被设计出来要走的路——它诞生于 TensorFlow 和 IREE 项目，目的就是让张量运算能在多层抽象之间有序地降低。  张量类型：值语义的多维数组 MLIR 里的 tensor&lt;4x4xi64&gt; 表示一个 4 行 4 列、元素类型为 i64 的多维数组。它和 memref&lt;4x4xi64&gt; 的区别在语义层面：tensor 是值语义（value semantics），一次操作产生一个新 tensor，原来的不变；memref 是引用语义（reference semantics），指向一块具体内存，修改直接生效。 这个区别不是风格偏好，而是编译优化的前提。值语义让编译器可以自由重排、合并、拆分张量操作而不用担心别名问题。等到优化做完，再通过 bufferization 统一转成 memref...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-08-%E5%87%BD%E6%95%B0%E8%B0%83%E7%94%A8%E3%80%81%E9%80%92%E5%BD%92%E5%92%8C%E8%BF%94%E5%9B%9E%E5%80%BC/" title="从零编写现代编译器 08 - 函数调用、递归和返回值"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-08-%E5%87%BD%E6%95%B0%E8%B0%83%E7%94%A8%E3%80%81%E9%80%92%E5%BD%92%E5%92%8C%E8%BF%94%E5%9B%9E%E5%80%BC/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写现代编译器 08 - 函数调用、递归和返回值</div></div><div class="info-2"><div class="info-item-1">到第 07 篇为止，所有 Sprout 程序都只有一个 main 函数。表达式、变量、类型检查和参考解释器都工作正常，但程序无法把逻辑拆分成多个独立部分。本篇加入函数声明、函数调用、递归和一个内置的运行时打印函数，让 Sprout 开始像一门真正的编程语言。  签名收集：先扫描，再检查 函数之间可以互相调用，调用可能发生在被调用函数的定义之前。如果类型检查器从上到下逐个处理函数体，遇到一个尚未见过的函数名就只能报错。这不是我们想要的行为。 解决办法是分两趟处理。第一趟只扫描所有 fn 声明的签名——函数名、参数列表和返回类型——把它们记录到一张全局签名表里。第二趟才进入每个函数体做类型检查。这时签名表已经完整，任何函数都可以调用任何其他函数，包括自身。 12345678910111213// 第一趟：收集签名for decl in &amp;program.functions &#123;    let sig = Signature &#123;        params: decl.params.iter().map(|p| (p.name, p.ty)).collect(...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-02-%E8%AF%8D%E6%B3%95%E5%88%86%E6%9E%90%E5%99%A8%EF%BC%9A%E6%8A%8A%E6%96%87%E6%9C%AC%E5%88%87%E6%88%90-Token/" title="从零编写现代编译器 02 - 词法分析器：把文本切成 Token"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E7%8E%B0%E4%BB%A3%E7%BC%96%E8%AF%91%E5%99%A8-02-%E8%AF%8D%E6%B3%95%E5%88%86%E6%9E%90%E5%99%A8%EF%BC%9A%E6%8A%8A%E6%96%87%E6%9C%AC%E5%88%87%E6%88%90-Token/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写现代编译器 02 - 词法分析器：把文本切成 Token</div></div><div class="info-2"><div class="info-item-1">上一篇里，编译器能处理的输入是硬编码的——它只认识 fn main() -&gt; i64 { return 42; } 这一个程序，Token 序列直接写死在代码里。换一个数字就得改编译器源码。这不叫编译，这叫字符串替换。 这一篇要做的事情：给 Sprout 写一个词法分析器（lexer），让它读入任意源文本，逐字符扫描，输出一串带位置信息的 Token。后续的解析器将消费这个 Token 流，而不再关心原始字符。  词法分析器做什么 编译器前端的第一道工序是词法分析。它的输入是源文件的字节流，输出是 Token 序列。每个 Token 标记了一段源文本的语法角色：这是一个关键字，那是一个整数字面量，这里是左括号，那里是分号。 词法分析器不关心 Token 之间的组合是否合法。return return return 在词法层面完全没有问题——三个 Return Token。判断组合是否合法是解析器的工作。词法分析器只负责切割。 类比一下：词法分析像把一段中文拆成词语，每个词标上词性。&quot;我吃了三碗饭&quot;变成 [我/代词] [吃/动词] [了/助词] [三/数词...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">位置信息的传递链</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">LLVM 调试元数据</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">从 SSA 到 LLVM IR 时附加调试信息</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">DWARF 格式基础</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">运行时错误携带源码位置</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">调试器实测</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">优化对调试信息的影响</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">练习</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

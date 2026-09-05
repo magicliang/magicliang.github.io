@@ -1,0 +1,868 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>从零编写操作系统 11 - 分页与页故障：修改映射后重试同一条指令 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="物理页分配器已经能交出一页空闲 RAM，但它不决定一条访存指令最终访问哪一页。 本篇建立 32 位两级页表，开启分页，再让同一个虚拟地址先后访问两个物理页。 随后触发两次真正的页故障：一次读取未映射页，一次向只读页写入；处理函数修复映射，返回后重试原指令。 实验沿用单 CPU、64 MiB RAM 的 qemu32 模拟机，所有代码运行在 ring 0。 低 64 MiB 保持恒等映射，分页开启前">
+<meta property="og:type" content="article">
+<meta property="og:title" content="从零编写操作系统 11 - 分页与页故障：修改映射后重试同一条指令">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-11-%E5%88%86%E9%A1%B5%E4%B8%8E%E9%A1%B5%E6%95%85%E9%9A%9C/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="物理页分配器已经能交出一页空闲 RAM，但它不决定一条访存指令最终访问哪一页。 本篇建立 32 位两级页表，开启分页，再让同一个虚拟地址先后访问两个物理页。 随后触发两次真正的页故障：一次读取未映射页，一次向只读页写入；处理函数修复映射，返回后重试原指令。 实验沿用单 CPU、64 MiB RAM 的 qemu32 模拟机，所有代码运行在 ring 0。 低 64 MiB 保持恒等映射，分页开启前">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-11-%E5%88%86%E9%A1%B5%E4%B8%8E%E9%A1%B5%E6%95%85%E9%9A%9C/cover.svg">
+<meta property="article:published_time" content="2026-09-05T12:20:00.000Z">
+<meta property="article:modified_time" content="2026-09-05T12:42:02.240Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="x86">
+<meta property="article:tag" content="内存管理">
+<meta property="article:tag" content="操作系统">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-11-%E5%88%86%E9%A1%B5%E4%B8%8E%E9%A1%B5%E6%95%85%E9%9A%9C/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "从零编写操作系统 11 - 分页与页故障：修改映射后重试同一条指令",
+  "url": "https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-11-%E5%88%86%E9%A1%B5%E4%B8%8E%E9%A1%B5%E6%95%85%E9%9A%9C/",
+  "image": "https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-11-%E5%88%86%E9%A1%B5%E4%B8%8E%E9%A1%B5%E6%95%85%E9%9A%9C/cover.svg",
+  "datePublished": "2026-09-05T12:20:00.000Z",
+  "dateModified": "2026-09-05T12:42:02.240Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-11-%E5%88%86%E9%A1%B5%E4%B8%8E%E9%A1%B5%E6%95%85%E9%9A%9C/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '从零编写操作系统 11 - 分页与页故障：修改映射后重试同一条指令',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">712</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">866</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">15</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="not-top-img" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">从零编写操作系统 11 - 分页与页故障：修改映射后重试同一条指令</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav></header><main class="layout" id="content-inner"><div id="post"><div id="post-info"><h1 class="post-title">从零编写操作系统 11 - 分页与页故障：修改映射后重试同一条指令</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-05T12:20:00.000Z" title="Created 2026-09-05 20:20:00">2026-09-05</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-05T12:42:02.240Z" title="Updated 2026-09-05 20:42:02">2026-09-05</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%9F%BA%E7%A1%80%E8%AE%BE%E6%96%BD/">基础设施</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>14mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-05 20:42:02&quot;}" hidden></div><p>物理页分配器已经能交出一页空闲 RAM，但它不决定一条访存指令最终访问哪一页。<br>
+本篇建立 32 位两级页表，开启分页，再让同一个虚拟地址先后访问两个物理页。<br>
+随后触发两次真正的页故障：一次读取未映射页，一次向只读页写入；处理函数修复映射，返回后重试原指令。</p>
+<p>实验沿用单 CPU、64 MiB RAM 的 qemu32 模拟机，所有代码运行在 ring 0。<br>
+低 64 MiB 保持恒等映射，分页开启前后继续使用原 C 栈。<br>
+页目录和页表共占用 18 个物理页，演示结束后仍然保留；用于读写的两个数据页则归还分配器。</p>
+<span id="more"></span>
+<h1>一次访存经过哪几种地址</h1>
+<p>在此前的平坦段模型中，代码段和数据段基址都是 0。<br>
+指令使用的偏移经过分段后得到同值的线性地址，分页关闭时，再按此前建立的地址环境访问物理内存。<br>
+开启分页后，线性地址需要经过页表翻译；本文把这一层输入称为虚拟地址。</p>
+<p>物理页分配器返回的 <code>uint32_t</code> 仍然表示物理地址。<br>
+把它转换为 C 指针，得到的却是一次线性地址访问。<br>
+只有相关地址已经建立适当映射，这种直接转换才有效；分页不会自动给所有分配结果补上映射。</p>
+<p>本篇刻意保留低地址恒等映射，使物理页地址 p 同时可以通过虚拟地址 p 访问。<br>
+另选 <code>0x40000000</code> 作为实验虚拟地址，它不在低 64 MiB 窗口内，可以独立更换目标页。<br>
+因此同一个物理页会有低地址和高地址两个访问别名。</p>
+<h1>32 位地址按 10、10、12 位拆分</h1>
+<p>本实验采用非 PAE、4 KiB 页面，关闭 PSE 大页。<br>
+<a target="_blank" rel="noopener" href="https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-3a-part-1-manual.pdf">Intel SDM Volume 3A §4.3</a>给出了这种分页结构：一级页目录，二级页表，最后得到页框地址。<br>
+每一级都包含 1024 个四字节表项，恰好占一页。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">线性地址的位：31          22 21          12 11           0<br>              页目录索引      页表索引        页内偏移<br>                  10 位         10 位          12 位<br><br>CR3 → 页目录物理基址<br>       PDE[目录索引] → 页表物理基址<br>                      PTE[表索引] → 页框物理基址 + 页内偏移<br></code></pre></td></tr></table></figure>
+<p>页内偏移占 12 位，可以选择一页中的 4096 个字节。<br>
+一个页表覆盖 <code>1024 × 4 KiB = 4 MiB</code>，整个页目录最多描述 4 GiB 线性地址空间。<br>
+这不要求机器安装 4 GiB RAM；未使用的目录项和页表项可以保持不在场。</p>
+<p>对地址 <code>0x40000000</code>，目录索引为 256，页表索引和页内偏移都为 0。<br>
+本篇把独立实验页表接到 <code>directory[256]</code>，之后只修改它的第零项。<br>
+低地址窗口则使用目录项 0 到 15，正好覆盖 64 MiB。</p>
+<p>PDE 是 page-directory entry，保存下一层页表的物理基址和属性；PTE 是 page-table entry，保存目标页框的物理基址和属性。<br>
+CR3 保存的是页目录的物理基址，不能随意写入一个仅对软件有效的虚拟指针。<br>
+软件读写 PDE/PTE 时仍要通过线性地址访问表页，CPU 遍历页表时使用其中的物理地址，两种访问方式不能混淆。</p>
+<h1>表项低位控制在场和读写权限</h1>
+<p>页面按 4096 字节对齐，地址低 12 位为零，表项可以用这些位置存储属性。<br>
+本篇只主动设置 <code>PRESENT=1</code> 和 <code>WRITE=2</code>，没有设置 U/S 位。<br>
+低地址映射的 PDE 和 PTE 都是 P=1、R/W=1、U/S=0。</p>
+<table>
+<thead>
+<tr>
+<th>位</th>
+<th>名称</th>
+<th>当前用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>P</td>
+<td>为 1 时该级表项在场</td>
+</tr>
+<tr>
+<td>1</td>
+<td>R/W</td>
+<td>为 1 时允许写，为 0 时只读约束需要结合 WP</td>
+</tr>
+<tr>
+<td>2</td>
+<td>U/S</td>
+<td>保持 0，映射仅供 supervisor 访问</td>
+</tr>
+</tbody>
+</table>
+<p>权限需要同时考虑 PDE 和 PTE，不能只看最后一级。<br>
+例如把某个 PTE 设为可写，并不能绕过上级 PDE 的只读约束。<br>
+<a target="_blank" rel="noopener" href="https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-3a-part-1-manual.pdf">Intel SDM §4.6.1</a>还规定了 <code>CR0.WP</code> 对 supervisor 写入的影响：WP=1 时，内核写操作也必须遵守只读分页权限。</p>
+<p>这正是后面写保护实验必须开启 WP 的原因。<br>
+如果只开启 PG，仍让 supervisor 写入绕过只读约束，就不能用 ring 0 写入验证预期的保护故障。<br>
+CPU 还可能更新 Accessed、Dirty 等状态位，因此检查脚本按掩码核对地址与 P/RW/US，不要求整个表项永远等于初始化数值。</p>
+<h1>从分配器取得 18 个表页</h1>
+<p>低 64 MiB 的映射需要 16 个页表，再加一个页目录，共 17 页。<br>
+高地址实验另需一个页表，总计 18 页，也就是 72 KiB。<br>
+其中低地址结构本身就需要 68 KiB，不能把它们全部塞进仍受 64 KiB 运行区上限约束的静态 BSS。</p>
+<p><code>build_tables</code> 直接调用第 10 篇的物理页分配器。<br>
+页目录取第一张页，低地址页表取接下来的 16 张页，最后一张页作为实验页表。<br>
+每张页分配后显式清零，因为 <code>page_alloc</code> 不保证返回零填充的内容。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">uint32_t</span> pages[<span class="hljs-number">18</span>];<br><span class="hljs-type">unsigned</span> count = <span class="hljs-number">0</span>;<br><span class="hljs-keyword">while</span> (count &lt; <span class="hljs-number">18</span>) &#123;<br>    <span class="hljs-type">uint32_t</span> page = page_alloc();<br>    <span class="hljs-keyword">if</span> (!page) &#123;<br>        <span class="hljs-keyword">while</span> (count) KASSERT(page_free(pages[--count]));<br>        <span class="hljs-keyword">return</span> <span class="hljs-number">0</span>;<br>    &#125;<br>    pages[count++] = page;<br>    <span class="hljs-built_in">memset</span>((<span class="hljs-type">void</span> *)page, <span class="hljs-number">0</span>, PAGE_BYTES);<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>局部数组只有 72 字节，用来记录已经取得的页面，便于中途失败时逐一归还。<br>
+这段初始化运行在 PG=0 时；失败后尚未安装新表树，因此可以释放这些页。<br>
+回滚分支经过源码检查，当前记录没有注入页表分配耗尽，不能把它写成已经完成的低内存客体实验。</p>
+<p>低地址表项按物理页号直接填入：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs c">directory = (<span class="hljs-type">uint32_t</span> *)pages[<span class="hljs-number">0</span>];<br><span class="hljs-keyword">for</span> (<span class="hljs-type">unsigned</span> d = <span class="hljs-number">0</span>; d &lt; <span class="hljs-number">16</span>; ++d) &#123;<br>    <span class="hljs-type">uint32_t</span> *table = (<span class="hljs-type">uint32_t</span> *)pages[d + <span class="hljs-number">1</span>];<br>    <span class="hljs-keyword">for</span> (<span class="hljs-type">unsigned</span> t = <span class="hljs-number">0</span>; t &lt; <span class="hljs-number">1024</span>; ++t)<br>        table[t] = ((d * <span class="hljs-number">1024</span> + t) * PAGE_BYTES) | PRESENT | WRITE;<br>    directory[d] = pages[d + <span class="hljs-number">1</span>] | PRESENT | WRITE;<br>&#125;<br>test_table = (<span class="hljs-type">uint32_t</span> *)pages[<span class="hljs-number">17</span>];<br>directory[TEST_VA &gt;&gt; <span class="hljs-number">22</span>] = pages[<span class="hljs-number">17</span>] | PRESENT | WRITE;<br></code></pre></td></tr></table></figure>
+<p>清零还使其余目录项和实验页表项都不在场。<br>
+映射覆盖低 64 MiB，不表示这片范围内的所有地址都成为可分配 RAM。<br>
+保留区、VGA 和地址空洞仍由 E820 及分配器规则约束，演示不会因为它们有映射就主动遍历读写。</p>
+<h1>开启 PG 后，代码和栈仍在原地址</h1>
+<p>置 <code>CR0.PG</code> 的那条指令执行完成后，后续取指和访存都要满足分页规则。<br>
+正在执行的代码、原栈、异常入口、控制台数据以及页表的软件访问地址必须提前可达。<br>
+低地址恒等映射同时覆盖了这些对象，避免在开关分页时另做一次栈迁移。</p>
+<p>源码先关闭 CR4 的 PSE、PAE 和 PGE，再加载 CR3。<br>
+随后读取 CR0，按位加入 PG 与 WP，保留已经开启的 PE。<br>
+核心写入如下：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs c">cr4 &amp;= ~((<span class="hljs-number">1u</span> &lt;&lt; <span class="hljs-number">4</span>) | (<span class="hljs-number">1u</span> &lt;&lt; <span class="hljs-number">5</span>) | (<span class="hljs-number">1u</span> &lt;&lt; <span class="hljs-number">7</span>)); <span class="hljs-comment">/* PSE/PAE/PGE off. */</span><br>__asm__ <span class="hljs-title function_">volatile</span><span class="hljs-params">(<span class="hljs-string">&quot;mov %0,%%cr4; mov %1,%%cr3&quot;</span></span><br><span class="hljs-params">                 : : <span class="hljs-string">&quot;r&quot;</span>(cr4), <span class="hljs-string">&quot;r&quot;</span>(directory) : <span class="hljs-string">&quot;memory&quot;</span>)</span>;<br>__asm__ <span class="hljs-title function_">volatile</span><span class="hljs-params">(<span class="hljs-string">&quot;mov %%cr0,%0&quot;</span> : <span class="hljs-string">&quot;=r&quot;</span>(cr0))</span>;<br>cr0 |= <span class="hljs-number">0x80010000u</span>; <span class="hljs-comment">/* PG and WP; retain PE. */</span><br>__asm__ <span class="hljs-title function_">volatile</span><span class="hljs-params">(<span class="hljs-string">&quot;mov %0,%%cr0&quot;</span> : : <span class="hljs-string">&quot;r&quot;</span>(cr0) : <span class="hljs-string">&quot;memory&quot;</span>)</span>;<br></code></pre></td></tr></table></figure>
+<p>两次保存 ESP 的位置分别在设置控制寄存器之前和之后。<br>
+客体断言两个值相同；GDB 还验证这个值位于链接脚本声明的原栈范围内。<br>
+本篇正常镜像记录为 <code>CR3=0x10a000</code>、<code>ESP=0x1096f0</code>，开启分页没有改变栈地址。</p>
+<p>这些地址属于本篇冻结版本，新增代码导致的链接变化会影响数值。<br>
+本篇 <code>__kernel_end=0x109750</code>，初始空闲数是 16086，比上一篇快照少一页。<br>
+比较页面收支应使用本次启动保存的 <code>paging_initial_pages</code>，不能套用上一篇的 16087。</p>
+<h1>同一虚拟地址先读 A，再读 B</h1>
+<p>启用分页后，演示分配两个不同物理页 A、B，通过低地址恒等别名分别写入 <code>0x12345678</code> 和 <code>0x87654321</code>。<br>
+实验虚拟地址始终为 <code>0x40000000</code>，先映射到 A，再改为 B。<br>
+两次读取必须得到对应的不同值，才能证明高地址访问确实经过了页表。</p>
+<p>修改 PTE 后还要使旧地址翻译失效。<br>
+<a target="_blank" rel="noopener" href="https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-3a-part-1-manual.pdf">Intel SDM §4.10.4.1</a>规定的 <code>INVLPG</code> 以线性地址为操作数；本篇传入实验虚拟页地址，不是 PTE 自身的存储地址。<br>
+否则内存里的表项虽然更新，处理器仍可能使用缓存中的旧映射。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">static</span> <span class="hljs-type">void</span> <span class="hljs-title function_">invalidate</span><span class="hljs-params">(<span class="hljs-type">uint32_t</span> address)</span><br>&#123;<br>    __asm__ <span class="hljs-title function_">volatile</span><span class="hljs-params">(<span class="hljs-string">&quot;invlpg (%0)&quot;</span> : : <span class="hljs-string">&quot;r&quot;</span>(address) : <span class="hljs-string">&quot;memory&quot;</span>)</span>;<br>&#125;<br><span class="hljs-type">static</span> <span class="hljs-type">void</span> <span class="hljs-title function_">test_map</span><span class="hljs-params">(<span class="hljs-type">uint32_t</span> physical, <span class="hljs-type">uint32_t</span> flags)</span><br>&#123;<br>    KASSERT(!(physical &amp; <span class="hljs-number">4095</span>));<br>    test_table[<span class="hljs-number">0</span>] = physical | flags;<br>    invalidate(TEST_VA);<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>所有实验映射变化都通过 <code>test_map</code>，包括清除映射和放宽只读权限。<br>
+重新加载 CR3 也涉及地址翻译失效，但本篇只改一个虚拟页，用 <code>INVLPG</code> 就能表达需要刷新的范围。<br>
+当前只有一个 CPU；以后若多个 CPU 同时使用这套页表，还需要处理其他 CPU 的翻译缓存。</p>
+<h1>错误码 0 与 3 分别表示什么</h1>
+<p>页故障通过异常向量 14 进入，CPU 自动压入错误码。<br>
+公共汇编入口对该向量不再补一个零，仍沿用第 07 篇的 68 字节同特权级现场布局。<br>
+错误码记录这次访问为什么失败，与 PTE 属性位的含义不同。</p>
+<table>
+<thead>
+<tr>
+<th>错误码位</th>
+<th>为 0</th>
+<th>为 1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P</td>
+<td>不在场导致故障</td>
+<td>保护条件违反</td>
+</tr>
+<tr>
+<td>W/R</td>
+<td>读访问</td>
+<td>写访问</td>
+</tr>
+<tr>
+<td>U/S</td>
+<td>supervisor 访问</td>
+<td>user 访问</td>
+</tr>
+</tbody>
+</table>
+<p>清空实验 PTE 后，由 ring 0 读取，预期得到 <code>error=0</code>。<br>
+把 B 映射为 present、readonly，再由 ring 0 写入，且 WP=1，预期得到 <code>error=3</code>，即 P 与 W/R 同时为 1。<br>
+这里的 3 不是“把 PTE 的 PRESENT 和 WRITE 原样打印出来”。</p>
+<p><a target="_blank" rel="noopener" href="https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-3a-part-1-manual.pdf">Intel SDM §4.7 与异常 14 的说明</a>还定义了其他错误条件。<br>
+本篇没有构造保留位错误；在固定的 PSE=0 非 PAE 模式下，不能任意设置一个高位就声称完成了 RSVD 实验。<br>
+原始错误码始终完整打印，恢复逻辑则只接受预定的精确值。</p>
+<h1>先保存 CR2，再输出诊断</h1>
+<p>CR2 保存导致页故障的线性地址，保存的 EIP 指向故障指令。<br>
+两者用途不同：CR2 用于定位哪一个地址无法访问，EIP 用于定位哪条指令发起访问。<br>
+打印函数如果又产生页故障，CR2 会被后一次故障覆盖，因此分发函数先读取 CR2，再调用页故障处理函数。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">uint32_t</span> fault_address;<br>__asm__ <span class="hljs-title function_">volatile</span><span class="hljs-params">(<span class="hljs-string">&quot;mov %%cr2,%0&quot;</span> : <span class="hljs-string">&quot;=r&quot;</span>(fault_address))</span>;<br><span class="hljs-keyword">if</span> (frame-&gt;<span class="hljs-built_in">vector</span> == <span class="hljs-number">14</span>) &#123; paging_fault(frame, fault_address); <span class="hljs-keyword">return</span>; &#125;<br></code></pre></td></tr></table></figure>
+<p>这次保存发生在进入 C 分发函数之后、任何诊断输出之前。<br>
+它依赖此前已经映射好的异常入口、栈和数据；不能把它理解为任意嵌套故障下都能恢复的完整机制。<br>
+当前实验也不在处理函数中临时分配页面，待修复的 B 页已经预先取得。</p>
+<h1>只修复精确匹配的实验故障</h1>
+<p>读写探针使用独立汇编标签，让错误指令的位置可以准确比较：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs nasm">paging_read:<br>paging_read_fault:<br>    mov eax, [0x40000000]<br>    ret<br>paging_write:<br>paging_write_fault:<br>    mov dword [0x40000000], 0xfeedface<br>    ret<br></code></pre></td></tr></table></figure>
+<p>处理函数首先要求 CR2 等于实验地址，CS 等于内核代码段选择子 8。<br>
+读故障还要求阶段为 1、错误码为 0、EIP 等于读标签，且当前 PTE 恰好为零。<br>
+写故障要求阶段为 2、错误码为 3、EIP 等于写标签，且 PTE 低三位只有 PRESENT。</p>
+<p>条件全部满足后，函数把实验页重新映射到预先保存的 <code>repair_page</code>，允许读写并执行 <code>INVLPG</code>。<br>
+随后清除 <code>expected_fault</code>，增加故障计数，返回公共汇编出口。<br>
+它没有更改现场中的 EIP，也没有按指令长度向后跳过失败访问。</p>
+<p><code>iretd</code> 恢复现场后，CPU 重新执行原来的 <code>mov</code>。<br>
+读探针这次读到 B 的 <code>0x87654321</code>；写探针这次完成写入，B 的低地址别名读回 <code>0xfeedface</code>。<br>
+如果处理函数只打印信息就返回，又不修复映射，原指令会再次触发同样的故障。</p>
+<p>GDB 检查在处理函数入口核对错误码、地址、EIP、阶段和表项。<br>
+修复返回后，再在对应汇编标签设置硬件断点，确认实际执行重新到达保存的同一个 EIP。<br>
+正常镜像的两处地址分别为 <code>0x102cd0</code> 与 <code>0x102cd6</code>，不能用故障变体 ELF 的地址替代。</p>
+<h1>解除映射后释放数据页，活动页表继续保留</h1>
+<p>演示结束先清零实验 PTE 并失效翻译，再释放 A 和 B。<br>
+这样已经撤销的高地址映射不会继续通过旧缓存访问被分配器重新交出的页面。<br>
+低地址恒等窗口仍保留，所以释放物理页并不等于删除它的所有虚拟别名；后续调用者仍须遵守所有权规则。</p>
+<p>页目录、16 个低地址页表和一个高地址页表继续供 CPU 使用，不能随数据页释放。<br>
+最终空闲数应为 <code>16086 - 18 = 16068</code>。<br>
+GDB 除了检查计数，还检查占用位图恰好有 18 个置位，并确认它们包含当前目录和全部活动表页。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="day11-screen.png" alt="开启分页、重新映射与两次页故障恢复的客体画面"></p>
+<p>高地址只读实验只限制这一个别名。<br>
+同一物理 B 页仍有低地址 RW 别名，低地址窗口也包含内核 text 和页表，因此不能宣称实现了内核代码只读或安全隔离。<br>
+非 PAE 表项没有 NX 位，本篇不具备 W^X，也没有用户态、进程地址空间或通用虚拟内存接口。</p>
+<h1>未预期的页故障必须停机</h1>
+<p>独立的 <code>mbr-pagefault.img</code> 在正常演示完成后，再次调用读取探针。<br>
+此时高地址 PTE 已清零，恢复阶段也已经清除，即使故障地址相同，也不会重新进入白名单恢复路径。<br>
+处理函数打印 CR2、原始错误码和完整同级现场，然后调用 <code>panic</code>。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="day11-pagefault.png" alt="未预期页故障输出现场并停机的客体画面"></p>
+<p>故障检查先用 GDB 确认 <code>panic_halt</code> 位置确实是 HLT 指令。<br>
+另外启动一次不在该指令前暂停的客体，再由 QEMU monitor 读取 <code>HLT=1</code>，确认处理器实际进入停止状态。<br>
+正常镜像和故障镜像分别保存截图，故障画面不会覆盖正常演示结果。</p>
+<h1>下载与复现</h1>
+<p><a href="os-day-11-source.zip">下载第 11 篇完整源码</a>，解压目录前缀为 <code>os-day-11</code>。<br>
+源码冻结提交为 <code>851ec46333fdc377201598bf93a6bb6cdf3d8aec</code>，实现位于 <code>examples/build-an-os</code>。<br>
+继续使用第 01 篇已经准备好的 <code>localhost/build-an-os:day01</code> 镜像，无需为本篇重建工具链。</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs sh">unzip os-day-11-source.zip<br><span class="hljs-built_in">cd</span> os-day-11/examples/build-an-os<br>podman run --<span class="hljs-built_in">rm</span> -v <span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>:/work&quot;</span> -w /work localhost/build-an-os:day01 make check-paging<br>podman run --<span class="hljs-built_in">rm</span> -v <span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>:/work&quot;</span> -w /work localhost/build-an-os:day01 make check<br></code></pre></td></tr></table></figure>
+<p>两条检查命令顺序执行，脚本共享 GDB 的 1234 端口，不应同时运行。<br>
+<code>check-paging</code> 核对控制寄存器、16384 个低地址 PTE、故障与重试、页面收支和真实停机；正常路径还继续运行到 <code>keyboard_ready</code>。<br>
+<code>make check</code> 继续执行既有引导、装载、C 入口、控制台、异常、时钟、键盘和物理页回归。</p>
+<p>本篇 <code>docs/day11-evidence.md</code> 记录的正常输出包括：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">PG+WP enabled CR3=0x10a000 same stack=0x1096f0<br>remap A -&gt; B + INVLPG OK<br>PAGE FAULT CR2=0x40000000 error=0 EIP=0x102cd0<br>nonpresent read repaired; same EIP retry OK<br>PAGE FAULT CR2=0x40000000 error=3 EIP=0x102cd6<br>WP readonly write repaired; same EIP retry OK<br>PAGING OK retained tables=18 free=16068<br></code></pre></td></tr></table></figure>
+<p>完整回归及源码附件独立解压后的累计检查均退出 0，实验范围限于指定 QEMU、单 CPU、64 MiB 的配置。<br>
+串口、GDB 和停止状态产物保存在 <code>build/paging-*-serial.txt</code>、<code>build/paging-*-gdb.txt</code> 与 <code>build/paging-halted-registers.txt</code>。<br>
+两张画面来自 QEMU 显示设备；它们辅助观察结果，寄存器与页表断言承担对应的状态检查。</p>
+<h1>练习</h1>
+<ol>
+<li>计算 <code>0x40001004</code> 的目录索引、页表索引和页内偏移，再说明当前表树访问该地址为什么会故障。</li>
+<li>给实验页表的第二项建立映射，验证两个相邻虚拟页可以映射到不相邻物理页，并分别执行失效操作。</li>
+<li>在单独实验变体中保持 WP=1，把高地址 PDE 改为只读，预测只改 PTE 为可写能否恢复写访问；保留未预期故障的停机路径。</li>
+</ol>
+<p>上一篇：<a href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-10-%E7%89%A9%E7%90%86%E9%A1%B5%E5%88%86%E9%85%8D/">10 - 物理页分配</a>。</p>
+<p>下一篇：<a href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-12-%E5%86%85%E6%A0%B8%E5%A0%86/">12 - 内核堆</a>，在页面分配与映射的基础上处理按字节申请内存的需求。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-11-%E5%88%86%E9%A1%B5%E4%B8%8E%E9%A1%B5%E6%95%85%E9%9A%9C/">https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-11-%E5%88%86%E9%A1%B5%E4%B8%8E%E9%A1%B5%E6%95%85%E9%9A%9C/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F/">操作系统</a><a class="post-meta__tags" href="/tags/%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86/">内存管理</a><a class="post-meta__tags" href="/tags/x86/">x86</a></div><div class="post-share"><div class="social-share" data-image="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-11-%E5%88%86%E9%A1%B5%E4%B8%8E%E9%A1%B5%E6%95%85%E9%9A%9C/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-10-%E7%89%A9%E7%90%86%E9%A1%B5%E5%88%86%E9%85%8D/" title="从零编写操作系统 10 - 物理页分配：哪些内存真正可以交出去"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-10-%E7%89%A9%E7%90%86%E9%A1%B5%E5%88%86%E9%85%8D/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 10 - 物理页分配：哪些内存真正可以交出去</div></div><div class="info-2"><div class="info-item-1">内核已经能处理时钟中断和键盘事件，但新增数据仍依赖静态数组。 页表、任务栈或文件缓存需要动态取得内存时，必须知道哪些物理地址可以使用、哪些已经分配，以及释放是否有效。 本篇把第 04 篇取得的 E820 内存图转换成 4 KiB 物理页分配器。 实验仍使用单 CPU、64 MiB RAM 的 qemu32 模拟机，分页保持关闭。 分配器管理固定上限内的页框，返回物理地址；它不建立虚拟地址映射，也不提供任意字节大小的 malloc。 实测初始空闲页数为 16087，客体耗尽全部页面、验证每页数据并释放后，空闲数恢复为 16087。  E820 可用内存还需要扣除内核占用 E820 描述固件报告的系统地址范围。 内核已经装入内存，却不意味着固件会把这段地址从 type 1 区域里扣掉。 若直接把所有 type 1 页面交给调用者，分配结果可能覆盖正在运行的代码或栈。 ACPI 6.5 第 15 章定义了 BIOS 内存图接口和范围类型。 其中 type 1 表示可用 RAM；其他类型不能在本实验中直接当作普通空闲页。 低地址区域也可能有固件或引导程序用途，规范 §15.2要求调用方考...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-12-%E5%86%85%E6%A0%B8%E5%A0%86/" title="从零编写操作系统 12 - 内核堆：在物理页内分配、分裂与合并"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-12-%E5%86%85%E6%A0%B8%E5%A0%86/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 12 - 内核堆：在物理页内分配、分裂与合并</div></div><div class="info-2"><div class="info-item-1">物理页分配器每次交出 4096 字节，队列节点、字符串和小结构体却通常用不满一页。 本篇在已经建立恒等映射的物理页内实现 kmalloc 和 kfree，按请求长度分配空间，并在释放时合并相邻空闲块。 堆最多持有四个独立页面，返回地址按 16 字节对齐，单次请求上限为 4076 字节。 实验继续运行在单 CPU、64 MiB RAM 的 qemu32 环境中，所有代码位于 ring 0。 正常镜像验证不同大小的读写、真实耗尽和回收；独立故障镜像破坏对象尾部标记，记录拒绝结果后主动进入诊断停机。 尾部标记由软件检查，越界写入发生时不会因此自动产生硬件异常。  页分配和字节分配各自管理什么 page_alloc() 依据 E820 和保留区规则选择可用物理页，返回物理地址。 它只记录页面归属，不知道页内有几个对象，也不知道其中某个对象申请了多少字节。 如果一个 17 字节对象独占一页，剩余空间仍然被这次页分配占用。 堆从页分配器取得整页，再用块头描述页内区间。 同一页可以同时容纳多个对象，释放一个对象后，其他对象继续有效。 分页还提供了另一项必要条件：这些物理字节必须能被当前虚拟地址...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-01-%E5%87%86%E5%A4%87%E5%B7%A5%E5%85%B7%E9%93%BE/" title="从零编写操作系统 01 - 准备工具链：源代码怎样变成磁盘里的字节"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-01-%E5%87%86%E5%A4%87%E5%B7%A5%E5%85%B7%E9%93%BE/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 01 - 准备工具链：源代码怎样变成磁盘里的字节</div></div><div class="info-2"><div class="info-item-1">在普通应用项目里，编译成功后通常可以直接运行可执行文件。自制操作系统还缺少一段工作：谁把文件里的指令放进内存，谁准备栈，CPU 又从哪里开始执行？ 本篇先把这些问题拆开验证。第一条实验生成 ELF32/i386 文件，检查源代码、符号、链接地址和机器指令的对应关系。第二条实验把一块全零磁盘接到 QEMU，观察固件启动失败，再用 GDB 停住并单步执行 CPU。 两条实验还没有连接起来。sample.elf 不会被写进空磁盘，也不会由 BIOS 加载。本篇完成后得到的是可用的编译与调试环境；第 02 篇才开始写 BIOS 能执行的启动扇区。  宿主、目标与固件 本次实验的宿主链路是 ARM macOS 上的 Podman Linux 虚拟机，容器内运行 Debian 12 aarch64。交叉编译器本身是一段 ARM Linux 程序，它生成的指令却属于 32 位 x86。QEMU 再通过 TCG 动态翻译运行这个 x86 客体，不要求宿主 CPU 支持直接执行 x86 指令，机制见 QEMU TCG 文档。 12345678ARM macOS  └─ Podman Linux V...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/" title="从零编写操作系统 09 - 键盘与事件队列：把中断接收和字符处理分开"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 09 - 键盘与事件队列：把中断接收和字符处理分开</div></div><div class="info-2"><div class="info-item-1">键盘接入后，内核需要同时处理两种节奏：设备产生扫描码时必须及时接收，字符转换、退格和整行输出则可以留在前台执行。把打印放进 IRQ1 会延长关中断时间，也会让输入设备直接依赖控制台。 本篇在已有异常入口和 PIC 重映射上接入 PS/2 键盘。IRQ1 只接收原始字节并放进队列；主循环负责 US set 1 解析与简单行编辑。输入回车后显示 LINE: ...，尚未执行命令，也没有 shell。  IRQ1 接到已有中断入口 第 08 篇把主 PIC 的向量起点设为 0x20。键盘接主片 IRQ1，因此向量为 0x21，即十进制 33。 123456789PS/2 键盘扫描码    ↓i8042 输出缓冲区 → IRQ1    ↓主 PIC → IDT[33] → 公共汇编入口    ↓trap_dispatch → keyboard_irq    ↓ 原始字节入队，主 PIC EOIiret 恢复前台 → 出队 → 解析 → 行编辑 kernel/exceptions.c 现在初始化前 34 个 IDT 表项，0—31 为异常，32 为时钟，33 为键盘。其余表项仍不在场，不能...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-04-%E8%BF%9B%E5%85%A5%E4%BF%9D%E6%8A%A4%E6%A8%A1%E5%BC%8F/" title="从零编写操作系统 04 - 进入保护模式：建立第一份运行环境"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-04-%E8%BF%9B%E5%85%A5%E4%BF%9D%E6%8A%A4%E6%A8%A1%E5%BC%8F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 04 - 进入保护模式：建立第一份运行环境</div></div><div class="info-2"><div class="info-item-1">第 03 篇已经让第一阶段启动扇区加载第二阶段，也让第二阶段读取载荷并检查边界。它仍然停留在实模式。实模式下可以方便调用 BIOS，也能通过操作数前缀使用 32 位寄存器；后续内核需要的平坦地址空间和权限隔离仍要建立在保护模式上。 本篇完成第一次处理器模式切换：在进入保护模式前收集 E820 内存图，打开 A20，建立 GDT，设置 CR0.PE，再用远跳转刷新代码段。切换完成后，32 位代码直接写 VGA 文本显存，GDB 能观察到保护模式状态。BIOS 调用到这里为止，后面的内核不能再按实模式方式直接调用 int 10h 或 int 13h。  为什么先把 BIOS 调用做完 BIOS 服务是实模式时代的接口。第 03 篇依赖它读盘；本篇还要依赖它查询内存图。进入保护模式后，CPU 的段解释、地址宽度和中断入口都变了。没有虚拟 8086 模式、实模式回跳或专门 BIOS 调用桥时，内核不能继续把 int 15h 当作普通函数使用。 切换前后的准备顺序如下： 1234567891011real mode  ├─ read disk through BIOS EDD  ├─ pr...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-08-%E6%97%B6%E9%92%9F%E4%B8%AD%E6%96%AD/" title="从零编写操作系统 08 - 时钟中断：让外部事件打断当前执行"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-08-%E6%97%B6%E9%92%9F%E4%B8%AD%E6%96%AD/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 08 - 时钟中断：让外部事件打断当前执行</div></div><div class="info-2"><div class="info-item-1">上一篇的异常由正在执行的指令触发。时钟中断来自处理器外部：即使内核没有执行 int，定时器也能发出请求，经中断控制器送到 CPU，再通过 IDT 进入处理函数。 本篇接入传统 PC 的 8259A PIC 与 8254 PIT，只开放 IRQ0。正常内核收到 20 次时钟中断后关闭外部 IRQ，继续原有控制台自检；两个独立诊断镜像验证屏蔽、恢复和漏发 EOI 的后果。入口仍沿用上一篇的保存与恢复路径，尚未加入调度或任务切换。  从 PIT 输出到 IDT 第 32 项 PIT 的 channel 0 产生周期信号，连接主 PIC 的 IRQ0 输入。PIC 根据屏蔽位和优先级判断是否请求 CPU 响应；CPU 接受请求后获得向量，再查 IDT。 12345678910111213PIT channel 0 周期输出    ↓主 PIC 的 IRQ0 输入    ↓  IMR、优先级及 CPU 当前 IF 允许CPU 接受可屏蔽外部中断    ↓IDT[0x20] → isr32 → exception_common    ↓trap_dispatch(frame) → timer...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">一次访存经过哪几种地址</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">32 位地址按 10、10、12 位拆分</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">表项低位控制在场和读写权限</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">从分配器取得 18 个表页</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">开启 PG 后，代码和栈仍在原地址</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">同一虚拟地址先读 A，再读 B</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">错误码 0 与 3 分别表示什么</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">先保存 CR2，再输出诊断</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">9.</span> <span class="toc-text">只修复精确匹配的实验故障</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">10.</span> <span class="toc-text">解除映射后释放数据页，活动页表继续保留</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">11.</span> <span class="toc-text">未预期的页故障必须停机</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">12.</span> <span class="toc-text">下载与复现</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">13.</span> <span class="toc-text">练习</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

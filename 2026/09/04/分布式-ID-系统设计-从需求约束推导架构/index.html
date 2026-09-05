@@ -1,0 +1,1028 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>分布式 ID 系统设计：从需求约束推导架构 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="数据库自增列足以支撑单库业务。系统拆成多个写入节点后，ID 生成突然变成一项基础设施能力：它要避免碰撞，不能拖慢写路径，还要经受扩容、时钟异常、数据库切换、配置漂移和跨地域网络分区。 这类系统最容易从算法名称开始讨论：UUID、Snowflake、数据库序列、号段。算法当然重要，但架构并不是从算法列表里挑出来的。它来自一组可验证的约束：唯一到什么范围，顺序要强到什么程度，故障时允许停多久，ID 可">
+<meta property="og:type" content="article">
+<meta property="og:title" content="分布式 ID 系统设计：从需求约束推导架构">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/04/%E5%88%86%E5%B8%83%E5%BC%8F-ID-%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-%E4%BB%8E%E9%9C%80%E6%B1%82%E7%BA%A6%E6%9D%9F%E6%8E%A8%E5%AF%BC%E6%9E%B6%E6%9E%84/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="数据库自增列足以支撑单库业务。系统拆成多个写入节点后，ID 生成突然变成一项基础设施能力：它要避免碰撞，不能拖慢写路径，还要经受扩容、时钟异常、数据库切换、配置漂移和跨地域网络分区。 这类系统最容易从算法名称开始讨论：UUID、Snowflake、数据库序列、号段。算法当然重要，但架构并不是从算法列表里挑出来的。它来自一组可验证的约束：唯一到什么范围，顺序要强到什么程度，故障时允许停多久，ID 可">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg">
+<meta property="article:published_time" content="2026-09-04T02:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-05T12:42:02.235Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="ID 生成器">
+<meta property="article:tag" content="Snowflake">
+<meta property="article:tag" content="分布式系统">
+<meta property="article:tag" content="号段模式">
+<meta property="article:tag" content="系统设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "分布式 ID 系统设计：从需求约束推导架构",
+  "url": "https://magicliang.github.io/2026/09/04/%E5%88%86%E5%B8%83%E5%BC%8F-ID-%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-%E4%BB%8E%E9%9C%80%E6%B1%82%E7%BA%A6%E6%9D%9F%E6%8E%A8%E5%AF%BC%E6%9E%B6%E6%9E%84/",
+  "image": "https://magicliang.github.io/img/cover-distributed-systems.svg",
+  "datePublished": "2026-09-04T02:00:00.000Z",
+  "dateModified": "2026-09-05T12:42:02.235Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/04/%E5%88%86%E5%B8%83%E5%BC%8F-ID-%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-%E4%BB%8E%E9%9C%80%E6%B1%82%E7%BA%A6%E6%9D%9F%E6%8E%A8%E5%AF%BC%E6%9E%B6%E6%9E%84/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '分布式 ID 系统设计：从需求约束推导架构',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">712</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">866</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">15</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-distributed-systems.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">分布式 ID 系统设计：从需求约束推导架构</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">分布式 ID 系统设计：从需求约束推导架构</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-04T02:00:00.000Z" title="Created 2026-09-04 10:00:00">2026-09-04</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-05T12:42:02.235Z" title="Updated 2026-09-05 20:42:02">2026-09-05</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">6.7k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>20mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-05 20:42:02&quot;}" hidden></div><p>数据库自增列足以支撑单库业务。系统拆成多个写入节点后，ID 生成突然变成一项基础设施能力：它要避免碰撞，不能拖慢写路径，还要经受扩容、时钟异常、数据库切换、配置漂移和跨地域网络分区。</p>
+<p>这类系统最容易从算法名称开始讨论：UUID、Snowflake、数据库序列、号段。算法当然重要，但架构并不是从算法列表里挑出来的。它来自一组可验证的约束：唯一到什么范围，顺序要强到什么程度，故障时允许停多久，ID 可以暴露什么信息，以及团队能维护多少协调状态。</p>
+<span id="more"></span>
+<h2 id="先定义-id-的合同">先定义 ID 的合同</h2>
+<p>“生成一个全局唯一且递增的 ID”看似明确，实际混合了几种不同语义。若不拆开，评审阶段达成的共识很可能只是每个人对同一句话的不同理解。</p>
+<h3 id="唯一性有作用域">唯一性有作用域</h3>
+<p>唯一性至少要说明三个边界：</p>
+<ul>
+<li>命名空间：全公司、单业务、单租户、单表，还是单个分片。</li>
+<li>时间范围：进程存活期间、数据保留期，还是系统整个生命周期。</li>
+<li>保证方式：确定性不重叠，还是碰撞概率低到工程上可接受。</li>
+</ul>
+<p>数据库序列和合理分配的 Snowflake 节点空间可以给出确定性的不重叠保证。UUIDv4 依靠足够大的随机空间降低碰撞概率。两者都常被称为“全局唯一”，但证明路径并不相同。</p>
+<p>命名空间是一个容易被漏掉的参数。同一套发号集群可以按业务键隔离序列；不同系统也可以用固定前缀、版本位或独立数据库避免相撞。只说“全局”而不写清全局的边界，无法形成可测试的契约。</p>
+<h3 id="顺序不是单一属性">顺序不是单一属性</h3>
+<p>分布式 ID 常见的顺序要求可以分成四级：</p>
+<table>
+<thead>
+<tr>
+<th>语义</th>
+<th>含义</th>
+<th>典型用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单节点单调</td>
+<td>同一生成器后发的 ID 更大</td>
+<td>日志排序、局部游标</td>
+</tr>
+<tr>
+<td>时间可排序</td>
+<td>大部分情况下，较晚生成的 ID 排在后面</td>
+<td>B+Tree 写入局部性、粗略时间排序</td>
+</tr>
+<tr>
+<td>全局严格单调</td>
+<td>任意两个成功请求都能得到统一先后关系</td>
+<td>少数强序号场景</td>
+</tr>
+<tr>
+<td>提交顺序</td>
+<td>事务先对外完成，排序键就一定更小</td>
+<td>审计、跨地域一致读</td>
+</tr>
+</tbody>
+</table>
+<p>Snowflake 和 UUIDv7 可以提供时间可排序的标识，但不能自动提供事务提交顺序。客户端 A 先拿到 ID 100，客户端 B 后拿到 101，B 完全可能先提交。此时按 ID 排序会得到“取号顺序”，而不是“业务生效顺序”。</p>
+<p>若业务真正需要提交顺序，序号必须在事务提交边界产生或由事务系统提供提交时间戳。把更复杂的位布局塞进 ID，无法修复这个语义缺口。</p>
+<h3 id="空洞-复用和持久化边界">空洞、复用和持久化边界</h3>
+<p>高可用发号通常会产生空洞。数据库事务回滚、节点预取一段号码后宕机、进程重启放弃本地缓存，都会让部分 ID 永远不被使用。</p>
+<p>空洞和重复是两类问题：</p>
+<ul>
+<li>空洞通常只影响观感和容量利用率。</li>
+<li>重复会破坏主键、幂等键和数据关联，属于正确性故障。</li>
+</ul>
+<p>因此，发号系统可以承诺“不复用”，很少应该承诺“无空洞”。PostgreSQL 的序列文档也明确说明，序列值不会随事务回滚，无空洞序列需要代价更高的锁与串行化。发票号、票据号等受监管编号应单独建模，不能直接复用通用分布式 ID 的可用性假设。</p>
+<h3 id="表示形式也属于架构">表示形式也属于架构</h3>
+<p>位宽决定容量、寿命和协议兼容性。64 位整数适合数据库主键和多数后端语言，但 JavaScript 的安全整数只有 53 位，跨端 API 通常应使用字符串承载。128 位 UUID 有标准格式和更大的空间，代价是索引、更宽的网络字段与存储占用。</p>
+<p>ID 是否可枚举也要提前决定。连续整数会泄露业务规模，含时间字段的 ID 会暴露大致创建时间，某些节点字段还可能泄露拓扑。随机性可以降低猜测难度，却不能替代权限校验。OWASP 将对象级授权缺失列为独立风险，无论对象 ID 是整数、UUID 还是字符串，服务端都必须验证调用者是否有权访问该对象。</p>
+<p>对外业务编号和内部主键也应分开。<code>{biz}{date}{sequence}</code> 适合作为订单号、工单号等展示字段；如果序列按天归零，日期就必须参与唯一性范围。它不应顺带承担数据库主键、事务顺序和权限校验。跨端传输时仍宜使用字符串，避免前导零或大整数精度丢失。</p>
+<h2 id="从约束走向方案">从约束走向方案</h2>
+<p>方案选择可以压缩成一棵决策树。关键不是寻找功能最多的算法，而是停止引入不需要的协调。</p>
+<pre><code class="hljs mermaid">flowchart TD
+    A[定义唯一性作用域与寿命] --&gt; B&#123;需要严格提交顺序吗&#125;
+    B -- 是 --&gt; C[在事务或共识层生成提交序]
+    B -- 否 --&gt; D&#123;必须使用 64 位整数吗&#125;
+    D -- 否 --&gt; E&#123;需要时间可排序吗&#125;
+    E -- 否 --&gt; F[UUIDv4]
+    E -- 是 --&gt; G[UUIDv7]
+    D -- 是 --&gt; H&#123;可以可靠管理节点身份与时钟吗&#125;
+    H -- 是 --&gt; I[Snowflake 类方案]
+    H -- 否 --&gt; J&#123;可接受每次访问中心存储吗&#125;
+    J -- 是 --&gt; K[数据库序列或 Redis INCR]
+    J -- 否 --&gt; L&#123;可依赖数据库且允许空洞吗&#125;
+    L -- 是 --&gt; M[号段模式]
+    L -- 否 --&gt; N[重新协商位宽、顺序或可用性]</code></pre>
+<h3 id="集中计数器：最直接的序列化点">集中计数器：最直接的序列化点</h3>
+<p>数据库序列或 Redis <code>INCR</code> 都能把“下一个号码”收敛到一个中心状态。每次请求都访问中心存储，语义直观，适合流量适中、已经依赖该存储且能够接受中心故障影响发号的系统。</p>
+<p>Redis <code>INCR</code> 会把整数值原子加一；key 不存在时按零处理。<code>INCRBY</code> 可以一次推进较大的步长，因此也能用于预留号段。后一种用法不再让每个业务请求访问 Redis，而是由节点批量取号，再从本地内存发放。</p>
+<p>把 Redis 当作持久发号源时，唯一性证明不能停在“命令是原子的”。Redis 默认异步复制，故障切换可能丢失主节点已经确认、但尚未复制的写入；若计数器因此回退，恢复后的序号可能与已落库 ID 重复。RDB、AOF 及其刷盘策略决定可恢复到哪个位置，却不会自动证明高水位永不倒退。无法接受重复时，应在恢复后校准到已知最大值之外，或者改用具备可靠持久化边界的数据库序列、号段服务。</p>
+<p>按日期拆 key 可以分散生命周期并方便运营查询，例如 <code>id:order:20260904</code>。但每日序列会重复，最终编号必须包含日期或其他不重叠前缀。<code>ORD202609040000001</code> 是业务编号，不是“一个递增数字就天然全局唯一”。</p>
+<h3 id="uuid：省掉发号服务">UUID：省掉发号服务</h3>
+<p>如果业务只需要低碰撞概率的标识，UUIDv4 往往已经够用。它不依赖数据库、注册中心或节点编号，调用方可以在本地生成。RFC 9562 定义的 UUIDv4 有 122 位随机或伪随机数据，适合不要求数值递增的场景。</p>
+<p>UUIDv7 把 48 位 Unix 毫秒时间放在高位，并为剩余部分保留随机数或单调构造空间。它改善了按字节排序和数据库索引局部性，同时保留了无中心生成的优势。</p>
+<p>UUIDv7 仍需处理本地时钟回退和同一毫秒内的生成顺序。实现可以等待时钟追平、维护单调计数器或拒绝继续发号。RFC 提供了构造规则，却不会替部署环境消除时钟故障。</p>
+<p>适合 UUID 的条件很清楚：</p>
+<ul>
+<li>接受 128 位或字符串表示。</li>
+<li>不需要确定性的全局严格单调。</li>
+<li>希望调用方本地生成，减少运行中的基础设施依赖。</li>
+<li>可以接受随机碰撞概率模型，或通过数据库唯一约束做最后防线。</li>
+</ul>
+<h3 id="snowflake：用节点空间换取本地吞吐">Snowflake：用节点空间换取本地吞吐</h3>
+<p>原始 Twitter Snowflake 把 64 位整数拆成时间、数据中心、节点和同毫秒序列。经典布局是 41 位时间、5 位数据中心、5 位节点、12 位序列；最高位保持为 0，使结果落在有符号 64 位正整数范围内。</p>
+<p>生成路径只读取本地时间和进程内计数器，因此延迟低、吞吐高。协调被移出了每次请求，转移到两个低频问题：谁有权使用某个节点编号，以及时钟异常时谁负责阻止重复。</p>
+<p>位布局不是标准答案。它是一份容量预算：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">单时间片单节点容量 = 2 ^ sequence_bits<br>可并行节点数       = 2 ^ worker_bits<br>时间字段寿命       = 2 ^ time_bits × 时间单位<br></code></pre></td></tr></table></figure>
+<p>给节点位多分一位，就会从时间或序列中少一位。将时间单位从毫秒改成 10 毫秒可以延长寿命，但会压缩单时间片内的吞吐余量。不同衍生实现采用不同布局，不能把某个实现的容量数字当成 Snowflake 的固有属性。</p>
+<p>Snowflake 的真正难点在控制面：</p>
+<ul>
+<li>节点编号必须在有效期内唯一，进程重启和容器漂移不能造成重用。</li>
+<li>节点租约过期后，需要纪元或隔离期阻止旧进程继续发号。</li>
+<li>时钟回退必须被检测，策略可以是等待、拒绝、使用逻辑时间或切换纪元。</li>
+<li>序列溢出后只能等待下一个时间片，延迟指标必须能看见这类停顿。</li>
+</ul>
+<p>原始实现遇到时钟回退会直接拒绝发号。这个选择保护了唯一性，却把时钟可靠性变成可用性前提。如果业务要求时钟异常期间继续服务，就要增加纪元位、持久化逻辑时钟或外部时间协调，并承担更多状态管理成本。</p>
+<h3 id="号段：把数据库协调摊薄">号段：把数据库协调摊薄</h3>
+<p>号段模式适合不愿把唯一性绑定到机器时钟，又已经有可靠关系数据库的系统。数据库不为每个请求分配一个 ID，而是原子地把某个业务序列的高水位推进一大段。应用节点取得这段号码后，在内存中逐个发放。</p>
+<h4 id="从-ticket-server-到号段预留">从 Ticket Server 到号段预留</h4>
+<p>Flickr 的 Ticket Server 是集中计数器的经典实现：专用 MySQL 表只保存发号状态，通过 <code>REPLACE INTO</code> 推进自增值，再用 <code>LAST_INSERT_ID()</code> 取回号码。它把发号从业务分库中剥离出来，以一个明确的序列化点换取跨库唯一。</p>
+<p>两台 Ticket Server 可以把 <code>auto-increment-increment</code> 都设为 2，并分别使用偏移 1 和 2，从而只生成奇数或偶数。两套空间天然不相交，不需要依赖主从复制来判定下一个号码。这是静态分区，不是可随意扩缩容的多主复制；增加或移除节点会改变模数与偏移，必须先划出新的不相交空间，不能直接原地改配置。</p>
+<p>号段模式沿着同一思路减少了中心协调频率：数据库不再为每个请求发一个号，而是一次预留一段，节点随后在本地发放。唯一性仍由持久化高水位保证，热路径则不再承担一次数据库往返。</p>
+<h4 id="原子预留一个号段">原子预留一个号段</h4>
+<p>一种通用的分配语义是：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">UPDATE</span> id_alloc<br><span class="hljs-keyword">SET</span> max_id <span class="hljs-operator">=</span> LAST_INSERT_ID(max_id <span class="hljs-operator">+</span> :step)<br><span class="hljs-keyword">WHERE</span> namespace <span class="hljs-operator">=</span> :namespace;<br></code></pre></td></tr></table></figure>
+<p>同一数据库连接随后读取 <code>LAST_INSERT_ID()</code>，得到新的高水位 <code>new_max</code>，本次独占区间就是 <code>(new_max - step, new_max]</code>。MySQL 文档说明，<code>LAST_INSERT_ID(expr)</code> 保存的是当前连接状态，因此更新与读取必须在同一连接上完成。连接池封装如果把两条语句拆到不同物理连接，这个协议就失效。</p>
+<p>这套协议把数据库请求率近似降低为：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">数据库补段 QPS ≈ ID 生成 QPS / 每段长度<br></code></pre></td></tr></table></figure>
+<p>节点还可以维护双缓冲：当前号段消费到某个阈值时，异步预取下一段；当前段耗尽后直接切换。双缓冲降低了数据库抖动传到调用方的概率，但没有创造无限可用性。当前段和下一段同时不可用时，发号仍然必须失败或限流。</p>
+<p>号段长度需要从负载和故障窗口推导：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">建议段长 ≥ 峰值 QPS × 目标补段间隔 × 安全系数<br></code></pre></td></tr></table></figure>
+<p>段太短会提高数据库压力，使一次抖动更快暴露给调用方；段太长会增加节点宕机时浪费的号码，也会拉大不同节点 ID 的跨度。自适应步长可以根据上一段的消费时间调整，但必须设置上下界，避免瞬时流量把段长永久推高。</p>
+<p>号段模式的持久化边界是数据库高水位。数据库从旧快照恢复、跨集群迁移遗漏最新值，都会让高水位倒退。恢复后不能直接开放发号，应先将每个命名空间的水位推进到已知最大值之外，或切换到一个不相交的新纪元。</p>
+<h3 id="强顺序：把协调放回提交边界">强顺序：把协调放回提交边界</h3>
+<p>若需求是“先完成的事务一定有更小的排序键”，独立发号服务无法单独兑现承诺。取号与提交之间存在任意长的业务处理、网络延迟和重试，提交顺序可以随时反转。</p>
+<p>强顺序需要一个能够观察提交边界的序列化点，例如单主日志、共识协议决定的日志位置，或具备外部一致性语义的分布式事务系统。Google Spanner 使用 TrueTime 表达时钟不确定区间，并在提交协议中等待，从而让提交时间戳符合外部可观察的事务顺序。</p>
+<p>这类能力会增加跨节点协调、尾延迟和分区期间的可用性成本。若用途只是主键、分库路由或粗略排序，引入强顺序属于过度设计。若用途是审计或跨地域事务可见顺序，则应明确支付这笔成本，不应由 Snowflake 的时间高位冒充。</p>
+<h2 id="架构由数据面和控制面组成">架构由数据面和控制面组成</h2>
+<p>算法选定后，还需要把职责放到正确的运行路径。低延迟发号属于数据面；节点租约、配置、纪元、迁移和水位修复属于控制面。</p>
+<pre><code class="hljs mermaid">flowchart LR
+    Client[业务客户端] --&gt; API[ID API 或 SDK]
+    API --&gt; FastPath[本地快速路径]
+    FastPath --&gt; Clock[时间与序列状态]
+    FastPath --&gt; Segment[当前号段]
+
+    Control[控制面] --&gt; Lease[节点租约与纪元]
+    Control --&gt; Config[命名空间与位布局版本]
+    Control --&gt; Guard[冲突检测与停发开关]
+
+    Store[(持久化分配状态)] --&gt; Segment
+    Store --&gt; Control
+    Metrics[指标与审计] &lt;--&gt;|状态| API
+    Metrics &lt;--&gt;|状态| Control</code></pre>
+<p>不是每种实现都需要图中的全部组件。UUIDv4 可以只保留 SDK 和数据库唯一约束；简单号段服务不需要时钟状态；单机房且节点由静态配置管理的 Snowflake 可以暂时不建设复杂租约系统。组件是否存在，取决于它对应的风险是否真实存在。</p>
+<h3 id="api-合同">API 合同</h3>
+<p>发号接口至少要固定这些字段：</p>
+<ul>
+<li><code>namespace</code>：隔离业务序列和容量策略。</li>
+<li><code>format_version</code>：让位布局或编码方式可以演进。</li>
+<li>返回类型：明确是有符号 64 位整数、无符号整数还是字符串。</li>
+<li>错误语义：区分过载、时钟回退、租约失效、补段失败和配置不一致。</li>
+<li>批量能力：批量取号要说明返回值是否连续，以及失败时是否整批作废。</li>
+</ul>
+<p>失败时返回随机数作为“兜底”会破坏系统最重要的不变量。正确的降级通常是拒绝、限流、切换到预先设计且不相交的备用空间，或者让上游进入可重试状态。</p>
+<h3 id="配置也是唯一性证明的一部分">配置也是唯一性证明的一部分</h3>
+<p>位布局、时间纪元、节点编号范围、数据中心编号和号段步长不能只被视作调优参数。前几项直接参与唯一性证明，配置漂移等价于让两个生成器采用不同的数学规则。</p>
+<p>启动时应校验配置版本和取值范围。运行中若发现本地版本落后、节点租约失效或纪元冲突，应停止发号，而不是继续使用缓存配置。对正确性参数采用 fail closed，会牺牲局部可用性，却避免更难修复的重复 ID。</p>
+<h2 id="故障模型决定保护机制">故障模型决定保护机制</h2>
+<p>正常路径的基准测试只能证明速度，无法证明系统在生产环境中仍然唯一。设计评审应逐项回答故障发生后是否会重复、停多久、如何恢复。</p>
+<table>
+<thead>
+<tr>
+<th>故障</th>
+<th>直接风险</th>
+<th>建议机制</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>时钟回退</td>
+<td>回到已经使用过的时间片</td>
+<td>等待、拒绝、逻辑时间或切换纪元</td>
+</tr>
+<tr>
+<td>节点编号重复</td>
+<td>不同进程生成相同位组合</td>
+<td>租约、唯一约束、纪元与旧进程隔离</td>
+</tr>
+<tr>
+<td>序列耗尽</td>
+<td>同一时间片无可用编号</td>
+<td>等待下一时间片并记录尾延迟</td>
+</tr>
+<tr>
+<td>数据库补段失败</td>
+<td>当前段耗尽后不可用</td>
+<td>双缓冲、提前补段、余量告警和限流</td>
+</tr>
+<tr>
+<td>数据库恢复旧快照</td>
+<td>高水位倒退导致区间重发</td>
+<td>停发、对账、推进水位或切换新纪元</td>
+</tr>
+<tr>
+<td>配置漂移</td>
+<td>位布局或空间边界不一致</td>
+<td>版本校验、集中发布、异常时停发</td>
+</tr>
+<tr>
+<td>网络分区</td>
+<td>多地域同时占用同一空间</td>
+<td>静态拆分空间或使用共识分配</td>
+</tr>
+<tr>
+<td>进程重启</td>
+<td>本地缓存号段丢失</td>
+<td>放弃剩余区间，永不复用</td>
+</tr>
+</tbody>
+</table>
+<p>最危险的故障往往不是依赖完全宕机，而是系统仍能运行，持有的状态却已经过期。典型情况包括失去租约的旧进程、恢复到旧水位的数据库，以及拿着旧位布局继续发号的实例。健康检查若只看进程和端口，发现不了这些问题。</p>
+<h2 id="跨地域设计先选择一致性边界">跨地域设计先选择一致性边界</h2>
+<p>跨地域部署有两条主要路径。</p>
+<p>第一条是静态拆分 ID 空间。地域、单元或纪元占用不相交的前缀，每个故障域在本地独立发号。网络分区时仍可用，代价是不能得到全局严格递增，容量也要提前切分。</p>
+<p>第二条是所有地域共享一个强一致分配域。共识组决定节点租约、高水位或全局顺序。它简化了唯一性证明，却把跨地域网络延迟和多数派可用性带入热路径或补段路径。</p>
+<p>异步复制的多主计数器不能同时提供这两条路径的优点。分区期间两个主节点可能从相同水位继续分配，恢复复制后再处理冲突已经太晚，因为重复 ID 可能早已进入业务表。若要多主独立工作，必须事先切出不相交的空间。</p>
+<h2 id="容量规划要留下可观测的余量">容量规划要留下可观测的余量</h2>
+<p>Snowflake 类方案要计算三个上限：</p>
+<ul>
+<li>每个时间片的序列容量和溢出等待概率。</li>
+<li>节点编号容量，以及灰度、扩容和临时实例占用的余量。</li>
+<li>时间字段寿命，以及纪元结束前的格式迁移窗口。</li>
+</ul>
+<p>号段方案要计算另外三个上限：</p>
+<ul>
+<li>峰值流量下，一段号码能支撑多久。</li>
+<li>数据库最长抖动期间，本地两段缓存能否继续服务。</li>
+<li>一次节点故障最多浪费多少号码，业务是否接受。</li>
+</ul>
+<p>容量告警不应只盯 CPU 和 QPS。更有价值的指标包括：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>每时间片序列使用率</td>
+<td>提前发现 Snowflake 序列接近耗尽</td>
+</tr>
+<tr>
+<td>时钟回退次数与最大幅度</td>
+<td>判断时间源和虚拟化环境是否稳定</td>
+</tr>
+<tr>
+<td>节点租约冲突、失效次数</td>
+<td>发现 worker 空间被重复占用</td>
+</tr>
+<tr>
+<td>当前号段余量与可用秒数</td>
+<td>预测数据库故障何时传导到调用方</td>
+</tr>
+<tr>
+<td>补段延迟及失败率</td>
+<td>发现数据库抖动和连接池问题</td>
+</tr>
+<tr>
+<td>拒绝发号次数</td>
+<td>判断保护机制是否正在影响业务</td>
+</tr>
+</tbody>
+</table>
+<p>监控还需要按命名空间区分。总量正常不能说明某个热点业务没有耗尽序列或号段。</p>
+<h2 id="迁移比初次上线更容易破坏唯一性">迁移比初次上线更容易破坏唯一性</h2>
+<p>位布局一旦进入生产数据，就成为长期协议。改变节点位数、时间纪元或编码格式，会影响数据库类型、分片路由、排序和下游解析。</p>
+<p>安全迁移通常包含四个阶段：</p>
+<ol>
+<li>给新格式分配明确版本或不相交的数值空间。</li>
+<li>让消费者先具备同时读取新旧格式的能力。</li>
+<li>灰度切换生成端，并监控碰撞、排序和容量指标。</li>
+<li>等旧生成器、离线任务和缓存全部退出后，再结束兼容窗口。</li>
+</ol>
+<p>号段系统迁移数据库时，还要携带每个命名空间的高水位。只复制表结构和静态配置不够。Snowflake 系统迁移注册中心时，要防止新旧控制面同时向不同进程授予同一个节点编号。</p>
+<p>回滚也必须提前设计。如果新旧格式共享同一空间，简单回滚二进制可能重新使用已经分配过的编号。版本位、纪元或双写水位的价值，主要体现在这种不顺利的路径上。</p>
+<h2 id="选型表">选型表</h2>
+<table>
+<thead>
+<tr>
+<th>需求组合</th>
+<th>优先方案</th>
+<th>需要接受的边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无中心、本地生成、不要求整数</td>
+<td>UUIDv4</td>
+<td>概率唯一、索引随机写入</td>
+</tr>
+<tr>
+<td>无中心、128 位、希望按时间排序</td>
+<td>UUIDv7</td>
+<td>暴露时间，单调性依赖实现</td>
+</tr>
+<tr>
+<td>64 位、本地高吞吐、时间大致有序</td>
+<td>Snowflake 类</td>
+<td>管理节点身份和时钟异常</td>
+</tr>
+<tr>
+<td>64 位、流量适中、可接受每次访问中心存储</td>
+<td>数据库序列或 Redis INCR</td>
+<td>中心存储进入热路径，恢复语义必须可靠</td>
+</tr>
+<tr>
+<td>64 位、不信任时钟、已有可靠数据库</td>
+<td>号段模式</td>
+<td>允许空洞，维护高水位和补段路径</td>
+</tr>
+<tr>
+<td>跨地域严格提交顺序</td>
+<td>事务/共识系统的提交序</td>
+<td>更高协调成本和尾延迟</td>
+</tr>
+<tr>
+<td>受监管的连续业务编号</td>
+<td>独立业务序列</td>
+<td>锁、串行化和较低可用性</td>
+</tr>
+</tbody>
+</table>
+<p>一个系统也可以组合多种方案。数据库主键使用 Snowflake，外部资源 ID 使用随机 UUID；订单表使用普通分布式 ID，发票号使用受事务约束的独立序列。不同语义用不同标识承载，通常比让一个 ID 同时负责排序、安全、路由和业务编号更稳妥。</p>
+<h2 id="设计评审清单">设计评审清单</h2>
+<p>上线前可以用以下问题检查方案是否闭环：</p>
+<ul>
+<li>唯一性的命名空间、寿命和保证方式能否写成可测试条件？</li>
+<li>ID 顺序究竟代表生成时间、单节点顺序，还是事务提交顺序？</li>
+<li>时钟回退、节点租约失效和数据库水位倒退时，系统是否会停发？</li>
+<li>计算出的节点数、时间寿命、单时间片容量或号段故障窗口是否覆盖峰值？</li>
+<li>配置和格式升级是否有版本、灰度、回滚与旧实例隔离方案？</li>
+<li>ID 是否暴露时间、规模或拓扑；对象权限是否独立校验？</li>
+<li>指标能否在号码耗尽或正确性保护触发前给出告警？</li>
+</ul>
+<h2 id="可复用的推导方法">可复用的推导方法</h2>
+<p>分布式 ID 设计中有几条能迁移到其他基础设施的规律。</p>
+<h3 id="先定义语义-再选择机制">先定义语义，再选择机制</h3>
+<p>“递增”拆成局部单调、时间可排序、全局顺序和提交顺序后，很多争论会自然消失。队列 offset、版本号、时间戳服务也适用同样的方法：先写出观察者能验证的语义，再讨论实现。</p>
+<h3 id="把协调移到低频路径">把协调移到低频路径</h3>
+<p>集中计数器在每次取号时协调，结构简单，却会让中心存储进入热路径。Snowflake 只在节点编号分配时协调，号段模式只在批量预留时协调，正常发号留在本地。这种设计用少量预分配和状态租约换取热路径性能，常见于令牌、配额和分片路由系统。</p>
+<h3 id="用不相交空间隔离故障域">用不相交空间隔离故障域</h3>
+<p>地域前缀、worker 位、号段和纪元的共同作用，是提前划分不会相撞的空间。只要边界不重叠，各故障域可以独立运行；代价是空间利用率下降以及全局顺序变弱。</p>
+<h3 id="不让标识承担授权和事务语义">不让标识承担授权和事务语义</h3>
+<p>ID 可以帮助定位对象，不负责证明调用者有权读取对象；时间高位可以帮助粗略排序，不负责证明事务先提交。职责分离能防止看似便利的编码格式演变成安全或一致性漏洞。</p>
+<p>一个可维护的分布式 ID 系统最终应交付四项结果：语义合同、不重叠空间证明、异常停发与恢复规则、容量和正确性指标。算法只是其中的生成函数，架构价值主要体现在函数之外。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9562.html">RFC 9562: Universally Unique IDentifiers</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/twitter-archive/snowflake">Twitter Snowflake 官方存档仓库</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/twitter-archive/snowflake/blob/snowflake-2010/src/main/scala/com/twitter/service/snowflake/IdWorker.scala">Twitter Snowflake 2010 版 IdWorker 源码</a></li>
+<li><a target="_blank" rel="noopener" href="https://code.flickr.net/2010/02/08/ticket-servers-distributed-unique-primary-keys-on-the-cheap/">Flickr: Ticket Servers: Distributed Unique Primary Keys on the Cheap</a></li>
+<li><a target="_blank" rel="noopener" href="https://dev.mysql.com/doc/refman/8.0/en/information-functions.html">MySQL 8.0 Reference Manual: Information Functions</a></li>
+<li><a target="_blank" rel="noopener" href="https://redis.io/docs/latest/commands/incr/">Redis INCR</a></li>
+<li><a target="_blank" rel="noopener" href="https://redis.io/docs/latest/commands/incrby/">Redis INCRBY</a></li>
+<li><a target="_blank" rel="noopener" href="https://redis.io/docs/latest/operate/oss_and_stack/management/replication/">Redis replication</a></li>
+<li><a target="_blank" rel="noopener" href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">Redis persistence</a></li>
+<li><a target="_blank" rel="noopener" href="https://tech.meituan.com/2019/03/07/open-source-project-leaf.html">美团技术团队：Leaf 分布式 ID 生成服务</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/Meituan-Dianping/Leaf">Meituan-Dianping/Leaf</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/current/sql-createsequence.html">PostgreSQL: CREATE SEQUENCE</a></li>
+<li><a target="_blank" rel="noopener" href="https://research.google/pubs/spanner-googles-globally-distributed-database-2/">Spanner: Google’s Globally Distributed Database</a></li>
+<li><a target="_blank" rel="noopener" href="https://docs.cloud.google.com/spanner/docs/true-time-external-consistency">Google Cloud: TrueTime and external consistency</a></li>
+<li><a target="_blank" rel="noopener" href="https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/">OWASP API1:2023 Broken Object Level Authorization</a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/04/%E5%88%86%E5%B8%83%E5%BC%8F-ID-%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-%E4%BB%8E%E9%9C%80%E6%B1%82%E7%BA%A6%E6%9D%9F%E6%8E%A8%E5%AF%BC%E6%9E%B6%E6%9E%84/">https://magicliang.github.io/2026/09/04/%E5%88%86%E5%B8%83%E5%BC%8F-ID-%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-%E4%BB%8E%E9%9C%80%E6%B1%82%E7%BA%A6%E6%9D%9F%E6%8E%A8%E5%AF%BC%E6%9E%B6%E6%9E%84/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/ID-%E7%94%9F%E6%88%90%E5%99%A8/">ID 生成器</a><a class="post-meta__tags" href="/tags/Snowflake/">Snowflake</a><a class="post-meta__tags" href="/tags/%E5%8F%B7%E6%AE%B5%E6%A8%A1%E5%BC%8F/">号段模式</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-distributed-systems.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/29/MySQL-%E7%BB%8F%E5%85%B8%E6%9E%B6%E6%9E%84%E6%A8%A1%E5%BC%8F-%E4%BB%8E%E4%B8%BB%E4%BB%8E%E5%A4%8D%E5%88%B6%E5%88%B0%E5%88%86%E5%BA%93%E5%88%86%E8%A1%A8/" title="MySQL 经典架构模式：从主从复制到分库分表"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-29</div><div class="info-item-2">MySQL 经典架构模式：从主从复制到分库分表</div></div><div class="info-2"><div class="info-item-1">MySQL 在绝大多数业务系统中扮演事实源的角色。Redis 和 ES 都是派生存储——数据可以从 MySQL 重建，反过来不行。围绕 MySQL 的架构模式，核心问题始终是三个：怎么扛住读写压力、怎么保证数据不丢、怎么随业务增长水平扩展。 下面整理十个生产环境中反复出现的 MySQL 架构模式。和 ES 架构模式 与 Redis 用例全解 形成三件套：Redis 管热路径和派生状态，ES 管可搜索的派生索引，MySQL 管事实。  模式速查    模式 解决的问题 核心机制 典型场景     主从复制 + 读写分离 读压力分摊 binlog 复制 + 代理层路由 读多写少的业务   半同步复制 + 增强半同步 主从切换时数据不丢 after-sync / after-commit 金融、订单   双主（互为主从） 机房级故障切换 双向复制 + 自增步长错开 同城双活   级联复制 大规模从库扩展 从库的从库 读流量极大的分析场景   分库分表 单库容量和写入瓶颈 水平分片 + 路由中间件 亿级数据量   影子表与 Online DDL 大表结构变更不锁表 pt-osc / gh...</div></div></div></a><a class="pagination-related" href="/2025/07/29/%E5%89%AF%E6%9C%AC%E5%A4%8D%E5%88%B6%E7%AE%97%E6%B3%95%E4%B8%8E%E6%9E%B6%E6%9E%84/" title="副本复制算法与架构——PacificA、Elasticsearch、Kafka、Pulsar 全面对比"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-07-29</div><div class="info-item-2">副本复制算法与架构——PacificA、Elasticsearch、Kafka、Pulsar 全面对比</div></div><div class="info-2"><div class="info-item-1">本文将深入剖析 PacificA、Elasticsearch、Kafka、Pulsar 四大分布式系统的副本复制机制，揭示它们在一致性、可用性和性能之间的精妙权衡。这些系统虽然都通过副本复制来保证数据可靠性和高可用性，但在具体的实现策略上各有特色，反映了不同的设计哲学和适用场景。  引言：为什么需要副本复制 数据可靠性与高可用性 在分布式系统中，硬件故障是常态而非例外。Google 的统计数据显示，一个拥有 10,000 台服务器的数据中心，每天平均会有 2-3 台服务器发生故障。如果数据只存储在一台机器上，那么这台机器的故障就意味着数据的永久丢失。 副本复制（Replication） 是解决这个问题的核心手段：将数据复制到多台机器上，即使部分机器故障，数据仍然可用。 CAP 定理的实际影响 CAP 定理告诉我们，在网络分区（Partition）发生时，分布式系统只能在**一致性（Consistency）和可用性（Availability）**之间二选一：    选择 含义 代表系统     CP 网络分区时拒绝服务，保证一致性 ZooKeeper、etcd、HBase   AP...</div></div></div></a><a class="pagination-related" href="/2026/06/21/NRW-%E4%BB%B2%E8%A3%81%E5%8F%82%E6%95%B0-%E5%88%86%E5%B8%83%E5%BC%8F%E5%89%AF%E6%9C%AC%E8%AF%BB%E5%86%99%E7%9A%84%E6%95%B0%E5%80%BC%E9%97%AE%E9%A2%98/" title="NRW 仲裁参数——分布式副本读写的数值问题"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">NRW 仲裁参数——分布式副本读写的数值问题</div></div><div class="info-2"><div class="info-item-1">问题 分布式系统把数据复制到 N 个节点上。写入时让 W 个节点确认，读取时查询 R 个节点。W 和 R 取多少，才能保证读到最新写入的数据？ &quot;取多数派&quot;是工程师最常见的直觉回答，但&quot;多数&quot;到底是多少——N 的一半多一个？还是 N 的三分之二？这两个数字分别在什么条件下出现，背后的推导和权衡，远比&quot;取多数派&quot;三个字复杂。 起源：Gifford 加权投票（1979） NRW 模型的源头是 David K. Gifford 在 1979 年 SOSP 会议上发表的论文 Weighted Voting for Replicated Data。Gifford 的模型比今天常见的等权版本更一般化：每个副本节点被分配一个投票权重 wᵢ，所有节点的总票数 V = Σwᵢ。读仲裁所需票数 Vr 和写仲裁所需票数 Vw 必须满足两个约束： 12约束 1：Vr + Vw &gt; V约束 2：Vw &gt; V / 2 约束 1 保证任何一次读操作至少触碰到一个持有最新版本的节点——读集合和写集合必然有交集。约束 2 保证任何两次写操作至...</div></div></div></a><a class="pagination-related" href="/2026/06/28/Elasticsearch-%E7%BB%8F%E5%85%B8%E6%9E%B6%E6%9E%84%E6%A8%A1%E5%BC%8F-%E4%BB%8E%E6%97%B6%E5%BA%8F%E7%B4%A2%E5%BC%95%E5%88%B0%E8%B7%A8%E9%9B%86%E7%BE%A4%E6%A3%80%E7%B4%A2/" title="Elasticsearch 经典架构模式：从时序索引到跨集群检索"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-architecture.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">Elasticsearch 经典架构模式：从时序索引到跨集群检索</div></div><div class="info-2"><div class="info-item-1">Elasticsearch 不只是一个搜索引擎。围绕它的分片、副本、别名、ILM 等原语，生产环境中沉淀出了一批反复出现的架构模式。这些模式解决的问题各不相同——有的管数据生命周期，有的管多租户隔离，有的管读写分离——但核心思路一致：用 ES 的原语组合出业务需要的数据分布和访问路径。 下面整理十个常见的 ES 架构模式。“时间分区索引 + 别名滚动”——每月一个物理索引、基于别名查询、定期淘汰老索引——是日志和时序场景的基石，配置也最精细，放在第一个。  模式速查    模式 解决的问题 核心原语 典型场景     时间分区索引 + 别名滚动 数据无限增长的生命周期管理 Index Template + Alias + ILM/Rollover 日志、订单流水、审计   冷热分层存储 不同时效数据的成本优化 Node Attribute + Allocation Filter + ILM 日志、监控指标   读写分离 写入不影响搜索延迟 写别名 + 读别名 + Replica 调度 高写入吞吐 + 低延迟搜索   多租户索引隔离 租户间数据和性能隔离 Index-per-ten...</div></div></div></a><a class="pagination-related" href="/2026/04/14/Anthropic-Managed-Agents%E6%B7%B1%E5%BA%A6%E7%A0%94%E7%A9%B6/" title="Anthropic Managed Agents 深度研究：解耦大脑与双手的架构哲学"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/04/14/Anthropic-Managed-Agents%E6%B7%B1%E5%BA%A6%E7%A0%94%E7%A9%B6/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-04-14</div><div class="info-item-2">Anthropic Managed Agents 深度研究：解耦大脑与双手的架构哲学</div></div><div class="info-2"><div class="info-item-1"> 原文链接：Scaling Managed Agents: Decoupling the brain from the hands 研究时间：2026-04-14 研究方法：多轮迭代搜索 + 交叉验证 + 结构化综合  前言：从&quot;程序即未设想之物&quot;说起 Anthropic 在 2026 年 4 月发布的 Managed Agents 服务，解决了一个经典的计算机科学问题：如何为&quot;尚未设想的程序&quot;设计系统。 这个问题的答案，早在几十年前操作系统设计时就已经给出——通过虚拟化硬件为通用抽象（进程、文件），使得 read() 系统调用既能访问 1970 年代的磁盘组，也能访问现代 SSD。抽象层保持稳定，底层实现自由演进。 Managed Agents 做了同样的事情：将 Agent 组件虚拟化为三个核心组件——Session（追加式事件日志）、Harness（调用 Claude 并将工具调用路由到相关基础设施的循环）、Sandbox（Claude 可以运行代码和编辑文件的执行环境），并在此基础上通过**两个扩展维度——Many Brains（多...</div></div></div></a><a class="pagination-related" href="/2021/01/29/EBS/" title="EBS 分布式块存储技术解析"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2021/01/29/EBS/EBS-volume-chunk-server.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-01-29</div><div class="info-item-2">EBS 分布式块存储技术解析</div></div><div class="info-2"><div class="info-item-1">EBS 的定义 EBS（Elastic Block Storage）是一种高可用、高性能、弹性可扩展的分布式块存储服务。对于业务来说，它就像是一块普通的磁盘——使用方式和访问本地磁盘一样，但数据实际上存储于远端的网络节点上。 EBS 主要应用于以下场景：  有状态容器的状态存储：解决容器重启后数据丢失的问题 海量数据存储：邮件系统、监控平台、数据库、用户录音、集成测试平台、MySQL 备份等  EBS 的文件系统结构 在 EBS 分布式块存储系统中，ChunkServer 是最终存储业务写入数据的核心服务。 核心组件 123456789101112131415161718192021┌─────────────────────────────────────────┐│              Volume (逻辑卷)              ││  ┌─────────┐ ┌─────────┐ ┌─────────┐   ││  │  Chunk  │ │  Chunk  │ │  Chunk  │   ││  │   #1    │ │   #2    │ │   #N...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%88%E5%AE%9A%E4%B9%89-id-%E7%9A%84%E5%90%88%E5%90%8C"><span class="toc-number">1.</span> <span class="toc-text">先定义 ID 的合同</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%94%AF%E4%B8%80%E6%80%A7%E6%9C%89%E4%BD%9C%E7%94%A8%E5%9F%9F"><span class="toc-number">1.1.</span> <span class="toc-text">唯一性有作用域</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%A1%BA%E5%BA%8F%E4%B8%8D%E6%98%AF%E5%8D%95%E4%B8%80%E5%B1%9E%E6%80%A7"><span class="toc-number">1.2.</span> <span class="toc-text">顺序不是单一属性</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%A9%BA%E6%B4%9E-%E5%A4%8D%E7%94%A8%E5%92%8C%E6%8C%81%E4%B9%85%E5%8C%96%E8%BE%B9%E7%95%8C"><span class="toc-number">1.3.</span> <span class="toc-text">空洞、复用和持久化边界</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%A1%A8%E7%A4%BA%E5%BD%A2%E5%BC%8F%E4%B9%9F%E5%B1%9E%E4%BA%8E%E6%9E%B6%E6%9E%84"><span class="toc-number">1.4.</span> <span class="toc-text">表示形式也属于架构</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BB%8E%E7%BA%A6%E6%9D%9F%E8%B5%B0%E5%90%91%E6%96%B9%E6%A1%88"><span class="toc-number">2.</span> <span class="toc-text">从约束走向方案</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%9B%86%E4%B8%AD%E8%AE%A1%E6%95%B0%E5%99%A8%EF%BC%9A%E6%9C%80%E7%9B%B4%E6%8E%A5%E7%9A%84%E5%BA%8F%E5%88%97%E5%8C%96%E7%82%B9"><span class="toc-number">2.1.</span> <span class="toc-text">集中计数器：最直接的序列化点</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#uuid%EF%BC%9A%E7%9C%81%E6%8E%89%E5%8F%91%E5%8F%B7%E6%9C%8D%E5%8A%A1"><span class="toc-number">2.2.</span> <span class="toc-text">UUID：省掉发号服务</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#snowflake%EF%BC%9A%E7%94%A8%E8%8A%82%E7%82%B9%E7%A9%BA%E9%97%B4%E6%8D%A2%E5%8F%96%E6%9C%AC%E5%9C%B0%E5%90%9E%E5%90%90"><span class="toc-number">2.3.</span> <span class="toc-text">Snowflake：用节点空间换取本地吞吐</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%8F%B7%E6%AE%B5%EF%BC%9A%E6%8A%8A%E6%95%B0%E6%8D%AE%E5%BA%93%E5%8D%8F%E8%B0%83%E6%91%8A%E8%96%84"><span class="toc-number">2.4.</span> <span class="toc-text">号段：把数据库协调摊薄</span></a><ol class="toc-child"><li class="toc-item toc-level-4"><a class="toc-link" href="#%E4%BB%8E-ticket-server-%E5%88%B0%E5%8F%B7%E6%AE%B5%E9%A2%84%E7%95%99"><span class="toc-number">2.4.1.</span> <span class="toc-text">从 Ticket Server 到号段预留</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E5%8E%9F%E5%AD%90%E9%A2%84%E7%95%99%E4%B8%80%E4%B8%AA%E5%8F%B7%E6%AE%B5"><span class="toc-number">2.4.2.</span> <span class="toc-text">原子预留一个号段</span></a></li></ol></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%BC%BA%E9%A1%BA%E5%BA%8F%EF%BC%9A%E6%8A%8A%E5%8D%8F%E8%B0%83%E6%94%BE%E5%9B%9E%E6%8F%90%E4%BA%A4%E8%BE%B9%E7%95%8C"><span class="toc-number">2.5.</span> <span class="toc-text">强顺序：把协调放回提交边界</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9E%B6%E6%9E%84%E7%94%B1%E6%95%B0%E6%8D%AE%E9%9D%A2%E5%92%8C%E6%8E%A7%E5%88%B6%E9%9D%A2%E7%BB%84%E6%88%90"><span class="toc-number">3.</span> <span class="toc-text">架构由数据面和控制面组成</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#api-%E5%90%88%E5%90%8C"><span class="toc-number">3.1.</span> <span class="toc-text">API 合同</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%85%8D%E7%BD%AE%E4%B9%9F%E6%98%AF%E5%94%AF%E4%B8%80%E6%80%A7%E8%AF%81%E6%98%8E%E7%9A%84%E4%B8%80%E9%83%A8%E5%88%86"><span class="toc-number">3.2.</span> <span class="toc-text">配置也是唯一性证明的一部分</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%85%E9%9A%9C%E6%A8%A1%E5%9E%8B%E5%86%B3%E5%AE%9A%E4%BF%9D%E6%8A%A4%E6%9C%BA%E5%88%B6"><span class="toc-number">4.</span> <span class="toc-text">故障模型决定保护机制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%B7%A8%E5%9C%B0%E5%9F%9F%E8%AE%BE%E8%AE%A1%E5%85%88%E9%80%89%E6%8B%A9%E4%B8%80%E8%87%B4%E6%80%A7%E8%BE%B9%E7%95%8C"><span class="toc-number">5.</span> <span class="toc-text">跨地域设计先选择一致性边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92%E8%A6%81%E7%95%99%E4%B8%8B%E5%8F%AF%E8%A7%82%E6%B5%8B%E7%9A%84%E4%BD%99%E9%87%8F"><span class="toc-number">6.</span> <span class="toc-text">容量规划要留下可观测的余量</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%BF%81%E7%A7%BB%E6%AF%94%E5%88%9D%E6%AC%A1%E4%B8%8A%E7%BA%BF%E6%9B%B4%E5%AE%B9%E6%98%93%E7%A0%B4%E5%9D%8F%E5%94%AF%E4%B8%80%E6%80%A7"><span class="toc-number">7.</span> <span class="toc-text">迁移比初次上线更容易破坏唯一性</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%80%89%E5%9E%8B%E8%A1%A8"><span class="toc-number">8.</span> <span class="toc-text">选型表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%AE%BE%E8%AE%A1%E8%AF%84%E5%AE%A1%E6%B8%85%E5%8D%95"><span class="toc-number">9.</span> <span class="toc-text">设计评审清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%AF%E5%A4%8D%E7%94%A8%E7%9A%84%E6%8E%A8%E5%AF%BC%E6%96%B9%E6%B3%95"><span class="toc-number">10.</span> <span class="toc-text">可复用的推导方法</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%85%88%E5%AE%9A%E4%B9%89%E8%AF%AD%E4%B9%89-%E5%86%8D%E9%80%89%E6%8B%A9%E6%9C%BA%E5%88%B6"><span class="toc-number">10.1.</span> <span class="toc-text">先定义语义，再选择机制</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%8A%8A%E5%8D%8F%E8%B0%83%E7%A7%BB%E5%88%B0%E4%BD%8E%E9%A2%91%E8%B7%AF%E5%BE%84"><span class="toc-number">10.2.</span> <span class="toc-text">把协调移到低频路径</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%94%A8%E4%B8%8D%E7%9B%B8%E4%BA%A4%E7%A9%BA%E9%97%B4%E9%9A%94%E7%A6%BB%E6%95%85%E9%9A%9C%E5%9F%9F"><span class="toc-number">10.3.</span> <span class="toc-text">用不相交空间隔离故障域</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%8D%E8%AE%A9%E6%A0%87%E8%AF%86%E6%89%BF%E6%8B%85%E6%8E%88%E6%9D%83%E5%92%8C%E4%BA%8B%E5%8A%A1%E8%AF%AD%E4%B9%89"><span class="toc-number">10.4.</span> <span class="toc-text">不让标识承担授权和事务语义</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">11.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
