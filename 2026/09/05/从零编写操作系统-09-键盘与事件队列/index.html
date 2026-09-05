@@ -1,0 +1,790 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>从零编写操作系统 09 - 键盘与事件队列：把中断接收和字符处理分开 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="键盘接入后，内核需要同时处理两种节奏：设备产生扫描码时必须及时接收，字符转换、退格和整行输出则可以留在前台执行。把打印放进 IRQ1 会延长关中断时间，也会让输入设备直接依赖控制台。 本篇在已有异常入口和 PIC 重映射上接入 PS&#x2F;2 键盘。IRQ1 只接收原始字节并放进队列；主循环负责 US set 1 解析与简单行编辑。输入回车后显示 LINE: ...，尚未执行命令，也没有 shell。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="从零编写操作系统 09 - 键盘与事件队列：把中断接收和字符处理分开">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="键盘接入后，内核需要同时处理两种节奏：设备产生扫描码时必须及时接收，字符转换、退格和整行输出则可以留在前台执行。把打印放进 IRQ1 会延长关中断时间，也会让输入设备直接依赖控制台。 本篇在已有异常入口和 PIC 重映射上接入 PS&#x2F;2 键盘。IRQ1 只接收原始字节并放进队列；主循环负责 US set 1 解析与简单行编辑。输入回车后显示 LINE: ...，尚未执行命令，也没有 shell。">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/cover.svg">
+<meta property="article:published_time" content="2026-09-05T12:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-05T11:27:39.587Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="C">
+<meta property="article:tag" content="x86">
+<meta property="article:tag" content="中断">
+<meta property="article:tag" content="操作系统">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "从零编写操作系统 09 - 键盘与事件队列：把中断接收和字符处理分开",
+  "url": "https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/",
+  "image": "https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/cover.svg",
+  "datePublished": "2026-09-05T12:00:00.000Z",
+  "dateModified": "2026-09-05T11:27:39.587Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '从零编写操作系统 09 - 键盘与事件队列：把中断接收和字符处理分开',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">678</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">792</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">15</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="not-top-img" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">从零编写操作系统 09 - 键盘与事件队列：把中断接收和字符处理分开</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav></header><main class="layout" id="content-inner"><div id="post"><div id="post-info"><h1 class="post-title">从零编写操作系统 09 - 键盘与事件队列：把中断接收和字符处理分开</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-05T12:00:00.000Z" title="Created 2026-09-05 20:00:00">2026-09-05</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-05T11:27:39.587Z" title="Updated 2026-09-05 19:27:39">2026-09-05</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%9F%BA%E7%A1%80%E8%AE%BE%E6%96%BD/">基础设施</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.8k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>13mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-05 19:27:39&quot;}" hidden></div><p>键盘接入后，内核需要同时处理两种节奏：设备产生扫描码时必须及时接收，字符转换、退格和整行输出则可以留在前台执行。把打印放进 IRQ1 会延长关中断时间，也会让输入设备直接依赖控制台。</p>
+<p>本篇在已有异常入口和 PIC 重映射上接入 PS/2 键盘。IRQ1 只接收原始字节并放进队列；主循环负责 US set 1 解析与简单行编辑。输入回车后显示 <code>LINE: ...</code>，尚未执行命令，也没有 shell。</p>
+<span id="more"></span>
+<h1>IRQ1 接到已有中断入口</h1>
+<p>第 08 篇把主 PIC 的向量起点设为 <code>0x20</code>。键盘接主片 IRQ1，因此向量为 <code>0x21</code>，即十进制 33。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs text">PS/2 键盘扫描码<br>    ↓<br>i8042 输出缓冲区 → IRQ1<br>    ↓<br>主 PIC → IDT[33] → 公共汇编入口<br>    ↓<br>trap_dispatch → keyboard_irq<br>    ↓ 原始字节入队，主 PIC EOI<br>iret 恢复前台 → 出队 → 解析 → 行编辑<br></code></pre></td></tr></table></figure>
+<p><code>kernel/exceptions.c</code> 现在初始化前 34 个 IDT 表项，0—31 为异常，32 为时钟，33 为键盘。其余表项仍不在场，不能因为增加一个设备就把未知向量全部指向一个空处理函数。</p>
+<p>分发入口新增的分支很短：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-keyword">if</span> (frame-&gt;<span class="hljs-built_in">vector</span> == <span class="hljs-number">33</span>) &#123; keyboard_irq(); <span class="hljs-keyword">return</span>; &#125;<br><span class="hljs-keyword">if</span> (frame-&gt;<span class="hljs-built_in">vector</span> == <span class="hljs-number">32</span>) &#123; timer_irq(); <span class="hljs-keyword">return</span>; &#125;<br></code></pre></td></tr></table></figure>
+<p>IRQ1 继续使用前文的 68 字节同特权级 frame。汇编补入零错误码、保存寄存器并清 DF，C 处理完成后沿原路径恢复现场。</p>
+<p>真实设备中断探针记录了 <code>vector=33</code>、<code>error=0</code>、<code>CS=8</code>。保存现场的 IF 为 1，进入 C 处理函数后 IF 和 DF 都为 0：前者说明中断打断了允许外部中断的前台，后者符合中断门和 C 入口约定。</p>
+<p>正常启动仍先执行时钟演示；演示结束后 IRQ0 被屏蔽。键盘初始化最终写主 PIC 的 IMR 为 <code>0xfd</code>，只开放 IRQ1，从片继续全部屏蔽。因此本篇空闲唤醒不依赖周期 tick。</p>
+<h1>先确定设备输出哪一种扫描码</h1>
+<p>字符 <code>a</code> 不会直接从端口读成 ASCII <code>0x61</code>。当前解析器按 US set 1 解释数据，普通 A 键按下是 <code>0x1e</code>，释放是 <code>0x9e</code>；字符大小写还要结合修饰键状态。</p>
+<p>键盘扫描码集合与控制器 translation 是两个独立设置。若键盘输出 set 2，控制器可能把它转换成 set 1；也可以关闭转换，直接要求键盘输出 set 1。初始化必须明确选择一条路径，否则正确性会依赖 BIOS 留下的状态。</p>
+<p>本篇关闭 translation，并显式设置键盘为 set 1。QEMU 官方固定版本中的 <a target="_blank" rel="noopener" href="https://github.com/qemu/qemu/blob/v7.2.0/hw/input/pckbd.c">i8042 控制器实现</a> 与 <a target="_blank" rel="noopener" href="https://github.com/qemu/qemu/blob/v7.2.0/hw/input/ps2.c">PS/2 键盘实现</a> 分别保存和处理这两个设置。这里引用 v7.2.0 源码；实验实际运行的是 QEMU 7.2.22，两者不混作同一个版本。</p>
+<p>初始化全过程 IF=0，PIC 的 IRQ1 也保持屏蔽。控制器和键盘命令的顺序如下：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>操作</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>隔离设备</td>
+<td><code>0xad</code>、<code>0xa7</code></td>
+<td>关闭键盘、鼠标接口</td>
+</tr>
+<tr>
+<td>清理输出</td>
+<td>最多读取 256 个旧字节</td>
+<td>避免把残留输入误认作应答</td>
+</tr>
+<tr>
+<td>设置控制器</td>
+<td>读模式字，清 translation 和设备 IRQ 位</td>
+<td>确定原始扫描码路径</td>
+</tr>
+<tr>
+<td>设置键盘</td>
+<td>开接口，发送 <code>F5 F0 01 F4</code></td>
+<td>停扫描、选择 set 1、开扫描</td>
+</tr>
+<tr>
+<td>开放中断</td>
+<td>开控制器 IRQ1，写 PIC <code>0xfd</code></td>
+<td>开始运行期接收</td>
+</tr>
+</tbody>
+</table>
+<p><code>F5</code>、<code>F0</code>、参数 <code>01</code> 和 <code>F4</code> 每一步都要求返回 <code>0xfa</code> ACK。每次读写等待最多轮询 100000 次；超时或未知回复会返回失败，输出 <code>KEYBOARD INIT FAIL</code>，不会无限等待或无限重发。</p>
+<p>这是一种有界的启动初始化，未实现运行期命令队列。Caps Lock 只改变软件大小写状态，不发送 LED 命令，因此 ACK 不会与日常扫描码混在 IRQ 消费路径里。</p>
+<p>端口 <code>0x64</code> 用来读取状态或写控制器命令，<code>0x60</code> 用来读数据或写设备数据。读取数据前检查输出缓冲区非空；状态中的 AUX、超时或校验错误使当前字节不能作为普通键盘输入。</p>
+<h1>64 个槽为什么只存 63 个字节</h1>
+<p><code>kernel/keyboard.c</code> 用固定数组保存扫描码，不在中断中分配内存：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-meta">#<span class="hljs-keyword">define</span> QUEUE_SIZE 64</span><br><span class="hljs-type">static</span> <span class="hljs-keyword">volatile</span> <span class="hljs-type">uint8_t</span> raw[QUEUE_SIZE];<br><span class="hljs-type">static</span> <span class="hljs-keyword">volatile</span> <span class="hljs-type">unsigned</span> head, tail;<br></code></pre></td></tr></table></figure>
+<p><code>head</code> 指向生产者下次写入的位置，<code>tail</code> 指向消费者下次读取的位置。两者相等表示空；若推进后的 <code>head</code> 等于 <code>tail</code>，表示满。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">unsigned</span> next = (head + <span class="hljs-number">1</span>) % QUEUE_SIZE;<br><span class="hljs-keyword">if</span> (next == tail) ++keyboard_dropped;<br><span class="hljs-keyword">else</span> &#123; raw[head] = byte; head = next; &#125;<br></code></pre></td></tr></table></figure>
+<p>保留一个空槽可以用两个索引区分空和满，所以 64 个物理槽的可用容量为 63 字节。一次普通按键通常有按下、释放两个字节，容量不能直接说成“63 次敲键”。</p>
+<p>队列满时丢弃新字节，保留已排队的顺序，并递增 <code>keyboard_dropped</code>。当前实现没有覆盖最旧字节，也没有从 IRQ 中等待前台腾出空间。</p>
+<p>IRQ 接收函数的完整工作如下：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">void</span> <span class="hljs-title function_">keyboard_irq</span><span class="hljs-params">(<span class="hljs-type">void</span>)</span><br>&#123;<br>    ++keyboard_irqs;<br>    <span class="hljs-type">uint8_t</span> status = inb(<span class="hljs-number">0x64</span>);<br>    <span class="hljs-keyword">if</span> (status &amp; <span class="hljs-number">1</span>) &#123;<br>        <span class="hljs-type">uint8_t</span> byte = inb(<span class="hljs-number">0x60</span>);<br>        <span class="hljs-keyword">if</span> (!(status &amp; <span class="hljs-number">0xe0</span>)) &#123;<br>            <span class="hljs-type">unsigned</span> next = (head + <span class="hljs-number">1</span>) % QUEUE_SIZE;<br>            <span class="hljs-keyword">if</span> (next == tail) ++keyboard_dropped;<br>            <span class="hljs-keyword">else</span> &#123; raw[head] = byte; head = next; &#125;<br>        &#125; <span class="hljs-keyword">else</span> ++keyboard_dropped;<br>    &#125;<br>    outb(<span class="hljs-number">0x20</span>, <span class="hljs-number">0x20</span>);<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>每次最多读一个字节。无数据、异常字节和队列满路径也都会到达主 PIC EOI；它们不能因提前返回而留下未完成的 IRQ 服务状态。</p>
+<p>这里没有解析扫描码，没有调用 <code>kprintf</code>，也没有修改当前编辑行。设备接收和用户可见输出之间的依赖被限制在原始字节队列上。</p>
+<p>该队列的并发条件是单 CPU、一个 IRQ 生产者、一个前台消费者。前台通过短 CLI 临界区访问队列，IRQ 入口本身保持 IF=0；不能把这些 <code>volatile</code> 声明单独搬到多核程序中，当作通用无锁队列。</p>
+<h1>从检查空队列到 HLT</h1>
+<p>前台取出一个字节后立即开中断，再做解析和输出。空队列时执行紧邻的 <code>sti; hlt</code>：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs c">__asm__ <span class="hljs-title function_">volatile</span><span class="hljs-params">(<span class="hljs-string">&quot;cli&quot;</span> ::: <span class="hljs-string">&quot;memory&quot;</span>)</span>;<br><span class="hljs-keyword">if</span> (keyboard_consumer_paused || tail == head) &#123;<br>    __asm__ <span class="hljs-title function_">volatile</span><span class="hljs-params">(<span class="hljs-string">&quot;sti; hlt&quot;</span> ::: <span class="hljs-string">&quot;memory&quot;</span>)</span>;<br>    <span class="hljs-keyword">continue</span>;<br>&#125;<br><span class="hljs-type">uint8_t</span> byte = raw[tail];<br>tail = (tail + <span class="hljs-number">1</span>) % QUEUE_SIZE;<br>__asm__ <span class="hljs-title function_">volatile</span><span class="hljs-params">(<span class="hljs-string">&quot;sti&quot;</span> ::: <span class="hljs-string">&quot;memory&quot;</span>)</span>;<br><span class="hljs-type">int</span> c = keyboard_parse(&amp;parser, byte);<br></code></pre></td></tr></table></figure>
+<p>检查空队列与准备睡眠在 IF=0 下衔接，<code>sti; hlt</code> 放在同一段汇编中。若检查后已经出现待处理 IRQ，它能唤醒这次休眠，不会形成“字节已入队，CPU 却睡到下一次事件”的空隙。</p>
+<p><code>keyboard_consumer_paused</code> 是 GDB 诊断开关。置 1 后前台暂停消费，但 IRQ1 继续接收；它为满队列测试提供可重复的入口，正常使用时保持零。</p>
+<p>GDB 断点本身会停止 CPU，因此判断实际空闲状态使用 HMP <code>info registers</code>。本次空闲记录为 <code>EFL=00000246</code>、<code>HLT=1</code>，IF 位已设置，CPU 确实处于休眠状态。</p>
+<h1>扫描码解析保存哪些状态</h1>
+<p>解析器只接受一个原始字节并返回一个字符或零，既不操作端口，也不访问队列：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">key_parser</span> &#123;</span><br>    <span class="hljs-type">uint8_t</span> left, right, caps, caps_down, extended, pause;<br>&#125;;<br><span class="hljs-type">int</span> <span class="hljs-title function_">keyboard_parse</span><span class="hljs-params">(<span class="hljs-keyword">struct</span> key_parser *p, <span class="hljs-type">uint8_t</span> byte)</span>;<br></code></pre></td></tr></table></figure>
+<p>这样的函数可以直接编译进宿主检查程序，复用内核实际解析代码。宿主检查只证明给定字节序列的结果；设备初始化、IRQ 入口和队列还需要 QEMU 运行检查。</p>
+<p>普通 set 1 字节的高位表示释放。释放事件通常不输出字符，却必须更新 Shift 和 Caps Lock 的按键状态；忽略所有 break code 会造成修饰键一直保持按下。</p>
+<p>左 Shift 的 code 为 42，右 Shift 为 54，两者分别保存。同时按住两侧 Shift 后释放左侧，右侧仍应让字母大写，因此不能用一个布尔值在任意 Shift 释放时直接清零。</p>
+<p>Caps Lock 在从释放到按下时翻转一次。<code>caps_down</code> 使重复 make code 不会连续切换 Caps；释放事件再清除按下标记。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">unsigned</span> shift = p-&gt;left || p-&gt;right;<br><span class="hljs-keyword">if</span> (c &gt;= <span class="hljs-string">&#x27;a&#x27;</span> &amp;&amp; c &lt;= <span class="hljs-string">&#x27;z&#x27;</span>) &#123;<br>    <span class="hljs-keyword">if</span> (shift ^ p-&gt;caps) c -= <span class="hljs-string">&#x27;a&#x27;</span> - <span class="hljs-string">&#x27;A&#x27;</span>;<br>&#125; <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (shift &amp;&amp; shifted[code]) &#123;<br>    c = shifted[code];<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>字母使用 Shift 与 Caps 的异或结果。标点只查 Shift 映射表，因此 Caps 不会把 <code>1</code> 改成 <code>!</code>；Shift 会。</p>
+<p>映射表限制为 US 布局，零表项被忽略。这里没有键盘布局切换、Unicode 输入法或扩展方向键动作。</p>
+<h1>E0 与 Pause 需要明确消费边界</h1>
+<p>多字节序列不能逐个当普通键处理。QEMU v7.2.0 的 <a target="_blank" rel="noopener" href="https://github.com/qemu/qemu/blob/v7.2.0/hw/input/ps2.c">set 1 按键编码</a> 中，普通 PrintScreen 使用带 E0 前缀的序列，其中含有形似 Shift 的字节：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">PrintScreen 按下：E0 2A E0 37<br>PrintScreen 释放：E0 B7 E0 AA<br>Pause：          E1 1D 45 E1 9D C5<br></code></pre></td></tr></table></figure>
+<p>当前策略是忽略所有 E0 扩展键：遇到 <code>E0</code> 设置标记，下一个非前缀字节消费后返回零。这样 <code>E0 2A</code> 和 <code>E0 AA</code> 不会写入普通左 Shift 状态。</p>
+<p>Pause 使用精确尾序列匹配。<code>E1</code> 开始后依次期望 <code>1D 45 E1 9D C5</code>；全部匹配则恢复普通状态，整个按键不输出字符。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-keyword">if</span> (p-&gt;pause) &#123;<br>    <span class="hljs-keyword">if</span> (byte == pause_tail[p-&gt;pause - <span class="hljs-number">1</span>]) &#123;<br>        <span class="hljs-keyword">if</span> (++p-&gt;pause == <span class="hljs-number">6</span>) p-&gt;pause = <span class="hljs-number">0</span>;<br>        <span class="hljs-keyword">return</span> <span class="hljs-number">0</span>;<br>    &#125;<br>    p-&gt;pause = <span class="hljs-number">0</span>;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>尾序列失配时，已匹配部分被丢弃，当前字节再按普通解析流程处理一次。这是有限的失配处理规则，不需要递归，也不会无限跳过输入。</p>
+<p>这些规则不能恢复任意损坏的数据流。孤立 <code>E0</code> 后若接普通 A 键，该字节仍会被当成扩展序列的一部分而吞掉；丢失 Shift 的释放码也不能靠观察下一个字母推断出正确状态。</p>
+<p>宿主检查专门覆盖完整 Pause、PrintScreen、部分 Pause 失配、截断 E0，以及特殊序列后的普通字符。通过这些检查只能说明声明支持的边界成立。</p>
+<h1>溢出后丢弃当前行并重置状态</h1>
+<p>原始字节丢失可能破坏前缀和修饰键状态，因此前台不能在 <code>keyboard_dropped</code> 变化后继续提交旧行。主循环在关中断的短临界区执行：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs c">seen_dropped = keyboard_dropped;<br>tail = head;<br>parser = (<span class="hljs-keyword">struct</span> key_parser)&#123;<span class="hljs-number">0</span>&#125;;<br>keyboard_line_length = <span class="hljs-number">0</span>;<br>keyboard_line[<span class="hljs-number">0</span>] = <span class="hljs-number">0</span>;<br>++keyboard_resets;<br></code></pre></td></tr></table></figure>
+<p>清队列防止残余字节继续参与解析，清 parser 同时清理前缀、左右 Shift 与 Caps 状态，清当前行避免把不完整输入当作一条正常提交。随后开中断，打印溢出计数和重试提示。</p>
+<p>提示要求释放全部按键再重试。软件清零无法知道哪些键仍被物理按住，也不恢复设备 LED；若仍按着 Shift，清零后的软件状态可能与实际按键状态不同。</p>
+<p>这里还有另一种容量限制：<code>keyboard_line[64]</code> 最多保存 63 个字符，最后一格放 <code>\0</code>。行满后忽略新字符，但仍处理退格和回车；它不会触发原始队列溢出复位。</p>
+<p>退格删除行末字符并调用 <code>console_putc('\b')</code>。VGA 路径擦除一个单元格，UART 只发出 BS 字节；串口终端是否视觉擦除由终端决定，不能把 BS 本身当成“退格、空格、退格”完整擦除序列。</p>
+<p>回车输出 <code>LINE: 当前内容</code> 并清空编辑行。前台没有命令解析或命令执行入口，输入 <code>help</code> 也只会回显 <code>LINE: help</code>。</p>
+<h1>用真实 IRQ 检查字符与溢出</h1>
+<p>HMP 正常序列为 <code>a b backspace shift-c caps_lock d caps_lock pause print e ret</code>。它同时经过设备编码、控制器、IRQ1、队列、解析器和行编辑，预期是：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">LINE: aCDe<br></code></pre></td></tr></table></figure>
+<p><code>b</code> 被退格删除，Shift 使 <code>c</code> 大写，Caps 使 <code>d</code> 大写，第二次 Caps 恢复小写；Pause 与 PrintScreen 不产生字符，之后的 <code>e</code> 也没有被伪 Shift 污染。</p>
+<p>满队列实验暂停前台消费，再发送 45 次 <code>a</code> 的按下和释放。90 个普通扫描码超过 63 字节容量，本次暂停时记录 <code>dropped=27</code>、尚未 reset。</p>
+<p>恢复消费标记后，用 Enter 唤醒空闲 CPU。此次唤醒又造成一个丢弃，截图计数为 28；前台清状态后重试 <code>o k ret</code>，得到 <code>LINE: ok</code>，最终 <code>keyboard_resets=1</code>。</p>
+<p>检查程序要求丢弃计数大于零，不固定为 27 或 28，因为唤醒事件与消费恢复的调度会影响最终计数。恢复后 PIC 记录为 <code>imr=fd isr=00</code>。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="day09-screen.png" alt="真实键盘 IRQ 输入、溢出提示与重新输入结果"></p>
+<p>实际 <code>make run</code> 的 curses 窗口还输入了 <code>a b Backspace c Enter</code>，屏幕显示 <code>LINE: ac</code>。随后切换到 QEMU monitor 执行 <code>quit</code>，退出码为 0。这条路径不直接调用宿主解析函数。</p>
+<h1>下载与重跑</h1>
+<p>本篇完整源码提交为 <code>9b3952af499ed77e5b87af950d408448d4c92e48</code>，提供<a href="os-day-09-source.zip">源码附件</a>。解压目录前缀为 <code>os-day-09/</code>，使用第 01 篇已有工具链容器运行：</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs sh">unzip os-day-09-source.zip<br><span class="hljs-built_in">cd</span> os-day-09/examples/build-an-os<br>podman run --<span class="hljs-built_in">rm</span> -v <span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>:/work&quot;</span> -w /work localhost/build-an-os:day01 make check-keyboard<br>podman run --<span class="hljs-built_in">rm</span> -v <span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>:/work&quot;</span> -w /work localhost/build-an-os:day01 make check<br></code></pre></td></tr></table></figure>
+<p>需要交互输入时执行：</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs sh">podman run --<span class="hljs-built_in">rm</span> -it -v <span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>:/work&quot;</span> -w /work localhost/build-an-os:day01 make run<br></code></pre></td></tr></table></figure>
+<p>退出 curses 窗口时，按 Esc 后按 2 切换到 QEMU monitor，再输入 <code>quit</code> 并回车。</p>
+<p>两条检查串行执行，避免占用同一 GDB 端口。固定实验配置为 QEMU 7.2.22、<code>pc-i440fx-7.2</code>、<code>qemu32</code>、TCG、单 CPU、64 MiB 与 SeaBIOS。</p>
+<p><code>check-keyboard.sh</code> 先用已有 C 编译器运行解析器断言，再通过 GDB 内嵌 Python 执行 <code>tools/check-keyboard.py</code>。该容器没有独立 <code>python3</code>，因此不能把脚本入口随意换成 <code>python3 tools/check-keyboard.py</code>。</p>
+<p><code>build/keyboard-frame.txt</code> 保存中断现场检查，<code>keyboard-overflow.txt</code> 保存满队列记录，<code>keyboard-idle.txt</code> 保存实际休眠状态。串口日志为 <code>build/keyboard-serial.txt</code>，截图由键盘检查生成在 <code>build/day09-screen.png</code>。</p>
+<p>源码附件独立解压后的累计 <code>make check</code> 已通过，继续覆盖启动装载、E820、A20、保护模式、C 运行库、控制台、异常与时钟诊断。正常内核现在进入持久键盘循环，旧控制台检查停在本篇新增的 <code>console_demo_done</code> 检查点；原 VGA、串口、IF 和 PIC 断言保留。</p>
+<p>固定 QEMU 环境中的运行结果不等同于物理键盘兼容性测试。USB 键盘、运行期命令应答、多核队列和扩展键动作均不在本篇实现范围内。</p>
+<h1>练习</h1>
+<ol>
+<li>手工追踪“左右 Shift 同时按下、释放左 Shift、按 A、释放右 Shift”的 parser 字段变化，解释单个 Shift 布尔值会在哪一步出错。</li>
+<li>分别输入完整 Pause、<code>E1 1D 1E</code> 和 <code>E0 1E 1E</code>，对照宿主检查说明消费边界；不要把后两组结果解释为任意丢码恢复能力。</li>
+<li>在实验副本中比较行满与原始队列满：前者为何仍可退格提交，后者为何必须废弃当前行并要求释放全部按键？</li>
+</ol>
+<p>上一篇：<a href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-08-%E6%97%B6%E9%92%9F%E4%B8%AD%E6%96%AD/">08 - 时钟中断</a>。下一篇：<a href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-10-%E7%89%A9%E7%90%86%E9%A1%B5%E5%88%86%E9%85%8D/">10 - 物理页分配</a>。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/">https://magicliang.github.io/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F/">操作系统</a><a class="post-meta__tags" href="/tags/C/">C</a><a class="post-meta__tags" href="/tags/x86/">x86</a><a class="post-meta__tags" href="/tags/%E4%B8%AD%E6%96%AD/">中断</a></div><div class="post-share"><div class="social-share" data-image="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-08-%E6%97%B6%E9%92%9F%E4%B8%AD%E6%96%AD/" title="从零编写操作系统 08 - 时钟中断：让外部事件打断当前执行"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-08-%E6%97%B6%E9%92%9F%E4%B8%AD%E6%96%AD/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 08 - 时钟中断：让外部事件打断当前执行</div></div><div class="info-2"><div class="info-item-1">上一篇的异常由正在执行的指令触发。时钟中断来自处理器外部：即使内核没有执行 int，定时器也能发出请求，经中断控制器送到 CPU，再通过 IDT 进入处理函数。 本篇接入传统 PC 的 8259A PIC 与 8254 PIT，只开放 IRQ0。正常内核收到 20 次时钟中断后关闭外部 IRQ，继续原有控制台自检；两个独立诊断镜像验证屏蔽、恢复和漏发 EOI 的后果。入口仍沿用上一篇的保存与恢复路径，尚未加入调度或任务切换。  从 PIT 输出到 IDT 第 32 项 PIT 的 channel 0 产生周期信号，连接主 PIC 的 IRQ0 输入。PIC 根据屏蔽位和优先级判断是否请求 CPU 响应；CPU 接受请求后获得向量，再查 IDT。 12345678910111213PIT channel 0 周期输出    ↓主 PIC 的 IRQ0 输入    ↓  IMR、优先级及 CPU 当前 IF 允许CPU 接受可屏蔽外部中断    ↓IDT[0x20] → isr32 → exception_common    ↓trap_dispatch(frame) → timer...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-07-%E5%BC%82%E5%B8%B8%E5%85%A5%E5%8F%A3/" title="从零编写操作系统 07 - 异常入口：CPU 出错后把哪些信息交给内核"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-07-%E5%BC%82%E5%B8%B8%E5%85%A5%E5%8F%A3/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 07 - 异常入口：CPU 出错后把哪些信息交给内核</div></div><div class="info-2"><div class="info-item-1">串口和 panic 可以报告代码主动检测到的错误，但前提是程序执行到了检查位置。除数为零、指令无效、段选择子越界，会让处理器直接转入异常处理。没有异常入口，上一篇建立的输出能力也无从调用。 本篇安装 IDT，把异常现场整理成 C 结构，打印向量、错误码和寄存器。一个受控 INT3 探针验证返回路径，除零、非法指令和一般保护异常分别验证故障路径。范围限定在 32 位保护模式、同一特权级、固定 QEMU 教学配置；设备 IRQ 尚未启用。  IDT 决定异常从哪里进入 处理器通过异常向量查找中断描述符表 IDT。向量 0 对应除法错误 #DE，3 对应断点 #BP，6 对应无效操作码 #UD，13 对应一般保护异常 #GP。IDT 中的门描述符给出目标代码段和入口地址。 1234567891011指令触发异常    ↓CPU 按向量查 IDT，检查门与目标代码段    ↓CPU 保存返回现场，转入对应汇编 stub    ↓stub 补齐向量与错误码，公共入口保存寄存器    ↓trap_dispatch(frame)    ├─ 受控 INT3：返回公共入口，恢复现场，IRETD ...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-06-%E8%BE%93%E5%87%BA%E4%B8%8E%E6%95%85%E9%9A%9C%E7%8E%B0%E5%9C%BA/" title="从零编写操作系统 06 - 输出与故障现场：建立串口、控制台和 panic"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-06-%E8%BE%93%E5%87%BA%E4%B8%8E%E6%95%85%E9%9A%9C%E7%8E%B0%E5%9C%BA/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 06 - 输出与故障现场：建立串口、控制台和 panic</div></div><div class="info-2"><div class="info-item-1">第 05 篇已经完成从保护模式到 kernel_main 的交接，栈、参数、已初始化数据和 BSS 都有检查。内核还需要把检查结果输出成可保存的日志，并在无法继续时留下调用位置。 第 06 篇增加 COM1 串口、VGA 文本控制台和 panic。正常镜像会演示换行、滚屏与格式化；独立故障镜像触发断言，同时输出文件名、行号和表达式，随后循环执行 hlt。这些功能仍运行在单核、未开启 IRQ、没有分页的早期内核里。  输出模块在自检之前初始化 启动器仍按第 05 篇的契约装载内核。stage2 完成 E820、A20 和保护模式切换，把内核复制到 0x100000；入口汇编清 BSS、建立栈，再把 BootInfo 指针传给 C。新增的控制台没有改变这条装载路径。 kernel_main 的第一步是 console_init()，之后才检查 BootInfo、data、BSS 和最小运行时函数。这个顺序让自检失败能输出具体原因。若先验证 BSS，输出模块却依赖尚未初始化的状态，坏 BSS 实验就可能连错误信息也无法显示。 因此，console_init() 显式把 row、colu...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-00-%E4%BB%8E%E5%90%AF%E5%8A%A8%E6%89%87%E5%8C%BA%E5%88%B0%E7%AA%97%E5%8F%A3/" title="从零编写操作系统 00 - 从启动扇区到窗口：这套操作系统准备实现什么"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-00-%E4%BB%8E%E5%90%AF%E5%8A%A8%E6%89%87%E5%8C%BA%E5%88%B0%E7%AA%97%E5%8F%A3/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 00 - 从启动扇区到窗口：这套操作系统准备实现什么</div></div><div class="info-2"><div class="info-item-1">这个系列准备从一个 512 字节启动扇区开始，逐步做出一个能运行用户程序、读取文件、响应键盘鼠标、显示窗口终端的教学操作系统。  路线故意选得朴素：x86 32 位、BIOS、C11、少量 NASM 汇编、QEMU 模拟 PC。它不是现代操作系统的完整复刻，也不追求真实机器兼容。它的目标是把“操作系统到底接管了什么”拆成一组可以运行、可以坏掉、可以诊断的实验。 最终目标是一条连续演示：从自制磁盘镜像启动，进入自制内核；打开一个终端窗口；运行 cat README.TXT；再运行 cat README.TXT | wc；最后运行一个 DEMO.EXE，它并发启动两个计数程序和一个故意越界访问的程序。越界程序应该被终止，两个计数程序继续前进，Shell 还能继续接收下一条命令。 这篇导读只给路线、边界和先修自测。首批配套项目提供工具链样例；自制内核尚未出现。后续每篇会在同一份代码上增加一个可观察能力，并给出构建命令、运行日志和故障实验。 最终系统长什么样 先用一张目标图定住边界。图里的“目标”表示后续实现完成后的结构，不是当前已经跑通的截图。 12345678910111213141...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-05-%E8%B7%B3%E8%BF%9B-C/" title="从零编写操作系统 05 - 跳进 C：入口、链接脚本与内存布局"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-05-%E8%B7%B3%E8%BF%9B-C/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 05 - 跳进 C：入口、链接脚本与内存布局</div></div><div class="info-2"><div class="info-item-1">第 04 篇的保护模式入口停在一段 32 位汇编里。本篇从这里继续，把磁盘中的真实内核复制到物理地址 0x100000，准备 BSS 和栈，再调用 kernel_main。 屏幕上的 KERNEL_MAIN OK 有几个前提：已初始化全局变量保持原值，未初始化全局变量为零，普通函数调用能返回，BootInfo 指针和调用栈符合约定。这些条件都在本篇镜像里检查；另一个故障镜像故意跳过 BSS 清零，输出 KERNEL BSS FAIL。  编译器不负责启动内核 GCC 生成指令，链接器安排地址，磁盘读取和运行环境由启动代码提供。-ffreestanding 选择独立环境，不能代替加载器，也不会附带完整标准库。普通应用依赖的启动对象、进程栈和零初始化内存，在这里都需要有明确来源。 第 03、04 篇的 payload 是 20000 字节测试数据。本篇将它替换为 C 和汇编编译得到的 kernel.elf，再经 objcopy -O binary 得到平坦文件。第二阶段仍读取固定 LBA 的镜像头与 payload，不解析 ELF 的 program headers。 1234567...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-04-%E8%BF%9B%E5%85%A5%E4%BF%9D%E6%8A%A4%E6%A8%A1%E5%BC%8F/" title="从零编写操作系统 04 - 进入保护模式：建立第一份运行环境"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-04-%E8%BF%9B%E5%85%A5%E4%BF%9D%E6%8A%A4%E6%A8%A1%E5%BC%8F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 04 - 进入保护模式：建立第一份运行环境</div></div><div class="info-2"><div class="info-item-1">第 03 篇已经让第一阶段启动扇区加载第二阶段，也让第二阶段读取载荷并检查边界。它仍然停留在实模式。实模式下可以方便调用 BIOS，也能通过操作数前缀使用 32 位寄存器；后续内核需要的平坦地址空间和权限隔离仍要建立在保护模式上。 本篇完成第一次处理器模式切换：在进入保护模式前收集 E820 内存图，打开 A20，建立 GDT，设置 CR0.PE，再用远跳转刷新代码段。切换完成后，32 位代码直接写 VGA 文本显存，GDB 能观察到保护模式状态。BIOS 调用到这里为止，后面的内核不能再按实模式方式直接调用 int 10h 或 int 13h。  为什么先把 BIOS 调用做完 BIOS 服务是实模式时代的接口。第 03 篇依赖它读盘；本篇还要依赖它查询内存图。进入保护模式后，CPU 的段解释、地址宽度和中断入口都变了。没有虚拟 8086 模式、实模式回跳或专门 BIOS 调用桥时，内核不能继续把 int 15h 当作普通函数使用。 切换前后的准备顺序如下： 1234567891011real mode  ├─ read disk through BIOS EDD  ├─ pr...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">IRQ1 接到已有中断入口</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">先确定设备输出哪一种扫描码</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">64 个槽为什么只存 63 个字节</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">从检查空队列到 HLT</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">扫描码解析保存哪些状态</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">E0 与 Pause 需要明确消费边界</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">溢出后丢弃当前行并重置状态</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">用真实 IRQ 检查字符与溢出</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">9.</span> <span class="toc-text">下载与重跑</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">10.</span> <span class="toc-text">练习</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
