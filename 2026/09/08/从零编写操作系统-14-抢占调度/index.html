@@ -1,0 +1,903 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>从零编写操作系统 14 - 抢占调度：时间片结束后怎样换一个任务 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="第 13 篇能够保存两条调用链，但 A 一旦进入不含 yield 的无限循环，已经就绪的 B 就无法运行。 本篇把第 08 篇的 PIT 时钟接入同一个调度器，让两个没有主动让出点的计算任务都取得进展。 时间片采用最小规则：每次时钟中断提出一次轮转请求，允许调度时在中断处理出口切换。 切换函数仍然只保存四个被调用者保存寄存器。 被时钟打断的完整寄存器与 EFLAGS 则留在原任务的中断栈帧里，等该">
+<meta property="og:type" content="article">
+<meta property="og:title" content="从零编写操作系统 14 - 抢占调度：时间片结束后怎样换一个任务">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-14-%E6%8A%A2%E5%8D%A0%E8%B0%83%E5%BA%A6/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="第 13 篇能够保存两条调用链，但 A 一旦进入不含 yield 的无限循环，已经就绪的 B 就无法运行。 本篇把第 08 篇的 PIT 时钟接入同一个调度器，让两个没有主动让出点的计算任务都取得进展。 时间片采用最小规则：每次时钟中断提出一次轮转请求，允许调度时在中断处理出口切换。 切换函数仍然只保存四个被调用者保存寄存器。 被时钟打断的完整寄存器与 EFLAGS 则留在原任务的中断栈帧里，等该">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-14-%E6%8A%A2%E5%8D%A0%E8%B0%83%E5%BA%A6/cover.svg">
+<meta property="article:published_time" content="2026-09-08T03:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-09T13:25:00.835Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="x86">
+<meta property="article:tag" content="任务调度">
+<meta property="article:tag" content="操作系统">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-14-%E6%8A%A2%E5%8D%A0%E8%B0%83%E5%BA%A6/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "从零编写操作系统 14 - 抢占调度：时间片结束后怎样换一个任务",
+  "url": "https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-14-%E6%8A%A2%E5%8D%A0%E8%B0%83%E5%BA%A6/",
+  "image": "https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-14-%E6%8A%A2%E5%8D%A0%E8%B0%83%E5%BA%A6/cover.svg",
+  "datePublished": "2026-09-08T03:00:00.000Z",
+  "dateModified": "2026-09-09T13:25:00.835Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-14-%E6%8A%A2%E5%8D%A0%E8%B0%83%E5%BA%A6/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '从零编写操作系统 14 - 抢占调度：时间片结束后怎样换一个任务',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">752</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">874</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">15</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="not-top-img" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">从零编写操作系统 14 - 抢占调度：时间片结束后怎样换一个任务</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav></header><main class="layout" id="content-inner"><div id="post"><div id="post-info"><h1 class="post-title">从零编写操作系统 14 - 抢占调度：时间片结束后怎样换一个任务</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-08T03:00:00.000Z" title="Created 2026-09-08 11:00:00">2026-09-08</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-09T13:25:00.835Z" title="Updated 2026-09-09 21:25:00">2026-09-09</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%9F%BA%E7%A1%80%E8%AE%BE%E6%96%BD/">基础设施</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">5.8k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>19mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-09 21:25:00&quot;}" hidden></div><p>第 13 篇能够保存两条调用链，但 A 一旦进入不含 <code>yield</code> 的无限循环，已经就绪的 B 就无法运行。<br>
+本篇把第 08 篇的 PIT 时钟接入同一个调度器，让两个没有主动让出点的计算任务都取得进展。<br>
+时间片采用最小规则：每次时钟中断提出一次轮转请求，允许调度时在中断处理出口切换。</p>
+<p>切换函数仍然只保存四个被调用者保存寄存器。<br>
+被时钟打断的完整寄存器与 EFLAGS 则留在原任务的中断栈帧里，等该任务恢复以后由 IRETD 还原。<br>
+实验另外检查允许中断但禁止抢占、真正关闭中断、嵌套恢复，以及屏蔽 IRQ0 后另一个任务停滞的区别。</p>
+<span id="more"></span>
+<h1>时钟可以打断调用约定没有覆盖的位置</h1>
+<p>普通 <code>task_yield()</code> 是编译器可见的函数调用。<br>
+编译器会按 ABI 处理跨调用仍然有效的数据，第 13 篇因此只需在切换函数中保存 EBP、EBX、ESI、EDI 和栈位置。<br>
+时钟中断却可能发生在加法与后续条件跳转之间，也可能发生在 EAX 刚算出一个值、尚未写回内存的时候。</p>
+<p>这种位置没有普通函数调用，不能允许中断处理随意丢弃 EAX、ECX、EDX 或条件标志。<br>
+若只保存四个寄存器，两个计数任务可能仍偶尔增长，但任务中的中间计算已经被破坏。<br>
+是否出现输出与是否正确恢复任意指令现场，需要分别验证。</p>
+<p>当前系统继续运行在单 CPU、32 位保护模式、ring 0，共享第 11 篇建立的页表。<br>
+本篇保存的是这套无浮点、无 SSE/MMX 环境中的整数执行现场，不切 CR3，也不切换用户权限。<br>
+这些限制与第 13 篇一起保留，不能把定时切栈直接等同于完整进程切换。</p>
+<h1>68 字节中断现场由硬件和汇编共同形成</h1>
+<p>同 CPL 的中断入口由 CPU 保存 EFLAGS、CS、EIP。<br>
+IRQ0 不带硬件错误码，向量入口额外压入零错误码和向量号 32，再进入共用汇编入口。<br>
+入口用 PUSHAD 保存通用寄存器，并把四个段寄存器扩展成四字节槽保存。</p>
+<p><a target="_blank" rel="noopener" href="https://cdrdv2-public.intel.com/825758/253668-sdm-vol-3a.pdf">Intel SDM Vol. 3A §6.12</a>描述了中断入口与返回规则。<br>
+当前从 ring 0 打断 ring 0，没有权限切换产生的旧 SS、旧 ESP 尾部；不能按用户态进入内核的布局多读八字节。<br>
+<code>kernel/exceptions.h</code> 的结构体与汇编顺序逐项对应：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs text">frame +  0  GS      +  4  FS      +  8  ES      + 12  DS<br>      + 16  EDI     + 20  ESI     + 24  EBP     + 28  PUSHAD_ESP<br>      + 32  EBX     + 36  EDX     + 40  ECX     + 44  EAX<br>      + 48  vector  + 52  error<br>      + 56  EIP     + 60  CS      + 64  EFLAGS<br>总长：68 字节<br></code></pre></td></tr></table></figure>
+<p>PUSHAD_ESP 是 PUSHAD 所记录的中间栈指针，不是另外一个可直接加载的完整任务现场指针。<br>
+POPAD 恢复时跳过这一槽，最终 ESP 依靠对称出栈和 IRETD 回到被打断位置。<br>
+源码用静态断言锁定结构体总长、vector 偏移 48 和 eflags 偏移 64，防止 C 字段修改后汇编仍沿用旧偏移。</p>
+<p>中断门在保存旧 EFLAGS 后清除 IF，因此 C 中断处理运行时 IF=0，但 frame 内仍有被打断代码的旧 IF。<br>
+共用入口还会 CLD，让 C 函数入口满足 DF=0；原 DF 已经保存在 frame 中，返回任务时必须恢复。<br>
+清除处理中使用的 DF 与保留任务原 DF 可以同时成立。</p>
+<h1>完整现场留栈，切换的仍是普通调用续点</h1>
+<p>调用链从硬件中断到任务切换保持同一份任务栈：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs text">A 的计算代码被 IRQ0 打断<br>  ↓ CPU + exception_common 保存完整 68 字节 frame<br>trap_dispatch(frame)<br>  ↓ 处理 IRQ0，发 EOI，进入最外层退出检查<br>task_trap_leave → preempt_pending → schedule_locked<br>  ↓ 普通 CALL<br>switch_context 保存 EBP/EBX/ESI/EDI 与 ESP<br>  ↓ 加载 B 的 ESP<br>B 的旧切换续点继续，或由 trampoline 首次启动<br></code></pre></td></tr></table></figure>
+<p>在 A 的栈上，完整 frame 位于较高地址，中间有 C 函数调用帧，再向低地址延伸到 <code>switch_context</code> 保存的四寄存器现场。<br>
+<code>tasks[A].saved_sp</code> 指向最下面这份普通切换现场，不直接指向 68 字节 frame。<br>
+把它强制转换为 <code>struct trap_frame *</code> 会从错误位置读取向量、EIP 和 flags。</p>
+<p>等某次时钟轮转再次选中 A，<code>switch_context</code> 先 RET 回 A 暂停的调度器调用点。<br>
+之后逐层返回到 <code>task_trap_leave</code>、<code>trap_dispatch</code>，再返回共用汇编入口。<br>
+入口恢复段寄存器与通用寄存器，跳过 vector/error，最后由 IRETD 消费 EIP、CS、EFLAGS。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">换回 A：RET → 调度器 C 返回链 → exception_common<br>        → 恢复段寄存器 → POPAD → 跳过 8 字节 → IRETD<br>        → A 被打断指令的续点<br></code></pre></td></tr></table></figure>
+<p>RET 负责恢复内核调度调用链，IRETD 负责恢复真正被中断的代码。<br>
+两层帧有不同布局和不同消费者，不需要把四寄存器切换函数扩展成第二份中断入口。</p>
+<p><code>exception_common</code> 用 EBX 保存原始 frame 指针，再向下对齐 ESP 并 CALL C。<br>
+EBX 属于被调用者保存寄存器，也在 <code>switch_context</code> 的保存集合里，因此跨任务挂起之后仍能找回同一个 frame。<br>
+若改为只用调用者可破坏的临时寄存器保存这根指针，普通 C 调用就可能使后续 <code>mov esp, ...</code> 恢复到错误地址。</p>
+<h1>EOI 必须在切走之前完成</h1>
+<p>时钟 handler 只做有界操作：递增 tick，记录调度请求，向主 PIC 发送 IRQ0 的 EOI。<br>
+它不会在更新 tick 的中间直接调用切换函数。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">void</span> <span class="hljs-title function_">timer_irq</span><span class="hljs-params">(<span class="hljs-type">void</span>)</span><br>&#123;<br>    ++timer_ticks;<br>    task_tick();<br>    <span class="hljs-keyword">if</span> (timer_mode != <span class="hljs-number">2</span>) timer_outb(<span class="hljs-number">0x20</span>, <span class="hljs-number">0x20</span>);<br>&#125;<br></code></pre></td></tr></table></figure>
+<p><code>timer_mode == 2</code> 是第 08 篇故意遗漏 EOI 的诊断模式。<br>
+本篇调度入口重新初始化 timer mode，正常路径会发送 EOI；旧故障实验仍保留独立用途。</p>
+<p>若先切到 B，等 A 再运行才发 EOI，PIC 的处理中状态就会跨任务保留。<br>
+后续定时投递可能因此受阻，而恢复 A 本身又依赖后续定时调度，最终出现只有一次切换或 tick 不再增长的现象。<br>
+完成设备确认与调度分离，使 B 开始运行时不会继续承担 A 尚未结束的 IRQ0 确认工作。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">void</span> <span class="hljs-title function_">trap_dispatch</span><span class="hljs-params">(<span class="hljs-keyword">struct</span> trap_frame *frame)</span><br>&#123;<br>    task_trap_enter();<br>    trap_handle(frame);<br>    task_trap_leave(frame-&gt;eflags &amp; <span class="hljs-number">0x200</span>);<br>&#125;<br></code></pre></td></tr></table></figure>
+<p><code>trap_handle</code> 返回意味着设备 handler 已完成，包括该路径需要的 EOI。<br>
+真正切换发生在统一出口，避免每个设备处理函数各自形成一套调度顺序。<br>
+时钟与调度热路径也不打印日志，减少中断栈深度和控制台重入机会。</p>
+<h1>每个任务分别记录中断深度和禁止抢占层数</h1>
+<p>任务对象增加两个字段：<code>trap_depth</code> 和 <code>preempt_count</code>。<br>
+前者记录尚未完成的 trap 处理层数，后者记录当前任务嵌套禁止抢占的层数。<br>
+这些状态属于具体调用链，不能把 A 的层数当成切到 B 后仍然适用的全局计数。</p>
+<p>当前 handler 不会主动 STI，因此没有打开普通 IRQ 嵌套。<br>
+但统一出口仍显式管理深度，只在最外层处理已经完成时考虑调度，便于用断言限制调用位置。<br>
+这不表示已支持任意嵌套中断或 NMI 调度。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">void</span> <span class="hljs-title function_">task_trap_leave</span><span class="hljs-params">(<span class="hljs-type">unsigned</span> interrupted_if)</span><br>&#123;<br>    KASSERT(tasks[current].trap_depth);<br>    --tasks[current].trap_depth;<br>    <span class="hljs-keyword">if</span> (interrupted_if) preempt_pending();<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>深度在调度判断前减一。<br>
+因此，A 即使还保留着等待将来返回的物理 trap frame，其逻辑处理深度也已经在出口降为零。<br>
+这里的“最外层已完成”指设备处理和嵌套处理结束，不意味着汇编 frame 已经弹出。</p>
+<p><code>interrupted_if</code> 来自被打断现场的旧 EFLAGS，不是 C handler 当前总为零的 IF。<br>
+如果同步异常打断了原本 IF=0 的临界区，即使已有调度请求，也不能因为正在退出一个 trap 就擅自切走。<br>
+待原调用者恢复自己的中断状态，再由符合条件的出口处理请求。</p>
+<h1>调度请求在允许的出口兑现</h1>
+<p>每次 PIT tick 调用 <code>task_tick()</code>，抢占演示激活时将 <code>need_resched</code> 置一。<br>
+该标志只表示 CPU 有待处理的轮转请求，不统计欠了多少个时间片。<br>
+当前单 CPU 只执行一条调用链，多个禁止抢占期间到来的 tick 可以合并成一个待办请求。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">static</span> <span class="hljs-type">void</span> <span class="hljs-title function_">preempt_pending</span><span class="hljs-params">(<span class="hljs-type">void</span>)</span><br>&#123;<br>    <span class="hljs-keyword">if</span> (!preempt_active || !need_resched || tasks[current].trap_depth)<br>        <span class="hljs-keyword">return</span>;<br>    <span class="hljs-keyword">if</span> (tasks[current].preempt_count) &#123;<br>        ++preempt_deferred;<br>        <span class="hljs-keyword">return</span>;<br>    &#125;<br>    tasks[current].state = RUNNABLE;<br>    schedule_locked();<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>尚在 trap 内层则继续返回，不从中间切走。<br>
+禁止抢占计数非零则留下 <code>need_resched</code>，只累计延期检查次数。<br>
+满足条件后把当前任务放回 RUNNABLE，复用第 13 篇三个槽的环形扫描。</p>
+<p>调度器同时断言当前 IF=0、当前任务的两种深度都为零，并在切栈之前清掉本次 <code>need_resched</code>。<br>
+如果等旧任务恢复后才清标志，新任务运行期间产生的新请求就可能被旧调用的收尾语句覆盖。<br>
+清除发生在消费本次请求的时刻，而不是某个无法预知何时恢复的返回点。</p>
+<p>本篇每个 tick 提出轮转，没有优先级、按任务权重分配或多 tick 配额。<br>
+PIT 沿用第 08 篇分频值 11932；tick 是客体中断计数，不能直接拿调试器暂停前后的宿主时间当实际时间片长度。<br>
+当前短临界区和 handler 都有明确工作量，延迟仍取决于这些不可抢占区间。</p>
+<p>首次启动也有独立协议：PIT 初始化完成并激活抢占演示后，新任务在 <code>task_start()</code> 内 STI。<br>
+第 13 篇的协作式演示保持原先 IF=0 的首次入口，<code>switch_context</code> 本身仍不无条件开中断。<br>
+已经运行过的抢占任务从旧中断调用链恢复，由自己的 IRETD 还原 IF。</p>
+<h1>禁止抢占保留设备中断</h1>
+<p><code>preempt_disable()</code> 只增加当前任务的禁止抢占计数。<br>
+它会短暂保存 flags 并 CLI，保护计数修改，随后恢复调用者的 IF。<br>
+调用前 IF=1 时，函数返回后时钟仍然可以进入。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">void</span> <span class="hljs-title function_">preempt_disable</span><span class="hljs-params">(<span class="hljs-type">void</span>)</span><br>&#123;<br>    <span class="hljs-type">uint32_t</span> flags = irq_save();<br>    ++tasks[current].preempt_count;<br>    irq_restore(flags);<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>演示连续调用两次 disable 后 STI，等待至少三个 tick。<br>
+预期 <code>timer_ticks</code> 持续增长，<code>need_resched</code> 被置一，而 <code>preempt_switches</code> 保持零。<br>
+这是“IRQ 已完成处理，但任务切换延期”的运行场景。</p>
+<p>第一次 <code>preempt_enable()</code> 仅把计数从二减为一，仍不能切换。<br>
+第二次减为零，若进入 enable 时 IF=1，便立即兑现已有请求；以后 bootstrap 恢复这次调用，才执行自己的 flags 恢复。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">void</span> <span class="hljs-title function_">preempt_enable</span><span class="hljs-params">(<span class="hljs-type">void</span>)</span><br>&#123;<br>    <span class="hljs-type">uint32_t</span> flags = irq_save();<br>    KASSERT(tasks[current].preempt_count);<br>    --tasks[current].preempt_count;<br>    <span class="hljs-keyword">if</span> (flags &amp; <span class="hljs-number">0x200</span>) preempt_pending();<br>    irq_restore(flags);<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>计数为零还调用 enable 属于配对错误，断言拒绝无符号下溢。<br>
+嵌套使用也不能用一个布尔值代替：内层结束时，外层仍可能依赖“不会切走”的约束。<br>
+只有最外层恢复才解除禁止抢占状态。</p>
+<p>禁止抢占不排除 IRQ handler 对共享数据的访问。<br>
+若中断与任务都修改同一个队列，仅增加 <code>preempt_count</code> 仍可能让 handler 看到半完成状态，应使用匹配 IRQ 访问的临界区协议。<br>
+当前堆、页分配器和调度器继续遵守既有短 CLI 保护；演示没有把控制台变成可被多个任务任意并发调用的接口。</p>
+<h1>IF=0 时，IRQ 本身还没有进入</h1>
+<p>另一个检查先在禁止抢占但 IF=1 的状态下积累请求，再执行 CLI，随后调用最后一层 <code>preempt_enable()</code>。<br>
+虽然计数降到零，进入 enable 前的 IF 仍为零，因此它保留请求而不切换，也不替调用者 STI。<br>
+原调用者应当独立决定何时退出关中断区。</p>
+<p>GDB 在 <code>preempt_cli_sample</code> 设置释放门，detach 后让客体自由运行一段宿主计时窗口。<br>
+窗口里 bootstrap 仍执行循环，但 tick 和切换计数应同时保持不变，IF 仍为零。<br>
+解除测试门后，代码还执行一段有界循环，再核对两项计数未变，最后恢复原 flags。</p>
+<table>
+<thead>
+<tr>
+<th>区间</th>
+<th>时钟 handler 是否执行</th>
+<th>tick</th>
+<th>任务切换</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IF=1，preempt_count&gt;0</td>
+<td>可以</td>
+<td>增长</td>
+<td>请求保留，暂不切换</td>
+</tr>
+<tr>
+<td>IF=0，preempt_count=0</td>
+<td>普通 IRQ 不能进入</td>
+<td>不增长</td>
+<td>暂不切换</td>
+</tr>
+<tr>
+<td>IF=1，preempt_count=0，最外层出口</td>
+<td>可以</td>
+<td>增长</td>
+<td>可兑现请求</td>
+</tr>
+</tbody>
+</table>
+<p>第二行不能描述成“每次时钟中断进入后判断禁止调度”。<br>
+时钟设备可能继续产生请求，但 CPU 的普通可屏蔽 IRQ 入口被 IF 阻止，软件没有执行 <code>timer_irq()</code>。<br>
+未处理的设备请求也不等价于每个物理脉冲都会被逐个补计，不能据此恢复精确经过时间。</p>
+<p>CLI 不屏蔽 NMI，不防止异常，也不是 SMP 互斥机制。<br>
+普通持锁区仍不能主动 yield；当前调度入口对禁止抢占层数的断言，只覆盖进入接口后的协议检查，不提供任意锁的自动识别。</p>
+<h1>用真实忙循环证明没有依赖 HLT 或 yield</h1>
+<p>两个任务各自只递增自己的 <code>preempt_counts[id]</code>。<br>
+计算循环内部不调用函数、不执行 <code>task_yield()</code>，也不执行 HLT：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-keyword">while</span> (!preempt_work_release ||<br>       preempt_counts[<span class="hljs-number">0</span>] &lt; <span class="hljs-number">200000</span> || preempt_counts[<span class="hljs-number">1</span>] &lt; <span class="hljs-number">200000</span>)<br>    ++preempt_counts[id];<br></code></pre></td></tr></table></figure>
+<p>两项阈值都满足以后，任务才允许离开计算阶段。<br>
+单看结束时 A、B 均超过阈值，还不足以排除一个任务先运行完，另一个任务随后才开始的弱实验。<br>
+因此脚本将 <code>preempt_work_release</code> 置零，让两任务在外部观察期间都保持忙循环。</p>
+<p>GDB detach 后自由运行 0.3 秒再 attach 读取 A、B 和 tick，随后重复一次。<br>
+要求 A、B 在第二次都大于第一次，tick 也增长，之后才将释放门设回一，让任务进入寄存器检查阶段。<br>
+调试门控制的是退出条件，不调用调度器，也没有替任务添加让出点。</p>
+<p>两次样本证明这两个计算任务在观察区间都获得了执行机会。<br>
+它不测量公平份额，也不保证每个精确宿主时间窗口中执行量相同；断点、TCG 执行与宿主调度都会影响计数。<br>
+32 位计数还存在回绕边界，脚本使用短窗口，不能把大小比较推广到无限运行时间。</p>
+<p>本次两个自由运行样本中，A 从 23700735 增至 45216100，B 从 24763327 增至 48848681，tick 从 40 增至 70。<br>
+正常路径截图记录演示完成后的汇总，进展判断依据上述内存采样与无让出点源码路径。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="day14-screen.png" alt="时钟抢占、现场探针与退出回收完成的客体画面"></p>
+<h1>HLT 探针单独检查完整寄存器和标志</h1>
+<p>计数增长不能确认被打断的七个普通通用寄存器都正确恢复。<br>
+<code>preempt_register_probe(seed)</code> 因此使用独立汇编路径，为 EAX、ECX、EDX、EBX、EBP、ESI、EDI 写入七个不同的基值，再加任务相关 seed。<br>
+A、B 的种子不同，避免把另一任务的现场装回来仍碰巧通过相同哨兵比较。</p>
+<p>探针先保存调用者自己的寄存器与 flags，布置测试值，再设置受检的算术标志、IF 和 DF，进入 HLT 等待真实 IRQ。<br>
+中断处理会调用 C、轮转到别的任务，然后在原任务恢复时从 HLT 后续指令继续。<br>
+该任务立即执行 PUSHFD 和 PUSHAD，把返回值捕获到栈上，先于任何可能改变算术标志的运算。</p>
+<p>探针随后 CLD，再按 16 字节约定对齐 C 调用栈，调用 <code>preempt_probe_check()</code>。<br>
+检查完成后恢复原寄存器与 flags，再正常返回任务代码。<br>
+这使故意设置的 DF=1 不会直接进入遵循 DF=0 约定的 C 检查函数。</p>
+<p>标志检查使用掩码 <code>0xed5</code>，比较 CF、PF、AF、ZF、SF、IF、DF、OF，并再次显式核对 IF 已开启。<br>
+掩码只覆盖选定状态，不是对全部 EFLAGS 位作逐位不变承诺；保留位和当前未使用的处理器功能不在该断言里。<br>
+两个任务各执行四轮探针，预期共八次通过，每轮还要求切换计数比进入探针前增加。<br>
+<code>preempt_probe_check()</code> 在短 CLI 区间中更新共享通过计数，随后恢复进入时的 flags。<br>
+共享变量上的 <code>++</code> 是读、改、写序列，<code>volatile</code> 不使它自动免受任务交错影响。</p>
+<p>GDB 额外从一个指定 owner 的探针入口追踪到 <code>switch_context</code>。<br>
+此时 <code>current</code> 已更新为下一个任务，CPU 的 ESP 尚在换出 owner 的栈上。<br>
+脚本沿 C 调用帧找到 <code>trap_dispatch(frame)</code>，核对 frame 位于 owner 栈页内、向量为 32，七寄存器与 flags 都符合该任务的哨兵。<br>
+这一时刻不能简单根据新的 <code>current</code> 判断当前 ESP 属于谁。</p>
+<p>再通过带 owner 条件的断点等同一个任务到达恢复检查点，确认它在切换次数增加后保留相同寄存器与标志。<br>
+这样检查的路径包含真实 IRQ0、一次任务选择变化和同一任务通过 IRETD 返回，而不只是直接调用普通切换 probe。</p>
+<p>HLT 探针刻意等待中断，不能用它证明 CPU 忙任务已具备抢占能力。<br>
+前一节无 CALL、无 HLT、无 yield 的计数循环负责进展证明，本节负责选择好的寄存器与标志恢复证明。<br>
+本次观察中，owner=1 的完整 IRQ0 frame 位于 <code>0x11ff44</code>，调度器已经选中 current=2。<br>
+同一个 owner 通过 IRETD 恢复时，切换计数从 67 增至 70，七寄存器与受检 flags 均保留；整个演示共完成八次探针检查。</p>
+<h1>屏蔽 IRQ0 后再次观察就绪任务停滞</h1>
+<p><code>preempt-mask</code> 变体让 A 首次运行时屏蔽 IRQ0，再进入无让出点的计数循环。<br>
+B 已创建并处于 RUNNABLE，但系统不再有这个轮转来源。<br>
+该场景保留 A 的正常计算，用于区分缺少调度事件与整个 CPU 停机。</p>
+<p>脚本在两个 0.3 秒自由运行窗口分别读取计数，要求 A 增长、B 保持零，并确认 B 仍然就绪。<br>
+同时检查 tick 与切换次数没有变化，定位到时钟投递被屏蔽这条边界。<br>
+若只是等串口超时，无法排除 QEMU 停在断点、B 创建失败或入口异常等其他原因。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="day14-masked.png" alt="屏蔽 IRQ0 时 A 增长而 B 保持就绪的诊断画面"></p>
+<p>截图取得以后，GDB 将 <code>preempt_mask_requested</code> 清零，A 的代码观察到请求变化，调用 <code>timer_mask(0)</code> 解除设备屏蔽。<br>
+后续继续执行同一组正常检查，要求 B 恢复进展，最后两任务都完成并回收栈页。<br>
+这是一次可恢复的故障注入，不需要把恢复判断建立在重启后运行了另一张正常镜像上。</p>
+<p>本次屏蔽窗口中，A 从 78017139 增至 155147236，B 保持零，tick=3、切换次数=1 均未改变。<br>
+解除屏蔽后，两计数重新取得进展，并完成后续现场与退出回收检查。<br>
+恢复门来自测试控制，任务调度仍由重新启用的真实 IRQ0 驱动。</p>
+<h1>退出回收与累计行为一起核对</h1>
+<p>任务完成忙循环与探针后返回入口，继续使用第 13 篇的 <code>task_exit()</code> 协议。<br>
+退出者只标 DEAD 并切走，bootstrap 等两者都结束后关闭时钟、停止抢占，再从自己的栈回收两张任务页。<br>
+回收前检查 canary、trap_depth 和 preempt_count，要求没有未完成处理层数或禁止抢占层数遗留。</p>
+<p>填充扫描记录本轮栈上被写过的范围，仍要求小于 <code>4096 - 256</code>。<br>
+抢占使 task 栈额外包含完整 IRQ frame 与 C 处理调用链，所以不能沿用第 13 篇的栈使用数作为本篇结果。<br>
+扫描仍可能漏掉未写入的 ESP 下移或写回填充值；它不是 guard page，也不是最坏栈深度证明。</p>
+<p>本次正常截图对应 A=45216101、B=48848682、切换 81 次、探针通过 8 次，禁止抢占测试观察到 3 个 tick。<br>
+两张栈的填充扫描结果均为 340 字节，回收 2 页后空闲页数恢复为 16065。<br>
+脚本还要求第 13 篇协作式检查标记保持成功，其独立切换计数仍为 387，再继续到 <code>keyboard_ready</code>。<br>
+抢占计数单独保存，避免把新实验次数混进旧版本的精确轮转断言。</p>
+<h1>下载与复现</h1>
+<p><a href="os-day-14.zip">下载第 14 篇完整源码</a>。<br>
+源码冻结提交为 <code>eeacce13e89cc6347645364095ecbafc7f4f2b1c</code>；仓库实现目录为 <code>examples/build-an-os</code>，附件将该目录内容直接放在 <code>os-day-14</code> 内。<br>
+沿用第 01 篇的工具链镜像，按顺序运行：</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs sh">unzip os-day-14.zip<br><span class="hljs-built_in">cd</span> os-day-14<br>podman run --<span class="hljs-built_in">rm</span> -v <span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>:/work&quot;</span> -w /work localhost/build-an-os:day01 make build check-preempt<br>podman run --<span class="hljs-built_in">rm</span> -v <span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>:/work&quot;</span> -w /work localhost/build-an-os:day01 make check<br></code></pre></td></tr></table></figure>
+<p>正常镜像为 <code>build/mbr.img</code>，故障注入镜像为 <code>build/mbr-preempt-mask.img</code>。<br>
+检查脚本位于 <code>tools/check-preempt.sh</code>，串口、GDB 和 QEMU 输出保存为 <code>build/preempt-{normal,masked}-{serial,gdb,qemu}.txt</code>。<br>
+各检查共享容器 loopback 的 1234 端口，应顺序执行。</p>
+<p>本轮定向 <code>check-preempt</code>、累计 <code>make check screenshot help</code> 以及源码附件独立解压后的 <code>make check</code> 均退出 0。<br>
+源码内 <code>docs/day14-evidence.md</code> 保存实现边界与本轮运行记录。</p>
+<p>时钟抢占解决不主动让出 CPU 的计算任务长期占用处理器的问题。<br>
+等待键盘输入的任务仍然没有必要反复消耗时间片检查队列；第 15 篇将增加阻塞与唤醒，让没有工作的任务暂时退出就绪集合。</p>
+<h1>练习</h1>
+<ol>
+<li>画出一次 IRQ0 抢占后 A 栈上的完整 frame、C 调用帧与四寄存器切换帧，分别标明 RET 与 IRETD 消费哪一部分。</li>
+<li>将禁止抢占嵌套加深到三层，预测前两次 enable 后 tick、切换次数和计数状态，再调整独立实验验证最外层恢复。</li>
+<li>对照屏蔽变体中“B 必须为 RUNNABLE”的断言，说明只检查 B=0 时，任务创建失败为什么可能被误判为抢占失效。</li>
+</ol>
+<p>上一篇：<a href="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-13-%E4%BF%9D%E5%AD%98%E4%B8%8E%E6%81%A2%E5%A4%8D%E6%89%A7%E8%A1%8C%E7%8E%B0%E5%9C%BA/">13 - 保存与恢复执行现场</a>。</p>
+<p>下一篇：<a href="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-15-%E7%AD%89%E5%BE%85%E4%B8%8E%E5%94%A4%E9%86%92/">15 - 等待与唤醒</a>。</p>
+<h1>参考资料</h1>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://cdrdv2-public.intel.com/825758/253668-sdm-vol-3a.pdf">Intel SDM Vol. 3A</a>：§6.12 的中断入口、门类型与返回；同 CPL 与权限切换的栈布局必须分别处理。</li>
+<li><a target="_blank" rel="noopener" href="https://www.uclibc.org/docs/psABI-i386.pdf">Intel386 System V psABI 1.0</a>：普通 C 调用的寄存器保存、栈对齐和 DF 约定；这些约定用于 handler 的 C 调用，不替代任意指令处的中断现场。</li>
+<li><a target="_blank" rel="noopener" href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html">Intel Software Developer Manuals</a>：CLI、HLT、PUSHAD、POPAD 与 IRETD 的指令语义。</li>
+<li><a target="_blank" rel="noopener" href="https://pdos.csail.mit.edu/6.1810/2025/xv6/book-riscv-rev5.pdf">MIT xv6 RISC-V book rev5</a>：调度调用续点与线程中断状态的概念参考；本篇保存布局依据实际 x86 入口，不照搬 RISC-V 寄存器。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-14-%E6%8A%A2%E5%8D%A0%E8%B0%83%E5%BA%A6/">https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-14-%E6%8A%A2%E5%8D%A0%E8%B0%83%E5%BA%A6/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F/">操作系统</a><a class="post-meta__tags" href="/tags/x86/">x86</a><a class="post-meta__tags" href="/tags/%E4%BB%BB%E5%8A%A1%E8%B0%83%E5%BA%A6/">任务调度</a></div><div class="post-share"><div class="social-share" data-image="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-14-%E6%8A%A2%E5%8D%A0%E8%B0%83%E5%BA%A6/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-13-%E4%BF%9D%E5%AD%98%E4%B8%8E%E6%81%A2%E5%A4%8D%E6%89%A7%E8%A1%8C%E7%8E%B0%E5%9C%BA/" title="从零编写操作系统 13 - 保存与恢复执行现场：先实现协作式任务"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-13-%E4%BF%9D%E5%AD%98%E4%B8%8E%E6%81%A2%E5%A4%8D%E6%89%A7%E8%A1%8C%E7%8E%B0%E5%9C%BA/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-08</div><div class="info-item-2">从零编写操作系统 13 - 保存与恢复执行现场：先实现协作式任务</div></div><div class="info-2"><div class="info-item-1">第 12 篇已经能按字节分配内核对象，但执行路径仍沿着同一份调用栈推进。 普通函数 A 调用 B 后，只有 B 返回，A 才能继续；如果 B 一直计算，其他工作就无法通过这条调用链取得 CPU。 本篇为两个内核任务各分配一张栈页，让任务在 task_yield() 处暂停，并在以后从同一次调用之后继续。 正常实验要求 A、B 各完成 128 轮计数，跨切换保留局部数组、被调用者保存寄存器和各自的中断允许状态，退出后归还两张栈页。 另一个镜像让 A 永远不调用 yield，检查 B 虽然已经就绪，计数仍然停在零。 这套实现只在单 CPU、ring 0、普通函数调用边界切换，没有时钟抢占，也没有独立用户地址空间。  暂停的调用链需要独立栈 函数调用会把返回位置放到栈上，局部变量与被保存的寄存器也可能占用栈空间。 若把一个执行中的函数暂停，再让另一个函数在同一片空间从头建立调用栈，前一个函数恢复时就可能读到被覆盖的数据。 独立栈使两条尚未结束的调用链能够同时保存在内存里；单 CPU 在任意时刻仍只执行其中一条。 第 10 篇的 page_alloc() 每次返回一张 4096 字节物理...</div></div></div></a><a class="pagination-related" href="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-15-%E7%AD%89%E5%BE%85%E4%B8%8E%E5%94%A4%E9%86%92/" title="从零编写操作系统 15 - 等待与唤醒：任务为什么不能一直轮询"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-15-%E7%AD%89%E5%BE%85%E4%B8%8E%E5%94%A4%E9%86%92/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-08</div><div class="info-item-2">从零编写操作系统 15 - 等待与唤醒：任务为什么不能一直轮询</div></div><div class="info-2"><div class="info-item-1">第 14 篇已经能用时钟轮转两个计算任务，但没有输入时，键盘消费者没有可处理的数据。 反复取得时间片再检查空队列，只会重复得到同一个结果。 本篇增加 BLOCKED 状态：消费者登记等待条件后退出就绪集合，生产者改变条件时再把它变回 RUNNABLE。 关键问题发生在检查条件与登记等待之间。 若输入恰好在这段间隙到达，生产者可能发现没有等待者，随后消费者却仍按旧结果进入阻塞，形成“条件已经满足，任务仍然睡着”的丢失唤醒。 实验用真实 PIT 中断分别制造错误顺序和受保护顺序，再把同一套等待接口接到定时睡眠、idle 与持续运行的键盘任务。  阻塞任务暂时退出就绪集合 RUNNABLE 表示可以执行，BLOCKED 表示正在等某项外部条件。 两者都可能保留完整调用栈，但调度器只从 RUNNABLE 中选下一个任务。 时钟每次到来不应把所有 BLOCKED 任务重新置为就绪，否则每个任务仍要定期醒来轮询。 123456789运行中的消费者    │ 条件不满足：登记等待，保存调用续点    ▼BLOCKED ── 生产者改变条件并唤醒 ──→ RUNNABLE            ...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-08-%E6%97%B6%E9%92%9F%E4%B8%AD%E6%96%AD/" title="从零编写操作系统 08 - 时钟中断：让外部事件打断当前执行"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-08-%E6%97%B6%E9%92%9F%E4%B8%AD%E6%96%AD/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 08 - 时钟中断：让外部事件打断当前执行</div></div><div class="info-2"><div class="info-item-1">上一篇的异常由正在执行的指令触发。时钟中断来自处理器外部：即使内核没有执行 int，定时器也能发出请求，经中断控制器送到 CPU，再通过 IDT 进入处理函数。 本篇接入传统 PC 的 8259A PIC 与 8254 PIT，只开放 IRQ0。正常内核收到 20 次时钟中断后关闭外部 IRQ，继续原有控制台自检；两个独立诊断镜像验证屏蔽、恢复和漏发 EOI 的后果。入口仍沿用上一篇的保存与恢复路径，尚未加入调度或任务切换。  从 PIT 输出到 IDT 第 32 项 PIT 的 channel 0 产生周期信号，连接主 PIC 的 IRQ0 输入。PIC 根据屏蔽位和优先级判断是否请求 CPU 响应；CPU 接受请求后获得向量，再查 IDT。 12345678910111213PIT channel 0 周期输出    ↓主 PIC 的 IRQ0 输入    ↓  IMR、优先级及 CPU 当前 IF 允许CPU 接受可屏蔽外部中断    ↓IDT[0x20] → isr32 → exception_common    ↓trap_dispatch(frame) → timer...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-07-%E5%BC%82%E5%B8%B8%E5%85%A5%E5%8F%A3/" title="从零编写操作系统 07 - 异常入口：CPU 出错后把哪些信息交给内核"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-07-%E5%BC%82%E5%B8%B8%E5%85%A5%E5%8F%A3/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 07 - 异常入口：CPU 出错后把哪些信息交给内核</div></div><div class="info-2"><div class="info-item-1">串口和 panic 可以报告代码主动检测到的错误，但前提是程序执行到了检查位置。除数为零、指令无效、段选择子越界，会让处理器直接转入异常处理。没有异常入口，上一篇建立的输出能力也无从调用。 本篇安装 IDT，把异常现场整理成 C 结构，打印向量、错误码和寄存器。一个受控 INT3 探针验证返回路径，除零、非法指令和一般保护异常分别验证故障路径。范围限定在 32 位保护模式、同一特权级、固定 QEMU 教学配置；设备 IRQ 尚未启用。  IDT 决定异常从哪里进入 处理器通过异常向量查找中断描述符表 IDT。向量 0 对应除法错误 #DE，3 对应断点 #BP，6 对应无效操作码 #UD，13 对应一般保护异常 #GP。IDT 中的门描述符给出目标代码段和入口地址。 1234567891011指令触发异常    ↓CPU 按向量查 IDT，检查门与目标代码段    ↓CPU 保存返回现场，转入对应汇编 stub    ↓stub 补齐向量与错误码，公共入口保存寄存器    ↓trap_dispatch(frame)    ├─ 受控 INT3：返回公共入口，恢复现场，IRETD ...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-03-%E4%B8%A4%E9%98%B6%E6%AE%B5%E5%BC%95%E5%AF%BC/" title="从零编写操作系统 03 - 两阶段引导：加载比一个扇区更大的程序"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-03-%E4%B8%A4%E9%98%B6%E6%AE%B5%E5%BC%95%E5%AF%BC/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 03 - 两阶段引导：加载比一个扇区更大的程序</div></div><div class="info-2"><div class="info-item-1">第 02 篇的启动扇区已经能被 BIOS 执行，并在屏幕上显示启动盘编号。继续增加读盘、内存图和模式切换代码时，第一扇区的空间很快就会用完。本篇让第一阶段读取一个更大的第二阶段，再由第二阶段读取并校验载荷。 这一版读取 20000 字节的确定性测试数据，分两次放到低端内存，验证首尾标识与校验和后停机。载荷仍是数据，没有执行 C 内核，也没有进入保护模式。  本系列当前阶段在 QEMU pc-i440fx + SeaBIOS 环境开发与验证；对物理硬件或其他虚拟机的适配将在后续篇章讨论。 两次加载分别解决什么 BIOS 先读取 LBA 0。第一阶段只有 512 字节，末尾保留字节 55 aa，偏移 446–509 仍留给未来分区表。第二阶段占用 8 个扇区，第一阶段将其装入物理地址 0x8000 后远跳转。 12345678910BIOS -&gt; MBR at 0000:7c00          |          | INT 13h AH=42h: LBA 1..8          v        stage2 at 0000:8000          |     ...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-10-%E7%89%A9%E7%90%86%E9%A1%B5%E5%88%86%E9%85%8D/" title="从零编写操作系统 10 - 物理页分配：哪些内存真正可以交出去"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-10-%E7%89%A9%E7%90%86%E9%A1%B5%E5%88%86%E9%85%8D/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 10 - 物理页分配：哪些内存真正可以交出去</div></div><div class="info-2"><div class="info-item-1">内核已经能处理时钟中断和键盘事件，但新增数据仍依赖静态数组。 页表、任务栈或文件缓存需要动态取得内存时，必须知道哪些物理地址可以使用、哪些已经分配，以及释放是否有效。 本篇把第 04 篇取得的 E820 内存图转换成 4 KiB 物理页分配器。 实验仍使用单 CPU、64 MiB RAM 的 qemu32 模拟机，分页保持关闭。 分配器管理固定上限内的页框，返回物理地址；它不建立虚拟地址映射，也不提供任意字节大小的 malloc。 实测初始空闲页数为 16087，客体耗尽全部页面、验证每页数据并释放后，空闲数恢复为 16087。  E820 可用内存还需要扣除内核占用 E820 描述固件报告的系统地址范围。 内核已经装入内存，却不意味着固件会把这段地址从 type 1 区域里扣掉。 若直接把所有 type 1 页面交给调用者，分配结果可能覆盖正在运行的代码或栈。 ACPI 6.5 第 15 章定义了 BIOS 内存图接口和范围类型。 其中 type 1 表示可用 RAM；其他类型不能在本实验中直接当作普通空闲页。 低地址区域也可能有固件或引导程序用途，规范 §15.2要求调用方考...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">时钟可以打断调用约定没有覆盖的位置</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">68 字节中断现场由硬件和汇编共同形成</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">完整现场留栈，切换的仍是普通调用续点</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">EOI 必须在切走之前完成</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">每个任务分别记录中断深度和禁止抢占层数</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">调度请求在允许的出口兑现</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">禁止抢占保留设备中断</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">IF&#x3D;0 时，IRQ 本身还没有进入</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">9.</span> <span class="toc-text">用真实忙循环证明没有依赖 HLT 或 yield</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">10.</span> <span class="toc-text">HLT 探针单独检查完整寄存器和标志</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">11.</span> <span class="toc-text">屏蔽 IRQ0 后再次观察就绪任务停滞</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">12.</span> <span class="toc-text">退出回收与累计行为一起核对</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">13.</span> <span class="toc-text">下载与复现</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">14.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">15.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

@@ -1,0 +1,932 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>从零编写操作系统 16 - 进入用户态：让错误程序无法直接改内核 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="第 15 篇已经能让任务等待、唤醒和接受时钟抢占，但所有任务仍在 ring 0，共享内核页表与执行权限。 一个错误指针可以改写内核数据，一条 CLI 可以阻止普通中断进入。 独立任务栈与轮转调度都不能代替访问权限。 本篇为两个用户任务建立独立地址空间，经 IRETD 进入 ring 3，让它们在相同虚拟地址递增各自的计数。 三轮实验分别让其中一个任务写内核数据、执行 CLI、执行 OUT，要求错误">
+<meta property="og:type" content="article">
+<meta property="og:title" content="从零编写操作系统 16 - 进入用户态：让错误程序无法直接改内核">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-16-%E8%BF%9B%E5%85%A5%E7%94%A8%E6%88%B7%E6%80%81/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="第 15 篇已经能让任务等待、唤醒和接受时钟抢占，但所有任务仍在 ring 0，共享内核页表与执行权限。 一个错误指针可以改写内核数据，一条 CLI 可以阻止普通中断进入。 独立任务栈与轮转调度都不能代替访问权限。 本篇为两个用户任务建立独立地址空间，经 IRETD 进入 ring 3，让它们在相同虚拟地址递增各自的计数。 三轮实验分别让其中一个任务写内核数据、执行 CLI、执行 OUT，要求错误">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-16-%E8%BF%9B%E5%85%A5%E7%94%A8%E6%88%B7%E6%80%81/cover.svg">
+<meta property="article:published_time" content="2026-09-08T05:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-09T13:25:00.837Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="x86">
+<meta property="article:tag" content="操作系统">
+<meta property="article:tag" content="用户态">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-16-%E8%BF%9B%E5%85%A5%E7%94%A8%E6%88%B7%E6%80%81/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "从零编写操作系统 16 - 进入用户态：让错误程序无法直接改内核",
+  "url": "https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-16-%E8%BF%9B%E5%85%A5%E7%94%A8%E6%88%B7%E6%80%81/",
+  "image": "https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-16-%E8%BF%9B%E5%85%A5%E7%94%A8%E6%88%B7%E6%80%81/cover.svg",
+  "datePublished": "2026-09-08T05:00:00.000Z",
+  "dateModified": "2026-09-09T13:25:00.837Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-16-%E8%BF%9B%E5%85%A5%E7%94%A8%E6%88%B7%E6%80%81/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '从零编写操作系统 16 - 进入用户态：让错误程序无法直接改内核',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">752</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">874</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">15</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="not-top-img" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">从零编写操作系统 16 - 进入用户态：让错误程序无法直接改内核</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav></header><main class="layout" id="content-inner"><div id="post"><div id="post-info"><h1 class="post-title">从零编写操作系统 16 - 进入用户态：让错误程序无法直接改内核</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-08T05:00:00.000Z" title="Created 2026-09-08 13:00:00">2026-09-08</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-09T13:25:00.837Z" title="Updated 2026-09-09 21:25:00">2026-09-09</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%9F%BA%E7%A1%80%E8%AE%BE%E6%96%BD/">基础设施</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">5.7k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>19mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-09 21:25:00&quot;}" hidden></div><p>第 15 篇已经能让任务等待、唤醒和接受时钟抢占，但所有任务仍在 ring 0，共享内核页表与执行权限。<br>
+一个错误指针可以改写内核数据，一条 CLI 可以阻止普通中断进入。<br>
+独立任务栈与轮转调度都不能代替访问权限。</p>
+<p>本篇为两个用户任务建立独立地址空间，经 IRETD 进入 ring 3，让它们在相同虚拟地址递增各自的计数。<br>
+三轮实验分别让其中一个任务写内核数据、执行 CLI、执行 OUT，要求错误任务停止，而另一个继续增长。<br>
+用户代码仍是内嵌的手写机器指令；本篇没有 ELF 加载器、系统调用或用户自行退出接口，有限实验由内核监督收尾。</p>
+<span id="more"></span>
+<h1>CPU 权限和页面权限分别限制什么</h1>
+<p>保护模式的当前权限级 CPL 由当前代码段选择子的低两位反映。<br>
+此前内核使用 CS=0x08、SS=0x10，运行在 CPL0；用户代码将使用 CS=0x1b、SS=0x23，运行在 CPL3。<br>
+这些数值同时包含 GDT 项索引和请求权限级，不能把低两位当作可以随意改写的普通配置开关。</p>
+<p>分页的 U/S 位决定页面是否允许用户访问。<br>
+即使代码运行在 ring 3，若页目录和页表错误地把内核区域都标成 user，它仍可能通过普通访存破坏内核。<br>
+反过来，仅有不同 CR3 而仍运行在 ring 0，也不能阻止任务执行特权指令。</p>
+<p>本篇同时建立 CPL3 执行环境、user 页面和共享的 supervisor 内核映射。<br>
+<a target="_blank" rel="noopener" href="https://cdrdv2-public.intel.com/825758/253668-sdm-vol-3a.pdf">Intel SDM Vol. 3A</a>分别描述分段权限、分页访问检查与特权指令规则，这些约束共同作用。<br>
+实验只覆盖当前已实现的页故障和一般保护异常退出路径，不声称所有用户异常都能隔离。</p>
+<h1>六张私有页描述一个用户地址空间</h1>
+<p>每个用户任务分配六张私有页，再单独申请一张内核栈页，总计七页。<br>
+<code>struct user_space</code> 中的数组记录全部六张页的所有权，供构造失败和任务结束时回收：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">user_space</span> &#123;</span> <span class="hljs-type">uint32_t</span> pages[<span class="hljs-number">6</span>]; &#125;;<br></code></pre></td></tr></table></figure>
+<table>
+<thead>
+<tr>
+<th>数组位置</th>
+<th>用途</th>
+<th>所处地址关系</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>pages[0]</td>
+<td>页目录</td>
+<td>物理地址写入 CR3</td>
+</tr>
+<tr>
+<td>pages[1]、pages[2]</td>
+<td>用户代码/数据页表、用户栈页表</td>
+<td>分别由 PDE 256、511 引用</td>
+</tr>
+<tr>
+<td>pages[3]</td>
+<td>代码页</td>
+<td>用户 VA 0x40000000，只读</td>
+</tr>
+<tr>
+<td>pages[4]</td>
+<td>数据页</td>
+<td>用户 VA 0x40001000，可读写</td>
+</tr>
+<tr>
+<td>pages[5]</td>
+<td>用户栈页</td>
+<td>用户 VA 0x7ffff000，可读写</td>
+</tr>
+</tbody>
+</table>
+<p>这里每张页都独立分配，不要求七张页物理连续。<br>
+用户栈顶设为 <code>0x80000000</code>，栈向下增长，当前映射只覆盖栈顶以下一页。<br>
+没有自动扩栈、按需分配或栈页保护区管理；超出实际映射仍会触发相应访问检查。</p>
+<p>全部私有页都位于此前低 64 MiB 恒等映射可访问的物理范围。<br>
+内核构造页表、复制代码和读取用户计数时，可以通过这些物理页的 supervisor 恒等别名操作。<br>
+这个别名属于内核权限，不能据此给用户同样的访问能力。</p>
+<h1>只共享低 64 MiB 内核映射</h1>
+<p>新页目录先整页清零，再复制内核页目录前 16 个 PDE。<br>
+每个 PDE 覆盖 4 MiB，16 项共同保留低 64 MiB 映射，页表本身继续共享。<br>
+这些项保持 supervisor，用户任务在自己的 CR3 下也不能访问其中的内核数据和页表。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">uint32_t</span> *pd = (<span class="hljs-type">uint32_t</span> *)space-&gt;pages[<span class="hljs-number">0</span>];<br><span class="hljs-built_in">memcpy</span>(pd, (<span class="hljs-type">void</span> *)user_kernel_cr3, <span class="hljs-number">16</span> * <span class="hljs-keyword">sizeof</span>(<span class="hljs-type">uint32_t</span>));<br>pd[USER_CODE &gt;&gt; <span class="hljs-number">22</span>] = space-&gt;pages[<span class="hljs-number">1</span>] | <span class="hljs-number">7</span>;<br>pd[(USER_STACK - PAGE_BYTES) &gt;&gt; <span class="hljs-number">22</span>] = space-&gt;pages[<span class="hljs-number">2</span>] | <span class="hljs-number">7</span>;<br></code></pre></td></tr></table></figure>
+<p>PDE 256 对应用户代码起点，PDE 511 对应用户栈所在区间。<br>
+第 11 篇曾在 PDE 256 建立实验别名，本篇不能整张复制旧页目录，再把这条旧别名误当用户地址空间的一部分。<br>
+这里只继承明确需要的 16 个内核 PDE，用户项由各自私有页表重新建立。</p>
+<p>低地址共享还保证加载新 CR3 时，正在执行的内核代码、旧内核栈、新内核栈、GDT、TSS 与任务表都保持可访问。<br>
+如果新页表没有映射当前代码或栈，CR3 加载成功后的下一次取指或栈访问就可能失败，根本到不了后续切换指令。<br>
+恒等映射在这里是跨地址空间切换得以继续执行的前提。</p>
+<p>两个用户任务则在相同 VA 下使用不同的物理页：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">                  任务 A 的 CR3                  任务 B 的 CR3<br>低 64 MiB     →   共享 supervisor 映射      ←    相同内核映射<br>0x40000000    →   A 的代码物理页                  B 的代码物理页<br>0x40001000    →   A 的数据物理页                  B 的数据物理页<br>0x7ffff000    →   A 的用户栈物理页                B 的用户栈物理页<br></code></pre></td></tr></table></figure>
+<p>因此 <code>0x40001000</code> 的含义取决于当前 CR3。<br>
+一张地址截图不足以证明隔离，必须连同页表路径、物理页归属和正在运行的任务一起判断。</p>
+<h1>PDE 与 PTE 都要满足用户访问要求</h1>
+<p>本篇标志值 7 表示 present、writable、user，5 表示 present、user 而不 writable。<br>
+代码和数据共享同一张用户页表，但使用不同 PTE 权限：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs c">code_pt[<span class="hljs-number">0</span>] = space-&gt;pages[<span class="hljs-number">3</span>] | <span class="hljs-number">5</span>;<br>code_pt[<span class="hljs-number">1</span>] = space-&gt;pages[<span class="hljs-number">4</span>] | <span class="hljs-number">7</span>;<br>stack_pt[<span class="hljs-number">1023</span>] = space-&gt;pages[<span class="hljs-number">5</span>] | <span class="hljs-number">7</span>;<br></code></pre></td></tr></table></figure>
+<p>允许 CPL3 访问需要 PDE 和 PTE 的 user 条件同时满足。<br>
+只修改叶子 PTE 而上级 PDE 仍为 supervisor，用户访问仍会失败；把 PDE 设为 user 也不会自动让其中每个 PTE 都可访问。<br>
+代码 PDE 可写是为了容纳同页表中的数据页，代码 PTE 自己仍保持只读。</p>
+<p>当前为 IA-32 非 PAE 分页，没有 NX 位。<br>
+只读代码页禁止用户写入，但数据页和栈页不因此获得硬件不可执行属性，不能宣称已经实现完整 W^X。<br>
+本次运行检查页表中的只读位，坏写实验针对 supervisor 内核数据，不把它当作“写用户代码页”的额外实测。</p>
+<p>内核复制代码时使用 pages[3] 的低地址恒等别名。<br>
+这条 supervisor 映射允许内核写入，与用户代码 VA 的只读映射分别受各自 PTE 约束。<br>
+用户不能通过猜出这个物理地址绕过权限，因为低 64 MiB 的页目录项仍是 supervisor。</p>
+<h1>GDT 加入用户段和一个 32 位 TSS</h1>
+<p>新 GDT 保留内核代码/数据段的原索引和属性，再加入 DPL3 代码段、DPL3 数据段与 TSS 描述符。<br>
+索引 3、4 加上 RPL3 后得到用户选择子 0x1b、0x23，TSS 使用索引 5 的选择子 0x28。<br>
+用户代码和数据段沿用平坦地址空间，真正的每任务内存归属主要由分页决定。</p>
+<p>TSS 不是本篇的任务切换保存区。<br>
+软件仍然使用第 13 篇的 <code>switch_context</code>，TSS 只提供 CPU 从用户态进入 ring 0 时需要的内核栈，以及 I/O 权限相关配置。<br>
+每个 CPU 一个 TSS 足够当前单 CPU 环境使用，每次调度更新其中的 ESP0。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">tss32</span> &#123;</span><br>    <span class="hljs-type">uint32_t</span> words[<span class="hljs-number">25</span>];<br>    <span class="hljs-type">uint16_t</span> trap, iomap;<br>&#125; __attribute__((packed));<br></code></pre></td></tr></table></figure>
+<p>静态断言要求 TSS 为 104 字节，I/O map base 字段偏移 102。<br>
+<code>words[1]</code> 对应 ESP0，<code>words[2]</code> 对应 SS0，后者设为内核数据选择子 0x10。<br>
+描述符 limit 为 103，即结构最后一个合法字节；GDT 载入后用 LTR 加载任务寄存器。</p>
+<p>I/O map base 设为 104，位于 TSS limit 之外，当前没有给用户开放任何有效的 I/O 许可位图。<br>
+配合用户初始 IOPL=0，用户执行受检 OUT 会产生一般保护异常。<br>
+这不是“用户自行选择不访问端口”的约定，权限由处理器检查。</p>
+<h1>切换任务时同时更新 CR3 和 ESP0</h1>
+<p>调度器选中 next 后、执行普通栈切换前调用 <code>user_switch()</code>。<br>
+用户任务传入私有页目录，普通内核任务回退到保存的 <code>user_kernel_cr3</code>。<br>
+ESP0 则更新为将要运行任务的内核栈顶；bootstrap 使用既有启动栈顶。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs c">user_tss.words[<span class="hljs-number">1</span>] = stack_top &gt; PAGE_BYTES<br>    ? stack_top : (<span class="hljs-type">uint32_t</span>)&amp;__stack_top;<br><span class="hljs-keyword">if</span> (!pd) pd = user_kernel_cr3;<br>__asm__ <span class="hljs-title function_">volatile</span><span class="hljs-params">(<span class="hljs-string">&quot;mov %0,%%cr3&quot;</span> : : <span class="hljs-string">&quot;r&quot;</span>(pd) : <span class="hljs-string">&quot;memory&quot;</span>)</span>;<br></code></pre></td></tr></table></figure>
+<p>CR3 决定用户 VA 的映射，ESP0 决定下一次从用户态进入内核时 CPU 选择哪张栈。<br>
+漏改 CR3 可能让 A 访问 B 的数据；漏改 ESP0 可能让 B 的下一次中断帧覆盖 A 的内核栈。<br>
+只核对其中一项，不能证明用户任务上下文切换完整。</p>
+<p>这段操作处在 IF=0 的调度临界区，加载新 CR3 与切换 ESP 之间不会插入普通 IRQ。<br>
+两者之间仍短暂使用旧内核栈，而新地址空间保留低 64 MiB 恒等映射，所以旧栈继续有效。<br>
+本篇没有实现 PCID、跨 CPU TLB 同步或用户页动态解除映射。</p>
+<h1>用 IRETD 建立第一次用户执行</h1>
+<p>首次用户任务仍先通过普通 trampoline 到达 <code>task_start()</code>，随后调用 <code>enter_user(USER_CODE, USER_STACK)</code>。<br>
+该汇编入口读取参数、切换数据段选择子，并构造一次返回到更低权限的硬件返回帧：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><code class="hljs nasm">cli<br>mov ecx, [esp+4]<br>mov edx, [esp+8]<br>mov ax, 0x23<br>mov ds, ax<br>mov es, ax<br>mov fs, ax<br>mov gs, ax<br>push dword 0x23<br>push edx<br>push dword 0x202<br>push dword 0x1b<br>push ecx<br>iretd<br></code></pre></td></tr></table></figure>
+<p>压栈顺序是用户 SS、用户 ESP、EFLAGS、CS、EIP，IRETD 从低地址开始逆序消费。<br>
+EFLAGS=0x202 开启 IF，并保持 IOPL、NT、VM 为零；这样用户计算可被 PIT 打断，又不能获得 ring 0 的 I/O 权限。<br>
+这里不会用普通 RET 改变 CPL，也没有让用户代码自行修改 CS 完成降权。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">当前内核 ESP → EIP = 0x40000000<br>               CS  = 0x1b<br>               EFLAGS = 0x202<br>               用户 ESP = 0x80000000<br>               用户 SS  = 0x23<br></code></pre></td></tr></table></figure>
+<p>用户入口是手写汇编字节，不是普通 C 函数。<br>
+它没有 CALL 建立的返回地址，也不依赖宿主 libc；用户栈虽然已经映射，当前计数代码不靠 C 局部变量验证深层用户调用栈。<br>
+将来运行用户 C 程序时，还需要独立的 <code>_start</code> 与调用对齐协议，不能把这个 IRETD 入口直接当成 main。</p>
+<h1>用户中断在内核栈上多保存八字节</h1>
+<p>用户代码被 IRQ0 打断时，CPU 根据 TSS.SS0/ESP0 切到当前任务的内核栈，再保存用户 SS、ESP 和返回状态。<br>
+汇编共用入口继续补齐 vector/error、通用寄存器和段寄存器。<br>
+前 68 字节仍与第 07、14 篇的公共 frame 相同，尾部多出用户 ESP 和 SS，总长 76 字节。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">frame +  0 ... +64  原来的 68 字节公共现场<br>      + 68          用户 ESP<br>      + 72          用户 SS<br></code></pre></td></tr></table></figure>
+<p>只有 <code>(frame-&gt;cs &amp; 3) == 3</code> 时才读取这两个尾字段。<br>
+同 CPL 内核中断没有该尾部，按 76 字节固定读取会把其他栈内容误当 SS/ESP。<br>
+<code>task_user_trap()</code> 还要求完整尾部落在当前任务的内核栈页内，并核对 CR3 与任务记录相同。</p>
+<p>IRQ0 路径记录用户 frame 后仍返回普通时钟 handler，继续 tick、EOI 和最外层调度。<br>
+恢复时保留第 14 篇两层返回：RET 回内核调用续点，最后 IRETD 回 CPL3，并消费用户 SS/ESP。<br>
+这次硬件返回会更换到用户栈，不能只按同 CPL 的 EIP/CS/EFLAGS 三项解释。</p>
+<p>GDB 在真实 <code>task_user_trap</code> 入口读取 19 个四字节字段。<br>
+脚本要求现场 CS=0x1b、用户 SS=0x23、用户 ESP=0x80000000，当前处理器已经是 CS=0x08、SS=0x10。<br>
+还要核对 frame 尾部恰好到达任务内核栈顶、TSS.ESP0 等于该栈顶、CR3 指向该任务私有页目录。</p>
+<p>本次 IRQ0 样本属于任务 1：frame 位于 <code>0x127fb4</code>，加 76 字节恰好到栈顶 <code>0x128000</code>，TSS.ESP0 也为 <code>0x128000</code>，CR3 为 <code>0x121000</code>。<br>
+保存的用户 CS/SS 为 <code>0x1b/0x23</code>，处理中 CPU 的 CS/SS 为 <code>0x08/0x10</code>；用户 ESP 为 <code>0x80000000</code>。<br>
+这项检查证明真实权限切换已经发生，而不只是代码写入了一个准备以后使用的 GDT 或 TSS。</p>
+<h1>相同虚拟地址的两个计数都增长</h1>
+<p>内嵌用户程序持续递增 <code>0x40001000</code>，每轮使用同一组绝对虚拟地址。<br>
+数据页同时包含实验模式、就绪标志、观察释放门、内核哨兵地址和已经发生用户 IRQ 的标记。<br>
+这些字段构成本篇专用实验协议，没有扩展成通用进程 ABI。</p>
+<p>用户计数达到阈值后仍需等待释放门和真实用户 IRQ 标记，才进入故障动作。<br>
+检查器临时将两份物理数据页里的释放门清零，使它们都留在计算循环，避免坏任务过早退出。<br>
+调试器控制故障何时放行，不替用户调用 yield，也不代替时钟产生任务切换。</p>
+<p>脚本执行两次 0.3 秒自由运行采样，要求 A、B 都增长。<br>
+然后在用户地址 <code>0x40000000</code> 设置临时硬件断点，实际停在 CPL3 指令，核对当前 CR3 与通过该 CR3 读取的 <code>0x40001000</code> 等于当前任务私有物理数据。<br>
+仅从内核恒等别名读出两个整数还不够，这一步把物理归属与实际用户访问连接起来。</p>
+<p>本次两次自由运行样本中，A 从 27709051 增至 51195437，B 从 21856827 增至 46478524。<br>
+随后用户指令断点读到 CPL3 和当前私有 CR3，用户数据 VA 的值与该任务物理数据页一致。<br>
+宿主窗口受 TCG、调试停顿与宿主调度影响，数据用于证明进展，不是吞吐或公平性基准。<br>
+完成观察后释放两道门，用户代码才继续本轮受控故障。</p>
+<h1>只把来自用户态的 PF 和 GP 转为任务退出</h1>
+<p>异常分派先根据保存的 CS 判断来源。<br>
+用户来源进入 <code>task_user_trap()</code>，当前只对向量 13 和 14 记录错误并请求结束当前任务；其他向量继续原有分派。<br>
+内核来源继续第 07、11 篇的诊断或特定页故障修复路径，不因当前恰好有用户任务而被伪装成用户错误。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-keyword">if</span> (frame-&gt;<span class="hljs-built_in">vector</span> != <span class="hljs-number">13</span> &amp;&amp; frame-&gt;<span class="hljs-built_in">vector</span> != <span class="hljs-number">14</span>) <span class="hljs-keyword">return</span> <span class="hljs-number">0</span>;<br>t-&gt;user_fault = frame-&gt;<span class="hljs-built_in">vector</span>;<br>t-&gt;user_error = frame-&gt;error;<br>t-&gt;user_eip = frame-&gt;eip;<br>t-&gt;user_address = address;<br>t-&gt;user_stop = <span class="hljs-number">1</span>;<br><span class="hljs-keyword">return</span> <span class="hljs-number">1</span>;<br></code></pre></td></tr></table></figure>
+<p>退出请求没有在 handler 中立刻释放内存。<br>
+统一 trap 出口先把深度减到零，再检查 <code>user_stop</code>，调用 <code>task_exit()</code> 标 DEAD 并切走。<br>
+该异常现场不再 IRETD 回到出错指令，因此不会不断重复同一条非法写或特权操作。</p>
+<p>CR2 仅在页故障解释中表示本次出错线性地址。<br>
+通用记录函数收到 CR2，不代表 GP 的 CR2 也有对应含义；GP 实验应核对向量、错误码和 EIP。<br>
+未实现用户非法指令、除零等异常的通用退出策略，也没有把 NMI 或双重故障纳入可恢复范围。</p>
+<h1>三轮故障分别检查页面与指令权限</h1>
+<p>每轮重新创建 A、B，A 保持普通计数，B 使用不同模式。<br>
+第一轮 B 将 <code>0xbadbad00</code> 写向内核哨兵地址，该页面 present 但属于 supervisor，预期得到 #PF，错误码 7。<br>
+低三位分别表示保护违规、写访问、用户访问；同时 CR2 应等于哨兵地址，哨兵保持 <code>0x51a7cafe</code>。</p>
+<p>第二轮 B 执行 CLI。<br>
+用户 CPL3 高于 IOPL0，预期产生 #GP(0)，不能真正关闭整个内核的普通中断。<br>
+第三轮 B 执行 <code>out 0x80, al</code>，当前 IOPL 与 TSS I/O 设置不允许该端口访问，同样预期 #GP(0)。</p>
+<p>脚本不只检查向量数组为 <code>14,13,13</code> 和错误码 <code>7,0,0</code>。<br>
+内核根据内嵌汇编中三个故障标签相对 <code>user_blob_start</code> 的偏移，计算实际用户 EIP，逐轮核对异常确实发生在预定指令。<br>
+这样可以排除程序尚未跑到测试动作，就因其他入口错误提前失败的情形。</p>
+<p>每轮 B 结束以后，再观察至少四个 tick，要求 A 的计数继续增长。<br>
+只看到 B 变为 DEAD 不能证明其他任务幸存；若页表回收或错误的栈切换破坏了 A，后续进展检查会失败。<br>
+本次三轮实测分别为：</p>
+<table>
+<thead>
+<tr>
+<th>错误操作</th>
+<th>向量 / 错误码</th>
+<th>用户 EIP</th>
+<th>B 退出后 A 增量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>写内核哨兵</td>
+<td>#PF / 7</td>
+<td>0x4000004a</td>
+<td>2042584</td>
+</tr>
+<tr>
+<td>CLI</td>
+<td>#GP / 0</td>
+<td>0x40000052</td>
+<td>2135467</td>
+</tr>
+<tr>
+<td>OUT 0x80, AL</td>
+<td>#GP / 0</td>
+<td>0x40000057</td>
+<td>2244561</td>
+</tr>
+</tbody>
+</table>
+<p>内核哨兵保持 <code>0x51a7cafe</code>，第一轮故障后的 bootstrap 已恢复内核 CR3。上述增量只用于确认幸存任务继续运行。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="day16-screen.png" alt="三个用户故障被隔离，幸存计数继续增长并完成回收的客体画面"></p>
+<h1>没有 exit 系统调用时由内核监督收尾</h1>
+<p>A 的用户程序没有主动返回内核的退出接口，正常模式只继续计数。<br>
+监督代码确认它在 B 出错后仍增长，就设置 A 的 <code>user_stop</code>，等待下一次符合协议的 trap 出口使其退出。<br>
+这是一段有限实验的内核控制，不是用户程序已经成功调用 exit。</p>
+<p>bootstrap 在本篇继续参加轮转，才能定期检查两个用户任务的状态。<br>
+等两者都 DEAD 后关闭实验时钟并回到内核 CR3，再从 bootstrap 栈回收它们的私有页和内核栈。<br>
+销毁函数明确断言待释放页目录不等于当前 CR3，避免释放仍被硬件使用的页目录。</p>
+<p>共享的低地址页表不在 <code>space.pages[]</code> 所有权数组里，因此销毁只释放六张私有页。<br>
+另外释放对应内核栈，合计每任务七页、每轮十四页。<br>
+三轮先后创建和回收六个任务，累计归还 42 张私有分配；不是同一时刻持有 42 页。</p>
+<p>内核栈回收仍检查 canary、trap_depth、preempt_count 和填充值修改范围。<br>
+76 字节用户 trap 与后续 C 调用会占用内核栈，不能沿用同 CPL 版本的栈扫描结果。<br>
+填充与 canary 依然只是有限诊断，不构成 guard page 或最坏深度保证。</p>
+<h1>七处分配失败都不能发布半成品任务</h1>
+<p>地址空间构造从清零所有权数组开始，每成功分配一页就保存地址。<br>
+六张页中任何一步失败，销毁函数只归还已经取得的页并清零记录，然后返回失败。<br>
+第七次分配是内核栈；若此处失败，调用者继续销毁已经完整建立但尚未发布的用户地址空间。</p>
+<p>任务对象先以 DEAD 状态填充，地址空间和栈都准备好后才改成 RUNNABLE。<br>
+否则 PIT 可能选中一份尚无有效 CR3 或入口栈的对象。<br>
+当前构造调用在既定内核协议下执行，没有异步用户加载或并行创建路径。</p>
+<p><code>user_fail_after</code> 从零到六依次触发七个失败点。<br>
+每次要求创建返回失败、空闲页数等于初始值、任务槽仍 DEAD、内核栈和私有页目录记录为空。<br>
+最后恢复正常分配路径，真正创建两个任务并确认页数减少十四。</p>
+<p>这覆盖创建过程的部分成功回滚，不等于本篇再次实际耗尽所有物理内存。<br>
+底层页分配耗尽属于此前章节的独立检查，故障注入用于稳定覆盖每一个不同回滚位置。<br>
+本次七个分配失败点全部通过回滚检查，三轮回收六个任务后空闲页恢复为 16063，最后两张内核栈的填充扫描均为 228 字节。<br>
+所有已退出任务的六张私有页记录和内核栈字段均清零，共享内核映射继续保留。</p>
+<p>当前内核文件为 37140 字节，镜像头记录内存占用 61008 字节，仍在 65536 字节装载上限内。<br>
+新增 <code>user.c</code> 单独使用 <code>-Os</code>，页表继续运行时按页分配，没有通过扩大装载边界或放置 BSS 大页表数组容纳增量。</p>
+<p>本篇结束以后继续进入第 15 篇的持久键盘任务路径。<br>
+用户实验的私有分配已经归还，键盘任务仍会申请并长期持有自己的内核栈页，不能把交互态描述成零任务页占用。</p>
+<h1>下载与复现</h1>
+<p><a href="os-day-16.zip">下载第 16 篇完整源码</a>。<br>
+冻结源码提交为 <code>802fb4a7a368b5caf949474a4a8d90b61a29ebbd</code>；仓库实现目录为 <code>examples/build-an-os</code>，附件将目录内容直接放在 <code>os-day-16</code> 内。<br>
+继续使用既有工具链镜像，顺序运行：</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs sh">unzip os-day-16.zip<br><span class="hljs-built_in">cd</span> os-day-16<br>podman run --<span class="hljs-built_in">rm</span> -v <span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>:/work&quot;</span> -w /work localhost/build-an-os:day01 make build check-user<br>podman run --<span class="hljs-built_in">rm</span> -v <span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>:/work&quot;</span> -w /work localhost/build-an-os:day01 make check<br></code></pre></td></tr></table></figure>
+<p>检查脚本为 <code>tools/check-user.sh</code>，三轮故障都在正常镜像 <code>build/mbr.img</code> 内受控执行。<br>
+串口、GDB、QEMU 输出分别保存在 <code>build/user-serial.txt</code>、<code>build/user-gdb.txt</code>、<code>build/user-qemu.txt</code>，截图为 <code>build/day16-screen.png</code>。<br>
+各检查共用容器 loopback 的 GDB 1234 端口，应顺序运行。</p>
+<p>本轮定向 <code>check-user</code> 与最终累计 <code>make check screenshot help</code> 均退出 0，包含三个实际故障 EIP 核对和此前章节回归。<br>
+源码附件独立解压验证为 <code>make check 退出 0，包含用户态隔离与全部累计检查</code>，实现边界与运行数据见源码内 <code>docs/day16-evidence.md</code>。</p>
+<p>用户代码现在不能直接写 supervisor 页面或执行受检特权操作，但也还不能主动请求内核输出数据。<br>
+第 17 篇将增加受控系统调用入口，让用户程序在参数检查之后使用内核能力。</p>
+<h1>练习</h1>
+<ol>
+<li>手算 0x40000000、0x40001000、0x7ffff000 的 PDE/PTE 索引，解释代码和数据为什么可以共享页表但保持不同写权限。</li>
+<li>分别画出 ring 0 IRQ 与 ring 3 IRQ 的 68/76 字节现场，说明 CPU 从用户态进入中断时为什么必须使用 TSS.ESP0。</li>
+<li>对照第七处分配失败与正常任务退出，指出两条路径由谁回收六张地址空间页，以及为什么都不能销毁当前正在使用的 CR3。</li>
+</ol>
+<p>上一篇：<a href="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-15-%E7%AD%89%E5%BE%85%E4%B8%8E%E5%94%A4%E9%86%92/">15 - 等待与唤醒</a>。</p>
+<p>下一篇：17 - 系统调用：在受控入口里使用内核能力。</p>
+<h1>参考资料</h1>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://cdrdv2-public.intel.com/825758/253668-sdm-vol-3a.pdf">Intel SDM Vol. 3A</a>：保护模式权限、分页访问检查、TSS、I/O 权限和不同 CPL 的中断/异常现场。</li>
+<li><a target="_blank" rel="noopener" href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html">Intel Software Developer Manuals</a>：LTR、IRETD、CLI、OUT 与控制寄存器指令规则。</li>
+<li><a target="_blank" rel="noopener" href="https://www.uclibc.org/docs/psABI-i386.pdf">Intel386 System V psABI 1.0</a>：本篇内核 C 调用仍遵守的寄存器与栈约定；手写用户入口尚未提供完整用户 C 启动环境。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-16-%E8%BF%9B%E5%85%A5%E7%94%A8%E6%88%B7%E6%80%81/">https://magicliang.github.io/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-16-%E8%BF%9B%E5%85%A5%E7%94%A8%E6%88%B7%E6%80%81/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F/">操作系统</a><a class="post-meta__tags" href="/tags/x86/">x86</a><a class="post-meta__tags" href="/tags/%E7%94%A8%E6%88%B7%E6%80%81/">用户态</a></div><div class="post-share"><div class="social-share" data-image="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-16-%E8%BF%9B%E5%85%A5%E7%94%A8%E6%88%B7%E6%80%81/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-15-%E7%AD%89%E5%BE%85%E4%B8%8E%E5%94%A4%E9%86%92/" title="从零编写操作系统 15 - 等待与唤醒：任务为什么不能一直轮询"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-15-%E7%AD%89%E5%BE%85%E4%B8%8E%E5%94%A4%E9%86%92/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-08</div><div class="info-item-2">从零编写操作系统 15 - 等待与唤醒：任务为什么不能一直轮询</div></div><div class="info-2"><div class="info-item-1">第 14 篇已经能用时钟轮转两个计算任务，但没有输入时，键盘消费者没有可处理的数据。 反复取得时间片再检查空队列，只会重复得到同一个结果。 本篇增加 BLOCKED 状态：消费者登记等待条件后退出就绪集合，生产者改变条件时再把它变回 RUNNABLE。 关键问题发生在检查条件与登记等待之间。 若输入恰好在这段间隙到达，生产者可能发现没有等待者，随后消费者却仍按旧结果进入阻塞，形成“条件已经满足，任务仍然睡着”的丢失唤醒。 实验用真实 PIT 中断分别制造错误顺序和受保护顺序，再把同一套等待接口接到定时睡眠、idle 与持续运行的键盘任务。  阻塞任务暂时退出就绪集合 RUNNABLE 表示可以执行，BLOCKED 表示正在等某项外部条件。 两者都可能保留完整调用栈，但调度器只从 RUNNABLE 中选下一个任务。 时钟每次到来不应把所有 BLOCKED 任务重新置为就绪，否则每个任务仍要定期醒来轮询。 123456789运行中的消费者    │ 条件不满足：登记等待，保存调用续点    ▼BLOCKED ── 生产者改变条件并唤醒 ──→ RUNNABLE            ...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-03-%E4%B8%A4%E9%98%B6%E6%AE%B5%E5%BC%95%E5%AF%BC/" title="从零编写操作系统 03 - 两阶段引导：加载比一个扇区更大的程序"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-03-%E4%B8%A4%E9%98%B6%E6%AE%B5%E5%BC%95%E5%AF%BC/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 03 - 两阶段引导：加载比一个扇区更大的程序</div></div><div class="info-2"><div class="info-item-1">第 02 篇的启动扇区已经能被 BIOS 执行，并在屏幕上显示启动盘编号。继续增加读盘、内存图和模式切换代码时，第一扇区的空间很快就会用完。本篇让第一阶段读取一个更大的第二阶段，再由第二阶段读取并校验载荷。 这一版读取 20000 字节的确定性测试数据，分两次放到低端内存，验证首尾标识与校验和后停机。载荷仍是数据，没有执行 C 内核，也没有进入保护模式。  本系列当前阶段在 QEMU pc-i440fx + SeaBIOS 环境开发与验证；对物理硬件或其他虚拟机的适配将在后续篇章讨论。 两次加载分别解决什么 BIOS 先读取 LBA 0。第一阶段只有 512 字节，末尾保留字节 55 aa，偏移 446–509 仍留给未来分区表。第二阶段占用 8 个扇区，第一阶段将其装入物理地址 0x8000 后远跳转。 12345678910BIOS -&gt; MBR at 0000:7c00          |          | INT 13h AH=42h: LBA 1..8          v        stage2 at 0000:8000          |     ...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-00-%E4%BB%8E%E5%90%AF%E5%8A%A8%E6%89%87%E5%8C%BA%E5%88%B0%E7%AA%97%E5%8F%A3/" title="从零编写操作系统 00 - 从启动扇区到窗口：这套操作系统准备实现什么"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-00-%E4%BB%8E%E5%90%AF%E5%8A%A8%E6%89%87%E5%8C%BA%E5%88%B0%E7%AA%97%E5%8F%A3/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 00 - 从启动扇区到窗口：这套操作系统准备实现什么</div></div><div class="info-2"><div class="info-item-1">这个系列准备从一个 512 字节启动扇区开始，逐步做出一个能运行用户程序、读取文件、响应键盘鼠标、显示窗口终端的教学操作系统。  路线故意选得朴素：x86 32 位、BIOS、C11、少量 NASM 汇编、QEMU 模拟 PC。它不是现代操作系统的完整复刻，也不追求真实机器兼容。它的目标是把“操作系统到底接管了什么”拆成一组可以运行、可以坏掉、可以诊断的实验。 最终目标是一条连续演示：从自制磁盘镜像启动，进入自制内核；打开一个终端窗口；运行 cat README.TXT；再运行 cat README.TXT | wc；最后运行一个 DEMO.EXE，它并发启动两个计数程序和一个故意越界访问的程序。越界程序应该被终止，两个计数程序继续前进，Shell 还能继续接收下一条命令。 这篇导读只给路线、边界和先修自测。首批配套项目提供工具链样例；自制内核尚未出现。后续每篇会在同一份代码上增加一个可观察能力，并给出构建命令、运行日志和故障实验。 最终系统长什么样 先用一张目标图定住边界。图里的“目标”表示后续实现完成后的结构，不是当前已经跑通的截图。 12345678910111213141...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-05-%E8%B7%B3%E8%BF%9B-C/" title="从零编写操作系统 05 - 跳进 C：入口、链接脚本与内存布局"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-05-%E8%B7%B3%E8%BF%9B-C/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 05 - 跳进 C：入口、链接脚本与内存布局</div></div><div class="info-2"><div class="info-item-1">第 04 篇的保护模式入口停在一段 32 位汇编里。本篇从这里继续，把磁盘中的真实内核复制到物理地址 0x100000，准备 BSS 和栈，再调用 kernel_main。 屏幕上的 KERNEL_MAIN OK 有几个前提：已初始化全局变量保持原值，未初始化全局变量为零，普通函数调用能返回，BootInfo 指针和调用栈符合约定。这些条件都在本篇镜像里检查；另一个故障镜像故意跳过 BSS 清零，输出 KERNEL BSS FAIL。  编译器不负责启动内核 GCC 生成指令，链接器安排地址，磁盘读取和运行环境由启动代码提供。-ffreestanding 选择独立环境，不能代替加载器，也不会附带完整标准库。普通应用依赖的启动对象、进程栈和零初始化内存，在这里都需要有明确来源。 第 03、04 篇的 payload 是 20000 字节测试数据。本篇将它替换为 C 和汇编编译得到的 kernel.elf，再经 objcopy -O binary 得到平坦文件。第二阶段仍读取固定 LBA 的镜像头与 payload，不解析 ELF 的 program headers。 1234567...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-12-%E5%86%85%E6%A0%B8%E5%A0%86/" title="从零编写操作系统 12 - 内核堆：在物理页内分配、分裂与合并"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-12-%E5%86%85%E6%A0%B8%E5%A0%86/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 12 - 内核堆：在物理页内分配、分裂与合并</div></div><div class="info-2"><div class="info-item-1">物理页分配器每次交出 4096 字节，队列节点、字符串和小结构体却通常用不满一页。 本篇在已经建立恒等映射的物理页内实现 kmalloc 和 kfree，按请求长度分配空间，并在释放时合并相邻空闲块。 堆最多持有四个独立页面，返回地址按 16 字节对齐，单次请求上限为 4076 字节。 实验继续运行在单 CPU、64 MiB RAM 的 qemu32 环境中，所有代码位于 ring 0。 正常镜像验证不同大小的读写、真实耗尽和回收；独立故障镜像破坏对象尾部标记，记录拒绝结果后主动进入诊断停机。 尾部标记由软件检查，越界写入发生时不会因此自动产生硬件异常。  页分配和字节分配各自管理什么 page_alloc() 依据 E820 和保留区规则选择可用物理页，返回物理地址。 它只记录页面归属，不知道页内有几个对象，也不知道其中某个对象申请了多少字节。 如果一个 17 字节对象独占一页，剩余空间仍然被这次页分配占用。 堆从页分配器取得整页，再用块头描述页内区间。 同一页可以同时容纳多个对象，释放一个对象后，其他对象继续有效。 分页还提供了另一项必要条件：这些物理字节必须能被当前虚拟地址...</div></div></div></a><a class="pagination-related" href="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-13-%E4%BF%9D%E5%AD%98%E4%B8%8E%E6%81%A2%E5%A4%8D%E6%89%A7%E8%A1%8C%E7%8E%B0%E5%9C%BA/" title="从零编写操作系统 13 - 保存与恢复执行现场：先实现协作式任务"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-13-%E4%BF%9D%E5%AD%98%E4%B8%8E%E6%81%A2%E5%A4%8D%E6%89%A7%E8%A1%8C%E7%8E%B0%E5%9C%BA/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-08</div><div class="info-item-2">从零编写操作系统 13 - 保存与恢复执行现场：先实现协作式任务</div></div><div class="info-2"><div class="info-item-1">第 12 篇已经能按字节分配内核对象，但执行路径仍沿着同一份调用栈推进。 普通函数 A 调用 B 后，只有 B 返回，A 才能继续；如果 B 一直计算，其他工作就无法通过这条调用链取得 CPU。 本篇为两个内核任务各分配一张栈页，让任务在 task_yield() 处暂停，并在以后从同一次调用之后继续。 正常实验要求 A、B 各完成 128 轮计数，跨切换保留局部数组、被调用者保存寄存器和各自的中断允许状态，退出后归还两张栈页。 另一个镜像让 A 永远不调用 yield，检查 B 虽然已经就绪，计数仍然停在零。 这套实现只在单 CPU、ring 0、普通函数调用边界切换，没有时钟抢占，也没有独立用户地址空间。  暂停的调用链需要独立栈 函数调用会把返回位置放到栈上，局部变量与被保存的寄存器也可能占用栈空间。 若把一个执行中的函数暂停，再让另一个函数在同一片空间从头建立调用栈，前一个函数恢复时就可能读到被覆盖的数据。 独立栈使两条尚未结束的调用链能够同时保存在内存里；单 CPU 在任意时刻仍只执行其中一条。 第 10 篇的 page_alloc() 每次返回一张 4096 字节物理...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">CPU 权限和页面权限分别限制什么</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">六张私有页描述一个用户地址空间</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">只共享低 64 MiB 内核映射</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">PDE 与 PTE 都要满足用户访问要求</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">GDT 加入用户段和一个 32 位 TSS</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">切换任务时同时更新 CR3 和 ESP0</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">用 IRETD 建立第一次用户执行</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">用户中断在内核栈上多保存八字节</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">9.</span> <span class="toc-text">相同虚拟地址的两个计数都增长</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">10.</span> <span class="toc-text">只把来自用户态的 PF 和 GP 转为任务退出</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">11.</span> <span class="toc-text">三轮故障分别检查页面与指令权限</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">12.</span> <span class="toc-text">没有 exit 系统调用时由内核监督收尾</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">13.</span> <span class="toc-text">七处分配失败都不能发布半成品任务</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">14.</span> <span class="toc-text">下载与复现</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">15.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">16.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
