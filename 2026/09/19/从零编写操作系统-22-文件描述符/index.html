@@ -1,0 +1,737 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>从零编写操作系统 22 - 文件描述符：把名字、游标与资源寿命分开 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="第 21 篇已经能在 FAT16 根目录中查找文件，并按指定 offset 读取字节。这个接口仍然不适合直接交给用户程序：调用者每次都要提供文件元数据和位置，内核也无法回答某个进程打开了哪些资源、两个调用是否应当共享读取位置，以及进程异常退出后由谁释放资源。 本篇增加两级句柄结构。每个进程拥有 8 个文件描述符槽，槽中保存对全局 open-file 对象的引用；open-file 对象保存类型、读">
+<meta property="og:type" content="article">
+<meta property="og:title" content="从零编写操作系统 22 - 文件描述符：把名字、游标与资源寿命分开">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-22-%E6%96%87%E4%BB%B6%E6%8F%8F%E8%BF%B0%E7%AC%A6/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="第 21 篇已经能在 FAT16 根目录中查找文件，并按指定 offset 读取字节。这个接口仍然不适合直接交给用户程序：调用者每次都要提供文件元数据和位置，内核也无法回答某个进程打开了哪些资源、两个调用是否应当共享读取位置，以及进程异常退出后由谁释放资源。 本篇增加两级句柄结构。每个进程拥有 8 个文件描述符槽，槽中保存对全局 open-file 对象的引用；open-file 对象保存类型、读">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-22-%E6%96%87%E4%BB%B6%E6%8F%8F%E8%BF%B0%E7%AC%A6/cover.svg">
+<meta property="article:published_time" content="2026-09-19T15:30:00.000Z">
+<meta property="article:modified_time" content="2026-09-19T11:17:03.284Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="x86">
+<meta property="article:tag" content="操作系统">
+<meta property="article:tag" content="文件描述符">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-22-%E6%96%87%E4%BB%B6%E6%8F%8F%E8%BF%B0%E7%AC%A6/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "从零编写操作系统 22 - 文件描述符：把名字、游标与资源寿命分开",
+  "url": "https://magicliang.github.io/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-22-%E6%96%87%E4%BB%B6%E6%8F%8F%E8%BF%B0%E7%AC%A6/",
+  "image": "https://magicliang.github.io/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-22-%E6%96%87%E4%BB%B6%E6%8F%8F%E8%BF%B0%E7%AC%A6/cover.svg",
+  "datePublished": "2026-09-19T15:30:00.000Z",
+  "dateModified": "2026-09-19T11:17:03.284Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-22-%E6%96%87%E4%BB%B6%E6%8F%8F%E8%BF%B0%E7%AC%A6/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '从零编写操作系统 22 - 文件描述符：把名字、游标与资源寿命分开',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">760</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">883</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">16</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="not-top-img" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">从零编写操作系统 22 - 文件描述符：把名字、游标与资源寿命分开</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav></header><main class="layout" id="content-inner"><div id="post"><div id="post-info"><h1 class="post-title">从零编写操作系统 22 - 文件描述符：把名字、游标与资源寿命分开</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-19T15:30:00.000Z" title="Created 2026-09-19 23:30:00">2026-09-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-19T11:17:03.284Z" title="Updated 2026-09-19 19:17:03">2026-09-19</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%9F%BA%E7%A1%80%E8%AE%BE%E6%96%BD/">基础设施</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.5k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>12mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-19 19:17:03&quot;}" hidden></div><p>第 21 篇已经能在 FAT16 根目录中查找文件，并按指定 offset 读取字节。这个接口仍然不适合直接交给用户程序：调用者每次都要提供文件元数据和位置，内核也无法回答某个进程打开了哪些资源、两个调用是否应当共享读取位置，以及进程异常退出后由谁释放资源。</p>
+<p>本篇增加两级句柄结构。每个进程拥有 8 个文件描述符槽，槽中保存对全局 open-file 对象的引用；open-file 对象保存类型、读写能力、引用计数、文件 offset 和 FAT 元数据。FAT 文件与物理终端由同一组 <code>open/read/fd_write/close</code> 系统调用访问，但各自拒绝不支持的操作。</p>
+<p>实验不只验证 <code>README.TXT</code> 能读出来。两次独立打开必须拥有不同 offset，父子进程显式映射同一个对象时必须共享 offset；正常退出和页故障退出都要在成为 ZOMBIE 前关闭 fd。另一个镜像连续制造六次 ELF 分配失败和一次内核栈失败，检查暂存引用是否全部回滚。终端实验则通过 QEMU HMP 注入真实 PS/2 按键，确认用户进程在 <code>int 0x80</code> 内阻塞，PIT 和 idle 仍能继续运行。</p>
+<span id="more"></span>
+<h2 id="一个整数不能保存全部文件状态">一个整数不能保存全部文件状态</h2>
+<p>文件描述符只是进程内的小整数。POSIX 对 open file description 的定义把另一组状态放在整数背后的对象里：当前 offset、访问模式和文件状态属于该对象；一个对象可以被多个 fd 引用。每次 <code>open()</code> 创建新对象，<code>dup()</code> 或进程继承则让多个 fd 指向同一对象。</p>
+<p>本项目采用同样的分层，但不宣称实现 POSIX：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs text">task.fds[0..7] ──一个槽持有一个引用──&gt; open_file[0..6]<br>                                           ├─ type<br>                                           ├─ refs<br>                                           ├─ readable / writable<br>                                           ├─ offset<br>                                           └─ FAT 元数据或终端后端<br></code></pre></td></tr></table></figure>
+<p>两张表承担不同责任。fd 表决定“当前进程用哪个整数访问对象”，所以关闭 fd 只清当前进程的槽；open-file 表决定“这次打开的状态是什么”，所以共享它的父子进程看到同一个 offset。FAT 目录项只描述磁盘上的文件，不保存任何进程的读取位置。</p>
+<p>全局表只有 7 个对象不是硬件限制。这个值刻意小于单进程的 8 个 fd 槽，专项实验可以分别触发两种耗尽：fd 表满返回 <code>EMFILE</code>；清出一个 fd 槽但仍让 7 个对象存活，再次打开返回 <code>ENFILE</code>。把两类错误分开后，诊断才能指出耗尽的是进程命名空间还是系统对象池。</p>
+<p>可迁移的设计规则是把“名字”和“被命名对象”分开。名字属于使用者，对象保存共享状态，引用计数只管理对象寿命。页表映射、socket 句柄和窗口句柄都会遇到相同的问题。</p>
+<h2 id="open-建立一条所有权链"><code>open</code> 建立一条所有权链</h2>
+<p><code>SYS_OPEN=6</code> 接收用户路径和 flags。当前 FAT 只支持 ASCII 8.3 文件名及只读访问，因此非零 flags 返回 <code>EINVAL</code>，路径超过 15 字节返回 <code>ENAMETOOLONG</code>。路径逐字节通过 <code>copy_from_user</code> 复制，内核不会直接解引用 CPL3 地址。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-keyword">if</span> (!task_fd_has_free_current())<br>    <span class="hljs-keyword">return</span> -FILE_EMFILE;<br><br><span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">open_file</span> *<span class="hljs-title">file</span>;</span><br><span class="hljs-type">int</span> result = file_open(path, flags, &amp;file);<br><span class="hljs-keyword">if</span> (result)<br>    <span class="hljs-keyword">return</span> result;<br><br><span class="hljs-type">int</span> fd = task_fd_install_current(file);<br><span class="hljs-keyword">if</span> (fd &lt; <span class="hljs-number">0</span>)<br>    file_put(file);<br><span class="hljs-keyword">return</span> fd;<br></code></pre></td></tr></table></figure>
+<p>顺序不能颠倒。先确认本进程还有 fd 槽，可避免明知无法安装时仍访问磁盘；FAT 查找成功后才分配 open-file；若安装 fd 失败，调用者持有的初始引用必须立即归还。<code>task_fd_install_current()</code> 还断言对象非空，避免把写入空槽误报成一次成功安装。</p>
+<p>成功时使用最低空闲 fd。根演示进程启动后，0 是终端输入，1 和 2 指向同一个终端输出对象；第一次打开文件因此返回 3。关闭中间槽后再次打开会复用该整数，但原对象只在最后一个引用消失时释放。</p>
+<p>当前 <code>SYS_WRITE=1(buffer,length)</code> 暂时保留，用于复跑第 17、19 篇的旧用户程序；新的描述符接口使用 <code>SYS_FD_WRITE=8(fd,buffer,length)</code>。这两个调用号并存是迁移期设计，不是 Linux i386 ABI。</p>
+<h2 id="用户地址在后端产生副作用前完成验证">用户地址在后端产生副作用前完成验证</h2>
+<p><code>read(fd, buffer, count)</code> 要写用户内存，因此逐页检查目标页存在且带用户可写权限；<code>fd_write</code> 只读取用户内存，代码页虽然只读，仍可作为合法源缓冲。两条路径都先检查 <code>address + count</code> 是否溢出、每页是否属于用户空间，以及 <code>count</code> 是否超过单次 256 字节上限。</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-keyword">if</span> (!user_range_ok(current_cr3(), address, length, <span class="hljs-number">1</span>))<br>    <span class="hljs-keyword">return</span> -ERR_EFAULT;<br><br><span class="hljs-type">uint8_t</span> bytes[FILE_IO_MAX];<br><span class="hljs-type">int</span> result = file_read(file, bytes, length);<br><span class="hljs-keyword">if</span> (result &gt; <span class="hljs-number">0</span>)<br>    KASSERT(copy_to_user(address, bytes, result));<br></code></pre></td></tr></table></figure>
+<p>读取先进入有界内核缓冲，再一次性 copyout。坏目标地址不会提前消费终端字符，也不会推进文件 offset。写终端时同样先把完整源范围复制进内核；若第二页缺失，屏幕和串口不会留下第一页面的输出前缀。</p>
+<p>零长度调用沿用第 17 篇的契约：有效 fd 返回 0，不检查未使用的地址；坏 fd 仍先返回 <code>EBADF</code>。专项镜像覆盖了低地址、只读目标页、跨入未映射页、32 位长度溢出和超过 256 字节上限。五个用户地址错误都返回到调用者，没有把可恢复的参数错误升级为页故障。</p>
+<p>这类接口应把验证放在第一个不可逆副作用之前。对文件是 offset 提交，对终端是消费输入或产生输出；后续的 pipe 则还包括改变缓冲区读写位置和唤醒对端。</p>
+<h2 id="短读-eof-和-offset-提交">短读、EOF 和 offset 提交</h2>
+<p>FAT 后端调用第 21 篇留下的 <code>fat_read_at(file, offset, buffer, length)</code>。只有返回正数后，open-file 的 offset 才增加实际字节数；返回 0 表示已经到达 EOF，负数表示错误。一次调用少于请求长度是合法短读，不能被用户程序直接当成失败。</p>
+<p>测试文件是 1479 字节。用户程序每次请求 128 字节，前 11 次得到完整块，最后一次得到 71 字节，再下一次得到 0。所有字节的 FNV-1a 为 <code>f34dc752</code>。这个读取仍然沿着第 21 篇构造的 <code>2 -&gt; 9 -&gt; 4</code> 非连续簇链完成。</p>
+<p>独立与共享 offset 用两组实验区分。两次 <code>open(&quot;README.TXT&quot;)</code> 后，A 先读 64 字节，B 再读 64 字节，两段内容相同；A 再读 256 字节，只推进 A 自己的对象。共享实验中，父进程先读 37 字节，子进程从映射到 fd 0 的同一对象读 19 字节，父进程下一字节来自 offset 56。</p>
+<p>FAT 模块有全局卷对象和工作缓冲，不可重入。当前系统为单 CPU，文件 syscall 处于 <code>trap_depth==1</code>，时钟中断只记录延期调度；<code>file_read()</code> 还在 FAT 调用期间禁止抢占，因此共享 offset 的“读取并提交”不会被另一任务插入。这个条件如果改变，例如磁盘等待开始主动睡眠，open-file 和 FAT 工作区就需要可睡眠的串行化协议，不能继续依赖当前执行模型。</p>
+<h2 id="引用从-spawn-转移到-exit">引用从 spawn 转移到 exit</h2>
+<p>本项目没有 <code>fork</code> 和 <code>dup</code>。<code>spawn(name, io_map)</code> 用一个项目专用的 32 位值显式映射子进程的 0、1、2：高位 magic 为 <code>0xd2200000</code>，三个低半字节分别保存来源 fd 加一，0 表示目标槽为空。</p>
+<p>映射不是把 offset 复制一份。内核先为三个来源对象逐项 <code>file_get()</code>，把引用暂存在局部数组，再装载 ELF、建立用户页和分配内核栈。任务槽成功发布后，数组中的引用转移给子进程；任一步失败，<code>mapped_put()</code> 释放所有已经取得的引用。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">父 fd 槽 ──ref──┐<br>                ├──&gt; 同一个 open_file(offset)<br>子 fd 槽 ──ref──┘<br></code></pre></td></tr></table></figure>
+<p>失败镜像把分配失败点从第一个 ELF 页推进到内核栈，连续七次 <code>spawn</code> 都返回 <code>ENOMEM</code>。随后关闭失败注入，正常 spawn、read 和 wait 成功。GDB 记录的 <code>fd_spawn_rollbacks=7</code>，文件对象分配/释放数和空闲页均回到初值。</p>
+<p>进程退出时，资源释放顺序是另一处关键边界：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">关闭全部 fd<br>  -&gt; 记录退出状态<br>  -&gt; 发布 ZOMBIE<br>  -&gt; 唤醒 wait 中的父进程<br>  -&gt; 父进程回收用户页、页表、内核栈和任务槽<br></code></pre></td></tr></table></figure>
+<p>故意越界的子进程在页故障后也进入同一 <code>process_publish_exit()</code>。断点命中时，它的 8 个 fd 槽已经全空，用户地址空间和内核栈仍然存在，任务尚未发布为 ZOMBIE。wait 路径只断言 fd 已清空，不做第二次 <code>file_put()</code>。这个顺序将在管道篇决定 EOF 能否到达：退出进程若等到父进程 wait 才关闭写端，读者可能永久等待。</p>
+<h2 id="终端读会在系统调用中阻塞">终端读会在系统调用中阻塞</h2>
+<p>终端输出对象同步调用 <code>console_putc()</code>，终端输入对象则复用第 09 篇的 IRQ1 原始扫描码队列和 set-1 解析器。IRQ handler 只读取端口、入队并唤醒等待者；<code>keyboard_read_char()</code> 是唯一消费者，旧 <code>keyboard_loop()</code> 不再与用户进程竞争同一队列。</p>
+<p>队列为空时，reader 已经从用户态通过 <code>int 0x80</code> 进入内核，<code>trap_depth</code> 为 1。旧的普通任务阻塞路径只接受深度 0，本篇让调度器显式保存当前允许深度：任务以 BLOCKED 状态切走，输入到达后再回到原内核栈，最终从同一次 syscall 返回用户态。</p>
+<p>测试通过 GDB 观察到：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">reader.state      = BLOCKED<br>reader.trap_depth = 1<br>reader.waiting_on = &amp;keyboard_waiters<br></code></pre></td></tr></table></figure>
+<p>暂停 0.2 秒后 PIT tick 增长，reader 没有重复轮询，CPU 落在 IF=1 的 idle <code>hlt</code>。随后 QEMU HMP 依次执行 <code>sendkey a</code>、<code>sendkey b</code> 和 <code>sendkey ret</code>，用户程序三次短读得到 <code>ab\n</code>。</p>
+<p>当前终端是逐字符输入，不是 canonical 终端。没有完整行缓冲、Ctrl-D、termios、作业控制或多个 reader 的公平性；“暂时没有按键”只会阻塞，不会被误报成 EOF。第 23 篇的 Shell 会在用户态组合这些字符。</p>
+<h2 id="三个镜像留下的证据">三个镜像留下的证据</h2>
+<p>正常镜像的串口末尾是：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">D22 CHILD shared offset +19<br>D22 CHILD fault after shared +11<br>D22 readonly source accepted<br>D22 FD independent/shared offsets, EOF, errors and limits OK<br>FD OK mode=0 reaped=5 exit-closes=14 rollback=0 blocks=0 pages=16049<br></code></pre></td></tr></table></figure>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="day22-fd-screen.png" alt="文件描述符正常实验"></p>
+<p><a href="day22-fd-serial.txt">正常串口记录</a>与<a href="day22-fd-gdb.txt">正常 GDB 记录</a>还检查了 <code>file_peak_live=7</code>、<code>file_allocations=file_releases=16</code>、14 次 exit 关闭和空闲页恢复。失败镜像的<a href="day22-fd-fail-serial.txt">串口</a>与<a href="day22-fd-fail-gdb.txt">GDB 记录</a>保存了七个失败点及恢复结果。终端实验的<a href="day22-fd-terminal-blocked.txt">阻塞现场</a>、<a href="day22-fd-terminal-idle.txt">idle 现场</a>、<a href="day22-fd-terminal-done.txt">完成记录</a>和<a href="day22-fd-terminal-serial.txt">串口输出</a>记录了 HMP 输入链路。</p>
+<p>专项检查后又在主工作区复跑 FAT、块设备、进程、系统调用、ELF、内存、容量和键盘检查，八项目标均退出 0，完整输出见<a href="day22-cumulative.txt">累计回归记录</a>。它们分别守住非连续/损坏簇链、ATA 错误、进程回收、用户复制、恶意 ELF、页分配、loader 上限和 PS/2 旧行为。</p>
+<h2 id="当前边界">当前边界</h2>
+<p>本篇只支持固定根目录中的 FAT16 8.3 文件；没有目录 fd、目录枚举、seek、写文件和当前工作目录。第 30 篇实现 <code>ls</code> 前仍需定义定宽目录项 ABI，不能把内核结构体直接复制给用户。</p>
+<p>损坏 FAT 和非连续簇链由第 21 篇的 <code>check-fat</code> 在同一累计代码上动态回归。本篇静态确认 offset 只在 <code>fat_read_at()</code> 成功后提交，但没有把损坏卷再经过 <code>SYS_READ</code> 跑一遍，因此不把这条边界记成 Day 22 专项动态覆盖。</p>
+<p>实验运行在 QEMU 8.2.2、SeaBIOS 1.16.3、<code>pc-i440fx-7.2</code>、TCG、qemu32、单 CPU和 64 MiB 内存。HMP <code>sendkey</code> 验证了模拟 i8042/PS/2 路径，不代表真实键盘或其他虚拟机实现。</p>
+<p>第 23 篇会让 Shell 和 <code>cat/echo</code> 只依赖 fd 接口，并把 ELF 从内核内嵌数组迁到 FAT16 文件。那时必须重新核验磁盘 ELF 的大小、恶意头、装载失败回滚和 Shell 的错误恢复。</p>
+<h2 id="下载与复现">下载与复现</h2>
+<p><a href="os-day-22.zip">下载第 22 篇完整源码</a>。附件 SHA-256：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">068c86aa51a33813a837e4a91ab2646a9db72209825bd1d221563a21c787b8a0<br></code></pre></td></tr></table></figure>
+<p>解压后执行：</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><code class="hljs sh">unzip os-day-22.zip<br><span class="hljs-built_in">cd</span> os-day-22<br>make build<br>make check-fd<br>make check-fat<br>make check-block<br>make check-process<br>make check-syscall<br>make check-elf<br>make check-memory<br>make check-runtime-limit<br>make check-keyboard<br></code></pre></td></tr></table></figure>
+<p>附件包含第 01–22 篇累计工程和打包前已经形成的 <code>docs/day22-*</code> 证据，不含任何 <code>build/</code> 产物。它在新的空目录中从零重建，随后运行本篇专项和八项累计回归，全部退出 0；重建的 <code>kernel.bin</code>、<code>mbr.img</code> 与 <code>day22-user.elf</code> 也和主工作区逐字节相同。完整输出见<a href="day22-zipcheck.txt">独立附件复验记录</a>，这份记录验证的是已经冻结的 ZIP，因此不反向放进 ZIP 自身。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>给同一进程增加 <code>dup(oldfd)</code>，验证两个 fd 共享 offset，并证明关闭其中一个不会释放对象。</li>
+<li>把 <code>file_open()</code> 调整为先分配 open-file 再查 FAT，故意让 fd 表满，观察错误优先级和无意义磁盘访问如何变化。</li>
+<li>设计 canonical 终端输入：明确退格、行缓冲上限、Ctrl-D、多个 reader 和窗口关闭时的唤醒规则，再决定这些状态属于终端对象还是 Shell。</li>
+</ol>
+<p>上一篇：<a href="/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-21-%E5%8F%AA%E8%AF%BB-FAT16/">21 - 只读 FAT16</a>。</p>
+<p>下一篇：23 - 用户态 Shell。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap03.html">POSIX.1-2024 Definitions</a>：fd、file offset 和 open file description 的定义。</li>
+<li><a target="_blank" rel="noopener" href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html">POSIX.1-2024 <code>open()</code></a>、<a target="_blank" rel="noopener" href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/dup.html"><code>dup()</code></a>、<a target="_blank" rel="noopener" href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/read.html"><code>read()</code></a>、<a target="_blank" rel="noopener" href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/write.html"><code>write()</code></a>、<a target="_blank" rel="noopener" href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/close.html"><code>close()</code></a> 与 <a target="_blank" rel="noopener" href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/_Exit.html"><code>_Exit()</code></a>：用于核对对象、偏移、短读、最后关闭和退出关闭语义。</li>
+<li><a target="_blank" rel="noopener" href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html#tag_16_09_07">POSIX.1-2024 §2.9.7 Thread Interactions with File Operations</a>：用于检查共享 open-file 操作的原子效果。</li>
+<li>Linux man-pages 6.19：<a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man2/open.2.html"><code>open(2)</code></a>、<a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man2/dup.2.html"><code>dup(2)</code></a>、<a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man2/read.2.html"><code>read(2)</code></a> 与 <a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man2/close.2.html"><code>close(2)</code></a>，用于独立交叉核对对象和 offset 语义。</li>
+<li><a target="_blank" rel="noopener" href="https://github.com/mit-pdos/xv6-riscv/blob/9e3161a9abf5f51ea402562d1874caf6c4926597/kernel/file.c">xv6-riscv <code>file.c</code></a>、<a target="_blank" rel="noopener" href="https://github.com/mit-pdos/xv6-riscv/blob/9e3161a9abf5f51ea402562d1874caf6c4926597/kernel/sysfile.c"><code>sysfile.c</code></a> 与 <a target="_blank" rel="noopener" href="https://github.com/mit-pdos/xv6-riscv/blob/9e3161a9abf5f51ea402562d1874caf6c4926597/kernel/proc.c"><code>proc.c</code></a>：固定提交 <code>9e3161a9abf5f51ea402562d1874caf6c4926597</code>，仅作教学实现对照，不用于证明 x86 trap 或本项目 ABI。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-22-%E6%96%87%E4%BB%B6%E6%8F%8F%E8%BF%B0%E7%AC%A6/">https://magicliang.github.io/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-22-%E6%96%87%E4%BB%B6%E6%8F%8F%E8%BF%B0%E7%AC%A6/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F/">操作系统</a><a class="post-meta__tags" href="/tags/x86/">x86</a><a class="post-meta__tags" href="/tags/%E6%96%87%E4%BB%B6%E6%8F%8F%E8%BF%B0%E7%AC%A6/">文件描述符</a></div><div class="post-share"><div class="social-share" data-image="/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-22-%E6%96%87%E4%BB%B6%E6%8F%8F%E8%BF%B0%E7%AC%A6/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-04-%E8%BF%9B%E5%85%A5%E4%BF%9D%E6%8A%A4%E6%A8%A1%E5%BC%8F/" title="从零编写操作系统 04 - 进入保护模式：建立第一份运行环境"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-04-%E8%BF%9B%E5%85%A5%E4%BF%9D%E6%8A%A4%E6%A8%A1%E5%BC%8F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 04 - 进入保护模式：建立第一份运行环境</div></div><div class="info-2"><div class="info-item-1">第 03 篇已经让第一阶段启动扇区加载第二阶段，也让第二阶段读取载荷并检查边界。它仍然停留在实模式。实模式下可以方便调用 BIOS，也能通过操作数前缀使用 32 位寄存器；后续内核需要的平坦地址空间和权限隔离仍要建立在保护模式上。 本篇完成第一次处理器模式切换：在进入保护模式前收集 E820 内存图，打开 A20，建立 GDT，设置 CR0.PE，再用远跳转刷新代码段。切换完成后，32 位代码直接写 VGA 文本显存，GDB 能观察到保护模式状态。BIOS 调用到这里为止，后面的内核不能再按实模式方式直接调用 int 10h 或 int 13h。  为什么先把 BIOS 调用做完 BIOS 服务是实模式时代的接口。第 03 篇依赖它读盘；本篇还要依赖它查询内存图。进入保护模式后，CPU 的段解释、地址宽度和中断入口都变了。没有虚拟 8086 模式、实模式回跳或专门 BIOS 调用桥时，内核不能继续把 int 15h 当作普通函数使用。 切换前后的准备顺序如下： 1234567891011real mode  ├─ read disk through BIOS EDD  ├─ pr...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-08-%E6%97%B6%E9%92%9F%E4%B8%AD%E6%96%AD/" title="从零编写操作系统 08 - 时钟中断：让外部事件打断当前执行"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-08-%E6%97%B6%E9%92%9F%E4%B8%AD%E6%96%AD/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 08 - 时钟中断：让外部事件打断当前执行</div></div><div class="info-2"><div class="info-item-1">上一篇的异常由正在执行的指令触发。时钟中断来自处理器外部：即使内核没有执行 int，定时器也能发出请求，经中断控制器送到 CPU，再通过 IDT 进入处理函数。 本篇接入传统 PC 的 8259A PIC 与 8254 PIT，只开放 IRQ0。正常内核收到 20 次时钟中断后关闭外部 IRQ，继续原有控制台自检；两个独立诊断镜像验证屏蔽、恢复和漏发 EOI 的后果。入口仍沿用上一篇的保存与恢复路径，尚未加入调度或任务切换。  从 PIT 输出到 IDT 第 32 项 PIT 的 channel 0 产生周期信号，连接主 PIC 的 IRQ0 输入。PIC 根据屏蔽位和优先级判断是否请求 CPU 响应；CPU 接受请求后获得向量，再查 IDT。 12345678910111213PIT channel 0 周期输出    ↓主 PIC 的 IRQ0 输入    ↓  IMR、优先级及 CPU 当前 IF 允许CPU 接受可屏蔽外部中断    ↓IDT[0x20] → isr32 → exception_common    ↓trap_dispatch(frame) → timer...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-21-%E5%8F%AA%E8%AF%BB-FAT16/" title="从零编写操作系统 21 - 只读 FAT16：从扇区追到文件字节"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-21-%E5%8F%AA%E8%AF%BB-FAT16/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">从零编写操作系统 21 - 只读 FAT16：从扇区追到文件字节</div></div><div class="info-2"><div class="info-item-1">第 20 篇已经能从 ATA 设备读出指定 LBA 的 512 字节，但用户程序仍然来自内核里的 ELF 字节数组。块设备只回答“某个扇区里是什么”；要回答“README.TXT 在哪里、有多长、怎样读出来”，还需要文件系统层。 本篇在已有 ATA PIO 接口上增加只读 FAT16。内核从 MBR 取第一分区，校验 BPB（BIOS Parameter Block）并计算卷布局，在固定根目录中查找 8.3 短名，再沿 FAT 簇链读取文件。测试文件故意存在 2 -&gt; 9 -&gt; 4 三个不连续簇中，因此“刚好读到一段连续数据”不能冒充 FAT 实现。 本篇还真实撞到了旧的 64 KiB 内核文件上限。扩容同时修改了镜像保留区、头部生产器、stage2 读取与校验、链接边界和失败镜像，并用精确 128 KiB/128 KiB+1 的实验区分成功边界和拒绝边界。  FAT16 分区需要真实的数据簇 原镜像只有 4096 个扇区，FAT 分区预定从 LBA 2048 开始。后半段总共只有 2048 个扇区，即使每簇只用一个扇区，扣除引导扇区、FAT 和根目录后也不可能得到 ...</div></div></div></a><a class="pagination-related" href="/2026/09/17/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-17-%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8/" title="从零编写操作系统 17 - 系统调用：把用户参数安全地带进内核"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/17/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-17-%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-17</div><div class="info-item-2">从零编写操作系统 17 - 系统调用：把用户参数安全地带进内核</div></div><div class="info-2"><div class="info-item-1">第 16 篇已经把任务降到 ring 3，并用页表阻止用户程序改写内核。隔离建立以后，用户程序也失去了直接输出、访问端口和控制调度器的能力。 本篇增加一个 DPL3 的 int 0x80 门和两项自定义系统调用：write 把用户字节写到控制台，yield 请求调度。难点集中在边界状态：CPU 怎样换到当前任务的内核栈，内核怎样检查一段可能跨页、回绕或指向 supervisor 页的地址，以及失败后怎样回到同一用户程序继续执行。 实验会故意传入第二页缺失的缓冲区。预置在第一页末尾的 LEAKFAIL 不能出现在串口里；否则说明输出在完整校验之前已经发生。  系统调用是受控的权限切换 用户态不能通过普通 call 跳进内核。call 只改变 EIP 和栈上的返回地址，不会把 CPL3 变成 CPL0，也不会从 TSS 取出内核栈。 int 0x80 走 IDT 门。处理器检查这个门是否存在、门的 DPL 是否允许软件调用，再完成权限切换和现场保存。第 16 篇建立的 TSS.ESP0 因而不只是 IRQ 的入口栈，也成为系统调用入口栈。 1234567891011121314151...</div></div></div></a><a class="pagination-related" href="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-16-%E8%BF%9B%E5%85%A5%E7%94%A8%E6%88%B7%E6%80%81/" title="从零编写操作系统 16 - 进入用户态：让错误程序无法直接改内核"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/08/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-16-%E8%BF%9B%E5%85%A5%E7%94%A8%E6%88%B7%E6%80%81/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-08</div><div class="info-item-2">从零编写操作系统 16 - 进入用户态：让错误程序无法直接改内核</div></div><div class="info-2"><div class="info-item-1">第 15 篇已经能让任务等待、唤醒和接受时钟抢占，但所有任务仍在 ring 0，共享内核页表与执行权限。 一个错误指针可以改写内核数据，一条 CLI 可以阻止普通中断进入。 独立任务栈与轮转调度都不能代替访问权限。 本篇为两个用户任务建立独立地址空间，经 IRETD 进入 ring 3，让它们在相同虚拟地址递增各自的计数。 三轮实验分别让其中一个任务写内核数据、执行 CLI、执行 OUT，要求错误任务停止，而另一个继续增长。 用户代码仍是内嵌的手写机器指令；本篇没有 ELF 加载器、系统调用或用户自行退出接口，有限实验由内核监督收尾。  CPU 权限和页面权限分别限制什么 保护模式的当前权限级 CPL 由当前代码段选择子的低两位反映。 此前内核使用 CS=0x08、SS=0x10，运行在 CPL0；用户代码将使用 CS=0x1b、SS=0x23，运行在 CPL3。 这些数值同时包含 GDT 项索引和请求权限级，不能把低两位当作可以随意改写的普通配置开关。 分页的 U/S 位决定页面是否允许用户访问。 即使代码运行在 ring 3，若页目录和页表错误地把内核区域都标成 user，它...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-01-%E5%87%86%E5%A4%87%E5%B7%A5%E5%85%B7%E9%93%BE/" title="从零编写操作系统 01 - 准备工具链：源代码怎样变成磁盘里的字节"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-01-%E5%87%86%E5%A4%87%E5%B7%A5%E5%85%B7%E9%93%BE/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 01 - 准备工具链：源代码怎样变成磁盘里的字节</div></div><div class="info-2"><div class="info-item-1">在普通应用项目里，编译成功后通常可以直接运行可执行文件。自制操作系统还缺少一段工作：谁把文件里的指令放进内存，谁准备栈，CPU 又从哪里开始执行？ 本篇先把这些问题拆开验证。第一条实验生成 ELF32/i386 文件，检查源代码、符号、链接地址和机器指令的对应关系。第二条实验把一块全零磁盘接到 QEMU，观察固件启动失败，再用 GDB 停住并单步执行 CPU。 两条实验还没有连接起来。sample.elf 不会被写进空磁盘，也不会由 BIOS 加载。本篇完成后得到的是可用的编译与调试环境；第 02 篇才开始写 BIOS 能执行的启动扇区。  宿主、目标与固件 本次实验的宿主链路是 ARM macOS 上的 Podman Linux 虚拟机，容器内运行 Debian 12 aarch64。交叉编译器本身是一段 ARM Linux 程序，它生成的指令却属于 32 位 x86。QEMU 再通过 TCG 动态翻译运行这个 x86 客体，不要求宿主 CPU 支持直接执行 x86 指令，机制见 QEMU TCG 文档。 12345678ARM macOS  └─ Podman Linux V...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E4%B8%AA%E6%95%B4%E6%95%B0%E4%B8%8D%E8%83%BD%E4%BF%9D%E5%AD%98%E5%85%A8%E9%83%A8%E6%96%87%E4%BB%B6%E7%8A%B6%E6%80%81"><span class="toc-number">1.</span> <span class="toc-text">一个整数不能保存全部文件状态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#open-%E5%BB%BA%E7%AB%8B%E4%B8%80%E6%9D%A1%E6%89%80%E6%9C%89%E6%9D%83%E9%93%BE"><span class="toc-number">2.</span> <span class="toc-text">open 建立一条所有权链</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E6%88%B7%E5%9C%B0%E5%9D%80%E5%9C%A8%E5%90%8E%E7%AB%AF%E4%BA%A7%E7%94%9F%E5%89%AF%E4%BD%9C%E7%94%A8%E5%89%8D%E5%AE%8C%E6%88%90%E9%AA%8C%E8%AF%81"><span class="toc-number">3.</span> <span class="toc-text">用户地址在后端产生副作用前完成验证</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%9F%AD%E8%AF%BB-eof-%E5%92%8C-offset-%E6%8F%90%E4%BA%A4"><span class="toc-number">4.</span> <span class="toc-text">短读、EOF 和 offset 提交</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%BC%95%E7%94%A8%E4%BB%8E-spawn-%E8%BD%AC%E7%A7%BB%E5%88%B0-exit"><span class="toc-number">5.</span> <span class="toc-text">引用从 spawn 转移到 exit</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%88%E7%AB%AF%E8%AF%BB%E4%BC%9A%E5%9C%A8%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8%E4%B8%AD%E9%98%BB%E5%A1%9E"><span class="toc-number">6.</span> <span class="toc-text">终端读会在系统调用中阻塞</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E4%B8%AA%E9%95%9C%E5%83%8F%E7%95%99%E4%B8%8B%E7%9A%84%E8%AF%81%E6%8D%AE"><span class="toc-number">7.</span> <span class="toc-text">三个镜像留下的证据</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%BD%93%E5%89%8D%E8%BE%B9%E7%95%8C"><span class="toc-number">8.</span> <span class="toc-text">当前边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%8B%E8%BD%BD%E4%B8%8E%E5%A4%8D%E7%8E%B0"><span class="toc-number">9.</span> <span class="toc-text">下载与复现</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">10.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">11.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
