@@ -1,0 +1,781 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>分布式系统 08：共识问题与安全活性边界 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="主节点没有按时回复，备节点能否立即接管？第 07 篇的主备与链式复制把这个问题留在了故障时间线上：旧主可能已经停止，也可能仍在接收写入，只是无法与备节点通信。两个节点分别开始服务，数据复制得再快，也不能补回对写入顺序缺失的共同决定。 一次共识先缩小这个问题：固定一组进程，各自提出一个值，最终决定同一个值。日志复制可以连续处理多个这样的决定，但单次共识的边界需要先明确。MIT 6.5840 的 Pa">
+<meta property="og:type" content="article">
+<meta property="og:title" content="分布式系统 08：共识问题与安全活性边界">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-08-%E5%85%B1%E8%AF%86%E9%97%AE%E9%A2%98%E4%B8%8E%E5%AE%89%E5%85%A8%E6%B4%BB%E6%80%A7%E8%BE%B9%E7%95%8C/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="主节点没有按时回复，备节点能否立即接管？第 07 篇的主备与链式复制把这个问题留在了故障时间线上：旧主可能已经停止，也可能仍在接收写入，只是无法与备节点通信。两个节点分别开始服务，数据复制得再快，也不能补回对写入顺序缺失的共同决定。 一次共识先缩小这个问题：固定一组进程，各自提出一个值，最终决定同一个值。日志复制可以连续处理多个这样的决定，但单次共识的边界需要先明确。MIT 6.5840 的 Pa">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg">
+<meta property="article:published_time" content="2026-09-19T10:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-19T13:21:31.349Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="FLP">
+<meta property="article:tag" content="共识">
+<meta property="article:tag" content="分布式系统">
+<meta property="article:tag" content="故障检测">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "分布式系统 08：共识问题与安全活性边界",
+  "url": "https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-08-%E5%85%B1%E8%AF%86%E9%97%AE%E9%A2%98%E4%B8%8E%E5%AE%89%E5%85%A8%E6%B4%BB%E6%80%A7%E8%BE%B9%E7%95%8C/",
+  "image": "https://magicliang.github.io/img/cover-distributed-systems.svg",
+  "datePublished": "2026-09-19T10:00:00.000Z",
+  "dateModified": "2026-09-19T13:21:31.349Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-08-%E5%85%B1%E8%AF%86%E9%97%AE%E9%A2%98%E4%B8%8E%E5%AE%89%E5%85%A8%E6%B4%BB%E6%80%A7%E8%BE%B9%E7%95%8C/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '分布式系统 08：共识问题与安全活性边界',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">770</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">898</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">17</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-distributed-systems.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">分布式系统 08：共识问题与安全活性边界</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">分布式系统 08：共识问题与安全活性边界</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-19T10:00:00.000Z" title="Created 2026-09-19 18:00:00">2026-09-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-19T13:21:31.349Z" title="Updated 2026-09-19 21:21:31">2026-09-19</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>13mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-19 21:21:31&quot;}" hidden></div><p>主节点没有按时回复，备节点能否立即接管？<a href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-07-%E4%B8%BB%E5%A4%87%E4%B8%8E%E9%93%BE%E5%BC%8F%E5%A4%8D%E5%88%B6/" title="分布式系统 07：主备与链式复制">第 07 篇的主备与链式复制</a>把这个问题留在了故障时间线上：旧主可能已经停止，也可能仍在接收写入，只是无法与备节点通信。两个节点分别开始服务，数据复制得再快，也不能补回对写入顺序缺失的共同决定。</p>
+<p>一次共识先缩小这个问题：固定一组进程，各自提出一个值，最终决定同一个值。日志复制可以连续处理多个这样的决定，但单次共识的边界需要先明确。MIT 6.5840 的 Paxos 讲义从故障与网络延迟难以区分切入；Stanford CS244b 把 FLP 放在开篇阅读。本篇沿着这一课程顺序，讨论决定必须满足什么，以及何种环境允许决定最终发生。<a target="_blank" rel="noopener" href="https://pdos.csail.mit.edu/6.824/notes/l-paxos.txt">MIT 2026 Lecture 4</a>、<a target="_blank" rel="noopener" href="https://www.scs.stanford.edu/24sp-cs244b/sched/">Stanford 2024课程表</a>。</p>
+<h1>共识需要同时限制结果与等待</h1>
+<p>考虑 A、B、C 三个进程，输入分别为 0、1、1。这里采用停止故障模型：进程可以永久停止执行，存活进程遵守算法，不伪造消息。成员集合事先固定；消息不会凭空产生或被篡改。崩溃恢复、动态成员和拜占庭故障需要额外定义。</p>
+<p>一次决定是不可撤销的输出。暂存候选值、投票、收到多数回复都不能未经论证就称为决定。采用以下四个目标时，每条执行历史都能有明确的检查对象。</p>
+<table>
+<thead>
+<tr>
+<th>性质</th>
+<th>本篇采用的要求</th>
+<th>违规情形</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>一致同意，uniform agreement</td>
+<td>任意两个已经决定的进程决定相同值</td>
+<td>A 决定 0，B 决定 1</td>
+</tr>
+<tr>
+<td>有效性，validity</td>
+<td>决定值曾被某个参与进程提出</td>
+<td>所有输入只有 0、1，却决定 7</td>
+</tr>
+<tr>
+<td>决定完整性，integrity</td>
+<td>每个进程至多决定一次</td>
+<td>A 先决定 0，随后改为 1</td>
+</tr>
+<tr>
+<td>终止性，termination</td>
+<td>每个正确进程最终决定</td>
+<td>某个一直正常执行的进程一直没有决定</td>
+</tr>
+</tbody>
+</table>
+<p>前三项限制可以出现的结果，属于这里的安全性要求。最后一项要求进展，属于活性。只保证不分叉很容易：所有进程永远等待即可。只要求很快有输出也容易：超时便决定自己的输入。两者都没有完成共识目标。</p>
+<p>“正确进程”需要按整条执行定义。在停止故障模型中，它不会崩溃，并持续获得执行机会。若 A 决定 0 后崩溃，B 再决定 1，uniform agreement 仍被破坏；只限制正确进程之间的 agreement 则可能不排除这条历史。Chandra–Toueg 在 §5 使用后一种 agreement，而其 §6.2 算法证明了更强的 uniform agreement。<a target="_blank" rel="noopener" href="https://www.cs.cornell.edu/courses/cs734/2000FA/cached%20papers/ct96.pdf">CT96，pp.239、244–246</a>。</p>
+<p>共识的“一致同意”也不等于<a href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-06-%E4%B8%80%E8%87%B4%E6%80%A7%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%88%86%E5%8C%BA%E8%BE%B9%E7%95%8C/" title="分布式系统 06：一致性模型与分区边界">第 06 篇讨论的线性一致性</a>。共识约束一次决定的值；线性一致性约束对象操作历史及其实时先后关系。要从日志共识得到一个线性一致的 KV 服务，还需处理日志应用、请求去重、读取路径与操作返回时机。</p>
+<h1>超时能观察到什么</h1>
+<p>在逻辑时刻 5，A 仍未收到 C 的心跳。以下两条历史在 A 处具有相同前缀。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">历史一：C 在发送心跳前停止；A 在 tick 1..5 收不到心跳。<br>历史二：C 正常发送；消息延迟至 tick 7；A 在 tick 1..5 收不到心跳。<br>共同观察：tick 5 时仍无心跳，触发同一超时分支。<br></code></pre></td></tr></table></figure>
+<p>如果 A 是确定性的，而且初始状态与本地事件相同，那么截至 tick 5 的行为也相同。它可以把 C 加入怀疑集合，但不能凭这段观察断言 C 已经崩溃。延迟上界若没有写入模型，任何固定超时都可能被更长但有限的延迟超过。</p>
+<p>对工程系统而言，怀疑仍然有用。超时可以触发重新连接、发起新一轮选举，或暂时拒绝服务。但允许新主写入，还必须确保旧主不能继续形成冲突决定。这个约束由任期、投票与提交规则等协议机制承担，超时本身没有提供证明。</p>
+<h1>FLP 排除的是哪一种保证</h1>
+<p>FLP 考察确定性协议、完全异步的消息传递，以及至多一个进程停止执行。异步意味着没有可用于算法保证的消息延迟和进程相对速度上界；可靠意味着发给正确进程的消息最终收到。某条消息可以延迟很久，但不能因此被任意永久丢弃。</p>
+<p>结论中的量词是：满足安全性和非平凡性、并要求容忍至多一次停止故障的确定性协议，存在一个允许的执行始终不作决定。它没有说所有执行都无法完成，更没有说多数服务器正常时每次请求都会失败。<a target="_blank" rel="noopener" href="https://groups.csail.mit.edu/tds/papers/Lynch/jacm85.pdf">FLP，§2–3，pp.376–380</a>。</p>
+<p>原文的非平凡性比前面的有效性弱：0 和 1 分别能在某个可达配置成为决定值。它排除“无论输入是什么都决定 0”这样的退化办法，却不完整约束输出与输入的对应关系。现代有效性加上终止要求当然也不能避开这个更弱任务的不可能性；引用定理时仍应保留定义区别。<a target="_blank" rel="noopener" href="https://arxiv.org/pdf/cs/0209014">Aspnes，§1</a>。</p>
+<h2 id="双价配置如何阻止最终决定">双价配置如何阻止最终决定</h2>
+<p>一个配置包含所有进程的本地状态以及尚未收到的消息。若从某配置出发，存在决定 0 的延伸，也存在决定 1 的延伸，称它为双价配置；若可能的决定值只剩一个，就成为单价配置。双价描述后续调度留下的可能性，不表示已经有进程决定了两个值。</p>
+<p>证明首先建立双价初态的存在。以较强的输入有效性理解这一步：全 0 输入必须最终决定 0，全 1 输入必须最终决定 1。把输入一个进程一个进程地改变，假如每个初态都单价，就会出现仅一个进程 p 的输入不同、决定值却不同的相邻初态。让 p 不执行，其他进程无法区分两种初态；容忍一次停止故障又要求它们最终决定，于是得到矛盾。原文用其较弱非平凡性也建立了对应结论。</p>
+<p>初态双价还不够。普通算法可能收到下一条消息就安全决定。FLP 的关键引理说明：从双价配置出发，对选定的待处理事件，可以先安排有限的其他事件，再处理它，使结果仍双价。证明利用了不同进程事件的可交换性，以及对某个进程停止执行的容忍要求；如果所有这类延伸都强制变成单价，就能构造彼此无法区分却被要求作不同决定的执行。这是证明直觉，完整分类见原文 §3 的引理 3。</p>
+<p>最后需要处理公平性：不能总把同一条消息延后。原文按进程轮转，并优先选择相应进程的较早消息；每次用引理补上一段有限调度，既处理选定事件又保持双价。无限连接后，每个进程都走无限步，每条消息最终交付，却始终没有决定。<a target="_blank" rel="noopener" href="https://groups.csail.mit.edu/tds/papers/Lynch/jacm85.pdf">FLP，§3，特别是 p.380</a>。</p>
+<p>因此，这条坏执行甚至可以没有实际崩溃。证明中“可能有一个进程停止”迫使协议不能无限依赖某个特定进程；最终构造再利用这些约束安排持续不决定的执行。“至多一个故障”不能被改写为“必须恰好一个故障”。</p>
+<h1>部分同步给终止增加条件</h1>
+<p>Dwork、Lynch、Stockmeyer 给出两种典型的部分同步描述。第一种存在固定通信与进程速度界，但协议事先不知道界有多大。第二种界已知，却只在未知的全局稳定时刻 GST 之后成立。两者都比已知界从一开始成立的同步模型弱，又比完全异步提供更多进展条件。<a target="_blank" rel="noopener" href="https://groups.csail.mit.edu/tds/papers/Lynch/jacm88.pdf">DLS88，摘要与 §1.2，pp.288–290</a>。</p>
+<p>在未知界的模型里，可以逐渐延长等待时间；在 GST 模型里，前期的轮次可能因过慢消息而失败。算法必须另外证明：环境满足所需条件后，某个轮次有足够时间完成。仅仅增长超时，并没有自动证明领导者最终稳定或消息处理不会饥饿。</p>
+<p>安全性仍须覆盖不稳定阶段。若 GST 前已经出现两个决定，稳定后再多交换消息也无法恢复不可撤销的同意。DLS 将安全性与终止分别处理：协议的同意与有效性不能因迟迟未稳定而失效，终止则依赖相应最终时序条件。</p>
+<p>“多数能通信足够久”可以概括一些算法的进展环境，不能替代完整模型。多数是固定配置中的多数，还要说明进程调度、通信方向、故障上限及协调者行为。对一组条件证明可终止，不表示真实部署中的某个超时配置已经满足那些条件。</p>
+<h1>故障检测器约束的是怀疑历史</h1>
+<p>故障检测器可以被抽象为每个进程随时间输出的怀疑集合。完整性描述故障者最终是否被发现，准确性限制对健康者的错误怀疑。两类性质不能相互替代：永远怀疑所有进程容易发现故障，但无法提供有用的准确性。</p>
+<table>
+<thead>
+<tr>
+<th>性质</th>
+<th>要求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>强完整性</td>
+<td>最终，每个崩溃进程都被每个正确进程永久怀疑</td>
+</tr>
+<tr>
+<td>强准确性</td>
+<td>任何进程在崩溃之前不被怀疑</td>
+</tr>
+<tr>
+<td>最终强准确性</td>
+<td>从某个时刻起，正确进程不再被怀疑</td>
+</tr>
+<tr>
+<td>最终弱准确性</td>
+<td>从某个时刻起，存在一个正确进程不再被任何正确进程怀疑</td>
+</tr>
+</tbody>
+</table>
+<p>强准确性包含“后来会崩溃的进程在崩溃前”的保护，不能只解释为正确进程不被怀疑。最终弱准确性也没有要求所有正确进程最终都被识别准确：除了受保护的那个进程，其他正确进程仍可能反复被误判。<a target="_blank" rel="noopener" href="https://www.cs.cornell.edu/courses/cs734/2000FA/cached%20papers/ct96.pdf">CT96，§2.3，pp.232–233</a>。</p>
+<p>强完整性与强准确性组成完美检测器 P；将准确性换成最终强准确性得到 ◇P，换成最终弱准确性得到 ◇S。符号 ◇ 表示最终性质。CT 的相关共识算法在多数进程正确时使用 ◇S：早期怀疑可以出错，协议仍需保护已经形成的决定约束，最终性质则帮助证明进展。</p>
+<p>这是一组关于全部输出历史的假设。一次心跳实验没有误判，不能证明实现了 P；连续一小时没有误判，也不能证明此后永远满足 ◇P。需要把网络、调度与超时增长的条件写进实现论证。最弱故障检测器的定理属于另一篇 Chandra–Hadzilacos–Toueg 论文，不与 CT96 的检测器分类混用。<a target="_blank" rel="noopener" href="https://www.cs.cornell.edu/info/people/sam/FDpapers.html">作者文献目录</a>。</p>
+<h1>随机化改变终止要求的量词</h1>
+<p>随机算法需要规定硬币操作的分布，以及调度者能够观察什么。给定允许的调度者后，常见目标是对随机结果以概率 1 终止；概率为零的不终止执行仍可能存在。它与确定性协议对全部允许执行都终止的要求不同。</p>
+<p>调度者能否读取过去的随机结果、是否能预知未来结果，会影响协议证明。实际选举中加入随机等待，有助于减少重复碰撞，但仅凭这一机制不能宣布解决了完全异步环境中的容错共识。随机化协议必须独立证明同意、有效性与概率终止。<a target="_blank" rel="noopener" href="https://arxiv.org/pdf/cs/0209014">Aspnes，§2、§4</a>。</p>
+<h1>三个可以运行的有限调度</h1>
+<p>代码位于仓库 <code>examples/distributed-systems/consensus08/main.go</code>。它使用 Go 标准库、逻辑 tick 和有限消息队列，无网络端口、子进程或真实计时。它没有实现可容错共识算法，三个场景分别检查观察前缀、安全性反例与有限延迟后的恢复。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">cd</span> examples/distributed-systems<br>GOCACHE=/private/tmp/ds-go-cache go run -race ./consensus08 -check<br>GOCACHE=/private/tmp/ds-go-cache go vet ./consensus08<br></code></pre></td></tr></table></figure>
+<p>调度器每步将时钟增加 1，然后按入队顺序交付当步到期的全部消息。默认观察窗口为 5；<code>-window 25</code> 可以改变窗口，内置检查还覆盖 1、2、5、25。tick 仅表示模型步，不对应毫秒。</p>
+<p>第一个场景比较 C 已停止和 C 心跳延迟两个世界。A 在窗口内记录完全相同的本地历史，包括触发怀疑；延迟世界的心跳随后到达。C 的真实状态由场景控制器知道，但没有泄露给 A 的决定逻辑。</p>
+<p>第二个场景刻意采用错误规则：窗口结束时决定自己的输入。三节点之间的六条提案消息都晚一个 tick 交付。A、B、C 先决定 <code>[0 1 1]</code>，随后消息全部送达，输出仍不改变。一个有限前缀已经足以证明这个规则违反同意要求。</p>
+<p>第三个场景保留相同输入与消息延迟，但等待收到全部三份输入后才决定最小值。窗口内三个进程都未决定；消息交付后全部得到 0。这个规则在无故障且可靠交付的场景中可以结束，却不能容忍某个成员在发送输入前崩溃。</p>
+<p>本地实际执行输出为：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">timeout: window=5 equal-prefix=true suspect-both=true delayed-heartbeat-at=7 delivered=1 pending=0<br>unsafe: window=5 before=[0 1 1] after=[0 1 1] agreement-violation=true delivered=6 pending=0<br>wait-all: window=5 before=[-1 -1 -1] after=[0 0 0] delivered=6 pending=0<br>checks: windows=[1 2 5 25] passed; finite-model observations only, no FLP proof<br></code></pre></td></tr></table></figure>
+<p><code>-1</code> 是未决定的内部标记。检查同时断言生成与交付消息数相等、队列为空，避免把“延迟后恢复”偷换成永久消息丢失。坏规则在消息送达前后保持同一组决定，也让消息交付后的结果有明确比较。</p>
+<p>这些结果属于已运行的本地模型观察。有限窗口未决定不能证明永远不决定；等待全部输入的简单规则失败，也不能证明所有协议都失败。FLP 的普遍结论来自双价性与无限公平执行的证明，不来自把窗口调得很大。</p>
+<h1>两道推导练习</h1>
+<p><strong>题一：</strong> 三个进程都一直运行，调度器永久保留一条发给 A 的消息，其余消息正常交付。A 一直未决定。这是否给出 FLP 所需的允许执行？若仅保留一百万步再交付呢？</p>
+<p><strong>解答：</strong> 第一种违反发给正确进程的消息最终交付要求，不是该模型的 admissible 执行。第二种没有仅因延迟长而违规，但一百万步的有限前缀仍不能证明无限不终止。需要继续构造满足交付和进程执行条件的无限历史，同时保持不决定；FLP 的调度引理承担这一工作。</p>
+<p><strong>题二：</strong> C 已崩溃并最终被所有正确进程永久怀疑。A、B 正确，某时刻以后 A 从不被怀疑，B 仍无限次被误判。这样的检测器是否可以属于 ◇S？能否据此让 B 超时便单独决定？</p>
+<p><strong>解答：</strong> 这条完整历史满足强完整性和最终弱准确性的相应要求，因而与 ◇S 相容。完整实现是否属于 ◇S 还须检查所有允许历史。最终弱准确性只需一个正确进程获得持续准确性，不保护全部正确进程。它也没有授权 B 单独决定；安全决定仍需协议规则，否则 B 的输出可能与 A 冲突。</p>
+<p>下一篇 Paxos 将具体处理这个缺口：后续轮次如何保留已经形成的决定约束，以及协调者竞争何时停止影响进展。</p>
+<h1>参考资料</h1>
+<ul>
+<li>Fischer、Lynch、Paterson：<a target="_blank" rel="noopener" href="https://groups.csail.mit.edu/tds/papers/Lynch/jacm85.pdf">Impossibility of Distributed Consensus with One Faulty Process</a>，JACM 32(2)，1985年4月，pp.374–382。</li>
+<li>Dwork、Lynch、Stockmeyer：<a target="_blank" rel="noopener" href="https://groups.csail.mit.edu/tds/papers/Lynch/jacm88.pdf">Consensus in the Presence of Partial Synchrony</a>，JACM 35(2)，1988年4月，pp.288–323。</li>
+<li>Chandra、Toueg：<a target="_blank" rel="noopener" href="https://www.cs.cornell.edu/courses/cs734/2000FA/cached%20papers/ct96.pdf">Unreliable Failure Detectors for Reliable Distributed Systems</a>，JACM 43(2)，1996年3月，pp.225–267。</li>
+<li>Aspnes：<a target="_blank" rel="noopener" href="https://arxiv.org/abs/cs/0209014">Randomized Protocols for Asynchronous Consensus</a>，arXiv v1登记2002-09-06；本次获取的PDF页首日期为2018-05-28。</li>
+<li>MIT：<a target="_blank" rel="noopener" href="https://pdos.csail.mit.edu/6.824/schedule.html">6.5840 Spring 2026课程安排</a>；Stanford：<a target="_blank" rel="noopener" href="https://www.scs.stanford.edu/24sp-cs244b/sched/">CS244b Spring 2024课程安排</a>。</li>
+</ul>
+<p><a href="evidence.txt" target="_blank" rel="noopener">论断证据表</a>记录资料版本、页节与核验边界；<a href="verification.txt" target="_blank" rel="noopener">本地验证记录</a>保留模型执行命令、输出及未覆盖事项。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-08-%E5%85%B1%E8%AF%86%E9%97%AE%E9%A2%98%E4%B8%8E%E5%AE%89%E5%85%A8%E6%B4%BB%E6%80%A7%E8%BE%B9%E7%95%8C/">https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-08-%E5%85%B1%E8%AF%86%E9%97%AE%E9%A2%98%E4%B8%8E%E5%AE%89%E5%85%A8%E6%B4%BB%E6%80%A7%E8%BE%B9%E7%95%8C/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/%E5%85%B1%E8%AF%86/">共识</a><a class="post-meta__tags" href="/tags/FLP/">FLP</a><a class="post-meta__tags" href="/tags/%E6%95%85%E9%9A%9C%E6%A3%80%E6%B5%8B/">故障检测</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-distributed-systems.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/21/%E5%85%B1%E8%AF%86%E7%AE%97%E6%B3%95%E6%8E%A8%E5%AF%BC-%E4%BB%8E%E9%B8%BD%E5%B7%A2%E5%8E%9F%E7%90%86%E5%88%B0-Paxos-ZAB-%E4%B8%8E-Raft/" title="共识算法推导——从鸽巢原理到 Paxos、ZAB 与 Raft"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">共识算法推导——从鸽巢原理到 Paxos、ZAB 与 Raft</div></div><div class="info-2"><div class="info-item-1">问题 三台服务器要对&quot;当前值是什么&quot;达成一致。任何一台随时可能宕机，网络消息可能延迟或丢失。怎样设计一套协议，使得所有正常运行的节点最终看到同一个结果？ 这就是分布式共识问题。Paxos、ZAB、Raft 用不同的方式回答了这个问题，但背后的数学内核只有一个——鸽巢原理推出的多数派交叉。 唯一需要的数学工具 鸽巢原理 鸽巢原理（抽屉原理）是高中数学竞赛的常客：n+1 只鸽子飞进 n 个巢，至少有一个巢里有两只鸽子。 多数派一定交叉 设集群有 N = 2f + 1 个节点，f 是允许同时宕机的节点数。多数派（quorum）的大小是 f + 1。 任取两个多数派 Q₁ 和 Q₂： 1|Q₁| + |Q₂| = (f+1) + (f+1) = 2f+2 &gt; 2f+1 = N 元素总数超过了全集大小，鸽巢原理给出结论：Q₁ ∩ Q₂ ≠ ∅，至少有一个节点同时属于两个多数派。 这条性质是 Paxos、ZAB、Raft 共同的地基。后面的推导都建立在它之上。 从零推导 Paxos 单提案者：没有任何困难 集群里只有一个提案者（proposer），问题极其简单：  ...</div></div></div></a><a class="pagination-related" href="/2026/06/26/Lucene-%E5%86%85%E9%83%A8-Segment-%E5%80%92%E6%8E%92%E7%B4%A2%E5%BC%95%E4%B8%8E-Doc-Values/" title="深入 Elasticsearch（02）：Segment、倒排索引与 Doc Values"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/Lucene-%E5%86%85%E9%83%A8-Segment-%E5%80%92%E6%8E%92%E7%B4%A2%E5%BC%95%E4%B8%8E-Doc-Values/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（02）：Segment、倒排索引与 Doc Values</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 ES 集群级架构——节点角色、集群状态和数据路径。这一篇进入单个 shard 内部的 Lucene 存储结构。 ES 的每个 shard 就是一个 Lucene index。Lucene index 不是一整块文件，而是由多个不可变的段（segment）组成。理解 segment 的内部结构，才能理解后续文章中 refresh、flush、merge、搜索延迟等机制为什么是那样设计的。 本文只抓一个问题：一个 Lucene segment 内部有哪些数据结构，它们各自承担什么角色。  Segment：不可变的存储单元 一个 Lucene index 由零个或多个 segment 组成。每个 segment 是一批文档的完整索引——包含这批文档的倒排索引、正排数据、字段信息等所有内容。 12345Lucene Index (= ES Shard)├── Segment 0  (committed, immutable)├── Segment 1  (committed, immutable)├── Segment 2  (committed, immutable)└─...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E5%AE%89%E5%85%A8%E4%BD%93%E7%B3%BB-%E8%AE%A4%E8%AF%81-%E6%8E%88%E6%9D%83%E4%B8%8E%E5%8A%A0%E5%AF%86/" title="安全体系：认证、授权与加密"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E5%AE%89%E5%85%A8%E4%BD%93%E7%B3%BB-%E8%AE%A4%E8%AF%81-%E6%8E%88%E6%9D%83%E4%B8%8E%E5%8A%A0%E5%AF%86/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">安全体系：认证、授权与加密</div></div><div class="info-2"><div class="info-item-1">上一篇分析了性能模型。这一篇进入生产环境的另一个关键维度：安全。 Kafka 早期版本没有内置安全机制——客户端连上 broker 就能读写任意 topic。自 0.9 版本起，Kafka 逐步引入了认证、授权和加密三层安全能力。这三层各自解决一个问题：认证确认身份，授权控制权限，加密保护传输通道。 本文只抓一个问题：Kafka 的安全体系如何分层工作，每一层的配置和机制是什么。 三层安全模型 1234567891011Client                          Broker  |                               |  |--- TLS handshake ------------&gt;|   Layer 3: Encryption  |&lt;-- certificate exchange ------|   (通道加密)  |                               |  |--- SASL authentication -----&gt;|   Layer 1: Authentication  |&lt;...</div></div></div></a><a class="pagination-related" href="/2026/06/26/Analysis-%E7%AE%A1%E9%81%93-%E4%BB%8E%E5%8E%9F%E5%A7%8B%E6%96%87%E6%9C%AC%E5%88%B0%E5%8F%AF%E6%90%9C%E7%B4%A2%E8%AF%8D%E9%A1%B9/" title="深入 Elasticsearch（04）：从原始文本到可搜索词项"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/Analysis-%E7%AE%A1%E9%81%93-%E4%BB%8E%E5%8E%9F%E5%A7%8B%E6%96%87%E6%9C%AC%E5%88%B0%E5%8F%AF%E6%90%9C%E7%B4%A2%E8%AF%8D%E9%A1%B9/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（04）：从原始文本到可搜索词项</div></div><div class="info-2"><div class="info-item-1">上一篇解决了文档的结构定义——mapping 把 JSON 字段翻译成 Lucene 数据结构。这一篇进入 text 类型字段怎样从原始字符串变成可搜索的词项。 mapping 决定一个字段&quot;要不要做全文索引&quot;，analysis 决定&quot;怎样做&quot;。一个 text 字段在写入时经过 analysis pipeline，产生一组标准化的词项（terms），这些词项被写入倒排索引。搜索时，查询文本也经过 analysis，产生同样标准化的词项，然后在倒排索引中匹配。 本文只抓一个问题：analysis pipeline 的三个阶段怎样工作，以及索引时分析和搜索时分析为什么可能用不同的 analyzer。  Analysis 三阶段 一个 analyzer 由三个组件按顺序组成： 12345原始文本  → Character Filter(s)  字符级预处理  → Tokenizer            切分为 token  → Token Filter(s)      token 级后处理  → [term1, term2, ...]  写入倒...</div></div></div></a><a class="pagination-related" href="/2026/06/26/%E5%AF%BC%E8%AF%BB-%E4%B8%BA%E4%BB%80%E4%B9%88-Elasticsearch-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%98%AF%E4%B8%80%E5%BC%A0%E5%80%92%E6%8E%92%E7%B4%A2%E5%BC%95/" title="深入 Elasticsearch（00）：为什么 Elasticsearch 的核心是一张倒排索引"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/%E5%AF%BC%E8%AF%BB-%E4%B8%BA%E4%BB%80%E4%B9%88-Elasticsearch-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%98%AF%E4%B8%80%E5%BC%A0%E5%80%92%E6%8E%92%E7%B4%A2%E5%BC%95/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（00）：为什么 Elasticsearch 的核心是一张倒排索引</div></div><div class="info-2"><div class="info-item-1">Elasticsearch 容易被归类成&quot;分布式搜索引擎&quot;或&quot;日志分析平台&quot;。这些标签描述了它的用途，但没有说清楚它的内部结构。把 Elasticsearch 拆到最底层，剩下的核心数据结构只有一个：倒排索引（inverted index）。mapping、analysis、shard、replica、aggregation 五个机制围绕这个数据结构逐层展开。  Elasticsearch 是一个以倒排索引为核心数据结构的分布式搜索与分析引擎。  本篇是系列导读。核心任务只有一个：说清楚倒排索引是什么，以及它和关系型数据库里的 B+Tree 索引有什么本质区别。  倒排索引的基本结构 关系型数据库的 B+Tree 索引从行出发。给定一个索引键值，B+Tree 能定位到存储这行数据的磁盘页。查找路径是： 1索引键值 → B+Tree 内部节点 → 叶子节点 → 行指针 → 数据页 倒排索引从词项（term）出发。给定一个词项，倒排索引能定位到包含这个词项的所有文档。查找路径是： 1词项 → Term Dictionary → Posting ...</div></div></div></a><a class="pagination-related" href="/2026/06/26/Aggregation-%E6%A1%86%E6%9E%B6-%E6%90%9C%E7%B4%A2%E4%B9%8B%E4%B8%8A%E7%9A%84%E5%AE%9E%E6%97%B6%E5%88%86%E6%9E%90/" title="深入 Elasticsearch（09）：搜索之上的实时分析"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/Aggregation-%E6%A1%86%E6%9E%B6-%E6%90%9C%E7%B4%A2%E4%B9%8B%E4%B8%8A%E7%9A%84%E5%AE%9E%E6%97%B6%E5%88%86%E6%9E%90/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（09）：搜索之上的实时分析</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 Query DSL 的查询体系——全文、精确、模糊、地理查询和 bool 组合。这一篇进入在搜索结果之上怎样做实时统计分析。 搜索返回匹配文档的列表。但很多场景不只需要文档列表，还需要统计信息：按类别分组计数、平均价格、日期趋势。ES 的 Aggregation 框架在搜索结果之上提供实时分析能力，不需要把数据导出到 OLAP 系统。 本文只抓一个问题：Aggregation 的三类聚合怎样工作，以及嵌套组合怎样构建复杂分析。  三类聚合 ES 的聚合分为三类，各有不同职责： 1234搜索结果集  → Bucket Aggregation   把文档分到不同的桶里    → Metric Aggregation  在每个桶内计算度量值      → Pipeline Aggregation  在聚合结果上再计算 Bucket 聚合按某种规则把文档分组——类似 SQL 的 GROUP BY。常见的 bucket 聚合：    聚合 分桶规则 类比 SQL     terms 按字段值分组 GROUP BY field   date_histogram 按时间间隔分组 ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">共识需要同时限制结果与等待</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">超时能观察到什么</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">FLP 排除的是哪一种保证</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%8C%E4%BB%B7%E9%85%8D%E7%BD%AE%E5%A6%82%E4%BD%95%E9%98%BB%E6%AD%A2%E6%9C%80%E7%BB%88%E5%86%B3%E5%AE%9A"><span class="toc-number">3.1.</span> <span class="toc-text">双价配置如何阻止最终决定</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">部分同步给终止增加条件</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">故障检测器约束的是怀疑历史</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">随机化改变终止要求的量词</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">三个可以运行的有限调度</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">两道推导练习</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">9.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

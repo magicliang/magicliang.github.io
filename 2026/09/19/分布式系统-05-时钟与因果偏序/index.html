@@ -1,0 +1,780 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>分布式系统 05：时钟与因果偏序 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="服务 P 修改一条记录，再发消息通知服务 Q；Q 收到通知后更新索引。两份日志的墙上时间却显示，索引更新比记录修改早了五毫秒。这个排序能证明系统违反了业务顺序吗？不能。机器时钟可能有偏差，但消息接收必须晚于相应发送，这条约束来自通信过程。 上一篇的网络 KV 与持久化恢复处理单机服务的请求顺序和故障恢复。跨越进程之后，一条本地日志不再包含全部事件，恢复出来的记录也未必足以比较另一台机器的操作。本篇">
+<meta property="og:type" content="article">
+<meta property="og:title" content="分布式系统 05：时钟与因果偏序">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-05-%E6%97%B6%E9%92%9F%E4%B8%8E%E5%9B%A0%E6%9E%9C%E5%81%8F%E5%BA%8F/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="服务 P 修改一条记录，再发消息通知服务 Q；Q 收到通知后更新索引。两份日志的墙上时间却显示，索引更新比记录修改早了五毫秒。这个排序能证明系统违反了业务顺序吗？不能。机器时钟可能有偏差，但消息接收必须晚于相应发送，这条约束来自通信过程。 上一篇的网络 KV 与持久化恢复处理单机服务的请求顺序和故障恢复。跨越进程之后，一条本地日志不再包含全部事件，恢复出来的记录也未必足以比较另一台机器的操作。本篇">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg">
+<meta property="article:published_time" content="2026-09-19T07:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-19T13:21:31.348Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Go">
+<meta property="article:tag" content="分布式系统">
+<meta property="article:tag" content="因果关系">
+<meta property="article:tag" content="逻辑时钟">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "分布式系统 05：时钟与因果偏序",
+  "url": "https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-05-%E6%97%B6%E9%92%9F%E4%B8%8E%E5%9B%A0%E6%9E%9C%E5%81%8F%E5%BA%8F/",
+  "image": "https://magicliang.github.io/img/cover-distributed-systems.svg",
+  "datePublished": "2026-09-19T07:00:00.000Z",
+  "dateModified": "2026-09-19T13:21:31.348Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-05-%E6%97%B6%E9%92%9F%E4%B8%8E%E5%9B%A0%E6%9E%9C%E5%81%8F%E5%BA%8F/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '分布式系统 05：时钟与因果偏序',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">770</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">898</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">17</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-distributed-systems.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">分布式系统 05：时钟与因果偏序</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">分布式系统 05：时钟与因果偏序</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-19T07:00:00.000Z" title="Created 2026-09-19 15:00:00">2026-09-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-19T13:21:31.348Z" title="Updated 2026-09-19 21:21:31">2026-09-19</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.6k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>15mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-19 21:21:31&quot;}" hidden></div><p>服务 P 修改一条记录，再发消息通知服务 Q；Q 收到通知后更新索引。两份日志的墙上时间却显示，索引更新比记录修改早了五毫秒。这个排序能证明系统违反了业务顺序吗？不能。机器时钟可能有偏差，但消息接收必须晚于相应发送，这条约束来自通信过程。</p>
+<a href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-04-%E7%BD%91%E7%BB%9CKV%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96%E6%81%A2%E5%A4%8D/" title="分布式系统 04：从网络 KV 到持久化恢复">上一篇的网络 KV 与持久化恢复</a>处理单机服务的请求顺序和故障恢复。跨越进程之后，一条本地日志不再包含全部事件，恢复出来的记录也未必足以比较另一台机器的操作。本篇从事件和消息定义因果偏序，用 Lamport 时钟保持这个偏序，再用向量时钟识别模型内的并发。物理时间仍有用途，只是它需要另一组假设。
+<h1>顺序从哪些事实产生</h1>
+<p>假定系统有固定的三个进程 P、Q、R。每个进程内部的事件按一个顺序执行，跨进程的影响全部通过显式消息传递；发送和接收是不同事件。消息可以延迟和乱序，讨论到的接收事件都有对应发送。进程不重启回退计数器，不复用身份，整数不溢出。若应用通过共享数据库等其他途径通信，也必须把那条路径纳入模型。</p>
+<p>在这个模型中，<code>a → b</code> 表示 a happens-before b，定义来自三条规则：同一进程上先发生的事件在后发生事件之前；消息发送在相应接收之前；关系具有传递性。它是严格偏序，不包含 <code>a → a</code>。两个不同事件之间，若两个方向都不存在这条关系，就称它们并发，记作 <code>a ∥ b</code>。<a target="_blank" rel="noopener" href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">Lamport 1978 年论文</a>在第 559 页给出这些定义。</p>
+<p>这里的“并发”不要求两个 CPU 在同一物理时刻执行。即使两条操作相隔一小时，只要模型内没有通信路径建立先后关系，仍可能是并发事件。相反，两次操作即使墙上时间相同，也可能通过消息有明确先后。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">局部顺序：P: a → b<br>          Q: c → d → e<br>          R: f → g → h<br>消息匹配：m1: a → d<br>          m2: e → g<br></code></pre></td></tr></table></figure>
+<p>消息边表示 <code>a → d</code> 和 <code>e → g</code>；三行局部顺序不表示不同进程间的物理时间距离。沿路径可得 <code>a → g</code>；b 和 g 之间没有任何方向的路径，因而并发。这张图也给出实验输入：每个进程的局部顺序，加上两条消息匹配边。</p>
+<p>happens-before 描述信息传播可能形成的影响。它不证明某个数据值在业务逻辑上实际改变了另一个数据值。Q 收到消息后完全忽略其内容，发送与接收之间依然存在协议层的先后关系。反过来，日志没有记录共享存储上的通信，也不能据此宣布两个业务操作互不相关。</p>
+<h1>一个整数能保留什么</h1>
+<p>Lamport 时钟为每个进程维护整数 L，初始为零。本地事件和发送事件把 L 加一；消息携带发送事件的 L；接收带有时间 t 的消息时执行 <code>L = max(L,t) + 1</code>。每个事件记录更新后的值。这里每次增加一是具体实现，原论文的时钟条件只要求相应顺序严格递增。</p>
+<p>证明 <code>a → b</code> 推出 <code>L(a) &lt; L(b)</code>，只需检查定义中的三种来源。同一进程每发生一个事件都增加时钟，所以局部先后保持严格小于。接收时取最大值再增加，接收时钟必定大于发送时钟。任意因果路径由这些边组成，而整数的严格小于具有传递性，结论就扩展到整条路径。论文第 560 页的 Clock Condition 与 IR1、IR2 是这一推导的依据。</p>
+<p>逆命题不成立。图中的 b 是 P 的第二个事件，<code>L(b)=2</code>；g 接收 Q 在 <code>L(e)=3</code> 时发出的消息，因此 <code>L(g)=4</code>。虽然 <code>2&lt;4</code>，b 与 g 仍没有因果路径。g 的较大数值可能来自另一个进程的活动，不能据此推出它接收过 b 的信息。</p>
+<p>相同的 Lamport 值也不能为同一条因果链标号。由于有因果关系必定严格递增，两个不同事件的时钟相等足以排除它们的两个因果方向。但时钟不同并不能排除并发，所以标量时钟只能给出部分否定证据，不能完整判定因果关系。</p>
+<p>若需要确定性的排序键，可比较 <code>(L,进程 ID)</code>，先比较时钟，再用固定的进程 ID 顺序打破平局。同一进程的事件本来就有不同的 L。这个排序扩展了因果偏序，但它也为并发事件人为选择了顺序。</p>
+<p>排序键不自动形成共识或全序广播。节点刚看到 <code>(4,Q)</code> 时，仍可能尚未收到另一条 <code>(3,P)</code> 消息；若立即输出，晚到消息就会破坏按键排序。哪些消息已经收齐、何时可以交付、失效节点是否还会发来更小的消息，都需要额外协议。Lamport 论文第 561 页的全序构造，不能直接替代这些交付条件。</p>
+<h1>向量保存各进程的事件前缀</h1>
+<p>为每个进程分配一个固定分量，维护三维向量 V，初始为 <code>[0,0,0]</code>。本地或发送事件只将自己的分量加一；接收消息时，先对本地向量与消息向量逐分量取最大值，再把自己的分量加一。事件记录更新后的向量，发送时复制整个向量，不能让消息继续引用以后会被修改的数组。</p>
+<p>例如 d 收到 a 的 <code>[1,0,0]</code> 时，Q 已经执行 c，自己的向量为 <code>[0,1,0]</code>。合并得到 <code>[1,1,0]</code>，再增加 Q 分量，d 的时间戳为 <code>[1,2,0]</code>。Q 的下一个事件 e 得到 <code>[1,3,0]</code>。R 在接收前已经执行 f，因此 g 的结果是 <code>[1,3,2]</code>，不能忽略本地已有事件而写成 <code>[1,3,1]</code>。</p>
+<p>定义向量 <code>u &lt; v</code> 为：每个分量都有 <code>u[i] ≤ v[i]</code>，且至少一个分量严格小于。不能使用编程语言里的字典序代替这个定义。<code>[2,0,0]</code> 与 <code>[1,3,2]</code> 各有大于对方的分量，两者不可比，正好对应 b 与 g 并发。</p>
+<p>标准向量算法在上述模型下具有双向性质：对不同事件 a、b，<code>a → b</code> 当且仅当 <code>V(a) &lt; V(b)</code>。这一结论见 <a target="_blank" rel="noopener" href="https://vs.inf.ethz.ch/publ/papers/VirtTimeGlobStates.pdf">Mattern 的 Virtual Time and Global States of Distributed Systems</a> §7–8，尤其 Theorem 10。文章发表于 1989 年会议论文集；链接是有少量编辑修订的授权重印版本，印刷页码与初版不同。</p>
+<p>证明可以用事件前缀解释。给进程 i 的事件按本地顺序编号，<code>V(e)[i]</code> 表示截至 e 的因果过去中，进程 i 已经到达的最大事件编号；若 e 本身属于 i，也把 e 包含在这个集合里。进程内的因果过去是连续前缀，因为知道第 k 个事件必定包含其全部局部前驱。</p>
+<p>这个不变量从全零初始状态开始成立。本地事件增加自己的编号；接收消息把发送方已包含的各个前缀合并进来，逐分量取最大值恰好是前缀并集。最后增加接收方自己的事件编号。消息只沿通信边传播，所以合并不会凭空加入没有因果路径的事件。</p>
+<p>若 <code>a → b</code>，a 包含的所有前缀都进入 b，故每个分量不减；沿途至少有一次事件发生，向量严格增加。反向设 a 属于进程 i、编号为 k，且 <code>V(a)&lt;V(b)</code>。于是 <code>V(b)[i]≥k</code>，按照不变量，b 的因果过去已包含 a。排除 a=b 后得到 <code>a → b</code>。这也证明了向量不可比等价于两个方向都没有因果关系。</p>
+<p>这一证明依赖完整的事件和通信模型。若进程重启后把自己的分量归零，编号 k 就可能被重复使用；若进程身份动态加入，却没有定义新分量和旧身份的处理，向量也失去统一含义。工程上需要持久化计数、区分进程 incarnation，或采用有清楚成员规则的其他版本表示。不能只复制三行更新公式，就宣称获得任意部署环境的因果检测。</p>
+<h1>能判定偏序，不代表能复原每条消息</h1>
+<p>Fidge 的 1988 年原始论文也研究向量时间戳，但其异步规则 RA4 和事件比较 EA1 的具体写法与上面的标准记法不同。涉及原公式时应保留其事件约定，不能把另一篇论文的更新规则接到它的比较条件上。原文扫描可见 <a target="_blank" rel="noopener" href="https://raw.githubusercontent.com/jeffrey-xiao/papers/master/causality/timestamps-in-message-passing-systems-that-preserve-the-partial-ordering.pdf">Timestamps in Message-Passing Systems That Preserve the Partial Ordering</a>，异步规则在第 58–59 页，证明在附录 A。</p>
+<p>后来的限制性结果直接关系到故障追踪。<a target="_blank" rel="noopener" href="https://ics.uci.edu/~cs230/reading/4.pdf">Fidge 1998 年的论文</a>说明，向量时间戳足以表示 happens-before，却未必能唯一恢复原通信图；消息乱序会让某条消息边在传递闭包中变得冗余。</p>
+<p>考虑两个进程。P 依次发送 m1、m2，对应 e、f；Q 先接收 m2，再接收 m1，对应 g、h。按照标准算法，四个向量依次为 <code>[1,0]</code>、<code>[2,0]</code>、<code>[2,1]</code>、<code>[2,2]</code>。其中已经有 <code>e → f → g → h</code>，所以额外的 m1 边 <code>e → h</code> 不再增加可达关系。</p>
+<p>再构造另一段执行，把 e 和 h 改为纯本地事件，只保留 f 到 g 的消息。四个时间戳完全一样，事件偏序也一样，实际发送的消息却少了一条。因此，仅凭向量时间戳不能知道 h 到底收到 m1 还是仅执行了本地操作。这个简化反例使用不同事件类型；Fidge 原文进一步讨论了即使附加事件类型仍存在的恢复限制。</p>
+<p>这不反驳向量时钟的双向定理：两段执行的因果闭包本来就相同。若追踪工具需要还原“哪次发送对应哪次接收”，应同时记录唯一消息 ID，或记录接收时携带的发送向量和接收向量等匹配信息。业务请求 ID、消息身份、事件时间戳解决的是不同问题。</p>
+<h1>物理钟与单调钟的工程边界</h1>
+<p>墙上时间适合展示日期、跨系统对照时间区间，但比较它需要了解同步误差、时钟调整和时间来源。仅有两个机器的时间戳大小，无法排除偏差造成的反转。逻辑时钟保留消息关系，却不表示实际经过的秒数；将 L 的差当作网络延迟也没有意义。</p>
+<p>本地测量耗时通常采用单调时钟。<a target="_blank" rel="noopener" href="https://pkg.go.dev/time@go1.27.0#hdr-Monotonic_Clocks">Go 1.27.0 time 文档的 Monotonic Clocks 节</a>说明，<code>time.Now()</code> 返回的 Time 可以同时包含墙上时间与单调读数。两个值都带单调读数时，<code>Sub</code>、<code>Before</code>、<code>After</code>、<code>Equal</code> 等使用该读数；任一个不带时，操作回到墙上时间。</p>
+<p>Go 的 JSON、Gob、二进制和文本序列化不保存单调读数，因为它在当前进程外没有意义。<code>time.Date</code>、<code>time.Parse</code>、<code>time.Unix</code> 产生的值也不含单调读数；<code>Round(0)</code> 是显式去掉该部分的方法。因而把起点序列化后传到另一个服务，再调用 <code>Sub</code>，不能声称继承了起始进程的单调耗时保证。<code>==</code> 还比较位置和内部表示，比较时间点通常应使用 <code>Equal</code>。</p>
+<p>某些系统休眠时单调钟会暂停，具体耗时需求仍应核对平台行为。单调读数也不提供跨机器统一原点，更不能单独保证租约安全：租约需要说明时钟速率或误差约束、服务暂停、请求延迟，以及持有者失效后旧操作怎样被拒绝。后续涉及租约与 TrueTime 时，这些假设必须重新列出。</p>
+<h1>实验：独立事件图核验所有事件对</h1>
+<p>代码在 <code>examples/distributed-systems/clocks05/main.go</code>，只使用 Go 标准库。它接收写在代码里的拓扑事件序列：事件 ID、进程 ID，以及接收事件对应的发送 ID。输入序列中 a 排在 c 前面只是计算时的拓扑安排，不会自动生成 a 到 c 的因果边。</p>
+<p>程序先按每个进程的前后事件构造局部边，再按消息 ID 构造发送到接收的边，用 Floyd–Warshall 计算传递闭包。这条路径不读取任何时间戳。另一条路径独立执行时钟更新，最后比较图可达性与时钟关系，避免把待检验的向量关系本身当作判定答案。</p>
+<p>在仓库的实验模块目录运行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">cd</span> examples/distributed-systems<br>GOCACHE=/private/tmp/ds-go-cache go run -race ./clocks05<br>GOCACHE=/private/tmp/ds-go-cache go vet ./clocks05<br></code></pre></td></tr></table></figure>
+<p>本地实际得到的八个事件如下。R 的 g 是第二个事件，因此向量第三项为 2。</p>
+<table>
+<thead>
+<tr>
+<th>事件</th>
+<th>操作</th>
+<th style="text-align:right">Lamport 值</th>
+<th>向量值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>a</td>
+<td>P 发送 m1</td>
+<td style="text-align:right">1</td>
+<td><code>[1,0,0]</code></td>
+</tr>
+<tr>
+<td>b</td>
+<td>P 本地事件</td>
+<td style="text-align:right">2</td>
+<td><code>[2,0,0]</code></td>
+</tr>
+<tr>
+<td>c</td>
+<td>Q 本地事件</td>
+<td style="text-align:right">1</td>
+<td><code>[0,1,0]</code></td>
+</tr>
+<tr>
+<td>d</td>
+<td>Q 接收 m1</td>
+<td style="text-align:right">2</td>
+<td><code>[1,2,0]</code></td>
+</tr>
+<tr>
+<td>e</td>
+<td>Q 发送 m2</td>
+<td style="text-align:right">3</td>
+<td><code>[1,3,0]</code></td>
+</tr>
+<tr>
+<td>f</td>
+<td>R 本地事件</td>
+<td style="text-align:right">1</td>
+<td><code>[0,0,1]</code></td>
+</tr>
+<tr>
+<td>g</td>
+<td>R 接收 m2</td>
+<td style="text-align:right">4</td>
+<td><code>[1,3,2]</code></td>
+</tr>
+<tr>
+<td>h</td>
+<td>R 本地事件</td>
+<td style="text-align:right">5</td>
+<td><code>[1,3,3]</code></td>
+</tr>
+</tbody>
+</table>
+<p>程序遍历 56 个不同事件的有序对，检查因果推出标量严格递增、因果与向量小于等价、并发与向量不可比等价。随后显式检查 b、g 的标量反例，并运行上一节的乱序消息例子，确认不同直接消息边可以产生相同时间戳和因果闭包。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">PASS pairs=56 scalar-implication=true vector-equivalence=true concurrent-equivalence=true<br>COUNTEREXAMPLE b,g scalar=2&lt;4 causal=false vectors-incomparable=true<br>PASS overtaking same-clocks=true same-happens-before=true different-message-edges=true<br></code></pre></td></tr></table></figure>
+<p>负例开关会删除接收时的向量合并，但仍增加本地分量；图构造与标量逻辑保持正常。执行以下命令应失败，这次本地执行也确实以非零状态退出：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">GOCACHE=/private/tmp/ds-go-cache go run ./clocks05 -omit-receive-merge<br></code></pre></td></tr></table></figure>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">vector equivalence failed a,d: reachable=true vectors=[1 0 0],[0 2 0]<br>exit status 1<br></code></pre></td></tr></table></figure>
+<p>程序还执行真实的 Go 时间 JSON 往返，检查 <code>Equal</code> 所表示的时间点未改变；单调字段被省略的保证来自官方 API 文档，不从 <code>Equal</code> 成功反推内部字段。另一个注入模型令墙上读数从 1000 变为 900、单调读数从 50 变为 60，得到 <code>wall-delta=-100</code> 与 <code>monotonic-delta=10</code>。它只展示回拨对减法的影响，没有修改操作系统时钟，也没有观察真实 NTP 调整。</p>
+<p>这些是单进程确定性模型与标准库调用的本地验证。race 检查通过不等于验证了真实分布式网络；固定八事件穷举也不是所有可能执行的形式化证明。一般性保证由前面的不变量推导支撑，实验负责暴露实现与推导之间的偏差。</p>
+<h1>两个推导练习</h1>
+<p><strong>练习一：</strong> 在八事件图中，把 b 改为发送事件，并让 R 在 g 之后、h 之前接收它。b 与原 g 还并发吗？新增接收事件和 b 又是什么关系？</p>
+<p>原 g 的因果过去不会因为未来多收一条消息而改变，所以 b 与 g 仍并发。新增接收事件记为 x，合并 g 的 <code>[1,3,2]</code> 和 b 的 <code>[2,0,0]</code> 后，再增加 R 分量，得到 <code>[2,3,3]</code>，此时 <code>b → x</code>。若 h 紧接 x，则 h 为 <code>[2,3,4]</code>。已发生事件的时间戳不能在后来补写，否则记录就不再对应当时的因果过去。</p>
+<p><strong>练习二：</strong> 若两个独立进程都用 <code>(Lamport 值,进程 ID)</code> 排序消息，且比较函数完全相同，是否足以让它们执行相同命令序列？</p>
+<p>还不够。P 已收到键为 <code>(4,Q)</code> 的命令并执行，R 先收到 <code>(3,P)</code> 再收到 <code>(4,Q)</code>，两者暂时拥有不同集合。相同比较函数只能保证对相同集合计算相同排序，不能保证集合何时完整、消息何时可交付。若还允许崩溃或消息永久丢失，等待策略又面临活性问题。下一篇的一致性模型将把“按因果排序”“保持单个客户端程序顺序”和“尊重真实时间先后”等要求分别写成可检查的历史条件。</p>
+<h1>参考资料与核验记录</h1>
+<p><a target="_blank" rel="noopener" href="https://ocw.mit.edu/courses/6-852j-distributed-algorithms-fall-2009/pages/readings/">MIT 6.852J Fall 2009 的课程阅读表</a>在 Lecture 11 将时钟、状态机模拟和向量时间戳放在同一教学单元，并列出 Lamport 与 Mattern。这是对系列 MIT 2026、Stanford 2024 主课程结构的补充，不把旧课程单元冒称为当年新版安排。</p>
+<p>核心来源包括 Lamport《Time, Clocks, and the Ordering of Events in a Distributed System》（CACM，1978 年 7 月，558–565 页），Fidge 1988 年原论文，Mattern 1989 年论文及链接重印版本，以及 Fidge《A limitation of vector timestamps for reconstructing distributed computations》（1998 年预印本、同年 Information Processing Letters 68(2) 正式发表）。Go API 行为按 Go 1.27.0 固定版本官方文档和本机该版本 <code>src/time/time.go</code> 的包文档核对，查阅日期为 2026-09-19。</p>
+<p><a href="evidence.txt" target="_blank" rel="noopener">论断与证据核验状态</a>记录页节定位、模型差异和反向限制检索；<a href="verification.txt" target="_blank" rel="noopener">实验验证记录</a>记录命令、实际输出和未验证事项。Fidge 1998 年的限制是追踪能力边界，不应写成“向量时钟的因果定理被推翻”。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-05-%E6%97%B6%E9%92%9F%E4%B8%8E%E5%9B%A0%E6%9E%9C%E5%81%8F%E5%BA%8F/">https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-05-%E6%97%B6%E9%92%9F%E4%B8%8E%E5%9B%A0%E6%9E%9C%E5%81%8F%E5%BA%8F/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Go/">Go</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/%E9%80%BB%E8%BE%91%E6%97%B6%E9%92%9F/">逻辑时钟</a><a class="post-meta__tags" href="/tags/%E5%9B%A0%E6%9E%9C%E5%85%B3%E7%B3%BB/">因果关系</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-distributed-systems.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-04-%E7%BD%91%E7%BB%9CKV%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96%E6%81%A2%E5%A4%8D/" title="分布式系统 04：从网络 KV 到持久化恢复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 04：从网络 KV 到持久化恢复</div></div><div class="info-2"><div class="info-item-1">服务端已经把 x=two 写入文件，并完成同步。返回客户端的连接随即关闭，客户端收到错误。服务进程被终止以后，新的进程应该恢复出什么值？客户端用原来的请求 ID 重试，应该重新写一遍，还是取回上次结果？ 第 01 篇的内存去重在重启后会丢失。本篇把业务修改、请求身份和返回结果放进同一条追加日志，再用真实 HTTP 连接和子进程终止验证恢复行为。第 03 篇 讨论 GFS 写入路径中的多个副本；这里暂时收窄到一台机器上的一个服务进程，把单副本自身必须兑现的承诺讲清楚。 网络接口需要先定义可观察语义 这个 KV 服务提供两类请求。GET /kv?key=x 查询当前值；POST /kv 接收包含 ID、Key、Value 的 JSON，将一个键设为指定字符串。写入返回原请求与全局递增的 Revision。首次成功修改获得一个新 revision，同 ID 同参数重试返回第一次的记录，不推进 revision。 revision 在这里仅是单个日志中的序号。它既不是物理时间，也不是跨节点一致性协议里的任期，更不能当作全局分布式事务版本。GET 返回当前值与存储的全局 revision。...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-03-GFS%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E5%89%AF%E6%9C%AC%E8%BE%B9%E7%95%8C/" title="分布式系统 03：GFS 写入路径与副本边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 03：GFS 写入路径与副本边界</div></div><div class="info-2"><div class="info-item-1">多个工作者可以重做同一份计算，保存计算结果的文件系统却必须回答另一组问题：数据放在哪些机器上，谁决定并发写入的先后，一次写入只有部分副本完成时能否读取，以及客户端收到成功究竟意味着什么。 上一篇：MapReduce 任务重试与输出提交区分了执行与发布。GFS 把这种区分推进到存储层：网络已经传完数据、某个副本已经改动文件、整个请求已经得到成功响应，是三个不同的时刻。混淆它们，会把失败后的残留内容当成已提交结果。 讨论对象是 Ghemawat、Gobioff 和 Leung 在 SOSP 2003 发表的 GFS。MIT 6.5840 Spring 2026 把它放在 MapReduce、RPC 之后，用它连接分片、复制与故障恢复。本篇的 Go 程序只执行有限内存时间线，不提供 GFS API，也没有真实的磁盘复制、租约时钟或网络传输。 从工作负载确定系统模型 2003 年 GFS 面向大型数据处理。文件较大，追加和顺序读取常见，系统需要聚合带宽，并把机器故障视为日常条件。这与任意程序都能直接使用的通用文件系统有距离。应用可以配合存储接口，接受校验记录、过滤重复等额外责任。原论文 ...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-07-%E4%B8%BB%E5%A4%87%E4%B8%8E%E9%93%BE%E5%BC%8F%E5%A4%8D%E5%88%B6/" title="分布式系统 07：主备与链式复制"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 07：主备与链式复制</div></div><div class="info-2"><div class="info-item-1">主节点返回写入成功后立刻故障，备节点接管却读不到这次写入。副本没有同时损坏，客户端也没有误读响应；只要成功响应早于复制完成，这条时间线就可能成立。复制协议要规定的，正是哪些事件必须发生在成功之前，以及换主之后哪些结果必须保留。 上一篇：一致性模型与分区边界给出了检查读写历史的标准。本篇把标准落到主备与链式复制的确认点上。课程结构参考 MIT 6.5840 2026 的 Chain Replication 讲义，协议以 OSDI 2004 原论文为依据；PostgreSQL 18.6 只用于核对真实产品的配置语义，配套程序是独立的有限事件模型。 成功、复制与可读是三个事件 设一个寄存器初值为 x=0，客户端提交 Put(x,1)。主节点可以先更新内存、记录日志，再把变化发送给备节点。备节点收到字节、写入本地日志、刷入稳定存储和应用到查询状态，各自需要不同步骤。“已经复制”若不指明其中哪一步，就不足以解释一次故障后的结果。 异步主备允许主节点在备节点达到所需状态之前返回成功。如下时间线中，主节点本地数据甚至可以已经落盘，切换仍会丢失这次已确认写入： 123P: 写入 1 ── 返回 ...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-02-MapReduce%E4%BB%BB%E5%8A%A1%E9%87%8D%E8%AF%95%E4%B8%8E%E8%BE%93%E5%87%BA%E6%8F%90%E4%BA%A4/" title="分布式系统 02：MapReduce 任务重试与输出提交"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 02：MapReduce 任务重试与输出提交</div></div><div class="info-2"><div class="info-item-1">一批输入有十八条记录。某个工作者写出半个结果文件后退出，调度器把同一份输入交给另一个进程。第二个进程成功了，最终结果能否保证每条记录只出现一次？如果第一个进程没有退出，只是回复得晚，它又该如何处理自己的结果？ 上一篇的 RPC 重试与请求去重讨论了一次调用可能执行多次。批处理框架面对相同的不确定性，却有一个有利条件：许多任务可以从固定输入重新计算。代价是框架必须规定哪一次执行的输出能进入下游，不能把工作者留下的所有文件直接拼起来。 MapReduce 把这件事与任务切分、数据分组、调度放进一个计算框架。本文沿用 2004 年论文的模型讨论保证，再用独立 Go 实验检查进程被杀和旧 attempt 晚到的发布边界。实验有真实子进程和文件操作，不连接分布式存储，不模拟成生产集群。 先确定计算结果是什么 输入记录为 (ID, key)，ID 从 0 到 17，key 表示 ID 的奇偶性。目标是按 key 收集 ID，并在每组内排序。正确结果只有两组：偶数组包含 0,2,...,16，奇数组包含 1,3,...,17。这个任务很小，但能检查重试后是否多算、漏算或分错组。 将输入按 ID...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-01-RPC%E9%87%8D%E8%AF%95%E4%B8%8E%E8%AF%B7%E6%B1%82%E5%8E%BB%E9%87%8D/" title="分布式系统 01：RPC 重试、并发与请求去重"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 01：RPC 重试、并发与请求去重</div></div><div class="info-2"><div class="info-item-1">计数器最初为 0。客户端调用 Add(1)，服务端把计数器改成 1，回复却在返回途中丢失。客户端等待超时，再调用一次，计数器变成 2。网络只丢了一条回复，业务却多执行了一次。 第 00 篇 已经区分“执行失败”与“没有观察到结果”。RPC 将这个区别带进接口设计：同一项业务操作可以对应多次网络尝试，接口必须说明如何识别它们，以及服务重启之后还保留什么证据。 RPC 隐藏了传输，没有消除失败 一次远程调用通常经过参数编码、请求传输、服务端解码与分发、业务执行、结果编码、回复传输和客户端解码。正常路径看起来接近函数调用，失败路径却多了两个独立进程和两个消息方向。 如果本地进程中的普通函数返回，调用者通常可以直接使用返回值。远程请求还可能卡在消息队列、连接缓冲区或服务端执行队列里；客户端停止等待时，服务端未必停止工作。客户端看到的超时，不能反推出业务修改已经回滚。MIT 2026 RPC 讲义把这种“不知道请求是否到达或执行”的情况作为 RPC 故障语义的起点。 TCP 提供的连接内字节流可靠性也不足以解决这个问题。服务端可以先提交业务，再在回复到达客户端之前崩溃；客户端重连之后，即使...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-06-%E4%B8%80%E8%87%B4%E6%80%A7%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%88%86%E5%8C%BA%E8%BE%B9%E7%95%8C/" title="分布式系统 06：一致性模型与分区边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 06：一致性模型与分区边界</div></div><div class="info-2"><div class="info-item-1">客户端 A 写入 x=1 并收到成功，客户端 B 随后读到 x=0。这个结果是否错误，取决于存储接口承诺的一致性模型。若接口承诺线性一致，且没有其他写入，它就是反例；若只承诺顺序一致，还要检查客户端之间的程序关系；若只承诺最终收敛，仅凭这一次旧读无法判定违反承诺。 上一篇：时钟与因果偏序用 happens-before 描述事件之间的因果关系。本篇把对象的读写规格加入时间线，区分哪些观察可以由一次合法执行解释。MIT 6.5840 和 Stanford CS244B 都将一致性、复制与容错放在课程主线中；这里先建立检查读写历史的工具，下一篇再比较复制协议如何满足这些约束。 先规定一个读写对象 设一个 KV 对象初始所有键的值都是 0。Put(x,1) 把 x 改为 1，并返回 OK；Get(x) 返回当前 x 的值。单线程执行 Put(x,1); Get(x) 时，读取必须得到 1。这个规则称为顺序规格，独立于对象用内存、磁盘还是多个副本实现。 并发历史记录每个操作的调用和返回事件，也记录客户端身份、参数及返回值。W_A(x,1)[1,4] 表示 A 在事件 1 调用写，在事件 ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">顺序从哪些事实产生</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">一个整数能保留什么</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">向量保存各进程的事件前缀</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">能判定偏序，不代表能复原每条消息</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">物理钟与单调钟的工程边界</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">实验：独立事件图核验所有事件对</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">两个推导练习</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">参考资料与核验记录</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
