@@ -1,0 +1,90 @@
+论断—证据—核验状态：Multi-Paxos 10
+记录日期2026-09-19；以下为对应研究备忘的完整证据副本。局部实验观测见verification.txt。
+
+# 10 Multi-Paxos 与复制状态机研究备忘
+
+研究日期：2026-09-19。对应蓝图 10：从单值 Paxos 到日志、领导者、确定性执行和客户端去重。研究备忘已用于 10 的正文与有限实验，2026-09-19 已实现并运行正常及四项变异；全站集成验收另见逐篇台账。不修改共享台账，不提交或推送。
+
+## 资料、版本与实际阅读范围
+
+| 编号 | 标题、版本/日期、URL | 实际阅读与用途 |
+|---|---|---|
+| S1 | Leslie Lamport, *Paxos Made Simple*；PDF 2001-11-01，SIGACT News 32(4), December 2001；https://lamport.azurewebsites.net/pubs/paxos-simple.pdf | §3，正文印刷页 8–10：状态机、逐槽共识、新领导者恢复、空洞及 no-op、流水线。PDF 浏览器页码含封面偏移。 |
+| S2 | Chandra, Griesemer, Redstone, *Paxos Made Live—An Engineering Perspective*；PODC 2007，pp398–407；Google 官方元数据 https://research.google/pubs/paxos-made-live-an-engineering-perspective-2006-invited-talk/ | 官方题名含“2006 Invited Talk”，发表年份仍为 2007。官方 PDF https://research.google.com/archive/paxos_made_live.pdf 的重定向读取失败；实际阅读全文为大学托管的原论文 https://www.cs.albany.edu/~jhh/courses/readings/chandra.podc07.paxos.pdf ，重点 §4.2、§5.1–5.3、§5.5。 |
+| S3 | van Renesse, Altınbüken, *Paxos Made Moderately Complex*；ACM Computing Surveys 47(3), Article42, February2015，36页；DOI https://doi.org/10.1145/2673577 | 作者入口 https://paxos.systems/paper/ ；实际全文 https://www.cs.cornell.edu/courses/cs7412/2011sp/paxos.pdf 。已核首页、页脚与出版元数据；路径里的 2011sp 不能作为版本日期。重点 §1、§2.1–2.4、§3、§4。 |
+| S4 | Robbert van Renesse, *Paxos Made Moderately Complex*，早期单作者 16 页稿；全文 https://www.cs.cornell.edu/courses/cs5414/2017fa/papers/PaxosComplex.pdf | 实际读前四页的模型、replica 与 perform，并查状态缩减部分。Cornell 2016 课程 https://www.cs.cornell.edu/courses/cs6410/2016fa/sched.htm 将旧稿标为 March25,2011；该日程所链接旧路径本次未成功取回。因此只能将 2011 作为课程给出的旧稿年代，不能宣称已对下载文件做版本哈希同一性验证。正文规则以 S3 正式版为准。 |
+| S5 | Liu, Chand, Stoller, *Moderately Complex Paxos Made Simple: High-Level Executable Specification of Distributed Algorithms*；arXiv1704.00082v4，2019-08-12；https://arxiv.org/pdf/1704.00082v4 | 实际读 §4.3（约 pp13–15）与 §6.2（p19）。初次提交是 2017，当前核对固定 v4，不将全文标成 2017 版。用于反向检查交付假设、重传和回复轮号匹配。 |
+| S6 | MIT 6.5840 Spring2026 课程及 Paxos lecture notes；https://pdos.csail.mit.edu/6.824/schedule.html ，https://pdos.csail.mit.edu/6.824/notes/l-paxos.txt | 滚动材料，访问2026-09-19；notes 约行290–319：Paxos到数据库复制、按日志顺序执行、将读操作放进日志。不能把此滚动文本当固定源码发布版。 |
+| S7 | Stanford CS244B Spring2024 课程日程；https://www.scs.stanford.edu/24sp-cs244b/sched/ | 实际核对 FLP、ZooKeeper、Raft、µSec Consensus 等课程路线；未列独立 Multi-Paxos 单元，不虚构该课具体讲授本节算法。 |
+
+## 论断—证据—核验状态
+
+| 论断 | 依据与定位 | 核验状态 / 边界 |
+|---|---|---|
+| 每个 slot 是一个共识实例；安全限制同槽内容，允许不同槽不同命令 | S1§3；S3 A4/A5、C1/C2，pp42:8–11 | 已交叉核对。共享 ballot 与 phase1 是跨槽组织优化，不把多槽投票混成同一个值的多数派。 |
+| 一个 ballot 只能由唯一领导者使用；同 ballot 同 slot 只能发一个命令 | S3§2.3/2.4，C1、唯一 ballot 与 commander | 已核。允许不同 ballot 的领导者并发；“唯一轮号所有者”与“任一时刻只有一个活跃领导者”是不同条件。 |
+| phase1 汇总一个 quorum 的 accepted，并对每个 slot 单独选最高 accepted ballot | S1§3；S3§2.4 pmax | 已交叉核对。即使某条记录只有一个报告者、无法证明已 chosen，也须保留；不能只恢复已有多数票证明的槽。 |
+| 新领导者未受旧 accepted 约束的槽可提出 no-op | S1§3 的136/137空洞例子 | 已核。no-op 仍必须取得该槽共识；本地填空不能替代共识。一般新命令也可占据自由槽。 |
+| 后面的槽可先 chosen，但应用状态只能推进连续已知 chosen 前缀 | S1§3；S3§2.1 R2/R3、slot_out；S6 | 已交叉核对。收到 slot4 的 decision 不等于可越过未知 slot2。 |
+| 相同初态、确定性命令和相同有序前缀产生相同状态与输出 | S1§3；S3§1/2.1 | 已交叉核对。随机数、时间、外部读取结果如影响状态，须成为已排序输入或另受协议约束；仅复制函数名不足。 |
+| 相同客户端请求可被 chosen 到多个槽，应用层还需识别重试 | S3§1 命令身份、§2.1 perform；S4 replica部分 | 已核。以(clientID,requestID)唯一标识逻辑请求；身份不得复用给不同操作。缓存结果是教学设计的明确扩展，不能说仅有槽内共识便产生端到端 exactly-once。 |
+| 自称 master 的节点可能已被取代，读其本地副本不自动线性一致 | S2§5.2 p401；S6日志读 | 已交叉核对。可把读也串入共识日志并等待有序执行；租约等优化需单独证明时钟与任期条件。 |
+| 稳定领导者可以在已建立的 ballot 下重复 phase2 | S1§3；S2§4.2；S3 scout/commander分离 | 已核。切换或抢占后不能未经恢复沿用旧值选择权；不借用历史产品延迟数字作为实验结果。 |
+
+建议正文统一术语：accepted 是某 acceptor 的局部票；chosen 是同一 ballot、slot、command 获得 quorum 历史票的事实；learned/decided 是某 replica 获得足够信息；applied 是按序执行到本地状态。若使用 committed，明确它在本篇等同于已确定日志命令，不能偷偷等同于所有副本已经应用。不同产品的 committed 定义另行核对。
+
+## 模型、精确规则与证明骨架
+
+固定三个 acceptor、两名可竞争 leader、若干 replica；非拜占庭；唯一全序 ballot，固定成员。沿用 S3 的成套规则：acceptor 先采用 ballot，phase2 仅在消息 ballot 等于当前 ballot 时接收；不要从 09 的宽松 `>=` 变体抽半套代码混用。对每个 ballot 的 scout/commander 保存不可变轮号，回复必须匹配原轮号和原 slot，不能拿 leader 当前可变轮号解释迟到消息。
+
+S3 基础模型把失败进程视为永久停止，并假设正确进程间最终可靠交付。若扩展为崩溃重启，promise 与 accepted 必须可靠恢复，且回复前持久化；若采用可丢消息网络，重传、去重和最终可达条件须显式添加。有限事件调度不能证明一般活性。
+
+逐槽复用 09 的多数派交叉归纳：固定槽 s，较高 ballot 的 phase1 quorum 与任何可能形成的较低 ballot 接受 quorum 相交；承诺与最高 accepted 规则约束后续提案。此推理不要求较低 ballot 先在时间上完成 chosen。随后另做状态机归纳：若各副本已应用同一长度 k 前缀，下一条确定性命令相同，则状态、请求结果和游标同步到 k+1。前一证明处理日志内容一致，后一证明处理执行一致，不能省去中间的连续前缀条件。
+
+稳定领导者批量建立 phase1 的前提是覆盖其要使用的槽、收集全部相关 accepted 信息并执行逐槽 pmax。不能将“省略重复 phase1”解释为“只恢复已提交的槽”。压缩、快照、重配置与 accepted 清理需要额外协议，本节实验不实现。
+
+## 反向检索与归因限制
+
+已以论文全名结合 errata、correction、safety、liveness、lost messages 检索。S5 是找到的具体原作者研究材料，不是搜索摘要猜测。
+
+- S5§4.3 的丢消息停滞分析明确改变了原可靠链路假设：propose 丢失可能留下阻塞执行的洞，phase1/phase2 回复丢失可能使角色等待。正文可用来解释工程重传需求，不能据此宣称原模型内的安全性被推翻。
+- S5§6.2 所述 safety violation 属于该文作者早期未发表规格；根因是将固定阶段轮号和可变 leader 轮号混淆。不能归咎于 S3 正式算法，也不能说所有 Multi-Paxos 都有此漏洞。
+- S1 的2015作者歧义说明沿用09备忘的已核出处：它要求精确协议，而未公开指出具体歧义句。不要把某论坛猜测当正式勘误。
+- 本次未找到 S2 或 S3 官方单列勘误，不等于证明不存在勘误。S2 历史租约实现采用 master 更短超时抵御漂移；此处不移植数值或宣称完全异步下可安全本地读。
+
+## 原创有限实验设计与实施边界
+
+单进程、Go标准库离散事件协议模型；不复制课程作业答案。打印消息交付、各 acceptor 状态、每槽票证、每 replica 游标与状态。必须称“有限调度模型”，不称真实网络、磁盘故障或产品端到端验证。
+
+使用 A/B/C 三个 acceptor，P/Q 两名 leader，ballot1/2，五个 slot。应用状态初始 x=0；命令身份与操作分离。判定器保留不可回退的历史 `Votes[(ballot,slot,command)]`，按不同 acceptor 身份计票。每槽历史 chosen 命令至多一个；不能只观察当前最高 accepted 来判断是否发生过冲突。
+
+正常轨迹：
+
+1. P 完成 ballot1 phase1，A/B/C 采用该轮。slot1 为请求 a#1 `Set(2)`，被 A/B 接受。slot2 尚无提案。slot3 为 a#2 `Add(3)`，只被 B 接受，给 A 的旧 accept 留在消息队列。slot4 为 b#1 `Mul(10)`，被 B/C 接受。
+2. Q 在 B/C 完成 ballot2 phase1，逐槽恢复1、3、4；slot3只有一个已接受报告也要恢复。slot2全空，提出 no-op。在 B/C 上完成这些槽 phase2。此时 slot1/3/4的命令与旧轮一致。
+3. 交付给 A 的迟到 ballot1 slot3 accept；A仍处旧轮，可以接受，历史 A/B 也形成该槽 quorum。正确恢复使两个 ballot 的 chosen 都是 Add(3)。这一步专门检验低轮后完成的交错。
+4. 将 chosen 通知以不同顺序送到三个 replica。先收到 slot4 时游标仍为0；收到slot1时 x=2、游标1；直到slot2与3可执行，连续前缀才推进到4，x=50。三者按各自乱序到达最终得到相同状态、去重表和游标。
+5. slot5再次提出同一逻辑请求 a#2 Add(3)，完成共识。应用层识别重试，x仍为50，并返回首次执行缓存结果5。随后从初始状态重放相同日志，完整状态、缓存、游标须相同。这里只验证内存重放；没有模拟磁盘原子性或外部副作用。
+
+变异验收，每项只改变一条规则：
+
+| 变异 | 预期反例 / 判定器 |
+|---|---|
+| 新领导者只恢复已有多数票证的槽，丢掉slot3单票并选no-op | slot3在ballot2的 B/C chosen no-op；随后迟到旧消息在ballot1的 A/B chosen Add(3)。历史判定器必须报同槽冲突，不能仅报“恢复不规范”。 |
+| 按decision到达顺序立即执行，先4再1再3 | 得到 x=5 而非50，且越过未知槽的前缀断言更早失败。使用非交换命令避免加法掩盖错误。 |
+| 去掉客户端去重 | slot5第二次Add(3)，得到53；状态与请求执行次数检查均失败。 |
+| 执行过程读取未复制的本地时间 | 注入各副本固定不同时间100/200/300作为输入，重放同一日志得到不同状态；明确这是故意违反确定性，不依赖真实随机时钟制造偶发测试。 |
+
+补充读边界情景可单列有限历史：旧leader只应用到slot1返回2；B/C随后完成并回复更新到50；客户端在写完成后向隔离旧leader发读，得到2。此历史违反真实时间顺序。它只说明无领导权确认的本地读不足，不宣称完成通用线性一致性检查器。正确对照可把读作为slot6共识命令，执行连续前缀后返回50。
+
+正常与变异应有明确退出码，并验证重复投票不增加quorum、不足quorum不生成有效chosen证据、来自旧ballot的回复不激活新轮。实验覆盖有限轨迹；形式证明、无界活性、真实持久化、性能、产品API均未由该实验验证。
+
+## 本次实施与独立复核
+
+- 已实施：examples/distributed-systems/multipaxos10/main.go，固定五槽、历史票证、==ballot、逐槽pmax、连续前缀、缓存结果重放、四项故障变异。
+- 未实施：建议中的slot6日志读，保持五槽；旧主读取仅比较副本状态，其实时历史由正文指定。没有真实网络/磁盘/持久化/重传/任期计时器/无界枚举。
+- 父代理独立阅读PMMC2015 §2.1 R1–R5/perform、§2.2 A2、§2.4 pmax与归纳，PMS§3、MadeLive§5.2、1704.00082v4§6.2；关键结论相符。
+- 本代理补读作者网站 https://paxos.systems/how/ 的acceptor、scout/commander、replica规则，与正式论文一致；网站为滚动材料，访问2026-09-19。
+- 运行证据与CLI环境限制集中在正文同名目录verification.txt，不能把本设计段的预期值当实测。
+
+三图补充（2026-09-19）：pmax图依据S3§2.4及history(false)的B/C回复；连续应用图依据S1§3、S3 R2/R3及normal的4,1,3,2通知顺序；去重图依据S3 perform及本实验缓存扩展，a#2首次结果5/当前状态50。未引入新事实。

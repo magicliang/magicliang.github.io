@@ -1,0 +1,798 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>分布式系统 10：Multi-Paxos 与复制状态机 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="单值 Paxos 为一个位置选定一个值。数据库却要不断处理请求：先设置余额，再扣款，再读取结果。即使每个位置都不会选出两个不同命令，副本按不同顺序执行这些位置，仍可能得到不同余额。Multi-Paxos 需要把逐槽共识、领导者恢复和状态机执行连接起来。 上一篇：多数派交叉与单值 Paxos建立了单值 Paxos 的承诺与选值规则。本篇沿用多数派交叉的证明方法，把共识实例扩展成日志槽。MIT 6.5">
+<meta property="og:type" content="article">
+<meta property="og:title" content="分布式系统 10：Multi-Paxos 与复制状态机">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-10-Multi-Paxos%E4%B8%8E%E5%A4%8D%E5%88%B6%E7%8A%B6%E6%80%81%E6%9C%BA/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="单值 Paxos 为一个位置选定一个值。数据库却要不断处理请求：先设置余额，再扣款，再读取结果。即使每个位置都不会选出两个不同命令，副本按不同顺序执行这些位置，仍可能得到不同余额。Multi-Paxos 需要把逐槽共识、领导者恢复和状态机执行连接起来。 上一篇：多数派交叉与单值 Paxos建立了单值 Paxos 的承诺与选值规则。本篇沿用多数派交叉的证明方法，把共识实例扩展成日志槽。MIT 6.5">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg">
+<meta property="article:published_time" content="2026-09-19T12:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-19T14:57:00.547Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Go">
+<meta property="article:tag" content="Paxos">
+<meta property="article:tag" content="分布式系统">
+<meta property="article:tag" content="状态机复制">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "分布式系统 10：Multi-Paxos 与复制状态机",
+  "url": "https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-10-Multi-Paxos%E4%B8%8E%E5%A4%8D%E5%88%B6%E7%8A%B6%E6%80%81%E6%9C%BA/",
+  "image": "https://magicliang.github.io/img/cover-distributed-systems.svg",
+  "datePublished": "2026-09-19T12:00:00.000Z",
+  "dateModified": "2026-09-19T14:57:00.547Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-10-Multi-Paxos%E4%B8%8E%E5%A4%8D%E5%88%B6%E7%8A%B6%E6%80%81%E6%9C%BA/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '分布式系统 10：Multi-Paxos 与复制状态机',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">793</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">915</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">22</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-distributed-systems.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">分布式系统 10：Multi-Paxos 与复制状态机</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">分布式系统 10：Multi-Paxos 与复制状态机</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-19T12:00:00.000Z" title="Created 2026-09-19 20:00:00">2026-09-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-19T14:57:00.547Z" title="Updated 2026-09-19 22:57:00">2026-09-19</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.8k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>15mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-19 22:57:00&quot;}" hidden></div><p>单值 Paxos 为一个位置选定一个值。数据库却要不断处理请求：先设置余额，再扣款，再读取结果。即使每个位置都不会选出两个不同命令，副本按不同顺序执行这些位置，仍可能得到不同余额。Multi-Paxos 需要把逐槽共识、领导者恢复和状态机执行连接起来。</p>
+<a href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-09-%E5%A4%9A%E6%95%B0%E6%B4%BE%E4%BA%A4%E5%8F%89%E4%B8%8E%E5%8D%95%E5%80%BCPaxos/" title="分布式系统 09：多数派交叉与单值 Paxos">上一篇：多数派交叉与单值 Paxos</a>建立了单值 Paxos 的承诺与选值规则。本篇沿用多数派交叉的证明方法，把共识实例扩展成日志槽。MIT 6.5840 的 Paxos 讲义也通过有序日志连接共识与数据库复制；Stanford CS244B 的课程路线提供复制与容错背景，不将其课程日程当作特定 Multi-Paxos 实现的规范。
+<h1>槽号与轮号是两个维度</h1>
+<p>日志槽号 slot 表示命令的执行位置；轮号 ballot 表示一次提案权限的竞争。一个领导者可以在同一轮里推进多个槽，一个槽也可能经过多轮恢复。把它们合成一个递增整数，会丢掉“同一槽在不同轮里接受过什么”的信息。</p>
+<p>本篇固定三个 acceptor A、B、C，多数派为两个。P 独占轮号 1，Q 独占轮号 2；两个领导者可以在一段时间内都运行。唯一轮号所有者保证同一 <code>(ballot,slot)</code> 只提出一个命令，不代表所有进程总能及时识别唯一活跃主节点。</p>
+<p>模型采用非拜占庭消息和固定成员。PMMC 正式论文的基础讨论使用崩溃停止与正确进程间最终可靠交付；本文有限调度只延迟或省略指定交付，不证明一般活性。若允许崩溃重启，承诺和接受记录必须在回复前可靠保存，并在重启后恢复；本篇内存程序没有实现这层磁盘协议。<a target="_blank" rel="noopener" href="https://www.cs.cornell.edu/courses/cs7412/2011sp/paxos.pdf">PMMC，§1–2</a></p>
+<p>几个状态需要分开记录。accepted 是一个 acceptor 已投过票；chosen 是同一轮、同一槽、同一命令获得多数派历史票的事实。learned 表示某个副本已经获知该决定，applied 表示它已把该命令按序执行到状态。本篇如使用“提交”，只指 chosen，不表示所有副本都已应用。</p>
+<p>例如 A、B 接受了槽 1 的写入，通知副本的消息却还在延迟。该命令已经 chosen，落后的副本仍可能没有 learned，更没有 applied。把副本的本地游标当作全局 chosen 边界，会误判已确定命令是否存在。</p>
+<h1>稳定领导者复用第一阶段</h1>
+<p>单值协议为每次竞争执行准备与接受两个阶段。Multi-Paxos 的稳定领导者完成一轮第一阶段后，可以在该轮中为多个槽运行第二阶段。减少的是重复取得提案权限的过程，逐槽选择安全命令的责任没有消失。<a target="_blank" rel="noopener" href="https://lamport.azurewebsites.net/pubs/paxos-simple.pdf">Paxos Made Simple，§3</a></p>
+<p>本文实验采用 PMMC 的成套规则：acceptor 收到更高轮号的第一阶段请求时采用该轮号；第二阶段仅在请求轮号<strong>等于</strong>本地已采用轮号时接受。09 篇采用的宽松比较变体与这里的消息规则不同，不能只替换一个比较符号，再假定其他状态转移与证明原样成立。</p>
+<p>领导者的 scout 为固定轮号收集第一阶段回复，commander 为固定 <code>(ballot,slot,command)</code> 收集第二阶段回复。每个角色必须保留自己的不可变身份。新主当前轮号变大，不会使一个旧回复自动成为新轮的票。实验还检查重复回复只能贡献一个 acceptor 身份，不能靠消息重传凑出多数派。</p>
+<p>领导者取得第一阶段多数派后，需要合并这些回复携带的 accepted 记录，对每个槽独立计算 pmax：在该槽所有报告中选择最高 accepted ballot 的命令。不同槽可能选到来自不同轮的命令。整体日志里“最高一条记录”不能替代逐槽比较。<a target="_blank" rel="noopener" href="https://www.cs.cornell.edu/courses/cs7412/2011sp/paxos.pdf">PMMC，§2.4</a></p>
+<p>第一阶段回复必须覆盖准备继续使用的槽，并带回相关接受信息。快照截断、成员变更和记录回收会改变需要携带的内容，必须另有协议证明。本篇把全部历史接受记录保留在内存，避免把尚未说明的压缩机制混进恢复规则。</p>
+<h1>一张接受票也不能随意丢弃</h1>
+<p>设 P 已建立轮号 1，五个槽的部分记录如下。应用状态初始 <code>x=0</code>，<code>Set(2)</code> 设置 x，<code>Add(3)</code> 加三，<code>Mul(10)</code> 乘十。</p>
+<table>
+<thead>
+<tr>
+<th>槽</th>
+<th>命令</th>
+<th>轮号 1 已接受者</th>
+<th>此时的状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>a#1：Set(2)</td>
+<td>A、B</td>
+<td>chosen</td>
+</tr>
+<tr>
+<td>2</td>
+<td>尚无提案</td>
+<td>无</td>
+<td>空洞</td>
+</tr>
+<tr>
+<td>3</td>
+<td>a#2：Add(3)</td>
+<td>B</td>
+<td>仅 accepted</td>
+</tr>
+<tr>
+<td>4</td>
+<td>b#1：Mul(10)</td>
+<td>B、C</td>
+<td>chosen</td>
+</tr>
+<tr>
+<td>5</td>
+<td>尚未使用</td>
+<td>无</td>
+<td>留给后续请求</td>
+</tr>
+</tbody>
+</table>
+<p>P 发往 A 的槽 3 接受消息被延迟。Q 在 B、C 完成轮号 2 的第一阶段，得到槽 1、3、4 的记录。虽然槽 3 只有 B 报告，Q 仍然必须恢复 <code>Add(3)</code>。恢复规则不要求先证明这个命令已经 chosen。</p>
+<p>Q 从 B、C 的回复恢复各槽，旧记录的轮号与新提案轮号分别保留：</p>
+<pre><code class="hljs mermaid">flowchart TD
+    B[&quot;B 回复：旧轮 1 的槽 1、3、4&quot;] --&gt; M[&quot;Q 完成轮 2 第一阶段多数派&quot;]
+    C[&quot;C 回复：旧轮 1 的槽 4&quot;] --&gt; M
+    M --&gt; P[&quot;按槽分组，各取最高 accepted ballot&quot;]
+    P --&gt; S1[&quot;槽 1：Set 2&quot;]
+    P --&gt; S3[&quot;槽 3：Add 3&lt;br/&gt;仅 B 报告也必须恢复&quot;]
+    P --&gt; S4[&quot;槽 4：Mul 10&quot;]
+    P --&gt; S2[&quot;槽 2：无接受记录&lt;br/&gt;可以提出 no-op&quot;]
+    S1 --&gt; A[&quot;以轮 2 分别运行各槽第二阶段&lt;br/&gt;每槽仍需多数派&quot;]
+    S3 --&gt; A
+    S4 --&gt; A
+    S2 --&gt; A</code></pre>
+<p>如果 Q 错误地只保留“有多数票证明”的槽，就会把槽 3 当成自由位置。它可以在 B、C 上让槽 3 的 no-op 获得轮号 2 的多数票。此后那条旧消息到达 A：A 尚未采用轮号 2，仍可接受轮号 1 的 <code>Add(3)</code>。历史上 B 已经投过这张旧票，A 的票使轮号 1 的 A、B 也形成多数派。</p>
+<p>于是同一槽出现两个 chosen 命令：新轮的 no-op，以及更晚才凑齐多数票的旧轮 <code>Add(3)</code>。B 当前采用轮号 2 并不会撤销它过去投出的轮号 1 的票。仅检查 acceptor 当前最高记录，会漏掉这个反例。</p>
+<p>正确恢复让 Q 在槽 3 继续提出 <code>Add(3)</code>，则两轮 chosen 的命令相同。PMMC 的 A5 同时覆盖这两种时间方向：较低轮先形成多数派，或者较高轮已接受后，低轮的延迟消息才补齐旧多数派。轮号大小不等于 chosen 事实发生的时间先后。</p>
+<p>逐槽安全性的证明仍依靠交集。固定槽 s，较高轮第一阶段的多数派与任何较低轮可能形成的接受多数派相交。交点的承诺阻止其今后接受更低轮；已经接受的历史又通过 pmax 约束新提案。再对轮号归纳，最高接受记录携带的命令与既有选择兼容。只陈述“两个多数派总相交”，没有解释交点保存什么、何时拒绝、提案者如何选值，证明就不完整。</p>
+<h1>空洞必须通过共识填补</h1>
+<p>Q 已恢复槽 1、3、4，槽 2 在第一阶段回复中没有接受约束，可以为它提出 no-op。no-op 的含义是应用状态不变，但它仍然是槽 2 的正式候选值，需要通过同样的第二阶段多数派。</p>
+<p>副本不能看到槽 4 就在本地把槽 2 当成 no-op。另一个领导者可能已在槽 2 推进业务命令，或者本地尚未收到相关信息。跳过未知槽，相当于未经共识决定该槽没有效果。<a target="_blank" rel="noopener" href="https://lamport.azurewebsites.net/pubs/paxos-simple.pdf">Paxos Made Simple，§3 的空洞恢复示例</a></p>
+<p>共识的通知可以乱序到达，应用游标只能推进连续已知前缀。某个副本先收到槽 4，状态仍为0、已应用游标仍为0；随后收到槽1，状态变成2、游标为1。槽3的通知先到也不能越过槽2。等槽2的 no-op 决定到达，副本依序应用2、3、4，最终得到 <code>(2+3)*10=50</code>。</p>
+<pre><code class="hljs mermaid">flowchart TD
+    L4[&quot;learned 槽 4：Mul 10&quot;] --&gt; W0[&quot;槽 1 未知，等待&lt;br/&gt;applied = 0，x = 0&quot;]
+    W0 --&gt; L1[&quot;learned 槽 1：Set 2&quot;]
+    L1 --&gt; W1[&quot;应用槽 1&lt;br/&gt;applied = 1，x = 2&quot;]
+    W1 --&gt; L3[&quot;learned 槽 3：Add 3&quot;]
+    L3 --&gt; HOLE[&quot;槽 2 未知，不能执行槽 3、4&lt;br/&gt;applied = 1，x = 2&quot;]
+    HOLE --&gt; L2[&quot;learned 槽 2：已通过共识的 no-op&quot;]
+    L2 --&gt; APPLY[&quot;连续应用槽 2 → 3 → 4&lt;br/&gt;x：2 → 5 → 50&quot;]
+    APPLY --&gt; DONE[&quot;applied = 4，x = 50&quot;]</code></pre>
+<p>若按到达顺序立即执行，先乘十再设置二再加三，结果是5。实验刻意使用不交换的命令，使顺序错误直接表现为状态差异。只用连续加法验证，可能让错误执行顺序恰好得到同一数值。</p>
+<h1>相同日志之外还需要确定性</h1>
+<p>复制状态机的归纳需要相同初态、同一有序命令前缀以及确定性执行。假设两个副本执行完前 k 条命令后的状态相同，第 k+1 条命令也相同，确定性转移才保证下一状态和结果相同。逐槽安全证明保证命令一致，连续前缀保证次序一致，应用层还必须保证转移一致。</p>
+<p>例如命令只写“按本机当前时间增加计数”，每个副本读取不同时间，即使日志字节完全相同，也会生成不同状态。若业务确实需要时间或随机值，影响转移的具体值应成为已排序输入，或者由另一套可证明的协议产生。本篇变异实验注入100、200、300三个固定本地值，不依赖真实时钟碰巧不同。</p>
+<p>外部副作用也不因日志一致而自动幂等。一个副本在调用支付接口后、记录完成前崩溃，重放可能再次调用外部接口。将状态机命令排序，只约束复制状态中的执行；跨系统的一次业务效果还需要外部幂等键、事务边界或可恢复工作流。</p>
+<h1>重试可能占据两个槽</h1>
+<p>客户端 a 的请求 a#2 在槽 3 执行 <code>Add(3)</code>，执行时结果是5。客户端没有收到回复，重试后来又在槽 5 chosen。逐槽 Paxos 对此没有异议：两个槽各自只选了一个命令，槽内安全性完全成立。</p>
+<p>应用层用 <code>(clientID,requestID)</code> 识别逻辑请求。槽 5 到达执行位置时，查到 a#2 已执行，跳过状态变化并返回首次缓存结果5。此时 x 已经是50，因此“重试返回当前 x”与“重试返回首次结果”不是相同 API 语义。本文明确实现后者。<a target="_blank" rel="noopener" href="https://www.cs.cornell.edu/courses/cs7412/2011sp/paxos.pdf">PMMC 的命令身份与 perform，§1–2.1</a></p>
+<p>同一个请求进入两个槽时，状态变化与返回值走不同路径：</p>
+<pre><code class="hljs mermaid">flowchart TD
+    S3[&quot;槽 3 chosen：a#2，Add 3&quot;] --&gt; MISS[&quot;按序执行，缓存未命中&lt;br/&gt;x：2 → 5&quot;]
+    MISS --&gt; SAVE[&quot;记录 a#2 → 结果 5&lt;br/&gt;并保存对应操作身份&quot;]
+    SAVE --&gt; S4[&quot;槽 4 执行 Mul 10&lt;br/&gt;当前 x = 50&quot;]
+    S4 --&gt; S5[&quot;槽 5 chosen：重试 a#2，Add 3&quot;]
+    S5 --&gt; HIT[&quot;按序执行到槽 5&lt;br/&gt;请求身份与操作匹配缓存&quot;]
+    HIT --&gt; STATE[&quot;跳过 Add&lt;br/&gt;x 保持 50，游标推进到 5&quot;]
+    HIT --&gt; REPLY[&quot;返回首次缓存结果 5&lt;br/&gt;不是当前状态 50&quot;]</code></pre>
+<p>同一请求身份不能重新用于其他参数。实验遇到身份相同、操作不同的命令直接报错，避免把应用错误静默解释成成功重试。结果缓存属于本文教学实现的扩展；论文中的重复命令执行抑制不能直接当成任意客户端 API 的完整重试协议。</p>
+<p>去重记录、缓存结果和状态应一起进入可恢复状态。只持久化 x、重启后清空去重表，就可能在重放或客户端重试时再次加三。本篇验证从初始状态重放完整日志能恢复同样的状态、游标和缓存，没有验证磁盘上这些信息的原子更新，也没有实现缓存淘汰、客户端会话过期或快照。</p>
+<h1>旧领导者本地读仍可能过期</h1>
+<p>一个节点可以仍自认为是主节点，却已经被多数派上的新领导者取代。若旧节点只应用到槽1，本地 x 为2；新主已执行到槽4并向客户端确认，x 为50。客户端在这次写完成之后才去旧节点读取，直接得到2，就不满足线性一致性。</p>
+<p>Paxos Made Live 讨论了旧 master 提供陈旧读的问题。把读也作为日志命令，经共识并等待应用到它所在位置，是一种容易解释的做法；租约和其他读优化需要另外证明领导权、时间与读屏障条件，不能凭“节点名字叫 leader”省略。<a target="_blank" rel="noopener" href="https://www.cs.albany.edu/~jhh/courses/readings/chandra.podc07.paxos.pdf">Paxos Made Live，§5.2</a></p>
+<p>本篇程序只断言旧副本状态2与当前副本状态50。写完成后才调用旧主读的先后关系由上述场景指定，并未采集真实客户端网络历史，也没有实现日志读或租约。它证明这条未经领导权确认的本地读路径不足以保证新鲜度，不证明所有从副本读取的方案都不安全。</p>
+<h1>可运行的五槽调度</h1>
+<p>代码在 <code>examples/distributed-systems/multipaxos10/</code>，只使用 Go 标准库。A、B、C 和各副本都是单进程内的数据结构，消息交付由显式调用安排。程序打印准备、接受、票数以及副本游标，历史票证以 <code>(ballot,slot,command)</code> 为键，并按不同 acceptor 身份计数。</p>
+<p>从 <code>examples/distributed-systems</code> 运行：</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs sh">go run -race ./multipaxos10<br>go run ./multipaxos10 -scenario normal<br>go run ./multipaxos10 -scenario mutations<br>go vet ./multipaxos10<br></code></pre></td></tr></table></figure>
+<p>正常轨迹先建立轮号1，形成两个 chosen 槽和槽3的一张票，再让 Q 恢复并通过共识填槽2。迟到旧消息送达后，两轮在槽3仍选同一命令。三个副本分别按不同通知顺序接收日志，最终都应用到槽5，得到 x=50，a#2执行一次且缓存结果为5。从空状态重新顺序重放，全部应用状态与原副本相同。</p>
+<p>变异轨迹故意丢弃槽3单票，历史判定器必须发现两种 chosen 命令；另三项变异分别取消顺序应用、去重和确定性。预期观测依次为 x=5、x=53，以及三个副本状态不同。变异被检测时程序输出 <code>DETECTED</code> 并正常退出；未检测到预期错误才会 panic，因此退出码0不能脱离场景含义被解释成“变异协议安全”。</p>
+<p>程序还验证重复投票不增加多数派、旧轮第一阶段回复不能激活新轮、第二阶段错轮或错槽回复不能作为该 commander 的有效票。这些是固定轮号和消息关联规则的检查，不构成无界模型检查。2026-09-19 在 Go 1.27.0 darwin/arm64 上，完整调度的 race 运行与 go vet 均通过，四项变异均产生预期反例。实际命令结果见<a href="verification.txt" target="_blank" rel="noopener">验证记录</a>，逐项资料与版本见<a href="evidence.txt" target="_blank" rel="noopener">论断证据</a>。</p>
+<p>可靠交付假设之外还需要重传机制。Liu、Chand 和 Stoller 的2019版可执行规格研究讨论了放宽交付假设后，丢失请求或阶段回复如何造成停滞；它还分析了作者早期未发表规格中混淆固定阶段轮号和可变领导者轮号的问题。这些发现说明实现时需要核对假设与角色身份，不能归因为 PMMC 正式算法已被证明不安全。<a target="_blank" rel="noopener" href="https://arxiv.org/pdf/1704.00082v4">固定 v4，§4.3、§6.2</a></p>
+<h1>两道推导题</h1>
+<h2 id="只恢复已提交日志够不够">只恢复已提交日志够不够</h2>
+<p>Q 的第一阶段收集 B、C 的回复。槽3只有 B 报告旧轮接受了 X，没有任何进程提供完整多数票证明。Q 能否立即选择新命令 Y，并以“旧值未提交”为理由保证安全？</p>
+<p>不能。B 的旧票可能与另一个未参与恢复的 acceptor 的既有票或迟到票组成多数派。即使恢复时还没 chosen，后来也可能 chosen。Q 必须遵循该槽最高 accepted 规则；对未受约束的槽才有新值选择权。仅从缺少多数证明推导“旧值永远不可能被选定”，把未知事实当成了否定事实。</p>
+<h2 id="重试的结果为什么不是当前值">重试的结果为什么不是当前值</h2>
+<p>a#2首次在 x=2 时执行加三，结果5；其他命令把 x 改成50；a#2重试进入新槽。若副本跳过加法但返回50，是否仍然只执行了一次状态变化？是否满足本文的重试接口？</p>
+<p>状态变化确实只执行了一次，但不满足本文规定的首次结果重放语义。重试接口除了去重，还要规定返回哪次结果；缓存必须与请求身份绑定。若缓存已经回收，应明确报告结果不可恢复等约定行为，不能把当前状态伪装成原请求的返回结果。</p>
+<p>下一篇 11 转向 Raft 的任期、领导者选举与日志复制。它会继续使用“接受、确定、获知、应用”的区分，同时按照 Raft 自身的日志与任期约束重新建立证明，不能只把 Paxos 的角色名替换成 Raft 名称。</p>
+<h1>参考资料</h1>
+<ul>
+<li>Lamport：<a target="_blank" rel="noopener" href="https://lamport.azurewebsites.net/pubs/paxos-simple.pdf">Paxos Made Simple</a>，PDF日期2001-11-01，§3。</li>
+<li>van Renesse、Altınbüken：<a target="_blank" rel="noopener" href="https://www.cs.cornell.edu/courses/cs7412/2011sp/paxos.pdf">Paxos Made Moderately Complex</a>，ACM Computing Surveys 47(3)，Article42，2015-02，§1–2.4；<a target="_blank" rel="noopener" href="https://paxos.systems/paper/">作者网站</a>。下载目录中的2011不代表论文版本年份。</li>
+<li>Chandra、Griesemer、Redstone：<a target="_blank" rel="noopener" href="https://www.cs.albany.edu/~jhh/courses/readings/chandra.podc07.paxos.pdf">Paxos Made Live—An Engineering Perspective</a>，PODC2007，§4.2、§5.2；<a target="_blank" rel="noopener" href="https://research.google/pubs/paxos-made-live-an-engineering-perspective-2006-invited-talk/">Google官方元数据</a>。</li>
+<li>Liu、Chand、Stoller：<a target="_blank" rel="noopener" href="https://arxiv.org/pdf/1704.00082v4">Moderately Complex Paxos Made Simple</a>，v4，2019-08-12，§4.3、§6.2。</li>
+<li><a target="_blank" rel="noopener" href="https://pdos.csail.mit.edu/6.824/notes/l-paxos.txt">MIT 6.5840 2026 Paxos讲义</a>；<a target="_blank" rel="noopener" href="https://www.scs.stanford.edu/24sp-cs244b/sched/">Stanford CS244B 2024日程</a>。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-10-Multi-Paxos%E4%B8%8E%E5%A4%8D%E5%88%B6%E7%8A%B6%E6%80%81%E6%9C%BA/">https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-10-Multi-Paxos%E4%B8%8E%E5%A4%8D%E5%88%B6%E7%8A%B6%E6%80%81%E6%9C%BA/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Go/">Go</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/Paxos/">Paxos</a><a class="post-meta__tags" href="/tags/%E7%8A%B6%E6%80%81%E6%9C%BA%E5%A4%8D%E5%88%B6/">状态机复制</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-distributed-systems.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-07-%E4%B8%BB%E5%A4%87%E4%B8%8E%E9%93%BE%E5%BC%8F%E5%A4%8D%E5%88%B6/" title="分布式系统 07：主备与链式复制"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 07：主备与链式复制</div></div><div class="info-2"><div class="info-item-1">主节点返回写入成功后立刻故障，备节点接管却读不到这次写入。副本没有同时损坏，客户端也没有误读响应；只要成功响应早于复制完成，这条时间线就可能成立。复制协议要规定的，正是哪些事件必须发生在成功之前，以及换主之后哪些结果必须保留。 上一篇：一致性模型与分区边界给出了检查读写历史的标准。本篇把标准落到主备与链式复制的确认点上。课程结构参考 MIT 6.5840 2026 的 Chain Replication 讲义，协议以 OSDI 2004 原论文为依据；PostgreSQL 18.6 只用于核对真实产品的配置语义，配套程序是独立的有限事件模型。 成功、复制与可读是三个事件 设一个寄存器初值为 x=0，客户端提交 Put(x,1)。主节点可以先更新内存、记录日志，再把变化发送给备节点。备节点收到字节、写入本地日志、刷入稳定存储和应用到查询状态，各自需要不同步骤。“已经复制”若不指明其中哪一步，就不足以解释一次故障后的结果。 异步主备允许主节点在备节点达到所需状态之前返回成功。如下时间线中，主节点本地数据甚至可以已经落盘，切换仍会丢失这次已确认写入： 123P: 写入 1 ── 返回 ...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-04-%E7%BD%91%E7%BB%9CKV%E4%B8%8E%E6%8C%81%E4%B9%85%E5%8C%96%E6%81%A2%E5%A4%8D/" title="分布式系统 04：从网络 KV 到持久化恢复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 04：从网络 KV 到持久化恢复</div></div><div class="info-2"><div class="info-item-1">服务端已经把 x=two 写入文件，并完成同步。返回客户端的连接随即关闭，客户端收到错误。服务进程被终止以后，新的进程应该恢复出什么值？客户端用原来的请求 ID 重试，应该重新写一遍，还是取回上次结果？ 第 01 篇的内存去重在重启后会丢失。本篇把业务修改、请求身份和返回结果放进同一条追加日志，再用真实 HTTP 连接和子进程终止验证恢复行为。第 03 篇 讨论 GFS 写入路径中的多个副本；这里暂时收窄到一台机器上的一个服务进程，把单副本自身必须兑现的承诺讲清楚。 网络接口需要先定义可观察语义 这个 KV 服务提供两类请求。GET /kv?key=x 查询当前值；POST /kv 接收包含 ID、Key、Value 的 JSON，将一个键设为指定字符串。写入返回原请求与全局递增的 Revision。首次成功修改获得一个新 revision，同 ID 同参数重试返回第一次的记录，不推进 revision。 revision 在这里仅是单个日志中的序号。它既不是物理时间，也不是跨节点一致性协议里的任期，更不能当作全局分布式事务版本。GET 返回当前值与存储的全局 revision。...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-05-%E6%97%B6%E9%92%9F%E4%B8%8E%E5%9B%A0%E6%9E%9C%E5%81%8F%E5%BA%8F/" title="分布式系统 05：时钟与因果偏序"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 05：时钟与因果偏序</div></div><div class="info-2"><div class="info-item-1">服务 P 修改一条记录，再发消息通知服务 Q；Q 收到通知后更新索引。两份日志的墙上时间却显示，索引更新比记录修改早了五毫秒。这个排序能证明系统违反了业务顺序吗？不能。机器时钟可能有偏差，但消息接收必须晚于相应发送，这条约束来自通信过程。 上一篇的网络 KV 与持久化恢复处理单机服务的请求顺序和故障恢复。跨越进程之后，一条本地日志不再包含全部事件，恢复出来的记录也未必足以比较另一台机器的操作。本篇从事件和消息定义因果偏序，用 Lamport 时钟保持这个偏序，再用向量时钟识别模型内的并发。物理时间仍有用途，只是它需要另一组假设。 顺序从哪些事实产生 假定系统有固定的三个进程 P、Q、R。每个进程内部的事件按一个顺序执行，跨进程的影响全部通过显式消息传递；发送和接收是不同事件。消息可以延迟和乱序，讨论到的接收事件都有对应发送。进程不重启回退计数器，不复用身份，整数不溢出。若应用通过共享数据库等其他途径通信，也必须把那条路径纳入模型。 在这个模型中，a → b 表示 a happens-before b，定义来自三条规则：同一进程上先发生的事件在后发生事件之前；消息发送在相应接收之前...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-09-%E5%A4%9A%E6%95%B0%E6%B4%BE%E4%BA%A4%E5%8F%89%E4%B8%8E%E5%8D%95%E5%80%BCPaxos/" title="分布式系统 09：多数派交叉与单值 Paxos"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 09：多数派交叉与单值 Paxos</div></div><div class="info-2"><div class="info-item-1">A、B 已经接受 X，C 尚未收到消息，提议者又失联了。另一个提议者向 B、C 发起 Y，B 能否再接受？只规定“得到多数票即可成功”，两个值都可能拿到两票。禁止每个节点再次投票也不够：第一轮的票分散后，所有节点可能永久停在不同候选值上。 第 08 篇区分了安全性与活性。单值 Paxos 允许不断发起新一轮尝试，同时限制后续提案的取值，使所有获得多数接受的提案携带同一个值。MIT 6.5840 的 Paxos 讲义从多数派和两阶段进入这一问题；本篇以 Lamport 的原论文及课程精确伪代码为依据，推导约束，并用有限消息调度检查违反约束的后果。 MIT Paxos 讲义。 一次共识的模型和三个角色 本篇只有一个共识实例，成员固定为 A、B、C，法定集合 quorum 取任意两个 acceptor。一般多数派大小为 floor(N/2)+1。进程遵守协议，消息可以延迟、重复或丢失，但不被伪造；进程可以崩溃恢复，持久状态须在恢复后保留。这些约束不覆盖拜占庭行为和磁盘状态永久丢失。 proposer 生成提案，acceptor 持有承诺和接受记录，learner 根据接受证据得知结果。...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-06-%E4%B8%80%E8%87%B4%E6%80%A7%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%88%86%E5%8C%BA%E8%BE%B9%E7%95%8C/" title="分布式系统 06：一致性模型与分区边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 06：一致性模型与分区边界</div></div><div class="info-2"><div class="info-item-1">客户端 A 写入 x=1 并收到成功，客户端 B 随后读到 x=0。这个结果是否错误，取决于存储接口承诺的一致性模型。若接口承诺线性一致，且没有其他写入，它就是反例；若只承诺顺序一致，还要检查客户端之间的程序关系；若只承诺最终收敛，仅凭这一次旧读无法判定违反承诺。 上一篇：时钟与因果偏序用 happens-before 描述事件之间的因果关系。本篇把对象的读写规格加入时间线，区分哪些观察可以由一次合法执行解释。MIT 6.5840 和 Stanford CS244B 都将一致性、复制与容错放在课程主线中；这里先建立检查读写历史的工具，下一篇再比较复制协议如何满足这些约束。 先规定一个读写对象 设一个 KV 对象初始所有键的值都是 0。Put(x,1) 把 x 改为 1，并返回 OK；Get(x) 返回当前 x 的值。单线程执行 Put(x,1); Get(x) 时，读取必须得到 1。这个规则称为顺序规格，独立于对象用内存、磁盘还是多个副本实现。 并发历史记录每个操作的调用和返回事件，也记录客户端身份、参数及返回值。W_A(x,1)[1,4] 表示 A 在事件 1 调用写，在事件 ...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-03-GFS%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E5%89%AF%E6%9C%AC%E8%BE%B9%E7%95%8C/" title="分布式系统 03：GFS 写入路径与副本边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 03：GFS 写入路径与副本边界</div></div><div class="info-2"><div class="info-item-1">多个工作者可以重做同一份计算，保存计算结果的文件系统却必须回答另一组问题：数据放在哪些机器上，谁决定并发写入的先后，一次写入只有部分副本完成时能否读取，以及客户端收到成功究竟意味着什么。 上一篇：MapReduce 任务重试与输出提交区分了执行与发布。GFS 把这种区分推进到存储层：网络已经传完数据、某个副本已经改动文件、整个请求已经得到成功响应，是三个不同的时刻。混淆它们，会把失败后的残留内容当成已提交结果。 讨论对象是 Ghemawat、Gobioff 和 Leung 在 SOSP 2003 发表的 GFS。MIT 6.5840 Spring 2026 把它放在 MapReduce、RPC 之后，用它连接分片、复制与故障恢复。本篇的 Go 程序只执行有限内存时间线，不提供 GFS API，也没有真实的磁盘复制、租约时钟或网络传输。 从工作负载确定系统模型 2003 年 GFS 面向大型数据处理。文件较大，追加和顺序读取常见，系统需要聚合带宽，并把机器故障视为日常条件。这与任意程序都能直接使用的通用文件系统有距离。应用可以配合存储接口，接受校验记录、过滤重复等额外责任。原论文 ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">槽号与轮号是两个维度</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">稳定领导者复用第一阶段</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">一张接受票也不能随意丢弃</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">空洞必须通过共识填补</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">相同日志之外还需要确定性</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">重试可能占据两个槽</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">旧领导者本地读仍可能过期</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">可运行的五槽调度</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">9.</span> <span class="toc-text">两道推导题</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%AA%E6%81%A2%E5%A4%8D%E5%B7%B2%E6%8F%90%E4%BA%A4%E6%97%A5%E5%BF%97%E5%A4%9F%E4%B8%8D%E5%A4%9F"><span class="toc-number">9.1.</span> <span class="toc-text">只恢复已提交日志够不够</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%87%8D%E8%AF%95%E7%9A%84%E7%BB%93%E6%9E%9C%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E6%98%AF%E5%BD%93%E5%89%8D%E5%80%BC"><span class="toc-number">9.2.</span> <span class="toc-text">重试的结果为什么不是当前值</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">10.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
