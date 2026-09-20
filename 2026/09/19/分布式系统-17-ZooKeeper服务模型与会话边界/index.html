@@ -1,0 +1,791 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>分布式系统 17：ZooKeeper 服务模型与会话边界 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="配置更新、服务发现和主节点选举，都需要多个进程对少量共享状态形成一致的解释。ZooKeeper 提供的接口很小：创建节点、读取数据、带版本更新、列出孩子，以及接收变化通知。但这些接口的有效范围不同。一次 TCP 断开不等于会话结束；收到 Watch 不等于拿到了新值；临时节点消失，也不能证明原进程已经停止访问外部资源。 第 16 篇 用受限搜索检查原创 Raft 核心。本篇转向实际产品的 API">
+<meta property="og:type" content="article">
+<meta property="og:title" content="分布式系统 17：ZooKeeper 服务模型与会话边界">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-17-ZooKeeper%E6%9C%8D%E5%8A%A1%E6%A8%A1%E5%9E%8B%E4%B8%8E%E4%BC%9A%E8%AF%9D%E8%BE%B9%E7%95%8C/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="配置更新、服务发现和主节点选举，都需要多个进程对少量共享状态形成一致的解释。ZooKeeper 提供的接口很小：创建节点、读取数据、带版本更新、列出孩子，以及接收变化通知。但这些接口的有效范围不同。一次 TCP 断开不等于会话结束；收到 Watch 不等于拿到了新值；临时节点消失，也不能证明原进程已经停止访问外部资源。 第 16 篇 用受限搜索检查原创 Raft 核心。本篇转向实际产品的 API">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg">
+<meta property="article:published_time" content="2026-09-19T15:40:00.000Z">
+<meta property="article:modified_time" content="2026-09-20T06:36:00.613Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Watch">
+<meta property="article:tag" content="ZooKeeper">
+<meta property="article:tag" content="会话">
+<meta property="article:tag" content="分布式系统">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "分布式系统 17：ZooKeeper 服务模型与会话边界",
+  "url": "https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-17-ZooKeeper%E6%9C%8D%E5%8A%A1%E6%A8%A1%E5%9E%8B%E4%B8%8E%E4%BC%9A%E8%AF%9D%E8%BE%B9%E7%95%8C/",
+  "image": "https://magicliang.github.io/img/cover-distributed-systems.svg",
+  "datePublished": "2026-09-19T15:40:00.000Z",
+  "dateModified": "2026-09-20T06:36:00.613Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-17-ZooKeeper%E6%9C%8D%E5%8A%A1%E6%A8%A1%E5%9E%8B%E4%B8%8E%E4%BC%9A%E8%AF%9D%E8%BE%B9%E7%95%8C/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '分布式系统 17：ZooKeeper 服务模型与会话边界',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+</head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">881</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1028</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">32</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-distributed-systems.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">分布式系统 17：ZooKeeper 服务模型与会话边界</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">分布式系统 17：ZooKeeper 服务模型与会话边界</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-19T15:40:00.000Z" title="Created 2026-09-19 23:40:00">2026-09-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-20T06:36:00.613Z" title="Updated 2026-09-20 14:36:00">2026-09-20</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">5.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>17mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-20 14:36:00&quot;}" hidden></div><p>配置更新、服务发现和主节点选举，都需要多个进程对少量共享状态形成一致的解释。ZooKeeper 提供的接口很小：创建节点、读取数据、带版本更新、列出孩子，以及接收变化通知。但这些接口的有效范围不同。一次 TCP 断开不等于会话结束；收到 Watch 不等于拿到了新值；临时节点消失，也不能证明原进程已经停止访问外部资源。</p>
+<a href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-16-%E4%BB%8E%E6%95%85%E9%9A%9C%E8%BD%A8%E8%BF%B9%E5%88%B0%E6%9C%89%E9%99%90%E7%8A%B6%E6%80%81%E6%90%9C%E7%B4%A2/" title="分布式系统 16：从故障轨迹到有限状态搜索">第 16 篇</a> 用受限搜索检查原创 Raft 核心。本篇转向实际产品的 API 合同，使用 Apache ZooKeeper 3.9.6 官方服务端和 Java 客户端完成本机 TCP 实验。第 18 篇再讨论 ZAB 如何组织更新与恢复，不能把前面实现的 Raft 机制直接套进 ZooKeeper。
+<p>课程结构参考 <a target="_blank" rel="noopener" href="https://pdos.csail.mit.edu/6.824/notes/l-zookeeper.txt">MIT 6.5840 的 ZooKeeper 讲义</a>及 <a target="_blank" rel="noopener" href="https://www.scs.stanford.edu/24sp-cs244b/sched/">Stanford CS244B 的论文研读安排</a>。2010 年原论文解释协调服务的设计取舍；本篇涉及的持久 Watch 和 Java 会话终止行为，则按 3.9.6 文档与发布源码核对。</p>
+<h1>实验的系统模型</h1>
+<p>服务端、客户端和代理都运行在同一台机器、同一个 JVM 中。故障注入只中断 A 的网络连接，B、服务端和本地文件系统继续运行；没有模拟拜占庭消息、数据损坏、CPU 长时间停顿或整个 JVM 崩溃。代理允许连接时按字节转发，阻断时关闭两端 socket 并拒绝新的连接。客户端库负责重连、心跳和 Watch 恢复，验收代码不伪造协议响应。</p>
+<p>这个安排能把“服务仍然工作，但一个客户端失联”分离出来。B 的正常请求是对照，A 的连接和会话状态是被观察对象。事件等待设置 25 秒上限，超过上限会使实验失败；它不会把等待超时自动解释成 ZooKeeper 已过期。会话标识、Stat、返回码和事件轨迹共同决定断言结果。</p>
+<h1>znode 的状态不只有一串字节</h1>
+<p>ZooKeeper 的命名空间是一棵树。一个 znode 可以同时有数据和孩子，路径用于定位，数据用于保存小规模协调信息。应用可以把 <code>/service/api</code> 的孩子作为注册项，也可以用 <code>/config/api</code> 的数据存配置引用。znode 不适合存放大对象：读写替换整段数据，较大的数据会增加传输与处理成本。原论文把这种接口定位为构造协调机制的基础操作，而非完整应用数据库。<a target="_blank" rel="noopener" href="https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf">Hunt 等，USENIX ATC 2010，§2.1–2.4</a></p>
+<p><code>getData</code> 除了返回字节，还能填写 <code>Stat</code>。其中 <code>version</code> 对应数据变化，<code>cversion</code> 对应孩子集合变化，<code>aversion</code> 对应 ACL 变化。它们不能互换使用。修改某个孩子的数据，不等于修改父节点的数据版本；通过父节点的 <code>version</code> 做 CAS，也不会自动验证孩子集合未变。<a target="_blank" rel="noopener" href="https://zookeeper.apache.org/doc/r3.9.6/apidocs/zookeeper-jute/org/apache/zookeeper/data/Stat.html">3.9.6 Stat API</a></p>
+<p>图中每个字段回答一种具体变化；没有一个字段能替代整个子树的状态。</p>
+<pre><code class="hljs mermaid">flowchart TD
+    R[&quot;/service&quot;] --&gt; A[&quot;/service/api&quot;]
+    A --&gt; D[&quot;data: 配置引用&quot;]
+    A --&gt; V[&quot;version: 本节点数据变化&quot;]
+    A --&gt; C[&quot;cversion: 孩子集合变化&quot;]
+    A --&gt; P[&quot;aversion: ACL 变化&quot;]
+    A --&gt; N[&quot;/service/api/instance-1&quot;]
+    N --&gt; E[&quot;ephemeralOwner: 所属 session&quot;]</code></pre>
+<p><code>czxid</code>、<code>mzxid</code>、<code>pzxid</code> 关联创建、数据修改和孩子变化的事务标识。zxid 表达事务顺序，不能当作每个节点从零开始的数据版本。一个 <code>multi</code> 事务的多个子操作可以共享同一个 zxid；3.9.6 <code>DataTree.processTxn</code> 给子事务头复用父事务的 zxid。因此，“每个节点变化都对应不同 zxid”并不准确。<a target="_blank" rel="noopener" href="https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/DataTree.java#L1010">固定版 DataTree.java</a></p>
+<h1>带版本更新怎样防止覆盖</h1>
+<p>两个客户端都读到值 <code>zero</code>、版本 0。A 执行 <code>setData(path, one, 0)</code> 后版本变为 1；B 再以版本 0 写入，服务端返回 <code>BadVersion</code>。版本比较与更新在服务端操作中完成，B 无法用一个过期的读取结果无声覆盖 A 的更新。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant A as 客户端 A
+    participant Z as ZooKeeper
+    participant B as 客户端 B
+    A-&gt;&gt;Z: getData
+    Z--&gt;&gt;A: zero, version 0
+    B-&gt;&gt;Z: getData
+    Z--&gt;&gt;B: zero, version 0
+    A-&gt;&gt;Z: setData one, expected 0
+    Z--&gt;&gt;A: 成功，version 1
+    B-&gt;&gt;Z: setData stale, expected 0
+    Z--&gt;&gt;B: BadVersion，值不变
+    B-&gt;&gt;Z: setData unconditional, expected -1
+    Z--&gt;&gt;B: 成功，version 2</code></pre>
+<p><code>-1</code> 明确绕过版本比较，适合确实需要无条件替换的操作。它不能作为 CAS 冲突后的通用重试参数，否则原本要防止的覆盖会重新发生。3.9.6 的 <code>checkAndIncVersion</code> 在非 <code>-1</code> 且版本不符时抛出异常，通过后增加版本。<a target="_blank" rel="noopener" href="https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/PrepRequestProcessor.java#L737">固定版 PrepRequestProcessor.java</a></p>
+<p>这个机制的正确性直觉只涉及同一节点生命周期内的条件更新：成功响应说明指定版本条件在更新时满足；明确的 <code>BadVersion</code> 说明该请求未完成这次修改。网络断开导致的未知结果是另一类情况，不能从“没有收到成功”推出“没有修改”。业务仍要重新读取和判断，不能把 CAS 当作请求去重协议。</p>
+<p>版本也不是永久身份。节点删除再创建后可以重新从初始版本开始，整数版本还有表示范围。长期保存的 <code>(path, version)</code> 不能自行解决删除重建带来的 ABA 问题；如果业务需要跨生命周期身份，必须另行设计标识和校验规则。</p>
+<h1>顺序编号属于父节点</h1>
+<p>创建 <code>PERSISTENT_SEQUENTIAL</code> 或 <code>EPHEMERAL_SEQUENTIAL</code> 节点时，客户端提供前缀，服务端返回包含编号的完整路径。应用必须保存这个返回值。<code>a-</code> 和 <code>b-</code> 两种前缀并不会在同一父节点下获得互不影响的计数器。</p>
+<p>本地实验先在 <code>/zk17/seq</code> 下创建 <code>a-</code> 顺序节点，然后创建普通孩子 <code>ordinary</code>，最后创建 <code>b-</code> 顺序节点，得到：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">/zk17/seq/a-0000000000<br>/zk17/seq/ordinary<br>/zk17/seq/b-0000000002<br></code></pre></td></tr></table></figure>
+<p>固定源码使用父节点的 <code>cversion</code> 生成 <code>%010d</code> 后缀。父节点下普通孩子的创建、删除也会影响这一计数，所以顺序节点编号可以跳跃。不同父节点有各自范围；<code>getChildren</code> 的返回顺序也不能直接当成编号排序结果。<a target="_blank" rel="noopener" href="https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/PrepRequestProcessor.java#L668">固定版 PrepRequestProcessor.java</a></p>
+<p>通常范围内补零便于比较名称，但底层计数是有符号整数。官方 Guide 明确记录溢出后出现负数的边界；实验没有通过大量创建验证该边界。用这类编号做业务设计时，不能把它升级成跨目录、无限期、无间隙的全局序列。<a target="_blank" rel="noopener" href="https://zookeeper.apache.org/doc/r3.9.6/zookeeperProgrammers.html#Sequence+Nodes+--+Unique+Naming">3.9.6 Programmer’s Guide，Sequence Nodes</a></p>
+<h1>session 跨越连接，临时节点跟随 session</h1>
+<p>A 创建临时节点后，<code>ephemeralOwner</code> 标识创建它的 session。临时节点不允许孩子；实际调用在本篇实验中返回 <code>NoChildrenForEphemerals</code>。节点的存在期与 session 相关，而非某条 TCP 连接的存续期。短暂断连时客户端可以重连并继续原 session；在持续失联的场景下，服务端确认 session 过期后执行相应清理。正常关闭 session 同样会清理其临时节点；实验专门保留连接故障后的自然过期路径，避免把主动关闭当作过期证据。</p>
+<p>客户端请求一个 timeout，服务端按配置协商实际值。实验请求并得到 8000 ms，服务端 tickTime 为 500 ms，显式设置最小 1000 ms、最大 16000 ms。这些是实验配置。不能把某次临时节点删除时刻写成精确的超时承诺：最后一次有效活动、服务端到期处理、通知传输和客户端回调都有各自的时间位置。</p>
+<p>服务端清理和客户端得知终止需要分别观察。图中 B 直连服务，A 的连接被阻断；B 能观察到清理，并不要求 A 已经收到同样的信息。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant A as 客户端 A
+    participant P as 断连代理
+    participant Z as ZooKeeper
+    participant B as 客户端 B
+    A-&gt;&gt;Z: 创建 ephemeral，属于 session S
+    B-&gt;&gt;Z: exists 并注册删除 Watch
+    Note over A,P: 关闭旧 TCP，拒绝新连接
+    Z-&gt;&gt;Z: session 到期并删除 ephemeral
+    Z--&gt;&gt;B: NodeDeleted
+    B-&gt;&gt;Z: exists
+    Z--&gt;&gt;B: 不存在
+    Note over A: 可能已本地终止，也可能仍在连接
+    Note over P: 放行后续连接
+    A-&gt;&gt;Z: 若 handle 尚存活，尝试恢复 S
+    Z--&gt;&gt;A: 若已过期，恢复失败
+    Note over A: Expired 终止旧 handle；新建 handle 获取新 session</code></pre>
+<p>3.9.6 Java 客户端还有必须单列的实现细节：已有 session 在接收空闲达到 <code>expirationTimeout</code> 后，可以本地关闭 handle 并排入 <code>Expired</code>，该内部阈值按协商 timeout 的 <code>4/3</code> 设置。因此，不能断言客户端“必须重连以后才知道过期”。本地终止也不直接执行服务端临时节点删除，验证服务端状态仍需独立观察。<a target="_blank" rel="noopener" href="https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/ClientCnxn.java#L1244">固定版 ClientCnxn.java</a></p>
+<p>这一差别有明确修订背景：<a target="_blank" rel="noopener" href="https://issues.apache.org/jira/browse/ZOOKEEPER-4508">ZOOKEEPER-4508</a> 修复无法连接任何服务器时客户端无限重试而不报告过期的问题，修复版本包含 3.9.3；<a target="_blank" rel="noopener" href="https://issues.apache.org/jira/browse/ZOOKEEPER-4921">ZOOKEEPER-4921</a> 又处理相关的新会话重连问题，修复于 3.9.4。历史 issue 用于解释边界变化，不能据此声称这些旧版本缺陷仍原样存在于 3.9.6。</p>
+<p>session 过期也不意味着 A 所在进程已停止。A 可能继续执行不经过 ZooKeeper 的代码。临时节点可以表达注册状态，却不能单独强制外部数据库或存储拒绝旧持有者；第 19 篇会进一步讨论这种边界与 fencing。</p>
+<h1>默认 Watch 通知一次变化</h1>
+<p>读取和监听要围绕同一次 API 调用组织。<code>getData(path, watcher, stat)</code> 返回数据并注册数据 Watch；<code>exists</code> 可以对当前不存在的路径注册存在性 Watch，<code>getData</code> 则不能成功读取不存在的节点。默认 Watch 被触发后会消耗，应用要重新读取和注册。</p>
+<p>通知中包含事件类型和路径，不包含足以重建完整业务状态的全部旧值、新值。它的用途是提示重新获取状态。A 收到第一次更新通知后，B 可以继续更新；A 再读取时可能直接得到后来的值。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant A as 客户端 A
+    participant Z as ZooKeeper
+    participant B as 客户端 B
+    A-&gt;&gt;Z: getData + Watch
+    Z--&gt;&gt;A: value 0
+    B-&gt;&gt;Z: setData 1
+    Z--&gt;&gt;A: NodeDataChanged，Watch 消耗
+    B-&gt;&gt;Z: setData 2
+    Note over A,Z: 未重装，不产生第二次数据通知
+    A-&gt;&gt;Z: getData + 新 Watch
+    Z--&gt;&gt;A: value 2
+    B-&gt;&gt;Z: setData 3
+    Z--&gt;&gt;A: 新 NodeDataChanged</code></pre>
+<p>实验没有用“睡一秒没收到”判定一次性行为。A 收到第一次通知后，B 完成第二次写入，再向 A 发起异步 <code>getData</code>。完成回调在 A 的 EventThread 执行；实验等到该回调，确认读取值已更新，同时该窗口内数据通知计数仍为 1。重新注册后再写，通知计数变为 2。</p>
+<p>这个屏障成立于本例的条件：单服务端已处理 B 的写入，期间没有继续写入该路径，A 随后的读取响应与通知沿同一客户端处理路径排序。它不阻止将来的新写入，也不是任意并发系统的“再无事件”证明。</p>
+<p>回调只把事件记录进队列并唤醒等待者，不能在事件线程内等待另一个回调，否则应用自身就可能阻塞事件处理。检查还按路径、事件类型区分数据通知和 <code>None</code> 类型的连接状态事件，避免把 <code>Disconnected</code> 等状态变化误算成数据变更。</p>
+<p>Watch 顺序保证也不能扩张为两个客户端的线程调度保证。A 收到事件与 B 的调用返回，发生在不同连接和不同回调线程上；本篇不对它们建立未经验证的固定先后关系。</p>
+<h1>持久 Watch 保留注册，不提供离线事件日志</h1>
+<p><code>addWatch</code> 的 <code>PERSISTENT</code> 模式不需要每次触发后重新注册；<code>PERSISTENT_RECURSIVE</code> 还覆盖路径的后代。实验连续两次更新同一路径，A 都收到通知；递归监听中，孩子和孙节点的创建也被观察到，实验另检查根路径没有出现 <code>NodeChildrenChanged</code>。官方递归模式语义不为同一变化额外发送冗余的 <code>NodeChildrenChanged</code>。<a target="_blank" rel="noopener" href="https://zookeeper.apache.org/doc/r3.9.6/apidocs/zookeeper-server/org/apache/zookeeper/ZooKeeper.html#addWatch(java.lang.String,org.apache.zookeeper.Watcher,org.apache.zookeeper.AddWatchMode)">3.9.6 addWatch API</a></p>
+<p>持久注册与离线历史是两个不同要求。A 失联期间，B 可以创建并删除一个原本不存在的节点；A 恢复后读取仍然不存在，单凭最终状态无法推导期间发生过什么。对已有节点的 persistent Watch，同样不能假设离线更新会逐条补发。</p>
+<pre><code class="hljs mermaid">flowchart TD
+    D[&quot;A 断连；代理拒绝重连&quot;] --&gt; X[&quot;B 创建 transient，再删除&quot;]
+    D --&gt; Y[&quot;B 把 persistent 数据更新两次&quot;]
+    X --&gt; R[&quot;A 恢复同一 session&quot;]
+    Y --&gt; R
+    R --&gt; W[&quot;恢复 Watch 注册&quot;]
+    W --&gt; Q[&quot;A 异步读取回调屏障&quot;]
+    Q --&gt; N[&quot;transient 不存在；窗口内无创建或删除通知&quot;]
+    Q --&gt; V[&quot;读到最终数据；窗口内无离线更新回放&quot;]
+    V --&gt; U[&quot;新的在线更新正常产生通知&quot;]</code></pre>
+<p>3.9.6 <code>DataTree.setWatches</code> 给出了机制解释：普通 data/children Watch 恢复时可以比较当前状态与记录的 zxid，产生相应通知，但这也不是逐条恢复所有中间变化。persistent 两种模式的恢复分支重新加入 Watch，没有读取事务日志逐条重放离线事件。<a target="_blank" rel="noopener" href="https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/DataTree.java#L1488">固定版 DataTree.java</a></p>
+<p><a target="_blank" rel="noopener" href="https://issues.apache.org/jira/browse/ZOOKEEPER-4698">ZOOKEEPER-4698</a> 报告了持久 Watch 在断连期间丢失事件的情形。issue 的 affected version 标签本身不能证明 3.9.6 的行为；这里同时采用固定发布源码和本机实验。实际观察是：A 同 session 恢复，读到 B 离线期间最后写入的值，但经过回调屏障仍没有这些离线更新的通知；下一次在线更新能正常触发，说明注册已恢复。</p>
+<p><code>SyncConnected</code> 还不足以单独充当上述屏障。客户端完成握手时可以先排入这个状态事件，恢复 Watch 的请求仍需发送和处理。实验在它之后额外发起 A 的异步读取，等到完成回调才检查计数。有限观察窗口只证明这一条执行记录；“持久 Watch 不是可回放日志”的工程结论还依靠对应源码和 API 边界。</p>
+<p>需要可靠处理每一次业务事件的系统，应把业务事件保存在可持久读取的数据结构或事件存储中。Watch 可以促使消费者重新读取位置与状态，但不能替代事件本身，也不能用本地回调计数还原已经遗漏的更新次数。</p>
+<h1>官方服务与真实 TCP 的验证范围</h1>
+<p>实验代码位于 <code>examples/distributed-systems/zk17/Zk17.java</code>。所有协议处理来自 3.9.6 官方类，代理仅转发或关闭 TCP 字节流，不修改 ZooKeeper 消息。A 的短断连、长断连都同时关闭当前连接并拒绝新连接；只拒绝新建连接而保留旧 TCP，会让原来的心跳继续工作，无法构成所需故障。</p>
+<pre><code class="hljs mermaid">flowchart TD
+    A[&quot;官方客户端 A&quot;] --&gt; P[&quot;标准库 TCP 代理&lt;br/&gt;127.0.0.1 随机端口&quot;]
+    P --&gt; Z[&quot;官方独立 ZooKeeperServer&lt;br/&gt;127.0.0.1 随机端口&quot;]
+    B[&quot;官方客户端 B&lt;br/&gt;持续直连&quot;] --&gt; Z
+    T[&quot;验收线程&lt;br/&gt;断言、队列与有界等待&quot;] -.控制断连.-&gt; P
+    A -.记录事件并唤醒等待者.-&gt; T
+    B -.记录事件并唤醒等待者.-&gt; T
+    Z --&gt; F[&quot;本次独占 .build/zk17/run-*&lt;br/&gt;事务日志与快照&quot;]</code></pre>
+<p>从仓库的 <code>examples/distributed-systems</code> 目录执行，发行包和类文件都保存在固定构建目录。以下是本机 Java 17 路径；其他机器需替换安装位置。</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs sh"><span class="hljs-built_in">mkdir</span> -p .build/zk17/classes<br>/opt/homebrew/opt/openjdk@17/bin/javac \<br>  -<span class="hljs-built_in">cp</span> <span class="hljs-string">&#x27;.build/apache-zookeeper-3.9.6-bin/lib/*&#x27;</span> \<br>  -d .build/zk17/classes zk17/Zk17.java<br>/opt/homebrew/opt/openjdk@17/bin/java \<br>  -<span class="hljs-built_in">cp</span> <span class="hljs-string">&#x27;.build/zk17/classes:.build/apache-zookeeper-3.9.6-bin/lib/*&#x27;</span> Zk17<br></code></pre></td></tr></table></figure>
+<p>2026-09-20 的首轮实际运行中，CAS、顺序节点、临时节点限制、两类持久 Watch、一次性 Watch、短断连和自然过期场景全部通过。长断连后，约第 9935 ms，B 已确认临时节点不存在，A 的 handle 仍为 <code>CONNECTING</code>；放行后约第 10008 ms，A 收到 <code>Expired</code>，随后新 handle 建立了不同 session。这些是从程序起点计算的一次轨迹时间，不是 session 删除延迟的测量指标。</p>
+<p>实验没有调用 <code>server.expire</code>、主动关闭 A 或停止整个服务器来制造预期删除。<code>close</code> 只用于断言结束后及异常清理。每次运行保留自己的数据目录；清理尝试覆盖所有已创建客户端、代理和服务，即使某个关闭动作报错也继续清理其余资源。</p>
+<p>第一次启动在沙箱的回环 <code>bind</code> 上被拒，返回 <code>Operation not permitted</code>。同一命令通过环境的正规本地监听授权后完成实验，没有更换执行文件规避防护。最终源码增加失败清理保障后，独立复用同一批 class 文件再次运行，所有场景通过，帮助与错误参数退出码也符合预期。两次成功运行都观察到恢复握手导致的 <code>SessionExpiredException</code>；没有实测到本地接收空闲阈值先行终止的分支。原始日志摘录、源码校验值和最终复核情况见 <a href="verification.txt" target="_blank" rel="noopener">验证记录</a>，资料与论断对应关系见 <a href="evidence.txt" target="_blank" rel="noopener">证据表</a>。</p>
+<p>单进程服务没有 quorum，无法验证多数派故障后的可用性、ZAB 恢复、跨主机网络分区或掉电持久性。macOS 也仅作为本机开发验证环境。这里确认的是指定官方版本在真实 TCP 路径上的 API 和会话行为；性能数据、生产容量与完整协议证明均不在这些输出中。</p>
+<h1>两道练习</h1>
+<p><strong>练习一：一次性通知后的两次写入。</strong> A 用 <code>getData</code> 读取配置并注册 Watch，B 连续完成两个更新，A 收到一个通知后重新读取。A 能否根据通知次数判断配置只更新过一次？如果 A 随后用旧 <code>version</code> 写入，收到 <code>BadVersion</code>，能否改成 <code>-1</code> 就认为完成了原来的 CAS 意图？</p>
+<p>答案要点：通知只要求重新获取状态，默认注册被第一次变化消耗，中间版本可能未被逐个观察。重新读取可以得到更新后的状态，但通知次数不是更新计数。<code>BadVersion</code> 表明预期条件不成立；改用 <code>-1</code> 会改变操作语义。应按业务规则重新计算条件更新，若需要处理每次变化则保留独立事件历史。</p>
+<p><strong>练习二：服务端删除与客户端终止。</strong> A 经代理访问服务，B 直连。阻断 A 后，B 看到临时节点被删除，A 尚未收到 <code>Expired</code>。能否判定 A 已停止执行？反过来，A 本地收到 <code>Expired</code>，是否单靠这一事件就足以证明服务端节点已被清理？</p>
+<p>答案要点：两项都不能直接推出。服务端生命周期和客户端 handle 是不同观察对象，进程还可能访问其他外部资源。实验用 B 的通知加存在性读取验证清理，用 A 的状态和旧 handle 操作验证本地终止；外部资源能否拒绝旧持有者仍需要单独的授权或 fencing 机制。</p>
+<p>第 18 篇进入 ZAB：当服务由多个副本组成，提议、确认、提交和领导者恢复怎样维护更新顺序。这里的 znode 与 session API 是随后解释内部协议时需要保持的应用层边界。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-17-ZooKeeper%E6%9C%8D%E5%8A%A1%E6%A8%A1%E5%9E%8B%E4%B8%8E%E4%BC%9A%E8%AF%9D%E8%BE%B9%E7%95%8C/">https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-17-ZooKeeper%E6%9C%8D%E5%8A%A1%E6%A8%A1%E5%9E%8B%E4%B8%8E%E4%BC%9A%E8%AF%9D%E8%BE%B9%E7%95%8C/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/ZooKeeper/">ZooKeeper</a><a class="post-meta__tags" href="/tags/%E4%BC%9A%E8%AF%9D/">会话</a><a class="post-meta__tags" href="/tags/Watch/">Watch</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-distributed-systems.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-19-ZooKeeper%E4%B8%80%E8%87%B4%E6%80%A7%E9%94%81%E9%85%8D%E6%96%B9%E4%B8%8E%E5%A4%96%E9%83%A8fencing/" title="分布式系统 19：ZooKeeper 一致性、锁配方与外部 fencing"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 19：ZooKeeper 一致性、锁配方与外部 fencing</div></div><div class="info-2"><div class="info-item-1">一个进程的临时节点已经被删除，它保存在内存中的“持有锁”状态却可能还在。另一个进程获得了新资格，并不能自动取消旧进程发往数据库的请求。协调服务判断资格，客户端保留对资格的认知，外部资源决定是否接受写入；这三处状态并不会同时变化。 第 18 篇 解释了更新顺序和恢复前缀。本篇进一步区分普通读取、顺序锁和外部 fencing 的保证，使用 Apache ZooKeeper 3.9.6 官方服务与客户端验证三个本机场景。 课程结构仍参考 MIT ZooKeeper 讲义及 Stanford CS244B 日程，没有照搬课程作业实现。 更新有统一顺序，普通读仍可能陈旧 ZooKeeper 的更新进入复制提交链，普通读取可以由连接到的副本本地完成。客户端 FIFO 和同一 session 的进度约束，不等于任意两个 session 之间的实时顺序。 A 的更新完成以后，通过外部通道通知 B，B 再向落后副本读取，仍可能看到旧值。外部通知建立了应用层的先后关系，却没有让 B 所连接的副本自动推进到 A 的更新位置。如果把这段历史当成完整读写寄存器，它不满足线性一致性的实时顺序要求。Hunt ...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-18-ZAB%E5%8E%9F%E5%AD%90%E5%B9%BF%E6%92%AD%E4%B8%8E%E9%A2%86%E5%AF%BC%E8%80%85%E6%81%A2%E5%A4%8D/" title="分布式系统 18：ZAB 原子广播与领导者恢复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 18：ZAB 原子广播与领导者恢复</div></div><div class="info-2"><div class="info-item-1">主节点已经生成两条有依赖的状态变化，第一条只来得及到达部分副本，第二条还在传输中。此时切换领导者，新主应该继承什么？仅仅选出一个进程，或者选出一份较长日志，都没有完整回答这个问题。 第 17 篇 使用官方 ZooKeeper 3.9.6 验证了 znode、session 与 Watch。本篇讨论服务内部的 ZAB：领导者怎样取得一个可继续生成状态变化的历史前缀，以及副本何时能确认自己已接受了这个前缀。正文分别使用 DSN 2011 论文的协议模型、固定 3.9.6 的实现和原创有限实验，不把三者合并成同一份规格。 课程结构继续参考 MIT ZooKeeper 讲义与 Stanford CS244B 论文研读安排。本篇 Python 实验不调用 ZooKeeper 内核，也不复用前面 Raft 的代码冒充 ZAB；真实产品三节点故障实验留到第 22 篇。 状态变化之间可以有依赖 普通原子广播要求各副本的交付历史相容。ZAB 还围绕 primary-backup 的状态增量讨论顺序：primary 生成后一个增量时，可能已经使用了前一个增量的结果。恢复必须保留这种生成与应用的先后关...</div></div></div></a><a class="pagination-related" href="/2021/12/08/JDBC-%E9%97%AE%E9%A2%98/" title="JDBC 问题"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2021/12/08/JDBC-%E9%97%AE%E9%A2%98/JDBC%E6%95%B0%E6%8D%AE%E6%BA%90%E9%85%8D%E7%BD%AE.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-12-08</div><div class="info-item-2">JDBC 问题</div></div><div class="info-2"><div class="info-item-1">JDBC URL参数解析 参考《mysql JDBC URL参数解析》  JDBC数据源配置.xmind jdbc 调用层次 在创建事务的时候，调用 createTransaction 会先 getConnection。一开始的时候先试用发出两条语句：select 1;set autocommit=1;测试连接可用性。 12345678910112 = &#123;StackTraceElement@24652&#125; &quot;com.mysql.jdbc.MysqlIO.sqlQueryDirect(MysqlIO.java:2683)&quot;3 = &#123;StackTraceElement@24653&#125; &quot;com.mysql.jdbc.ConnectionImpl.execSQL(ConnectionImpl.java:2482)&quot;4 = &#123;StackTraceElement@24654&#125; &quot;com.mysql.jdbc.ConnectionImpl.execSQL(ConnectionImpl.j...</div></div></div></a><a class="pagination-related" href="/2026/05/20/%E8%87%AA%E5%B7%B1%E5%86%99%E4%B8%80%E4%B8%AA%E8%A7%A3%E9%87%8A%E5%99%A8-%E5%A4%A7%E6%AD%A5%E8%AF%AD%E4%B9%89%E4%B8%8E%E9%80%92%E5%BD%92%E6%B1%82%E5%80%BC/" title="自己写一个解释器：大步语义与递归求值"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/05/20/%E8%87%AA%E5%B7%B1%E5%86%99%E4%B8%80%E4%B8%AA%E8%A7%A3%E9%87%8A%E5%99%A8-%E5%A4%A7%E6%AD%A5%E8%AF%AD%E4%B9%89%E4%B8%8E%E9%80%92%E5%BD%92%E6%B1%82%E5%80%BC/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-20</div><div class="info-item-2">自己写一个解释器：大步语义与递归求值</div></div><div class="info-2"><div class="info-item-1">上一篇已经把字符串解析成 AST。程序结构稳定以后，下一步是给它一套求值规则。最直接的规则叫大步语义（big-step semantics）：给定一个表达式和环境，直接得到最终值；给定一个语句和环境，直接得到新的环境。 大步语义适合写成递归解释器。表达式节点递归求值，语句节点递归改变环境。它不会展示每一个中间状态，只关心完整运行后的结果。 本文会实现一个小语言。它支持数字、布尔值、变量、加法、乘法、小于、赋值、顺序执行、条件分支和 while 循环。  大步语义关心最终关系 大步语义可以先记成两条关系： 12expression + environment =&gt; valuestatement  + environment =&gt; new_environment 表达式会产生值，语句会改变环境。环境是变量名到值的映射。 例如： 1x + 1, &#123;x = 2&#125; =&gt; 3 赋值语句会得到一个新环境： 1x = x + 1, &#123;x = 2&#125; =&gt; &#123;x = 3&#125; 这套写法和 Java 程序员熟悉的递归下降解...</div></div></div></a><a class="pagination-related" href="/2020/07/19/Spring-%E4%B8%8E%E6%95%B0%E6%8D%AE%E5%BA%93/" title="Spring 与数据库"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2020/07/19/Spring-%E4%B8%8E%E6%95%B0%E6%8D%AE%E5%BA%93/TransactionAspectSupport.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2020-07-19</div><div class="info-item-2">Spring 与数据库</div></div><div class="info-2"><div class="info-item-1">Java 执行事务的过程  1.获取连接 Connection con = DriverManager.getConnection() 2.开启事务con.setAutoCommit(true/false); 在 Spring 事务里（如 DataSourceTransactionManager 的 doBegin 方法）里，总是会显式地 con.setAutoCommit(false);（不然哪有事务可言）。 3.执行CRUD 4.提交事务/回滚事务 con.commit() / con.rollback(); 5.关闭连接 conn.close();  本文涉及到的类型的类图    Spring 的事务管理核心类型和流程 DataSource 不同的数据源诞生不同的 DataSource。默认的 TransactionManager 本身是期待一个名叫“datasource”的数据源的。 FactoryBean 不同的 DataSource 装入不同的 FactoryBean，比如 JPA 的 EntityManagerFactory。 PlatformTransaction...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Kafka-Streams-%E5%9C%A8%E6%97%A5%E5%BF%97%E4%B9%8B%E4%B8%8A%E6%9E%84%E5%BB%BA%E6%B5%81%E5%A4%84%E7%90%86/" title="Kafka Streams：在日志之上构建流处理"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Kafka-Streams-%E5%9C%A8%E6%97%A5%E5%BF%97%E4%B9%8B%E4%B8%8A%E6%9E%84%E5%BB%BA%E6%B5%81%E5%A4%84%E7%90%86/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Kafka Streams：在日志之上构建流处理</div></div><div class="info-2"><div class="info-item-1">前十篇覆盖了 Kafka 作为消息基础设施的核心机制。这一篇开始看 Kafka 的生态扩展——第一个是内置的流处理库 Kafka Streams。 流处理容易被误解成&quot;又一套需要独立部署的集群&quot;。Kafka Streams 的核心定位不是集群，而是一个嵌入应用 JVM 的 Java 库。它把 Kafka topic 当作输入和输出，在应用进程内完成流式计算。 本文只抓一个问题：Kafka Streams 怎样在追加日志之上构建出有状态的流处理。 架构定位：库，不是集群 12345678910111213141516┌─────────────────────────────────────────┐│            Application JVM              ││  ┌───────────────────────────────────┐  ││  │         Kafka Streams Library     │  ││  │  ┌─────────┐  ┌───────────────┐  │  ││  │  │ Topol...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">实验的系统模型</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">znode 的状态不只有一串字节</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">带版本更新怎样防止覆盖</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">顺序编号属于父节点</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">session 跨越连接，临时节点跟随 session</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">默认 Watch 通知一次变化</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">持久 Watch 保留注册，不提供离线事件日志</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">官方服务与真实 TCP 的验证范围</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">9.</span> <span class="toc-text">两道练习</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

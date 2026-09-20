@@ -1,0 +1,108 @@
+第13篇：论断—证据—核验状态
+资料核验日期2026-09-19/20；实现日期2026-09-20。
+
+# 13：Raft 持久化、快照与安装快照——研究与实验设计
+
+研究日期：2026-09-19。状态：资料已核验；正文、实现、进程重启实验均未开始。依赖 12 的日志复制实现最终验收。本文是前置研究备忘，不计为完成篇章。
+
+## 范围与证据分层
+
+蓝图 13 要求注入写盘和重启边界，恢复后不回退已应用状态。沿用固定成员、非拜占庭、确定性状态机；不实现成员变更、外部数据库事务、快照流控或生产级 WAL。论文协议、etcd 指定版本实现、Go API、本机源码以及拟议实验分别记录，不能互相替代。
+
+04 的 `source/_posts/2026-09-19-分布式系统-04-网络KV与持久化恢复/evidence.txt` 已复读：它提供文件 Sync、目录 Sync、进程 SIGKILL 与断电的区别；其日志实验没有实现快照 rename 事务，不能把 04 的成功外推为 13 已验证。
+
+## 资料与精确支持范围
+
+| ID | 标题、版本或日期、URL | 定位及支持的论断 | 核验状态 |
+|---|---|---|---|
+| R1 | Ongaro/Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended Version)*，2014-05-20，https://raft.github.io/raft.pdf | Figure 2、§5.5：term/vote/log 在相应 RPC 回复前持久化；§7、Figure 12–13，印刷页 11–13：快照代表已应用的已提交前缀，边界 index/term 支持后续日志匹配，匹配后缀须保留 | 已读原文；不能把 Figure 13 当成完整文件事务代码 |
+| R2 | Ongaro 博士论文作者仓库，*Memory-based snapshotting*，master 滚动文本，访问 2026-09-19，https://raw.githubusercontent.com/ongardie/dissertation/master/compaction/memsnapshot.tex | 段落对应快照元数据、client metadata、日志丢弃、Implementation：快照包括客户端去重信息；完整写好后才能删前缀；LogCabin 使用临时文件、flush、rename；一致快照可使用 COW | 已读作者文本；未固定 SHA，不称冻结的 2014 PDF |
+| R3 | 同作者，*Disk-based state machines*，master，访问 2026-09-19，https://raw.githubusercontent.com/ongardie/dissertation/master/compaction/disksnapshot.tex | 开头持久状态讨论：仅缓存变更不足以替代日志，状态持久化后才可丢日志；一致快照需要对应同一版本 | 已读；后半作者明确推测的替代算法不纳入实现依据 |
+| R4 | Ongaro dissertation，*Updates and errata*，访问 2026-09-19，https://github.com/ongardie/dissertation#updates-and-errata | lastApplied 勘误：其持久性应与状态机一致；不能一律认定为易失变量 | 已核验作者勘误；此次未发现明确命名的 snapshot 专项修订，不宣称穷尽所有问题 |
+| R5 | etcd-io/raft `raft.go`，v3.6.0，https://github.com/etcd-io/raft/blob/v3.6.0/raft.go | `restore`，约 1764–1839 行：index 不大于 committed 的快照忽略；边界 term 匹配可推进 commit 而不安装状态快照；`loadState` 校验 commit 范围 | 已读版本源码；是该版本核心行为，不是所有 Raft 库统一 API |
+| R6 | etcd `server/etcdserver/raft.go`，v3.6.0，https://github.com/etcd-io/etcd/blob/v3.6.0/server/etcdserver/raft.go | 约 226–260 行：先保存 snapshot 文件与 WAL snapshot 记录，再保存 hardstate/entries；释放旧 WAL 前同步；错误为 fatal | 已读版本源码；未运行 etcd，不声称验证完整服务器持久性 |
+| R7 | *Corrupted WAL and snapshot restoring process*，etcd issue #10219，2018-10-26，https://github.com/etcd-io/etcd/issues/10219 | 报告先保存新 HardState.Commit、快照尚未保存即中断，恢复不一致；R6 注释直接回链此问题 | 历史报告与当前指定版本防护交叉吻合；报告的 master 非固定发布版；没有本地复现原故障 |
+| R8 | Go `os` API，go1.27.0，https://pkg.go.dev/os@go1.27.0 | `File.Sync`、`File.Write`、`File.Close`、`Rename`：检查写入与同步错误；Rename 有平台限制，API 不给所有 OS 相同原子性承诺 | 已读版本 API；API 文义不等于物理断电实测 |
+| R9 | Go Darwin `fd_fsync_darwin.go`，go1.27.0，https://github.com/golang/go/blob/go1.27.0/src/internal/poll/fd_fsync_darwin.go | `FD.Fsync`：先 F_FULLFSYNC，ENOTSUP 才回退 syscall.Fsync，处理 EINTR | 已读远端及本机同版本文件；未跟踪本次文件系统实际走哪一分支 |
+| R10 | Apple *Mac OS X Manual Page For fsync(2)*，存档页，页脚 1993-06-04，https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html | DESCRIPTION：主机缓冲刷出与设备缓存落介质不同；F_FULLFSYNC 请求更强刷新；ERRORS 包含 EIO 等 | 已读官方历史手册；存档日期不代表当前系统实现版本 |
+| R11 | Apple *rename(2)* 存档手册，访问 2026-09-19，https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/rename.2.html | 同文件系统重命名及替换的名称可见性；本机 `man 2 rename` 另核对原子替换描述 | 已读远端及本机手册；原子名称替换不证明最新文件字节已耐断电 |
+
+本机只读核验：Darwin 27.0.0 arm64；`go version` 为 go1.27.0 darwin/arm64；实际源码路径 `/opt/homebrew/Cellar/go/1.27.0/libexec/src/internal/poll/fd_fsync_darwin.go`。本研究没有执行新文件同步或故障实验。
+
+## 论断—证据—核验状态
+
+| 论断 | 证据与推理 | 状态 / 写作边界 |
+|---|---|---|
+| snapshot.index = k 对应状态机实际执行至 k 的状态，snapshot.term 是 log[k].term | R1 §7，R2 | 原文支持；不能把 currentTerm 写成 lastIncludedTerm |
+| 快照不是额外共识，压缩的是已达成共识的前缀 | R1 §7；R2 | 已交叉核验；仅已接收、未提交命令不能纳入 |
+| Snapshot、日志后缀、term/vote、恢复进度要组成可恢复的一代 | R6/R7 提供跨文件顺序反例；R2 的完整快照要求 | 工程综合结论；不意味着论文规定所有字段必须同一文件 |
+| index <= committed 的迟到快照不能倒退当前状态 | R5 restore；R1 Log Matching/State Machine Safety | 版本源码支持工程防护；Figure 13 没有完整显式 obsolete 判定，正文须说明补足 |
+| 匹配 k/term 保留 k 之后后缀；不匹配的未提交后缀可丢弃 | R1 Figure 13、R2；R5 的匹配分支是复用已有日志的优化 | 已交叉核验；勿把“总清空后缀”写成必需步骤 |
+| lastApplied 与状态机必须一致恢复 | R4；R3 | 作者勘误核验；持久数据库应用须原子更新数据与应用标记，或提供等价幂等恢复 |
+| Go 1.27 macOS File.Sync 不是仅调用 fsync | R9 本地/远端 | 源码验证；设备真实稳定介质语义未验证 |
+| SIGKILL 重启验证的是进程恢复 | R8–R11 的存储边界；04 | 不能模拟 OS 缓存丢失、掉电、控制器谎报成功 |
+
+## 反向核验及不能简化的地方
+
+已检索作者 errata、snapshot restore/obsolete、etcd WAL HardState 崩溃问题以及 Go Darwin Sync 修订。R4 是明确的作者更正，必须写进正文。R7 不能照搬其“模拟 power failure”措辞：failpoint/panic 是进程故障，报告能展示恢复排序错误，但不能证明断电介质行为。
+
+另检索到 https://github.com/etcd-io/raft/issues/157 （2024-02-06，*invariants gap: committing a stale snapshot*）。该报告本身保留可达性与后果疑问，因此仅作后续检索线索，不计为已证实安全漏洞，不把它用于断言 v3.6.0 有数据丢失问题。
+
+Figure 13 的简写不能直接成为生产磁盘代码：匹配分支提前返回不代表任意应用层都能忽略状态恢复；R5 可以 fast-forward 是因为已有对应日志可供应用。本文实现可选择完整安装状态后保留后缀，也可选择从现有日志推进，但必须固定一种契约。持久化状态机与易失状态机的恢复顺序不可混用。
+
+## 最小实现设计（原创，待 12 验收后实现）
+
+### 一代文件，避免先实现多文件 WAL 事务
+
+建议复用 12 的串行核心，用一个带版本和校验和的 `current` 文件原子发布一代：节点/集群身份、generation、currentTerm、votedFor、snapshot 的 index/term/固定配置/业务状态/去重结果、连续日志后缀、durableCommit。每次持久化重写整份文件，代价为 O(状态与后缀大小)，仅用于有限教学实验，不当作高吞吐方案。
+
+这里把 commit 也持久化是明确的实验设计扩展，便于无网络重启后恢复已应用进度；原论文 Figure 2 把 commitIndex 列为 volatile。运行时状态机仍易失：从快照 k 重放到 durableCommit，lastApplied 由重放得到；不得重放 commit 后的已接收尾部。每次推进 commit，先发布 durableCommit，再 apply 和对外暴露结果，因此恢复完成前不服务，恢复后进度至少覆盖之前已暴露的 applied。重放期间暂时从 k 起步不算服务状态回退。
+
+快照在串行事件边界复制，包含该边界完整业务状态及请求结果缓存。若业务操作含外部副作用，本设计不再成立；此实验只允许纯内存确定性操作。每个输出效果携带 generation，只有对应持久化完成才放行，不能让迟到的旧写入完成消息放行新回复。
+
+安装步骤：先处理 term 与角色规则；即使快照内容过期，更高 term 的持久化仍必须完成。若 k <= 当前 commit，忽略状态替换，继续执行本地已提交日志。若 k > commit，校验完整快照：本地 k/term 匹配就保留后缀，不匹配则丢掉被替代的未提交日志；原子发布新快照、后缀、hardstate、commit=k 后，恢复状态并回复。固定成员身份需匹配。此处采用完整有限消息，不实现 Figure 13 分块传输；不能把收到部分字节算安装成功。
+
+### 文件操作与不确定错误
+
+同目录唯一临时文件 → 完整 Write（检查短写及错误）→ 文件 Sync → Close → Rename 为 current → 打开父目录并 Sync、Close → 才确认持久化效果。新建节点目录也有父目录项边界；实验先显式初始化并同步目录，再启动协议。目录 Sync 的本机支持及错误须实际记录，不用 Linux man7 的保证替代 Darwin 实测。
+
+Rename 之前失败：不能发成功回复；恢复继续读旧 current，孤立临时文件不自动提升为正式文件。Rename 之后目录 Sync 失败：新名称可能已经可见，不能宣称失败等于没生效；停止该节点，不确认、不继续覆盖，也不尝试反向 rename。重启读取 canonical current，校验并完成必要同步后再服务。此时只保证实验环境下的实际观察，不把可见性升格为断电保证。
+
+恢复要检查版本、长度、校验和、身份、后缀从 k+1 连续、k <= commit <= lastIndex 等关系。无损场景 current 不合法应拒绝启动；不能自动回退某个旧文件后继续服务，否则可能丢已确认状态。只有显式 bootstrap 允许无文件节点从零开始。校验和不是恶意篡改认证，也不能证明全部硬件故障可检测。
+
+## 最小可执行验收设计（均为预期，尚未运行）
+
+使用标准库、真实子进程和临时目录。父进程通过 `os.Executable` 启动 node 子进程，以管道传送有限协议消息及观察结果；每个节点单独文件目录。子进程在指定步骤输出 `READY(stage,generation)` 后等待父指令，父进程准确 Kill、Wait 再以相同目录启动新 PID，不用 sleep 猜中断位置。所有状态由合法协议轨迹得到；仅负向变异允许故意破坏指定机制。
+
+| 场景 | 轨迹与必须断言 |
+|---|---|
+| 正常压缩与重启 | 提交并 apply 至 2，快照 2；再提交 3，接收但不提交 4；杀进程重启：重放到 3，状态与去重缓存相同，4 未应用，index 使用全局位置 |
+| 落后节点安装 | 阻断一个 follower，leader 压缩；恢复通信安装快照，再 AppendEntries：边界 index/term 可匹配，追赶后状态一致；分别验保留匹配后缀与丢弃冲突未提交后缀 |
+| 迟到快照 | 节点已 apply 到 4，再收到快照 2：状态、commit、applied 不回退；若 RPC 带更高合法 term，term 更新不丢失；重启仍保留进度 |
+| 发布中断及错误 | 在部分 Write、文件 Sync 后、Rename 后目录 Sync 前、完整同步后回复前精确中断；旧已确认进度始终保留。未确认新代允许旧/新完整状态，绝不能混代。分别注入短写、Sync、Rename、目录 Sync 返回错误，确认无成功回复且失败节点不继续服务 |
+| 去重与错误变异 | 快照含 Add 请求及缓存结果，重启重试只返回旧结果，不再次累加。移除去重快照内容应被断言捕获；故意先保存新恢复索引而沿用旧快照，启动应拒绝或状态哈希断言失败 |
+
+注入的 I/O 返回错误是受控代码路径验证，不是真实坏盘 EIO；真实文件调用的成功/失败与注入标签分开输出。可把测试阶段 Hook 包裹标准库调用，不能用全内存 mock 代替所有持久化。父进程只 kill 自己启动的子进程，目录只在专用临时根下。
+
+实现后记录普通运行、race、vet、help、非法参数和每次子进程 PID/退出状态。macOS Go 启动若再出现 signal killed，保留原错误与成功替代命令，不能写成 race 检查通过。不会在此研究阶段预填任何验证成功。
+
+## 正文图示建议与交接门槛
+
+建议三图：全局日志索引与 snapshot 边界；temp/Sync/Rename/dirSync 的发布和崩溃窗口；迟到快照忽略与新快照保留/丢弃后缀分支。图的协议依据为 R1/R5，文件发布为明确的本地设计。
+
+进入实现前确认 12 核心已验收，持久化效果能够覆盖日志变化而非仅 hardstate 变化。完成篇章仍需正文双扫描、实验真实运行、附件核对、全站构建与父级审查。本备忘只完成资料和可执行设计，不替代这些门槛。
+
+## 父线程独立复核（2026-09-19）
+
+重新读取R2作者memsnapshot完整文本、R7原报告、R9固定Go源码及本机同版本文件；另读R5/R6固定v3.6.0 raw源码。核对结果：作者要求快照完成写出后再截前缀，并保留线性一致客户端所需元数据；Go实际先F_FULLFSYNC，仅ENOTSUP回退；etcd先SaveSnap再Save(hardstate,entries)，释放旧WAL前Sync。restore对index<=committed返回，边界term匹配分支仅推进commit、未安装新状态机映像。以上仅资料/源码交叉核验，13尚无本地故障运行证据。
+
+本地设计边界：采用单代文件与持久commit以恢复易失状态机，是明确教学取舍，并非复刻etcd多文件流水线。每次快照状态和去重结果必须对应同一已应用索引；重启服务前重放已持久commit以内条目，不能将未提交尾部执行。目录同步失败发生在rename之后时，不应回滚或把操作断言为未发生。
+
+
+实施交付补充（2026-09-20）
+正文按 blog-editor 入口；已有系列封面复用；Mermaid配置enable/code_write已静态确认。
+落盘前：anti-ai-tone tech profile人工支撑/推进/节奏/连续性检查及check_prose.py：3826汉字，error0/warning0；随后anti-persona-fabrication逐段检查：无第一人称叙事、拟人经历、说书腔。
+图依据：图1原论文§7与全局索引实现；图2本地文件发布协议；图3原论文Figure13加etcd/raft v3.6.0 obsolete防护；图4作者lastApplied勘误与本实验volatile状态机重建。
+实现没有独立新增Raft协议：扩展累计raft/，新增raft13适配器。New/NewDurable共享构造，后者额外持久化Commit。父级已独立审查源码与资料。
+正文约3826汉字、四张Mermaid、两道练习；图渲染和全站构建由父级执行，此附件写入时尚待父验收。
+高term过期快照、Max索引、单节点第二持久批次属于核心输入边界检查，未称空集群完整轨迹。其余snapshot/cuts/errors使用真实子进程与文件。

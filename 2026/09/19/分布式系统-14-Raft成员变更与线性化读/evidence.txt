@@ -1,0 +1,102 @@
+# 14：成员变更与线性化读——前置研究
+
+研究日期：2026-09-20。状态：原始资料与固定版本源码已读取；累计核心与 raft14 驱动已实现；固定目录 race 构建九类场景与 CLI 已实际验证，编译/静态分析通过；旧篇累计运行回归仍有缺口，详见末尾。
+
+前置研究基线：main，HEAD `68acb17ace0813a213c24dd2695e874b51d359e8`。实施基线：13 已验收提交 `809e4d038aa69ad1ff3131206c12eca16d9c09df`；实现沿用该版累计核心。其他系列并行提交继续推进 HEAD，不覆盖其工作。蓝图 14 要求分别验证组成员变更与读屏障，并明确论文与实现版本。
+
+## 论断—证据—核验状态
+
+| 论断 | 原始证据与定位 | 状态及边界 |
+|---|---|---|
+| 直接切换任意旧、新集合可能同时存在互不相交的多数；joint 要求旧多数和新多数分别成立 | Ongaro/Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended Version)*，2014-05-20，§6、Figure 10/11，[论文](https://raft.github.io/raft.pdf)；raft v3.6.0 [quorum/joint.go](https://raw.githubusercontent.com/etcd-io/raft/v3.6.0/quorum/joint.go)，VoteResult/CommittedIndex | 已读交叉核对。源码用两边已确认索引的较小值；不得换成 union 的一个多数 |
+| 论文 joint 配置在日志存入时立即生效；joint 提交后才追加 final，新配置追加后立即启用 | 同论文 §6；作者博士论文 Chapter 4 的 [membership/arbitrary.tex](https://raw.githubusercontent.com/ongardie/dissertation/master/membership/arbitrary.tex) | 已读。作者仓库 master 为读取日滚动版本，不冒充 2014 PDF 固定字节。未提交配置被合法截断时必须恢复先前配置 |
+| final 提交前，被移除 leader 仍可推进复制，但不能作为新集合成员计票；final 提交后退位 | 论文 §6 | 已读。授权的消息发送者与当前 voters 不能粗暴用同一集合过滤 |
+| 单节点变更也有跨任期隐藏配置缺陷；作者提出新 leader 先提交本任期条目再发起新变更 | 作者 [Updates and errata](https://github.com/ongardie/dissertation#updates-and-errata)；Diego Ongaro, *bug in single-server membership changes*，2015-07-10，[原邮件](https://groups.google.com/g/raft-dev/c/t4xj6dJTP6E/m/d2D9LrWRza8J)，Counterexample 1、Solution | 已读。对象为博士论文单节点变更方案，不是论文 joint 算法；邮件当时说明尚无正式证明，不能写成已完成形式证明 |
+| etcd raft 的配置应用时点与论文不同 | raft v3.6.0 [doc.go](https://raw.githubusercontent.com/etcd-io/raft/v3.6.0/doc.go)，Usage、Implementation notes；[confchange.go](https://raw.githubusercontent.com/etcd-io/raft/v3.6.0/confchange/confchange.go)，EnterJoint/LeaveJoint/Simple | 已读。使用者在 committed entries 上调用 ApplyConfChange；doc 的单节点说明不能泛化为任意 joint 改动都只需旧多数 |
+| 线性化读需要本任期提交、请求之后的新 quorum 确认、应用到 readIndex | 论文 §8；作者博士论文 [clients/clients.tex](https://raw.githubusercontent.com/ongardie/dissertation/master/clients/clients.tex)，§6.4 Read-only queries | 已读。多数确认支持发送心跳时仍有领导权的论证，不保证响应到达时永远还是 leader |
+| CheckQuorum 不能代替每次读的证书；租约需要时钟条件 | raft v3.6.0 [raft.go](https://raw.githubusercontent.com/etcd-io/raft/v3.6.0/raft.go)，ReadOnlyOption、Config.CheckQuorum、ReadOnlyLeaseBased 验证；论文客户端章节 lease 小节 | 已读。配置检查要求 LeaseBased 配合 CheckQuorum，但这不是充分的时钟安全证明 |
+| etcd 默认 Range 走线性读屏障，并另等 appliedIndex | etcd v3.6.0 [v3_server.go](https://raw.githubusercontent.com/etcd-io/etcd/v3.6.0/server/etcdserver/v3_server.go)，Range、linearizableReadLoop、requestCurrentIndex；[rpc.proto](https://raw.githubusercontent.com/etcd-io/etcd/v3.6.0/api/etcdserverpb/rpc.proto)，RangeRequest.serializable；[API guarantees](https://etcd.io/docs/v3.6/learning/api_guarantees/) | 已读源码与 API 文档。API 是契约，存在缺陷时不能把契约当作所有执行均正确的证明；serializable 允许陈旧读 |
+| v3.6.0 server 依赖 raft/v3 v3.6.0 | [server/go.mod](https://raw.githubusercontent.com/etcd-io/etcd/v3.6.0/server/go.mod) 的 require | 已核固定 tag；不是用当前 main 推断历史版本 |
+| 重复 ReadIndex context 能破坏旧版批量读确认 | raft v3.6.0 [read_only.go](https://raw.githubusercontent.com/etcd-io/raft/v3.6.0/read_only.go)，addRequest/recvAck/advance；[issue #392](https://github.com/etcd-io/raft/issues/392)，2026-02-28 | 已读源码和官方反例；本地未运行产品复现，不能写成实际部署事故 |
+
+## 反向检索及版本修正
+
+检索对象包括作者 errata、single-server membership bug、ReadIndex 重复 context、process pause/stale read。找到三组不能省略的边界：
+
+1. 作者 2015 单节点反例：初始 C={1,2,3,4}。任期 1 的 leader 1 将 D={1,2,3,4,5} 仅存到 1、5 后离线；任期 2 的 2 经 2、3、4 当选，把 E={2,3,4} 存到 2、3 而按 E 提交。随后 1 可在任期 3 通过 1、4、5 按 D 当选，缺失已提交 E。关键是跨任期未提交配置，不是单次集合大小差 1 就自动安全。正文应复述边界，不把它说成 joint consensus 反例。
+2. raft [#397](https://github.com/etcd-io/raft/pull/397) 在 2026-03-09 合并，改为内部独立索引生成 heartbeat context；固定 [v3.7.0/read_only.go](https://raw.githubusercontent.com/etcd-io/raft/v3.7.0/read_only.go) 已读：heartbeatCtx 使用 confirmedReads+len(unconfirmedReads)，recvAck 按节点保留确认位置，maybeAdvance 用 JointConfig。不能仅从合并日期断言任意发行版已修复。[#398](https://github.com/etcd-io/raft/pull/398) 在 2026-03-10 合入 release-3.6，是明确重试不得复用 rctx 的文档限制，不能写成 3.6 分支已采用 #397 算法。v3.6.0 的 pending map 以调用者 context 为键，advance 批量释放该 context 之前的队列；删除后重用 context 与旧确认组合是危险所在。
+3. etcd [#20418](https://github.com/etcd-io/etcd/issues/20418) 是 process pause/stale read 报告；关联 [#21375](https://github.com/etcd-io/etcd/pull/21375) 虽于 2026-02-26 合并，但作者 2026-03-04 明确更正“doesn't fix stale read”。因此不能凭 Closed、合并标签或 backport 标签宣布问题解决。这里不推断全部 3.6.x 修复范围。
+
+主代理独立读取 #392 与 #397，确认重复 context 队列反例及合并日期；这是资料交叉核验，不是产品实验结果。研究时 Python urllib 对 raw GitHub 的三个只读请求出现 DNS 解析失败；同 URL 后经 web 工具读取成功。未切换认证，未运行 etcd 服务。
+
+## 14 应采用的协议边界
+
+建议累计教学核心采用论文 §6 的完整 joint 协议，产品源码只用于比较。不要把论文的日志追加即启用与 etcd 的应用接口切换拼在一个状态机中。
+
+联合配置的 quorum 谓词为：`majority(acks ∩ old) && majority(acks ∩ new)`。稳定配置只有一侧。它必须用于选举、日志提交和读确认；重复消息按节点去重。交叉成员可以分别在两侧计入，但同一侧不能重复计票。
+
+配置日志生命周期：稳定 Cold → 追加 joint(Cold,Cnew) 并立即采用双多数 → joint 按双多数提交 → 追加 final(Cnew) 并立即采用新多数 → final 按新多数提交。追加新变更前要求无未提交配置、当前不处 joint，并保守要求已有本任期提交。退出 joint 另设受控事件，只允许 joint 已提交后执行。后续 leader 应从日志恢复过渡阶段，经当前配置提交本任期 no-op 后完成过渡，而不是由外部手动设置配置。
+
+论文 joint 自身允许任意集合改动，但新增节点先以不投票身份赶上日志可避免可用性骤降。教学实验应明示投票成员与复制目标；不把“已加入路由表”当作已成为 voter。被移除节点继续自发竞选造成任期扰动属于另一个可用性问题，本篇需说明，未实现的防扰动机制不能冒称已有。
+
+## 累计接口的最小改动建议
+
+本次只读到第 13 篇进行中的 State：HardState、Log、Snapshot、Commit；Snapshot 已有 Members。以下是交接建议，未获代码验收。
+
+- 将 Entry 区分 command/noop/joint/final，配置携带规范排序、无重复且非零的成员集合。若使用 slice 载荷，现有 slices.Equal(Log) 与浅复制不再适用，State、消息、观察都必须深拷贝和按值比较。合法性检查必须在更新高 term 等状态前完成，维持此前输入失败不留下未保存变更的约束。
+- active config 来自快照边界配置，再按后缀中最新配置日志覆盖，包括未提交后缀。追加、截断、安装快照、重启都重新导出。快照保存的是快照 index 处的配置，不是节点当前最新配置；快照可能位于 joint 期间，所以只有一份 Members 不够表达全部状态，应支持 old/new 两侧。不能压缩掉配置历史后依赖启动参数恢复。
+- 分开已知身份/复制目标与 active voters。New 对旧 votedFor 的验证不能因该成员已被后续配置移除就拒绝合法恢复。移除中的 leader 仍能发送 final 的 AE；消息过滤不能简单拒绝所有不属于当前新 voters 的发送者。
+- 保持完整 State 持久化屏障；配置改变也须保存完成后释放协议效果。commit 的观察与应用游标分开，不能用调试 Status 作为客户端读完成承诺。13 的 NewDurable 和应用重建责任延续，不另造第二套存储接口。
+- 提供 BeginRead(token) 与 ReadReady(token,term,index) 的边界：后者只证明协议屏障完成，应用层必须等 applied>=index 再读取当前状态并响应。可复用已有 Effects 观察，但读结果不应误装成日志提交事件。
+
+读轮次用内部 `(node,term,localSeq)`，每次尝试新 ID；重启后不能在同 term 直接恢复 leader，必须经提升任期的新选举，因此不跨重启复用同一元组。请求时先确认本任期条目已提交，再捕获 readIndex，再发新探测。每个读独立收集当前任期和该轮次的 ACK，不复用旧 AE 成功、不做跨请求队列批量放行；ACK 不证明 follower 已有 readIndex，只证明这一轮领导权确认。
+
+失位时清空 pending reads；旧 ACK 即使不匹配也先遵守 higher-term 降级规则。任意 active config 改变，包括截断回滚，都取消现有读轮次并要求重试；这样不需要证明跨配置复用确认。joint 期间的新轮次按双多数。应用等待期间可保守地在失位后取消未响应的请求，这是允许失败/重试的简化，不必声称一旦失位所有此前读证书都在理论上无效。
+
+## 前置实验设计（保留原计划）
+
+下表是验收计划，不是已观察输出。正常轨迹应经事件接口产生，不直接手填不同节点日志冒充可达运行。独立 checker 保存跨崩溃的已提交事实、配置日志和读写调用/返回顺序。
+
+| 场景 | 正常要求 | 错误对照应暴露什么 |
+|---|---|---|
+| 多数计算 | Cold=ABC、Cnew=CDE；ABC 三票仍不满足新多数；ABCD 才同时满足两边 | union 的 3/5 错误通过；选举、commit、read 三处分别检查 |
+| 完整变更 | 由真实竞选、复制得到 ABC→joint→CDE；只有旧多数时 joint 不提交；移除 A 的 final 由 CDE 推进，A 随后退位 | 不等待 joint 提交便跳 final；被移除 A 自计为新成员 |
+| 恢复与回滚 | 部分节点保存未提交 joint 后重启能恢复 active；合法旧配置 leader 覆盖未提交 joint 后能回退；已提交 joint 不得丢失 | active 独立于日志、重启仅用启动 members、截断忘回滚 |
+| 快照边界 | 在 joint 或其后的合法应用边界快照，恢复后后缀配置仍优先；空后缀恢复快照配置 | 保存“现在配置”而非边界配置，或只保留 union |
+| 旧 leader 读 | 隔离 A，B/C 新 leader 写 x=2 并已返回，随后向 A 发起读；A 无新 quorum 不能成功 | A 仅看 Role 或 CheckQuorum 尚未触发就返回 x=1，违反实际时间顺序 |
+| 本任期提交 | 新 leader 已有旧任期数据但 commit 知识不足时先阻塞读；提交本任期 no-op 后放行 | 省略 current-term guard 获得过小 readIndex |
+| 应用滞后 | commit=r 且新 quorum 成立，应用仍 r-1；只产生屏障，不回复值；应用到 r 后才读 | 将 committed 当 applied，返回旧值 |
+| 迟到确认 | 读轮次 1 取消后创建轮次 2；延迟/重复轮次 1 ACK 不能放行 2；高 term ACK 先降级 | context 复用、重复计票或旧证书跨轮次使用 |
+| 配置中途变化 | 读进行中追加/回滚配置取消原轮次，重试按当前 stable/joint quorum | 用旧配置多数完成新配置下的读 |
+
+另用独立小模型说明直接 Cold=ABC→Cnew=ABCDE 的危险：旧多数 AB 与新多数 CDE 不交叉。这个错误配置分发模型不能称为正确 joint 核心的可达执行。
+
+租约不建议在本篇核心中实现。可用明确标注的逻辑时钟反例展示：旧 leader 计时暂停，而多数派的选举超时继续推进，新 leader 已完成写入；旧 leader 恢复时“本地租约尚未到期”不能作为证明。安全租约需要相对时钟速率界、处理暂停/迁移/时钟调整，按确认轮次开始时间保守计算到期，领导权转移前先使租约失效。该模型不是实际暂停测试，也不是把 etcd 的 KV TTL Lease API 当作 leader lease。
+
+## 下一步交接
+
+等 13 验收提交后重新读取核心，先确定快照配置载荷与日志 entry 类型，再实现 joint lifecycle，验证完成后叠加读屏障。正文至少分别画联合多数、配置过渡、ReadIndex→apply、旧 leader/迟到 ACK 反例四张机制图。产品部分引用固定 v3.6.0 的实现与已核缺陷边界；本地教学实验只能证明所执行有限轨迹，不能升级为 etcd 端到端验证或完整协议形式证明。
+
+
+## 2026-09-20 实施与静态复核
+
+已实现 configuration.go、reads.go 及累计 election/replication/snapshot 扩展，raft14 驱动共九类场景。Entry 使用集中校验的规范字符串配置，保持值可比较；State.Initial 与 known 身份分开。NewConfigured 在快照覆盖前独立验证 initial；动态 snapshot 不允许缺失完整两侧配置。匹配且将采用的 snapshot 边界核验 configAt(k)，避免把 joint 并集猜作 stable。
+
+AE 先构造覆盖后的候选后缀再验证配置生命周期，支持一次合法 AE 同含 joint/final；同索引同任期比较整个 Entry。正常场景通过真实竞选/复制/Change/LeaveJoint 产生消息；手填消息仅限明确非法输入负例。应用 apply 和 respond 已分开，响应尝试必须等待 applied fence；ready 后失位由独立 reads-cancelled 事件清空，重启丢弃旧读。
+
+主代理与独立审查者只读核验了初始配置、快照边界、批量配置和输入校验，并提出已修复的 applied-fence 假阳性与手填选举轨迹问题。静态源代码走查不构成运行证据。作者 `GOCACHE=/private/tmp/ds-go-cache go build ./raft ./raft11 ./raft12 ./raft13 ./raft14` exit 0；同包 go vet exit 0。主代理也独立报告同包 go vet exit 0。
+
+原设计表中的“独立 checker 保存跨崩溃已提交事实与读写历史”未实现成通用 checker：实际驱动为场景断言、独立集合计数与内存状态重建，旧主读指定写返回先于读调用。不得声称完整历史线性化检查、真实进程恢复或实现级安全证明。这一静态检查阶段尚未执行九类场景、race、CLI 与 11–13 新核心回归；后续真实运行结果见下一节，不从源码 PASS 字符串推导结果。
+
+父代理通过工具内纯 JS 进行了集合数学枚举（没有执行 Go/本机实验二进制）：旧123新345，32个子集里joint有效10个，并集三票错误接受123、124、125、145、245、345六组。该数学结果用于 driver oracle 常量，不等于 Go 场景通过。
+
+图示依据：双多数/配置生命周期/快照边界图来自论文 §6、作者 arbitrary 与 memsnapshot；读时序/ReadIndex应用等待/迟到确认图来自 clients Read-only queries 和官方 #392/#397。图中 ABC/CDE、x=9/27、round=(7,1)/(7,2) 为教学数值，不是产品观测。
+
+
+## 2026-09-20 固定目录实际运行更新
+
+用户澄清减少 /tmp 临时二进制，并非禁止实验。父级在 examples/distributed-systems 使用 `GOTMPDIR="$PWD/.build/tmp" GOCACHE=/private/tmp/ds-go-cache go build -race -o .build/raft14 ./raft14`，实际执行 `./.build/raft14`，九类场景全部 PASS、exit 0。Python subprocess 复用同文件检查 `-help` exit 0、`-scenario unknown` exit 2、位置参数 `unexpected` exit 2。作者没有另行运行或新建校验程序。
+
+累计运行回归命令 `./.build/raft11 && ./.build/raft12 && ./.build/raft13` 在第一个程序无输出 exit 137，原因未独立确认，后两者没有执行。遵照用户要求停止重试，没有改名/换路径规避。此前 ds13 的防护原因是用户确认的信息，不能直接挪用为本次 raft11 的根因。五包编译/静态检查通过，不能替代该运行回归缺口。
+
+本地观察只支持九类有限教学轨迹与 CLI 退出行为，不升级为形式安全证明、产品缺陷复现或真实 etcd E2E。旧方案表的 x=1/2 已在驱动具体化为 x=9/27，实际数据以场景代码与原始输出为准。

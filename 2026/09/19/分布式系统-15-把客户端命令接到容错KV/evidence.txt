@@ -1,0 +1,92 @@
+第15篇实施证据，2026-09-20
+当前状态：实验实现且固定目录race执行通过，父独立运行与CLI检查通过；正文/站点由父最终验收。
+下文保留原前置研究的资料、日期、URL、定位和当时状态；“仅研究”等首段为历史研究阶段，不是本附件当前实现状态。
+
+# 15：容错 KV——客户端命令、去重与历史检查
+
+研究日期：2026-09-20。基线：`0b2680d6d64d5ebb2a751561eaf1b3a72ea2e319`。状态：仅研究，未实现、未执行 Go 或实验二进制。本文件不是文章完成记录。唯一写入范围为本文件；其他代理的修改保留。
+
+## 先给结论
+
+本篇的增量是客户端逻辑操作如何穿过复制日志、确定性应用和回复，而非再次实现 Raft。网络超时只能说明客户端没有获得确定结果。写入可能尚未提交，也可能已经应用但回复丢失；重试必须保持同一个逻辑命令身份。
+
+建议原创教学接口用 Put/Get 加 Add（返回修改后的值），用 Add 暴露重复执行；固定三投票节点，复用 13 的快照恢复与 14 的读屏障。本篇可以使用预先分配且不复用的 clientID、单客户端最多一个未完成逻辑命令、递增 seq、无会话 GC 的有限实验。去重表保存完整请求载荷与原始结果，并与 KV、appliedIndex 一起快照。只在内存 leader handler 中记 seen 不够。
+
+历史 checker 必须正确处理结果未知的写，并采用修正后的线性一致性定义：被纳入见证的 pending 操作也受真实时间先后约束。不能只检查已返回的操作，也不能把尚未调用的未来写倒放在已完成读之前。
+
+## 资料与论断核验
+
+| 标题、版本/日期、URL | 支持的具体论断与定位 | 核验状态 |
+|---|---|---|
+| MIT 6.5840 Spring 2026 [Schedule](https://pdos.csail.mit.edu/6.824/schedule.html)、[Lab 4: Fault-tolerant Key/Value Service](https://pdos.csail.mit.edu/6.824/labs/lab-kvraft1.html) | Introduction、Part A/B/C：从 Raft 接到 RSM、KV，再快照；请求提交与应用结果要关联；丢失回复会触发重试 | 已实际读取。课程结构依据，不复制 skeleton、解答或测试输出 |
+| MIT Spring 2026 [Lab 2: Key/Value Server](https://pdos.csail.mit.edu/6.824/labs/lab-kvsrv1.html) | Unreliable network 部分：同版本 Put 防止二次修改，但重试收到 ErrVersion 不能区分自己的首次写成功与别人先写；返回 ErrMaybe | 已读。2026 Lab 4 承接版本化 Put/Get；不能把旧年度 Append/clientID 作业接口冒称该年要求。本文 session 协议是自主选型 |
+| Stanford CS244B Spring 2024 [Schedule](https://www.scs.stanford.edu/24sp-cs244b/sched/)、[Project](https://www.scs.stanford.edu/24sp-cs244b/labs/project.html) | 课表包含 Raft；项目强调独立系统研究和评估 | 已读。用于论文分析与实验形态，不称 Stanford 有与本文相同的 KV 作业 |
+| Ongaro/Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended Version)*，2014-05-20，[PDF](https://raft.github.io/raft.pdf) | §8：已提交但回复前崩溃可重复执行；客户端编号、状态机记结果；只读需要额外领导权确认。§7：快照保留状态及边界 | 已读。共识日志出现一次与业务效果出现一次是不同层次 |
+| Diego Ongaro, *Consensus: Bridging Theory and Practice*，2014 博士论文；作者滚动源码 [clients/clients.tex](https://raw.githubusercontent.com/ongardie/dissertation/master/clients/clients.tex) | Chapter 6，Implementing linearizable semantics：session 包含 seq/result；并发请求需保存集合；确定性 session 过期与过期身份拒绝。Read-only queries：等待应用到 readIndex | 已读。master 是读取日版本，不冒充 2014 固定字节；具体实现建议与论文分开 |
+| Herlihy/Wing, *Linearizability: A Correctness Condition for Concurrent Objects*，ACM TOPLAS 12(3)，1990-07，pp463–492，[原论文](https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf) | §2.2 pp468–469：历史、pending、扩展与合法顺序见证；§3.1 局部性 | 已读，但原 L2 有已发表勘误；实现采用下一行修正，不能照抄有误关系 |
+| Sela/Herlihy/Petrank, *Linearizability: A Typo*，arXiv:2105.06737v2，2021-07-29，[全文](https://arxiv.org/html/2105.06737) | §4 Definition 4.1：顺序关系取 complete(H′)，包括已补响应的 pending；§7 与线性化点定义等价 | 本代理实际读 §4/7；主代理独立读取并指出勘误。必须加入未来写不能解释过去读的负例 |
+| etcd v3.6 [API guarantees](https://etcd.io/docs/v3.6/learning/api_guarantees/)，页面修改日 2025-09-26 | Operation completed：超时/断网可能结果未知；KV 默认线性一致，Watch 另有保证 | 已读。契约与实际缺陷分开，不据此宣称任意历史都正确 |
+| etcd v3.6.0 [api/etcdserverpb/rpc.proto](https://raw.githubusercontent.com/etcd-io/etcd/v3.6.0/api/etcdserverpb/rpc.proto) | RangeRequest.serializable、PutRequest、TxnRequest：默认线性读；Put 无通用 clientID/seq 字段；Txn 条件和两分支 | 已读固定 tag。不能从“使用 Raft”推导 API 自动替应用提供无限期请求去重 |
+| etcd v3.6.0 [client/v3/retry_interceptor.go](https://github.com/etcd-io/etcd/blob/v3.6.0/client/v3/retry_interceptor.go) | isSafeRetry/isContextError：区分 repeatable/nonRepeatable；context deadline/cancel 不按此处逻辑继续重试 | GitHub 固定 tag 页面读取成功；raw URL 两次 Internal Error，未据错误推断文件不存在。未完整审计所有 API 调用方，不能把局部策略等同端到端 exactly-once |
+
+## 反向检索：去重、会话、应用游标与读漏洞
+
+作者 [Updates and Errata](https://github.com/ongardie/dissertation#updates-and-errata) 明确 lastApplied 的持久性应与状态机一致。若 KV 已保存但 applied 游标未保存，恢复可能重复执行；只保存游标却漏掉 KV/去重表也会跳过必要重建。本文应复用已验收恢复协议，不能为响应路径绕开它。作者 Chapter 6 的列出勘误是文字修正；“没有找到其他列出项”不等于不存在其他协议错误。
+
+论文客户端章节给出实质反例：不同副本按自己的墙钟删除 session，会使相同重复命令在部分副本重新执行，部分副本跳过；把缺失 session 自动当新会话同样可复活旧命令。教学版不做 GC，要明确空间随历史增长，不能把有限实验说成有界内存生产方案。若以后加入 ACK 水位、过期与注册，相关变更也必须由复制的确定性输入驱动，并拒绝已过期身份。
+
+第 14 篇已核的读缺陷继续有效：raft [#392](https://github.com/etcd-io/raft/issues/392)（2026-02-28）、[#397](https://github.com/etcd-io/raft/pull/397)（2026-03-09 合并）、[#398](https://github.com/etcd-io/raft/pull/398)（2026-03-10 文档限制），以及 etcd [#21375](https://github.com/etcd-io/etcd/pull/21375) 作者后来澄清不解决 stale read。15 不重复冒称产品复现。复用 14 独立读轮次，逻辑写去重 ID 与 ReadIndex 协议 context 绝不能混为一物：同一写重试保持身份，同一次读的新探测尝试使用新轮次。
+
+## 命令与回复模型
+
+命令建议明确包含 `(clientID, seq, kind, key, argument)`。收到相同 ID+seq 且不同载荷，应确定性拒绝身份冲突；不能随意返回另一个命令的缓存结果。clientID 必须跨重启不复用；客户端若不能持久保存尚未完成的命令，就必须把恢复后的尝试视作新操作，不能继续承诺它与旧操作恰好合并一次。
+
+把业务修改、去重结果、appliedIndex 视作一次确定性应用：按连续 committed 前缀处理，第一次写执行并缓存结果，后续重复日志位置只推进 applied、不再产生业务效果。不同 seq 的结果不能混用。即使限定串行客户端，延迟的旧请求仍可能在新请求完成后抵达；本篇保留所有已完成结果最容易使边界明确，后续才讨论水位清理。
+
+pending RPC 等待者属于易失协调状态，不随快照保存。它应按完整命令身份和尝试上下文关联，不能只凭日志 index。旧 leader 在 index i 提交 A 之前失位，新 leader 可在 i 写 B；如果旧 waiter 只按 i 唤醒，会把 B 的成功误回给 A。另一个并发风险是先提交再登记 waiter，单节点或快应用路径可能提前交付；串行教学驱动可在一次事件处理中明确登记与释放顺序，不能让实验调度偶然隐藏漏洞。
+
+读选择：Get 通过 14 的 BeginRead，拿到 ReadReady 后独立等待应用。不要把“尚未调用处理回复函数”当作屏障已验证：必须在应用落后时实际尝试响应并断言被阻塞。Get 的多次传输尝试合并为一个逻辑读时，开始点是首次调用，结束点是最终回复；若每次都是用户主动的新 Get，就不能返回旧逻辑读的缓存结果。
+
+业务状态只有内存且恢复总从快照+日志重建时，必须同时重建去重表。快照格式至少携带版本、KV、完整去重结果、applied 边界，并使用核心 SnapshotAt 的配置/term 边界。检查快照内容对应准确应用位置，禁止把当前 KV 数据配上较早 index。恢复完成前拒绝读写服务。
+
+## 独立历史 checker：pending 与修正后的真实时间关系
+
+记录客户端逻辑操作的 invocation/response 全局事件序号、身份、输入和结果；RPC 丢包、重试和 leader 跳转另记传输轨迹，不冒充多个业务操作。实验调度器的离散序号足以表达已观察到的实时先后，不需要跨进程物理时钟比较。
+
+checker 的输入不能使用 Raft 日志顺序来决定答案，否则绕过了待检性质。小规模穷举的顺序规范只含 KV 运算，允许并发操作交换。所有确定成功响应必须纳入；明确的无效果拒绝按声明语义处理。未知结果不是业务失败响应：将它投影为逻辑 pending，保留调用位置；用户界面的超时不充当该操作确定结束点。若业务需要返回 Unknown，必须说明这是对确定结果规范的历史投影，不能把它直接称为原始纯 Put/Get 的成功历史。
+
+对有限 pending 子集枚举是否纳入见证；纳入者在历史末尾补规范允许的响应，未纳入者删除。随后按扩展历史 complete(H′) 的真实时间边建 DAG：任何实际已完成操作 a 的 response 早于被选操作 b 的 invocation，必须 a 在 b 前，即使 b 原本 pending。对拓扑顺序执行独立规范并匹配所有已知返回。只有至少一个合法见证才判通过；搜索超预算返回 UNKNOWN，不能算 PASS。没有响应的操作不要求生效，但若后续读观测到其值，见证可能必须纳入它。
+
+必须有三类 checker 自身测试：
+
+- 初值 0；先调用 pending Put(1)，再完成 Get=1：允许把 pending 写纳入并先于读，应通过。只删 pending 的错误 checker 会误报。
+- 初值 0；先完成 Get=1，之后才调用 pending Put(1)：必须拒绝。只对原本 completed 操作建边的错误 checker 会接受；这是 2021 勘误直接对应的回归。
+- 初值 0；先完成 Put(1)，再调用并完成 Get=0：必须拒绝，无 pending 可用于解释；同时放入并发读写的可通过对照，避免 checker 永远拒绝。
+
+重试身份和业务计数也要独立检查。不要仅用 Put 相同值证明“没有重复效果”；Add 的返回值及后续 Get 能观察重复增加。操作最多一次是业务状态转换保证，不是 RPC 只到达一次，也不保证永久分区中最终完成。
+
+## 建议的原创验收批次（均未运行）
+
+| 轨迹 | 必要可观察证据 | 变异对照 |
+|---|---|---|
+| 提交并应用 Add 后丢弃回复，真实选举新 leader，重试同身份 | 原缓存结果相同，最终只加一次；成功 reply 发生在应用之后 | 去掉 dedup 后第二次增加，历史拒绝 |
+| 旧 leader 的未提交命令被新任期同 index 命令替换 | 旧调用保持未知或失败重试；不得收到另一命令结果 | waiter 仅按 index 关联时出现错答 |
+| 快照前有已应用但未回复写；压缩、销毁节点、恢复、再次重试 | 快照含去重结果，恢复后仍只加一次 | 快照只存 KV 漏去重，重试再次增加 |
+| 分区旧 leader，新多数派完成写，之后向旧侧读 | 旧侧不能给陈旧成功；恢复/路由到新侧后得到合法结果 | 本地直接 Get 返回旧值，历史拒绝 |
+| ReadReady 已产生但应用落后 | 实际调用 tryRespond 不答；逐步应用后答 | 跳过 applied 检查会产生旧值，历史拒绝 |
+| 一个 pending 写未回复，另一个客户端读到它；随后另造未来写负例 | checker 分别接受与拒绝，并输出合法见证或失败原因 | 全删 pending、遗漏 pending 的前驱边两种错误分别被识别 |
+| 同身份异载荷、重复的旧 seq、客户端身份重启复用 | 异载荷拒绝；旧 seq 返回对应历史结果；身份复用明确拒绝或排除 | 只存一个 lastResult 或无载荷校验时错答 |
+
+正常轨迹通过已有核心事件构造网络分区、消息延迟/丢失和选举，不手工伪造候选人的日志末端。用户已澄清：减少写入 tmp 的临时二进制，并非禁止实验。后续复用仓库固定 `.build/kv15`，构建临时目录使用 `.build/tmp`；不运行已被禁止的 ds13-parent-check，不对被终止的程序换名重试。静态代码审阅不能写成“本地验证通过”，内存状态恢复不能写成真实文件或断电恢复。
+
+下一步：实现前与主代理确定写操作接口和未知结果的历史投影，沿累计核心添加独立 service/client/history 层；不复制课程作业解答。正文宜画客户端到日志到应用到回复、回复丢失后的去重、快照包含 session、pending 见证四幅机制图。
+
+父代理独立复核（2026-09-20）：重新打开作者 clients/clients.tex 的请求重试、线性语义与会话段，以及 MIT Spring2026 Lab4 页面，确认请求身份/首次结果须进入复制状态机，确定性过期与拒绝旧会话是额外协议。已读 kv15/history.go、machine.go 首版，pending 前驱边与溢出拒绝规则符合设计；此处为静态核对，尚非运行验收。
+
+
+实施映射：
+本篇直接复用14的Node/Event/State/Snapshot，无核心修改。driver状态映像与应用重建为内存实验，不复用13实际文件子进程运行证据。machine完整身份/命令/首次结果与论文§8会话模型对应；history pending前驱按2021修订定义。
+身份冲突与overflow在直接状态机输入场景验证，不称为真实网络端到端拒绝。客户端无并发逻辑调用、无session GC、身份预分配不复用。
+图示6张分别依据：论文§8客户端重试/状态机结果（前3张）、作者快照与lastApplied勘误（第4张）、14已核Read-only queries（第5张）、2021修订定义（第6张）。x=5/50及参与者均为教学轨迹。
+首次retry变异错误预期已修：新增真实Get5观察而非弱化checker。所有正常消息来自实际核心事件，手工合成仅用于独立checker单元样例及明确错误响应对照。
+本机命令/输出/固定二进制SHA见verification.txt。

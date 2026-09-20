@@ -1,0 +1,794 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>分布式系统 15：把客户端命令接到容错 KV | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="客户端发出 Add(x,5)。集群已经提交并应用，x 从 0 变成 5，但返回值在传输途中丢失。客户端重试时，另一位 leader 收到了相同请求。Raft 可以把两次提交都正确复制，却不会自动识别它们代表同一个业务操作。如果状态机再次相加，日志完全一致，业务结果仍然错误。 第 14 篇 已经建立读屏障与配置边界。本篇把客户端身份、状态机、快照和回复接在同一份 Raft 核心上，并使用独立顺序规范">
+<meta property="og:type" content="article">
+<meta property="og:title" content="分布式系统 15：把客户端命令接到容错 KV">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-15-%E6%8A%8A%E5%AE%A2%E6%88%B7%E7%AB%AF%E5%91%BD%E4%BB%A4%E6%8E%A5%E5%88%B0%E5%AE%B9%E9%94%99KV/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="客户端发出 Add(x,5)。集群已经提交并应用，x 从 0 变成 5，但返回值在传输途中丢失。客户端重试时，另一位 leader 收到了相同请求。Raft 可以把两次提交都正确复制，却不会自动识别它们代表同一个业务操作。如果状态机再次相加，日志完全一致，业务结果仍然错误。 第 14 篇 已经建立读屏障与配置边界。本篇把客户端身份、状态机、快照和回复接在同一份 Raft 核心上，并使用独立顺序规范">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg">
+<meta property="article:published_time" content="2026-09-19T15:20:00.000Z">
+<meta property="article:modified_time" content="2026-09-20T06:36:00.612Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Go">
+<meta property="article:tag" content="Raft">
+<meta property="article:tag" content="分布式系统">
+<meta property="article:tag" content="线性一致性">
+<meta property="article:tag" content="请求去重">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "分布式系统 15：把客户端命令接到容错 KV",
+  "url": "https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-15-%E6%8A%8A%E5%AE%A2%E6%88%B7%E7%AB%AF%E5%91%BD%E4%BB%A4%E6%8E%A5%E5%88%B0%E5%AE%B9%E9%94%99KV/",
+  "image": "https://magicliang.github.io/img/cover-distributed-systems.svg",
+  "datePublished": "2026-09-19T15:20:00.000Z",
+  "dateModified": "2026-09-20T06:36:00.612Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-15-%E6%8A%8A%E5%AE%A2%E6%88%B7%E7%AB%AF%E5%91%BD%E4%BB%A4%E6%8E%A5%E5%88%B0%E5%AE%B9%E9%94%99KV/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '分布式系统 15：把客户端命令接到容错 KV',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+</head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">881</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1028</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">32</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-distributed-systems.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">分布式系统 15：把客户端命令接到容错 KV</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">分布式系统 15：把客户端命令接到容错 KV</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-19T15:20:00.000Z" title="Created 2026-09-19 23:20:00">2026-09-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-20T06:36:00.612Z" title="Updated 2026-09-20 14:36:00">2026-09-20</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.5k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>15mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-20 14:36:00&quot;}" hidden></div><p>客户端发出 Add(x,5)。集群已经提交并应用，x 从 0 变成 5，但返回值在传输途中丢失。客户端重试时，另一位 leader 收到了相同请求。Raft 可以把两次提交都正确复制，却不会自动识别它们代表同一个业务操作。如果状态机再次相加，日志完全一致，业务结果仍然错误。</p>
+<a href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-14-Raft%E6%88%90%E5%91%98%E5%8F%98%E6%9B%B4%E4%B8%8E%E7%BA%BF%E6%80%A7%E5%8C%96%E8%AF%BB/" title="分布式系统 14：Raft 成员变更与线性化读">第 14 篇</a> 已经建立读屏障与配置边界。本篇把客户端身份、状态机、快照和回复接在同一份 Raft 核心上，并使用独立顺序规范检查客户端历史。判断对象从“日志是否一致”推进到“成功返回的读写能否解释为合法的顺序执行”。
+<p>课程结构参考 MIT 6.5840 Spring 2026 的 Raft→RSM→KV→快照路径；当年课程接口使用版本化 Put/Get，本篇的 ClientID、Sequence 和 Add 是原创教学选择，不是该课程作业答案。Stanford CS244B 的论文研讨与独立项目要求提供了研究和评估形态。<a target="_blank" rel="noopener" href="https://pdos.csail.mit.edu/6.824/labs/lab-kvraft1.html">MIT 2026 Lab 4</a>、<a target="_blank" rel="noopener" href="https://pdos.csail.mit.edu/6.824/labs/lab-kvsrv1.html">MIT 2026 Lab 2</a>、<a target="_blank" rel="noopener" href="https://www.scs.stanford.edu/24sp-cs244b/labs/project.html">Stanford 2024 项目说明</a></p>
+<h1>一个逻辑操作，可以有多次尝试</h1>
+<p>逻辑请求携带 <code>(ClientID, Sequence, Kind, Key, Value)</code>。客户端重试时，这五项保持不变；每次传输另分配 AttemptID，记录发送给哪个节点。ClientID 预先分配且不复用，一个客户端同时最多有一个未完成逻辑操作，Sequence 随新操作递增。客户端若重启后遗失原请求身份，服务端无法仅凭“看起来相同的参数”保证把它合并成旧请求。</p>
+<pre><code class="hljs mermaid">flowchart TB
+  OP[&quot;逻辑操作 A/1：Add x 5&quot;] --&gt; A1[&quot;Attempt 1 → leader 1&quot;]
+  OP --&gt; A2[&quot;Attempt 2 → leader 2&quot;]
+  A1 --&gt; LOG[&quot;日志可有多个位置保存 A/1&quot;]
+  A2 --&gt; LOG
+  LOG --&gt; APPLY[&quot;状态机按 A/1 去重&quot;]
+  APPLY --&gt; ONE[&quot;一次业务修改，保存首次结果&quot;]</code></pre>
+<p>超时只说明客户端没有得到确定结果。它不能区分请求尚未提交、已提交未应用、已应用未返回，以及回复在传输中丢失。实验将这些尝试记录在传输轨迹中；逻辑历史从首次调用开始，到客户端真正收到确定回复才结束。WrongLeader 或丢失的回复不会被记成一次成功写，也不会被误记成“写确定没有发生”。<a target="_blank" rel="noopener" href="https://raft.github.io/raft.pdf">Raft 扩展论文，§8</a>、<a target="_blank" rel="noopener" href="https://etcd.io/docs/v3.6/learning/api_guarantees/">etcd v3.6 API guarantees，Operation completed</a></p>
+<p>这仍不是无限期的 exactly-once 服务承诺。永久分区下请求可能永远无法完成；客户端身份丢失、复用或去重记录被删除，也会改变保证。本篇仅在固定身份、保留全部去重结果、非拜占庭节点的有限模型内讨论业务效果不重复。</p>
+<h1>结果必须与修改一起进入状态机</h1>
+<p>应用状态包含 KV、Applied 和 Seen。Seen 的键是逻辑请求身份，值保存完整请求载荷及首次结果。首次执行命令时修改 KV 并记录结果；再次应用同身份同载荷时，返回旧结果，仅推进 Applied。同身份却不同载荷，返回确定性的 identity-conflict，不修改 KV，也不覆盖原缓存。</p>
+<p>Put 将键设为指定整数，Add 返回相加后的值。值域明确为有符号 64 位整数：Add 超出范围时返回 overflow，保留原值，并缓存这个拒绝结果。不能让 Go 的整数回绕偶然成为未声明的业务语义。Get 不进入写日志，通过读屏障获取状态。</p>
+<p>假设 A/1 的 Add 首次返回值应为 5，但回复丢失；B/1 随后 Put(x,50)；A/1 再次进入日志。此时返回当前 x=50 也不正确，重试应得到它自己的首次结果 5。只保存“已经处理过”这个布尔标记不够，只保存每个客户端最新一条结果也可能误答迟到的旧 Sequence。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+  participant A as 客户端 A
+  participant S as 复制状态机
+  participant B as 客户端 B
+  A-&gt;&gt;S: A/1 Add(x,5)
+  Note over S: x=5；Seen[A/1]=结果5
+  S--xA: 回复5丢失
+  B-&gt;&gt;S: B/1 Put(x,50)
+  S--&gt;&gt;B: 结果50
+  A-&gt;&gt;S: 重试A/1 Add(x,5)
+  Note over S: 命中完整身份与载荷，不再修改x
+  S--&gt;&gt;A: 原结果5，当前x仍为50</code></pre>
+<p>去重必须成为确定性状态机的一部分。仅在 leader 的请求处理器中保存 Seen，切主后就会失效。不同副本也不能分别依据各自墙钟删除会话，否则同一命令会在某些副本重新执行、另一些副本跳过。本篇不做会话 GC，空间随已处理请求数量增长。若以后加入确认水位、过期和注册，应把规则变成确定性的复制输入，并拒绝已经过期的旧身份。<a target="_blank" rel="noopener" href="https://raw.githubusercontent.com/ongardie/dissertation/master/clients/clients.tex">作者博士论文，客户端会话与线性化语义</a></p>
+<p>在 Raft 已提交前缀不丢失、各副本按同一顺序确定性应用的前提下，可以对已应用前缀归纳：空前缀没有任何写效果；首次遇到某个写 ID 时，状态机完成修改或确定性拒绝，并保存结果；之后相同 ID 的日志不会再次修改 KV。合法快照与重放同时保留 Seen、KV 和 Applied，因此重建后仍维持这条不变量。它证明的是声明模型内的至多一次写效果。返回前的提交和应用约束、新鲜读屏障及应用等待，还要共同满足客户端的真实时间顺序，才可能得到完整线性一致性结论；本篇有限历史 checker 不替代这部分全实现证明。</p>
+<h1>提交、应用与回复是三个事件</h1>
+<p>服务端收到写请求后，先登记等待者，再把编码后的命令交给 Raft。日志提交只是允许状态机执行的前提；应用完成得到结果，才能生成成功回复。网络调度器决定回复是否被客户端收到。即使是单线程教学驱动，也要明确这个顺序，避免单节点或快速应用路径在等待者登记前已经交付结果。</p>
+<pre><code class="hljs mermaid">flowchart TB
+  REQ[&quot;请求到达：先登记等待者&quot;] --&gt; PROPOSE[&quot;Propose：追加日志&quot;]
+  PROPOSE --&gt; SAVE[&quot;保存完整持久状态映像&quot;]
+  SAVE --&gt; COMMIT[&quot;多数确认后提交&quot;]
+  COMMIT --&gt; APPLY[&quot;连续应用：KV + Seen + Applied&quot;]
+  APPLY --&gt; RESULT[&quot;生成对应请求的结果&quot;]
+  RESULT --&gt; NET&#123;&quot;回复被送达？&quot;&#125;
+  NET --&gt;|&quot;否&quot;| PENDING[&quot;客户端逻辑操作仍 pending&quot;]
+  NET --&gt;|&quot;是&quot;| DONE[&quot;记录客户端返回事件&quot;]</code></pre>
+<p>等待者不能只按日志索引关联。旧 leader 在索引 i 追加 A，尚未提交就被隔离；新 leader 可以在同一索引提交 B。旧节点追赶后应用 B，若按 i 唤醒 A 的等待者，就会把 B 的结果误答给 A。本篇匹配完整请求载荷与身份，配置和 no-op 不产生业务写回复。</p>
+<p>实验保留旧等待者以直接检验这个风险：A 的未提交 Add 被 B 的 Put50 替换，A 不应收到 50；随后把原 Add 路由到新 leader，它可以作为尚未生效的逻辑请求执行并返回 55。错误对照只按 index 关联，独立历史检查器会拒绝由此产生的结果。</p>
+<p>回复本身也可能重复。A/1 已结束、A/2 已调用但未完成时，再送达 A/1 的旧回复，不应修改 KV，不应结束 A/2，也不应清除 A/2 的客户端活动记录。驱动复制一条实际产生的旧回复来检查这条边界，不能仅凭“重复回复被忽略”就假定身份关联正确。</p>
+<h1>快照同时保存 KV 与去重结果</h1>
+<p>快照格式带版本号、KV、完整 Seen 和 Applied。只有应用状态准确覆盖到 k，才能调用核心的 SnapshotAt(k,data)，由核心填写对应 term 和配置。恢复时先验证应用快照的 Applied 等于快照边界，再按连续顺序重放到 durableCommit。尚未提交的后缀不能提前执行。</p>
+<pre><code class="hljs mermaid">flowchart TB
+  IMAGE[&quot;快照：version + KV + Seen + Applied=k&quot;] --&gt; RESTORE[&quot;验证并恢复边界k&quot;]
+  LOG[&quot;Raft后缀 k+1 … durableCommit&quot;] --&gt; REPLAY[&quot;连续重放已提交条目&quot;]
+  RESTORE --&gt; REPLAY
+  REPLAY --&gt; SERVICE[&quot;恢复后可处理读写&quot;]
+  BAD[&quot;错误快照只保留KV，遗漏Seen&quot;] --&gt; RETRY[&quot;旧Add被当新请求再执行&quot;]</code></pre>
+<p>只保留 KV，会让回复丢失的 Add 在恢复后再次相加；只保留 Applied，却没有相应状态，则会跳过本该重建的数据。作者勘误明确指出，lastApplied 的持久性应与状态机一致。等待请求、RPC 上下文和读轮次属于易失协调状态，不随快照恢复。<a target="_blank" rel="noopener" href="https://github.com/ongardie/dissertation#updates-and-errata">作者 Updates and Errata</a></p>
+<p>本篇恢复实验复用累计 State 与 Snapshot 接口，在内存中保存映像、销毁 Node 和应用状态，再重新构造。它验证映像内容与重放边界，不是新的真实进程、文件系统或断电测试。真实文件保存顺序和进程切点证据仍由第 13 篇承担。</p>
+<h1>读必须穿过协议和应用两层屏障</h1>
+<p>Get 延续第 14 篇的只读路径。leader 需要先有本任期提交，再为本次尝试产生独立探测轮次，收集有效多数并获得 ReadReady。应用层还须等 Applied 至少到 ReadIndex，再读取 KV 返回。逻辑请求身份与协议轮次不能混用：写重试保留原身份，新读探测使用新轮次。</p>
+<pre><code class="hljs mermaid">flowchart TB
+  GET[&quot;逻辑Get的本次尝试&quot;] --&gt; ROUND[&quot;本任期提交 + 新读轮次&quot;]
+  ROUND --&gt; ACK[&quot;有效多数确认&quot;]
+  ACK --&gt; READY[&quot;ReadReady：ReadIndex=r&quot;]
+  READY --&gt; CHECK&#123;&quot;Applied ≥ r？&quot;&#125;
+  CHECK --&gt;|&quot;否&quot;| WAIT[&quot;实际尝试回复：不得成功&quot;]
+  WAIT --&gt; CHECK
+  CHECK --&gt;|&quot;是&quot;| VALUE[&quot;读取当前KV并回复&quot;]</code></pre>
+<p>屏障测试不能先执行所有日志，再调用回复函数，然后声称应用等待有效。实验先让新 leader 提交前缀但保持应用落后，真正调用 respond，确认没有回复；随后推进应用，再次调用才获得值。去掉 Applied 检查的错误版本会返回旧值，历史检查器应拒绝。</p>
+<p>分区场景中，旧 leader 的本地 x=9，新多数派已完成 Put(x,27)，之后客户端才向旧主发起 Get。旧主的读探测因协议链路分区被丢弃，不能成功；重试路由到新主后返回 27。直接读取旧主内存的错误对照返回 9，与真实时间先后冲突。修复分区并同步日志后，旧副本也应用到 27。</p>
+<p>网络模型有明确边界：Raft 消息进入显式队列，协议链路按分区规则丢弃；客户端发送、回复丢弃与重复由调度器单独控制。这里没有真实 socket，也没有给所有客户端 RPC 建立通用网络层。有限调度不能代替覆盖任意网络历史的证明。</p>
+<h1>独立历史检查器如何处理未知结果</h1>
+<p>检查器只读取客户端逻辑调用与返回，不使用日志顺序、commit、Applied 或 Seen 决定答案。独立顺序规范维护一个 KV 映射，定义 Put、Add、Get 和 overflow。最多八个逻辑操作，枚举符合真实时间约束的顺序，比较已知返回；超限和非法历史明确返回 unsupported 或输入错误。</p>
+<p>与<a href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-06-%E4%B8%80%E8%87%B4%E6%80%A7%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%88%86%E5%8C%BA%E8%BE%B9%E7%95%8C/" title="分布式系统 06：一致性模型与分区边界">第 6 篇</a> 的完整历史检查器不同，本篇允许 pending。它枚举哪些 pending 操作纳入见证，在历史末尾为纳入者补规范允许的响应，省略其余 pending，再寻找合法顺序。所有已返回的操作必须保留。身份冲突属于另一组直接状态机边界测试，当前正常历史 checker 不把这种拒绝伪装成成功 Put。</p>
+<pre><code class="hljs mermaid">flowchart TB
+  H[&quot;输入：已完成操作 + pending调用&quot;] --&gt; SELECT[&quot;枚举pending纳入子集&quot;]
+  SELECT --&gt; EDGE[&quot;建真实时间前驱：返回早于调用&quot;]
+  EDGE --&gt; DFS[&quot;枚举拓扑顺序并执行独立KV规范&quot;]
+  DFS --&gt; MATCH&#123;&quot;所有已知结果匹配？&quot;&#125;
+  MATCH --&gt;|&quot;是&quot;| WITNESS[&quot;接受并输出见证&quot;]
+  MATCH --&gt;|&quot;所有选择都否&quot;| REJECT[&quot;拒绝&quot;]</code></pre>
+<p>若 pending Put1 已调用，随后另一客户端 Get 返回 1，检查器必须允许把那次未回复写纳入见证。直接删除所有 pending，会把这个合法历史误报为错误。若后续 Get 返回 0，也可以省略该 pending 写，或将它放到读之后，不能强制每次没有回复的写都已生效。</p>
+<p>相反，如果 Get=1 已完成，之后才调用 pending Put1，就不能用这次未来写解释过去的值。被纳入见证的 pending 也必须排在其调用前已经完成的操作之后。这是 2021 年对原始线性一致性定义勘误的关键点：顺序约束来自扩展历史的 complete(H′)，不应只给原先就 completed 的目标操作建立前驱。<a target="_blank" rel="noopener" href="https://arxiv.org/html/2105.06737">Sela、Herlihy、Petrank，Linearizability: A Typo，v2，§4、§7</a></p>
+<p>检查器自测包含 pending 可观察写、pending 可省略、未来写不能解释过去读、已完成 Put 后陈旧读，以及重复事件、重复身份、同客户端重叠操作和规模上限。故意删除 pending 的错误版本会误拒前一个合法例子；故意漏掉 completed→pending 前驱的版本会接受未来写反例。两种错误方向相反，不能用一个永远接受或永远拒绝的检查器通过它们。</p>
+<h1>实验怎样避免验证假象</h1>
+<p>最初的重复执行对照只有未回复的 Add、随后完成的 Put50，以及 Add 重试返回 55。检查器判断它仍可线性化：Add 的调用区间与 Put 重叠，可以把逻辑 Add 放到 Put 之后。这个判断是正确的，错误在实验预期。</p>
+<p>修正后的轨迹在 Put50 之前加入另一客户端真实完成的 Get=5。这个读要求 Add 已产生可观察效果，不能再把唯一一次逻辑 Add 放到 Put 之后解释 55。正常版本重试返回原结果 5、最终值 50；去掉去重的版本返回 55，检查器拒绝。首次失败与修正都保留在验证附件中，未削弱规范来迁就实现。</p>
+<table>
+<thead>
+<tr>
+<th>轨迹</th>
+<th>正常观察</th>
+<th>明确错误对照</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>丢回复、切主、另写、重试</td>
+<td>重试返回首次结果5，最终值50</td>
+<td>删除去重得到55，历史拒绝</td>
+</tr>
+<tr>
+<td>快照与重建</td>
+<td>重试仍为5</td>
+<td>恢复遗漏Seen得到10，历史拒绝</td>
+</tr>
+<tr>
+<td>同索引命令替换</td>
+<td>原等待者不被误答，重试后55</td>
+<td>只按index回复50，历史拒绝</td>
+</tr>
+<tr>
+<td>ReadReady但应用落后</td>
+<td>响应被阻塞，追上后9</td>
+<td>跳过应用屏障返回旧值，历史拒绝</td>
+</tr>
+<tr>
+<td>分区旧主读</td>
+<td>无新多数不能成功；新主返回27</td>
+<td>直接读旧内存9，历史拒绝</td>
+</tr>
+</tbody>
+</table>
+<p>源码位于 <code>examples/distributed-systems/kv15/</code>。它直接导入累计 raft 包，没有修改核心或复制另一套 Raft；状态机与 checker 分别实现业务运算，避免用被测实现充当顺序规范。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">cd</span> examples/distributed-systems<br><span class="hljs-built_in">mkdir</span> -p .build/tmp<br>GOTMPDIR=<span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>/.build/tmp&quot;</span> GOCACHE=/private/tmp/ds-go-cache go build -race -o .build/kv15 ./kv15<br>./.build/kv15<br>GOCACHE=/private/tmp/ds-go-cache go vet ./kv15 ./raft<br></code></pre></td></tr></table></figure>
+<p>2026-09-20，固定目录 race 二进制的完整场景运行退出 0，正常轨迹和明确错误对照均得到预期 verdict，静态分析也通过。可查看 <a href="verification.txt" target="_blank" rel="noopener">命令、失败记录与实际输出</a> 和 <a href="evidence.txt" target="_blank" rel="noopener">原始资料及论断核验</a>。它验证有限教学轨迹，不是完整协议形式证明，也不是 etcd 产品端到端观察。</p>
+<p>etcd v3.6.0 的 Put API 没有通用 ClientID/Sequence 字段，客户端重试拦截器也区分可重复与不可重复操作。不能从“底层使用 Raft”推导它替任意业务提供无限期去重；实际重试语义还取决于具体 API、客户端策略和应用身份设计。<a target="_blank" rel="noopener" href="https://raw.githubusercontent.com/etcd-io/etcd/v3.6.0/api/etcdserverpb/rpc.proto">etcd v3.6.0 RPC 定义</a>、<a target="_blank" rel="noopener" href="https://github.com/etcd-io/etcd/blob/v3.6.0/client/v3/retry_interceptor.go">固定版本重试拦截器</a></p>
+<h1>两道练习</h1>
+<p><strong>练习一：为什么 Put 不足以证明去重？</strong> 同一个 Put(x,5) 执行两次，最后读到 5，是否证明它只执行了一次？</p>
+<p>不能。相同赋值掩盖了重复效果。Add 和返回值能让重复执行可观察，但历史仍需建立足够顺序约束：如果未回复 Add 与其他操作重叠，有时仍可重新排序解释结果。因此还应检查首次效果被另一操作观察的时点，以及缓存结果是否稳定。</p>
+<p><strong>练习二：快照已经保存 KV，为什么还要 Seen？</strong> 回复丢失的 Add 已使 x=5，快照保存了 x=5，日志也已压缩。恢复后收到原身份的重试，若 Seen 不在快照中，会发生什么？</p>
+<p>服务端只能把它当作未见过的请求，再次相加到 10。即使所有副本都做同样的错误转换，日志一致性仍不能修复业务语义。KV、Seen 与 Applied 共同描述已经执行的前缀，必须一起恢复。</p>
+<p>下一篇将继续讨论协议验证，把确定性故障注入与历史检查连接到有限状态搜索，寻找故意遗漏持久化或投票约束后的最小反例。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-15-%E6%8A%8A%E5%AE%A2%E6%88%B7%E7%AB%AF%E5%91%BD%E4%BB%A4%E6%8E%A5%E5%88%B0%E5%AE%B9%E9%94%99KV/">https://magicliang.github.io/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-15-%E6%8A%8A%E5%AE%A2%E6%88%B7%E7%AB%AF%E5%91%BD%E4%BB%A4%E6%8E%A5%E5%88%B0%E5%AE%B9%E9%94%99KV/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Go/">Go</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/Raft/">Raft</a><a class="post-meta__tags" href="/tags/%E7%BA%BF%E6%80%A7%E4%B8%80%E8%87%B4%E6%80%A7/">线性一致性</a><a class="post-meta__tags" href="/tags/%E8%AF%B7%E6%B1%82%E5%8E%BB%E9%87%8D/">请求去重</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-distributed-systems.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-16-%E4%BB%8E%E6%95%85%E9%9A%9C%E8%BD%A8%E8%BF%B9%E5%88%B0%E6%9C%89%E9%99%90%E7%8A%B6%E6%80%81%E6%90%9C%E7%B4%A2/" title="分布式系统 16：从故障轨迹到有限状态搜索"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 16：从故障轨迹到有限状态搜索</div></div><div class="info-2"><div class="info-item-1">一条测试通过，说明具体输入与调度没有触发已检查的错误。它没有回答：另一个消息先到会怎样，恢复恰好发生在两次授票之间会怎样，以及是否存在更短的失败过程。 第 15 篇 已用独立历史检查器判断有限客户端历史。本篇继续使用累计 Go Raft 核心，枚举一个明确受限的选举环境。目标是找出漏保存 votedFor 的最短反例，同时说明“穷尽”“最短”和“没有发现错误”分别依赖什么条件。 课程结构对应 MIT 6.5840 当前公开日程中的验证与 IronFleet 讨论，Stanford CS244B 则提供原始论文研讨路径。本篇的 BFS 和事件模型为原创实验，没有运行课程证明或照搬作业实现。MIT 2026 日程与验证讲义、Stanford 2024 日程 三种检查各自回答什么 确定性故障注入控制实现的一条执行轨迹：在哪一步丢消息、在哪一步重启、哪份状态保存错误。历史检查把外部调用与返回交给独立规格，判断这些结果是否能解释为合法顺序。状态搜索则枚举环境允许的不同动作，探索可达状态，再检查性质。 flowchart TB   CODE[&quot;实际核心 + 受控环境&quot;] ...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-13-Raft%E6%8C%81%E4%B9%85%E5%8C%96%E5%BF%AB%E7%85%A7%E4%B8%8E%E6%81%A2%E5%A4%8D%E8%BE%B9%E7%95%8C/" title="分布式系统 13：Raft 持久化、快照与恢复边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 13：Raft 持久化、快照与恢复边界</div></div><div class="info-2"><div class="info-item-1">节点已经执行到日志 100，保存了一份快照，然后删除前 100 条日志。进程重启时，快照里却只有执行到 80 的状态。日志复制算法即使完全正确，也无法补回已经被本地删除、又没有进入快照的那 20 次修改。 第 12 篇 讨论了哪些日志可以提交。持久化和快照把这个结论连接到文件系统：重启时必须恢复出一组相互对应的任期、投票、日志、应用状态和进度，才能继续遵守已经作出的决定。 本篇沿用前两篇的 Go 核心，接入真实文件与子进程恢复。实验使用固定成员、非拜占庭消息和确定性状态机；网络由父进程调度，文件由节点子进程写入。进程被杀死后，操作系统仍在运行。因此观察到的是进程恢复行为，不能把它当成断电、内核崩溃或磁盘控制器故障的验证。 从稳定存储前提到保存完成 Raft 的安全性依赖稳定存储。节点一旦给某个任期投票，恢复后仍须记得这张票；一旦成功确认接收日志，恢复后不能凭空失去所确认的前缀。论文 Figure 2 把 currentTerm、votedFor 和日志列为持久状态，要求相应更新在 RPC 回复之前进入稳定存储。§5.5 的崩溃恢复讨论建立在这个前提上。Raft 扩展论文，Figu...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-12-Raft%E6%97%A5%E5%BF%97%E5%8C%B9%E9%85%8D%E4%B8%8E%E6%9C%AC%E4%BB%BB%E6%9C%9F%E6%8F%90%E4%BA%A4/" title="分布式系统 12：Raft 日志匹配与本任期提交"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 12：Raft 日志匹配与本任期提交</div></div><div class="info-2"><div class="info-item-1">五台服务器里，三台都有同一条日志，是否就可以回复客户端“写入成功”？在 Raft 中，还要看条目产生于哪个任期，以及当前领导者凭什么判断它已经提交。 设 A 在旧任期写入 x，后来重新当选，并把 x 补到了多数节点。另一个节点可能保留着更新任期产生的冲突条目 y，仍有资格在下一轮赢得选举。此时直接提交 x，会把一个允许被覆盖的条目当成不可撤销的结果。 第 11 篇 建立了任期、投票与保存完成后的消息释放边界。本篇在同一个 Go 核心上加入实际日志，解释 AppendEntries 怎样修复分歧，以及“本任期条目获得多数确认”为什么能保护整段前缀。 模型与三个不同的位置 采用固定成员配置、崩溃恢复故障模型和非拜占庭消息行为。消息可以延迟、丢失、重复和乱序，节点不会任意伪造协议内容。多数始终按完整配置计算；五节点需要三个成员。成功确认的持久状态在恢复后仍然存在，是协议安全性的一项前提。 日志条目包含任期和命令，索引从 1 开始。leader 只在自身日志末尾追加当前任期的条目；follower 可以删除与合法领导者冲突的未提交后缀。实验中的命令是字符串，尚未接入应用状态机。 三个位置...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-14-Raft%E6%88%90%E5%91%98%E5%8F%98%E6%9B%B4%E4%B8%8E%E7%BA%BF%E6%80%A7%E5%8C%96%E8%AF%BB/" title="分布式系统 14：Raft 成员变更与线性化读"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 14：Raft 成员变更与线性化读</div></div><div class="info-2"><div class="info-item-1">三个副本 A、B、C 已经能够复制日志。扩容时，把配置直接改成 A、B、C、D、E，看起来只是多加两台机器。但旧配置的多数 A、B 与新配置的多数 C、D、E 没有交集。若两组分别依据各自配置选出 leader，原先依赖多数交集的安全性论证便失去了前提。 读取也有类似的边界。一个副本的本地角色仍是 leader，并不表示它此刻还能代表集群。它可能被隔离，而另一侧已经选出新 leader、完成新的写入。成员变更决定哪些确认构成有效多数，线性化读则要使用这些确认，把一次读连接到实际时间顺序。 第 13 篇 已经接通持久化、快照与恢复。本篇继续扩展同一份 Go 核心，采用论文的 joint consensus 时序，并明确区分论文规则、etcd 的固定版本实现与教学驱动。第 14 篇的固定目录 race 二进制已通过九类本地场景；累计旧篇运行回归仍有缺口，具体范围见实验记录。 多数必须分别计算 稳定配置 C 的多数满足 |Q∩C| &gt; |C|/2。两个 C 的多数必然相交；换成另一个集合 D 后，这个推理不能直接沿用。 joint 配置同时保存旧集合和新集合，要求同一批确认分别满...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-11-Raft%E4%BB%BB%E6%9C%9F%E6%8A%95%E7%A5%A8%E4%B8%8E%E9%80%89%E4%B8%BE%E5%AE%89%E5%85%A8/" title="分布式系统 11：Raft 任期、投票与选举安全"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 11：Raft 任期、投票与选举安全</div></div><div class="info-2"><div class="info-item-1">三台服务器 A、B、C 同时竞选。A 得到自己和 C 的票，成为领导者；随后 C 重启，忘掉已经投给 A 的记录，又投给 B。B 加上自己的票，也达到了多数。每次计票都没有算错，集群却在同一轮选出了两个领导者。 问题出在投票承诺没有跨越重启。一次选举能否安全，不只取决于票数，还取决于票属于哪一轮、由谁投出，以及已经回复成功的投票是否还能被遗忘。 第 10 篇 将稳定领导者与多槽日志联系起来。本篇开始构建另一条可累计的实现：先完成 Raft 的选举状态转换，下一篇再加入日志复制与提交。本篇的 Go 核心会继续复用；当前尚不能存储客户端命令，也不提供完整 Raft 服务。 任期把局部观察分开 采用一个固定成员配置，成员身份在实验期间不变。进程可能崩溃恢复，消息可能延迟、丢失、重复或乱序；节点不伪造身份、不发送任意错误内容。多数指完整配置中超过一半的成员，三节点需要两票，五节点需要三票，不能因两台暂时不可达就缩小分母。 每个节点保存自己的 currentTerm，即已经知道的最高任期。任期是逻辑轮次，不是由统一时钟切出的时间段。A 已经进入 term 4，隔离中的 B 仍可能只知道 t...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-00-%E7%B3%BB%E7%BB%9F%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%85%88%E4%BF%AE%E8%87%AA%E6%B5%8B/" title="分布式系统 00：系统模型、故障时间线与先修自测"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 00：系统模型、故障时间线与先修自测</div></div><div class="info-2"><div class="info-item-1">客户端发出 Put(x, 1)，等待超时。服务端究竟有没有修改 x？只凭这条错误，无法判定。请求可能没到，也可能已经执行，只是回复没有回来。工程上需要重试、查询或人工核对，理论上需要先写清楚：哪些事件发生了，谁能观察到这些事件，协议允许哪些执行。 分布式系统的学习从这个区别开始。运行在不同进程里的代码通过消息合作，每个进程只掌握局部状态；一项业务动作可以跨越多个故障边界。正确性不能只根据正常路径上的最终输出判断。 这是系列的入口篇。验收目标是根据三个节点和客户端的时间线，区分确定发生、仍有可能和无法判定的结果；配套 Go 程序重放有限故障组合，不实现共识协议。 从课程结构到实验路径 MIT 6.5840 Spring 2026把 RPC、存储和复制实验逐步连起来；Stanford CS244B Spring 2024更突出原论文讨论与研究。两份课表覆盖事务、分布式计算和信任模型，学习范围远大于 Paxos、Raft、ZooKeeper 与 etcd。 系列按先修关系重新排列：先获得分析请求、状态和故障的语言，再实现任务调度、KV、复制与分片，随后讨论协调服务、事务、缓存、计算系统...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">一个逻辑操作，可以有多次尝试</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">结果必须与修改一起进入状态机</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">提交、应用与回复是三个事件</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">快照同时保存 KV 与去重结果</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">读必须穿过协议和应用两层屏障</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">6.</span> <span class="toc-text">独立历史检查器如何处理未知结果</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">7.</span> <span class="toc-text">实验怎样避免验证假象</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">8.</span> <span class="toc-text">两道练习</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

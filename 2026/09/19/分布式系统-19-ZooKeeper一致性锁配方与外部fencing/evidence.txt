@@ -1,0 +1,107 @@
+第19篇论断—证据—核验记录
+日期2026-09-20
+以下保留实施前研究；“尚未运行”指研究当时，最终实施映射在末节。最终运行及缺口见verification.txt。
+
+# 19：ZooKeeper 一致性、锁配方与外部 fencing 研究
+
+研究日期2026-09-20。已读蓝图19、17/18研究与固定3.9.6相关源码。本文件是前置研究和实验设计；没有运行本篇实验，没有实现正文或代码。仅修改本文件。后续任何临时文件限 `examples/distributed-systems/.build/zk19/`，不得重试被防护拦截的程序。固定产品为ZooKeeper3.9.6，源码SHA `a355171b081b5b60749db8f19cca1528b0df936f`；官方source tar已由父核对SHA512，现有本地源码位于 `.build/apache-zookeeper-3.9.6`，官方发行包文档位于 `.build/apache-zookeeper-3.9.6-bin/docs`（均相对 examples/distributed-systems）。
+
+## 资料、论断与核验状态
+
+| 标题/版本/日期/URL | 定位与支持论断 | 核验状态与限制 |
+|---|---|---|
+| Hunt等，*ZooKeeper: Wait-free coordination for Internet-scale systems*，USENIX ATC2010，[原论文](https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf) | §2.3客户端FIFO、线性化更新、跨客户端外部通信不能自动刷新副本；§2.4锁；§4.4本地读与sync | 已实际读；§4.4以超时解释省略null事务的论证须结合1675反例，不可直接作为当前无条件保证 |
+| *ZooKeeper Programmer's Guide*，3.9.6，[固定文档](https://zookeeper.apache.org/doc/r3.9.6/zookeeperProgrammers.html) | Consistency Guarantees的A写/a再通知B例子；Watches；Java Binding的事件线程/异步回调顺序 | 网页与发行包HTML实际读；Guide的sync建议不覆盖1675边界；不同session不共享客户端FIFO |
+| *ZooKeeper Recipes and Solutions*，3.9.6，[固定文档](https://zookeeper.apache.org/doc/r3.9.6/recipes.html) | Locks步骤1–6与Recoverable Errors；Leader Election | web抓取Cache miss，已读取官方发行包同版本HTML，不能称网页读取成功；GUID、前驱exists及不存在重列均核对 |
+| [ZOOKEEPER-1675: Make sync a quorum operation](https://issues.apache.org/jira/browse/ZOOKEEPER-1675)，2013-03-26创建，页面最后更新2023-10-01 | 旧leader仍认为自己是leader，其follower的sync可能不包含新leader已完成写；指出论文§4.4超时理由不足 | 已读；Open/Unresolved，无Fix Version；Affects3.4.0/3.5.0不是3.9.6受影响证据，另以固定源码验证同类无新quorum路径 |
+| Burrows，*The Chubby lock service for loosely-coupled distributed systems*，OSDI2006，[官方论文页](https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/)、[PDF](https://storage.googleapis.com/gweb-research2023-media/pubtools/4444.pdf) | §2.4迟到请求、sequencer内锁名/模式/代数及接收方验证；§2.6 CheckSequencer | 已实际读；这是fencing原始设计依据，不是ZooKeeper自动提供外部资源校验的声明 |
+| [MIT6.5840 2026 Lecture9](https://pdos.csail.mit.edu/6.824/notes/l-zookeeper.txt) | 本地读、session fencing及应用协调结构 | 已读；课程所说ZK拒绝过期session请求限ZK自身，不能扩成外部数据库；其Raft类比不是实现归属，旧API/multi措辞也不照搬 |
+| [Stanford CS244B Spring2024日程](https://www.scs.stanford.edu/24sp-cs244b/sched/) | 首周ZooKeeper论文讨论 | 已读，仅作课程结构依据，不抄作业答案 |
+
+## 固定实现交叉核对
+
+所有下列文件位于同一SHA；网页前缀为 `https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/`。已本地实际读取，链接用于文章引用；没有源码运行验证。
+
+| 固定源码路径与位置 | 实现事实及边界 |
+|---|---|
+| `zookeeper-server/src/main/java/org/apache/zookeeper/server/FinalRequestProcessor.java:383,642–651` | getData调用本地ZKDatabase.getData；本次读自身不发quorum确认 |
+| `.../server/quorum/FollowerRequestProcessor.java:91–125` | sync加入pendingSyncs并转发leader；更新也转发，普通getData等不走更新转发分支 |
+| `.../server/quorum/Leader.java:1336 processSync,1347 sendSync` | outstandingProposals为空时直接发SYNC，否则挂在lastProposed之后；不是每次sync都发起新quorum轮次。1029附近在相应提议提交后释放pending sync |
+| `.../server/quorum/Follower.java:238`、`FollowerZooKeeperServer.java:115` | 收到SYNC完成对应pending请求；不能把这一响应解释成新leader身份的quorum证明 |
+| `.../server/PrepRequestProcessor.java:670` | 顺序后缀以父parentCVersion格式化为十位十进制；不同GUID前缀共享父计数，签名32位整数不是无限单调令牌 |
+| `zookeeper-recipes/zookeeper-recipes-lock/src/main/java/org/apache/zookeeper/recipes/lock/WriteLock.java:185–240` | 先列孩子找前缀，未找到才create；按ZNodeName排序并监听前驱，exists空则重试。此历史示例prefix使用sessionId，本文应使用每次逻辑获取唯一GUID；不把示例推广成同session同目录任意并发获取的通用封装 |
+
+18已独立核验的写入链（quorum确认、顺序提交、持久ACK配置条件）可作为写保证依据，不需在19重演Zab。17已核验server过期删除ephemeral与3.9.6客户端本地Expired路径，19必须沿用而非退回“只有重连才知道过期”的旧说法。
+
+## 一致性结论与反例
+
+**更新与读须分开。** 更新进入统一顺序，在论文模型和正常持久配置前提下满足论文的线性化更新保证；普通读取可在落后副本完成。同一session的操作次序和重新连接时的状态进度保障不等于跨session的实时顺序。A成功写1，经外部信道告诉B，B普通读0并不违反ZooKeeper所给普通读保证，但违反对完整读写寄存器的线性一致性要求。应用的通知不等于ZK协议中的同步边。
+
+**sync是有条件的推进工具，不应写成任意故障下的ReadIndex。** 当前leader及其顺序正常时，sync排在相关更新之后；然而1675允许旧leader与旧follower仍连接、新多数派已完成更新的窗口。旧leader无outstanding proposals时，固定源码直接答SYNC，没有重新证明自己仍获多数支持。Guide建议与未解决反例必须相邻呈现。不能用单机sync成功来验证跨leader线性一致性，也不能用一次sync超时判定所有更新失败。
+
+确需借写顺序建立屏障时，可在同一session成功完成一笔真实更新，再读（论文§2.3也讨论此路）；更新必须确实进入复制提交链，不能把失败的check、普通exists、心跳或读当作写屏障。该方案增加写开销，也要处理响应丢失和超时不确定；它不是对所有复杂跨路径读取提供原子快照。
+
+反向检索状态：1675直接质疑原论文超时论证；其关联2136/3600只作后续入口，本研究不据标题宣称已验证修复。没有发现并验证3.9.6对该路径加入新quorum确认。结论限定已读源码路径和已公开反例，未对完整发行版做形式证明或真实集群故障复现。
+
+## 锁与选主配方的必要条件
+
+每次逻辑获取生成唯一GUID，用 `guid-lock-` 前缀建立EPHEMERAL_SEQUENTIAL。若创建结果不确定，保留同GUID查找已有节点，不能盲目重试生成第二个候选。查找须识别自己的逻辑请求/所属session；过期后是新的获取，不能复用旧资格。GUID解决的是恢复查询标识，单靠本地内存GUID不提供无限期、任意重启的exactly-once。
+
+孩子列表没有排序保证；比较顺序后缀，不按含随机GUID的整个名字字典序排。若自身最小则有获取资格，否则只对紧邻的前驱调用exists(watch)。列出后前驱可能已删：exists返回不存在就重新列；返回存在才等待；收到通知仍重新判断，不能把任何watch通知直接当作拿锁。不要watch父的所有孩子变化，否则每次删除会唤醒所有等待者。正常一候选一节点时，前驱链每次释放只需唤醒后继；故障、重注册和会话事件仍可引起额外通知，不能宣称系统永远恰好一个回调。
+
+选主使用相同排队条件，但获得候选资格不代表业务恢复完成。可以另行发布准备就绪状态，客户端不得把排序最小等同于可服务。session过期后旧持有者可能仍有在途外部请求，即使其ZooKeeper客户端已收到Expired，这些请求也不会自动从其他系统消失。
+
+## 外部fencing的证明范围
+
+资源接收 `(lock-domain, token, operation)`，在同一原子临界区比较token与已接受高水位并执行写。新持有者的较大token已被资源接受后，较小token写必须拒绝；相等token可允许该持有者后续请求，但重复操作去重是另一问题。高水位与资源状态若需经故障恢复继续成立，必须一致持久化；内存版本仅证明本次无资源重启运行。
+
+高水位策略不会在ZK session过期的瞬间远程撤销请求。如果新token尚未到资源，旧请求仍可能被接受；正确承诺是“资源接受新代后不再接受旧代”。要更强即时授权语义，需要额外协议，不得暗含跨系统原子性。检查资格再发送写存在TOCTOU，必须在受保护资源提交点校验。
+
+token域必须明确：同一固定父节点、无重建、计数未溢出的有限实验中，顺序后缀可排序；生产不能默认它跨父删除重建、32位回绕、ensemble恢复替换而永久单调。czxid在同一ensemble历史中可提供事务顺序，但一个multi中的多个创建可共享zxid，不能无条件当任意节点唯一代号。使用独立持久epoch/计数器或资源认可的域代数时，也须规定恢复和比较规则。fencing不是认证机制；协议假设参与者不能任意伪造更大token越权。
+
+## 推荐可执行验收（尚未运行）
+
+复用17的Java17和官方3.9.6单实例、真实TCP客户端/可断连代理。不安装新软件，不生成临时可执行二进制；若沿用Java源码运行/既有构建方式，所有中间文件及日志放 `.build/zk19/`。单实例产品实验不声称三节点Zab恢复或容灾证明。
+
+1. **前驱链与竞态。** 三客户端依次建立候选，记录A/B/C顺序。B watch A、C watch B；释放A后断言B重新检查获资格，C未误获资格。另用驱动在list后、exists前删除前驱，断言exists为空立即重新列，不永久等待。只统计特定路径NodeDeleted；用官方异步读回调完成标定事件线程已处理的边界，不能用同步getData返回等同watch线程已排空。
+2. **创建结果丢失。** 驱动让真实create成功，但在应用封装层丢弃返回路径，留下同GUID的恢复任务。按GUID重列找到恰好一个节点；负例盲重试真实create产生两个候选。此为应用边界结果丢失注入，不称网络ConnectionLoss端到端复现；要声称后者须增加可证明丢失指定响应的协议代理，非本篇最低必要范围。
+3. **真实自然过期与延迟外部写。** A获t1后产生一条尚未送达资源的请求；仅断开A到ZK的代理，保留外部通道。B经官方watch及exists确认A候选已被服务端删除，获得t2并先向外部资源提交新状态。随后释放A旧请求：无fence分支错误接受，fence分支拒绝且新状态保留。外部资源可为独立loopback请求端点，同JVM不同服务组件；准确称API边界而非独立进程。不要把主动close当自然过期，也不要求A直到恢复连接才知Expired。
+4. **令牌域反例。** 单独模型/受控测试展示父重建后小序号不能与旧域高水位混比；明确不是生产修复。可同时验证新token首次到达前高水位尚不能拒绝旧请求，以限制强度声明。无需为了正文无限扩展持久外部存储实现。
+5. **读反例与sync限制。** 真实单实例只演示自己的写后读、CAS及sync API流程，不宣称复现陈旧读。若增加Python标准库有限调度模型，用5节点中旧leader+旧follower与新3节点多数分开，旧侧尚未处理失位的窗口展示1675路径；标明预设角色/延迟与源码分支模型，不是Zab实现或3.9.6真实复现。正文的关键论断由论文、issue、固定源码支撑，可不为资料结论强加模型实验。
+
+建议图示：本地读与外部通知时序；旧leader sync无quorum的五节点分区；GUID恢复分支；三个候选前驱watch链；过期后迟到外部写与fence对照；token域/资源高水位边界。每图标识时间方向、假设和观察对象，避免画成ephemeral删除会直接取消外部请求。
+
+交接结论：本篇最小完整实现应优先前三项真实产品/资源边界实验，读一致性通过精确资料与实现解释；有余量才加入第4/5项。所有结果目前均为设计预期，后续必须用实际输出替换，不得计为已完成实验。
+
+## 独立交叉核验补记
+
+父独立读取相同SHA的Leader.processSync/sendSync、FollowerRequestProcessor和FinalRequestProcessor，确认上述空队列直接SYNC与本地getData路径；并独立web读取1675的Open/Unresolved/无FixVersion。本项是独立源码与资料核验，不是真实分区实验。
+
+父另读官方source tar的 `zookeeper-docs/src/main/resources/markdown/recipes.md:202–260` 及Guide的有符号int溢出说明。固定配方原文可引用 [3.9.6源码内recipes.md](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-docs/src/main/resources/markdown/recipes.md)。配方开头“no two clients think they hold the same lock”不应照搬为暂停客户端的认知同步保证：本文必须区分服务端当前合法资格和进程仍保留的旧认知。顺序值2147483647之后转负，固定父且不回绕的实验前提不能省略。
+
+父与gfs03当前实现设计已收敛前三个场景，可复用17既有classes中的Events/client/barrier/Proxy；研究中的第4/5项仅可选，不是新增交付阻断要求。本文未新增任何临时程序或执行实验。
+
+父独立读取固定Internals关于OSC(U)、非线性化读和非quorum sync的说明，提供额外交叉。上述“先成功写再读”的屏障仅保证至少覆盖屏障前已完成更新；若讨论整体读操作，应将其调用区间定义为包括前置quorum写和后续同session读。不能把内部getData单独的调用区间当线性化读证明：另一写可能在屏障完成后、getData调用前完成，却尚未到该副本；更不能说某次写过以后所有读都线性化。
+
+## 实施交接补记
+
+独立核验补充（2026-09-20）：普通读可能陈旧与顺序锁安全并不矛盾。同session成功创建自己的候选节点后，后续读至少包含该创建所在更新前缀；所有更小编号的创建已进入此前缀，缺项只能意味着此前缀已包含删除。尚未知晓前驱删除只会保守等待。前提是固定父、不回绕、不复用编号，参与者只凭仍有效候选主张资格；过期旧业务线程仍需资源fencing。依据为论文§2.3、固定配方及[CommitProcessor同session写后读排队](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/quorum/CommitProcessor.java#L245)。状态：独立资料/源码推导核验，不是多副本陈旧读实验。
+
+父已选择增强的第二场景：本地明文代理真正丢弃指定GUID的成功create响应，而非仅在应用层忽略返回值。只有实际观察ConnectionLoss、同session恢复与GUID/ephemeralOwner查回唯一节点后，才可报告网络响应丢失实验通过；若未做到，保持未验证状态。第三场景外部资源是独立内存组件，不能报告独立进程/持久外部存储验证。
+
+父静态核对同SHA的 `zookeeper-jute/src/main/resources/zookeeper.jute:62–75,91–109,139–144,210–215` 与 `ClientCnxn.Packet.createBB:307–320`：四字节帧长度，握手独立结构无普通header；请求header为xid/type，响应header为xid/zxid/err，create记录含path。代理须每连接区分握手与普通帧，发送前记录目标xid，仅在匹配成功响应时丢弃；恢复代码不得读取代理截获的返回路径。
+
+
+## 最终实施与交叉核验映射
+
+- 真实API：官方ZooKeeper3.9.6独立服务、官方Java客户端、本机TCP。复用17固定helper，不修改17；无产品三节点/跨副本故障复现。
+- 普通读/更新：原论文§2.3、3.9.6 FinalRequestProcessor/FollowerRequestProcessor独立核对。sync1675为公开反例+固定Leader.processSync源码，未用单实例成功声称跨leader线性一致读。
+- 锁判断正确性：同session成功create后的读取至少包含自身创建前缀，所有更小编号创建已在此前缀；缺项表示该前缀已含删除，未知删除只多等。父和研究代理交叉核验CommitProcessor写后读次序。前提固定父/不回绕/有效自身候选，外部线程仍需要fence。
+- 前驱Watch：真实三客户端检验B watch A、C watch B；C不因A删除错误获取；list后exists前受控删除前驱使exists=null，立即重扫。没有sleep构造时序。
+- 研究原最低设计为应用返回丢失，最终实施提升为真实TCP故障：官方Jute解析目标create xid，在完整成功响应err0到达代理后丢弃并断链；客户端真实回调ConnectionLoss。恢复函数只读getChildren/exists/ephemeralOwner，未读取截获CreateResponse.path。
+- GUID唯一候选恢复：同session恢复后找回一个真实节点；盲重试再create实际生成两个，恢复函数拒绝歧义。不是服务端GUID去重或任意重启exactly-once。
+- 自然session过期：A到ZooKeeper的旧连接关闭且拒新连接，B实际观察前驱NodeDeleted并确认exists空，再判断自身最小。没有主动close/强制expire制造删除。
+- 外部资源：Resource是独立synchronized内存模型；比较token和写在同一临界区。实际断言资源见B新token前仍接受旧token；见新token之后旧线程写在无fence实例成功、fence实例失败且新值保留。未验证资源重启持久性或生产认证。
+- token域：仅同一个持续存在父节点，不重建、不回绕、不替换ensemble；正数范围校验不等于测试回绕。生产域代数未实现。
+- 六图依据分别为普通读跨客户端历史、1675公开窗口、实际前驱链、实际TCP/GUID恢复、实际过期/资源时序、Resource原子临界区。前两图为资料解释，不是本篇集群实测。
+- 临时路径限制：源码/class/显式数据/日志均仓库路径，但首轮JVM java.io.tmpdir仍为系统/var/folders。不能声称运行时内部从未写系统tmp。后续仅修文档限定TMPDIR及java.io.tmpdir，未重跑；父独立运行/CLI未执行。

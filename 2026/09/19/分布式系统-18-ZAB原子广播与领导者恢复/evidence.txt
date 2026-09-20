@@ -1,0 +1,96 @@
+第18篇论断—证据—核验
+核验日期2026-09-20
+以下为实施前研究记录；研究内“未运行”为当时状态，最终实现映射见末节与verification.txt。
+
+# 18：Zab 原子广播与恢复研究
+
+日期2026-09-20；前篇17已由父验收提交`d63ea116`。本文件仅前置研究，未实现、未运行实验。已读蓝图18要求（切主前后追踪提议、确认、提交与恢复总序）、17研究和固定源码。只修改本文件；任何后续草稿/输出均限仓库`examples/distributed-systems/.build/`，不使用tmp，不运行ds13-parent-check或重试raft11。
+
+## 资料与论断证据
+
+| 资料、版本/日期、URL | 定位及支持论断 | 核验状态 |
+|---|---|---|
+| Junqueira/Reed/Serafini, *Zab: High-performance broadcast for primary-backup systems*, DSN2011，pp245–256，[作者PDF](https://marcoserafini.github.io/assets/pdf/zab.pdf)，DOI10.1109/DSN.2011.5958223 | §II故障/信道模型；§III primary order；§IV三阶段；§V实现/活性；§VI不变量证明；Figure1独立slot对增量状态的反例 | 已实际读相关节；不是当前产品源码规格 |
+| 同作者 *Dissecting Zab*, Yahoo Labs YL-2010-0007，[官方归档PDF](https://cwiki.apache.org/confluence/download/attachments/24193444/yl-2010-007.pdf) | §3模型、§4算法、§5–6证明；恢复完成才ready | 已读模型及算法定位；技术报告编号2010，不伪称2011会议版逐字相同 |
+| [Zab1.0官方规范页](https://cwiki.apache.org/confluence/spaces/ZOOKEEPER/pages/24189846/Zab1.0)，访问2026-09-20 | FOLLOWERINFO、LEADERINFO、ACKEPOCH、DIFF/TRUNC/SNAP、NEWLEADER/UPTODATE、ACK/COMMIT | 已读。滚动wiki必须以固定3.9.6源码交叉核对，不当固定版本 |
+| [MIT2026 ZooKeeper讲义](https://pdos.csail.mit.edu/6.824/notes/l-zookeeper.txt)、[Stanford2024日程](https://www.scs.stanford.edu/24sp-cs244b/sched/) | 17已实际读取：协调服务、论文讨论与复制/本地读边界 | 本篇沿既有课程结构，不宣称课程完整讲授当前Zab1.0 |
+| [ZOOKEEPER-1282](https://issues.apache.org/jira/browse/ZOOKEEPER-1282)，2011历史修订 | currentEpoch应在NEWLEADER确认前持久，而非UPTODATE时才写 | 已读issue；历史缺陷不自动适用于当前版本 |
+| [ZOOKEEPER-3911](https://issues.apache.org/jira/browse/ZOOKEEPER-3911)，2020问题，FixVersion3.6.3/3.7.0 | DIFF同步未提交日志导致数据不一致 | 已读问题及FixVersion；与后续修订结合 |
+| [ZOOKEEPER-4646](https://issues.apache.org/jira/browse/ZOOKEEPER-4646) | NEWLEADER ACK早于同步事务持久化仍可丢已提交数据；Resolved Duplicate，无FixVersion | 已读；不能写成“4646已在某版本独立修好” |
+| [ZOOKEEPER-4785](https://issues.apache.org/jira/browse/ZOOKEEPER-4785)，FixVersion3.8.4/3.9.2/3.10.0 | DIFF过程中写currentEpoch、ACK早于保存事务的race | 已读；固定3.9.6 Learner包含对应修复顺序 |
+
+源码为父已SHA512校验的官方3.9.6 source tar，目录`examples/distributed-systems/.build/apache-zookeeper-3.9.6`；发布Version对应SHA `a355171b081b5b60749db8f19cca1528b0df936f`。以下方法均已实际本地读取；固定网页链接用于后续引用，不声称网页读取成功或已运行源码测试。共同URL前缀为 `https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/`。
+
+## 模型、机制与证明边界
+
+论文为crash-recovery模型，稳定存储保存承诺与历史；不处理拜占庭节点、伪造/损坏消息或持久数据无声丢失。信道按发送顺序接收，迭代结束会丢弃旧连接队列；实现用TCP和连接生命周期配合此假设。不能把任意消息重排的模型直接塞进FIFO协议后称发现Zab错误。安全性不依赖某次超时准确识别人是否死亡；活性需一个quorum及共同leader稳定足够久、消息及时传达，永久分区或持续选举不保证完成。论文§V.D/§VI活性条件支持这一点。
+
+论文§III的Agreement是已交付历史相容的安全性条件，不是通常口语里的最终全部送达；§III-B说明primary order与一般causal order不可比，不使用旧Internals宽泛causal一词替代定义。primary order不是“所有客户端请求存在因果关系”。增量状态B依赖同primary先生成的A，不能恢复出C,B而缺A。论文Figure1说明未经额外约束的独立Paxos slot组合不自动维护这种依赖，不说明Paxos不安全或无法构造正确状态机复制；本系列10的确定性命令日志与此处已计算增量状态应明确区分。primary integrity要求新primary生成自己的状态变化前已交付此前必须保留的历史，故恢复屏障有语义作用。
+
+持久变量须分开：论文f.p对应acceptedEpoch（承诺进入的新epoch），f.a对应currentEpoch（已接受NEWLEADER历史的epoch），history为接受的事务序列。currentEpoch不等于本机已收到UPTODATE，不等于客户端都知道新leader。zxid为(epoch,counter)的64位编码；[ZxidUtils.java](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/util/ZxidUtils.java)用高32位epoch、低32位counter。有限整数不能说无限递增；`(e,0)`是NEWLEADER标记，不是普通用户事务。
+
+同epoch至多一个被建立的leader：每个follower只对严格更高acceptedEpoch发有效epoch确认；相同epoch再次连接用currentEpoch=-1回报，不能再次计入epoch quorum。两个候选若要同epoch都建立，epoch确认quorum必相交，交点不能给第二份有效确认。选举暂时报告LEADING不等于已建立，可仍在恢复并最后失败。
+
+已选择历史保存直觉：旧chosen事务由quorum接受；后继discovery quorum与之相交，交点在交出状态前承诺不再接旧epoch，且历史选择先比较“已接受历史的epoch”再比较末尾zxid。在同步阶段把选定整个前缀保存到新quorum，才能归纳到再下一次切换。不能只用“多数派有交集”一句代替持久承诺、同epoch前缀和跨epoch同步三项不变量。即使更高epoch discovery发生在旧epoch的COMMIT通知前，旧quorum能否形成仍受交点先后承诺限制；chosen与known committed不是同一个观察。
+
+未提交尾部既不保证全部删除，也不保证全部保留：选定历史中的未确认尾部可在恢复中保留并成为已提交历史；不在选定历史中的分支须截断/覆盖。事务已被客户端观察成功后必须跨恢复保留；仅ConnectionLoss的操作仍可能成功。DIFF补缺、TRUNC删分支、SNAP传状态不是按日志长度任意挑一种，须服从选定历史及本地持久恢复条件。
+
+## 固定3.9.6实现定位
+
+| 文件/定位 | 实际规则及不可混淆项 |
+|---|---|
+| `quorum/FastLeaderElection.java:723 totalOrderPredicate`、选举循环943起 | 候选按peerEpoch、lastLoggedZxid、serverId比较，权重0不候选；logicalclock/electionEpoch是选举轮次，不能与Zab持久epoch混写。必须收足相应票，排序最高不等于立即当选 |
+| `quorum/Leader.java:1462 getEpochToPropose` | collecting participants的acceptedEpoch最大值+1，包含自己且quorum后保存自身acceptedEpoch；不是窥知所有存活/故障节点的全局最大值 |
+| `quorum/Learner.java:486 registerWithLeader` | FOLLOWERINFO带acceptedEpoch；收到更高LEADERINFO先保存acceptedEpoch，ACKEPOCH带currentEpoch和lastLoggedZxid；同acceptedEpoch回复-1避免重复确认 |
+| `quorum/Leader.java:1508 waitForEpochAck` | 依赖FLE已经选出足够新的候选；若follower StateSummary比leader更fresh，抛IOException，不能描述成此实现必从该follower拉全历史并换候选。论文通用历史选择与实现优化要分栏 |
+| `quorum/Learner.java:746–820 syncWithLeader NEWLEADER` | 同步事务append/process，显式数据库commit，之后setCurrentEpoch，再发ACK；代码注释关联3911/4394/4646/4643/4785。不得把异步排入SyncThread当作持久完成 |
+| `quorum/QuorumPeer.java:2260/2266` | setCurrentEpoch/setAcceptedEpoch先writeLongToFile，再改内存字段；持久文件不是选举消息的临时计数 |
+| `quorum/Leader.java:1613 waitForNewLeaderAck` | ACK zxid须匹配本次NEWLEADER；参与者计票，hasAllQuorums后quorumFormed；本篇固定配置只用普通多数，不偷换动态配置条件 |
+| `quorum/LearnerHandler.java:626–653` | waitForNewLeaderAck，再waitForStartup，之后排UPTODATE；单follower自己ACK不足以证明可服务，不必等待所有节点 |
+| `SyncRequestProcessor.java:227–248`、`quorum/SendAckRequestProcessor.java` | flush先ZKDatabase.commit，再交nextProcessor生成ACK，ACK代表前面的日志已通过持久链路。`persistence/FileTxnLog.java:155,407–411`默认forceSync开启才调用channel.force(false)；关闭forceSync或硬件不诚实会破坏持久模型 |
+| `quorum/Leader.java:970–979 tryToCommit` | 先检查outstanding中是否仍有zxid-1，存在则拒绝本次提交，再检查hasAllQuorums；广播同时依赖FIFO和有序处理。后面的warn不是这项前驱检查的替代 |
+
+父独立读取论文§II–III、Learner746–820、SyncRequestProcessor与FileTxnLog持久链路、Leader前驱提交检查及Internals、Leader1462–1649与StateSummary得出相同结论：旧Internals“最高zxid/全局最高+1”“类似2PC”等简述不能代替当前算法。广播中PROPOSAL/ACK/COMMIT也不等于跨数据库事务2PC；Zab还有leader恢复及历史保存协议。
+
+## 反向核查与规范版本
+
+检索得到两个不同Zab1.0 wiki页面。`pageId=26117136`显示旧SERVERINFO/NEWEPOCH草案；应使用上表`24189846`页面的FOLLOWERINFO/LEADERINFO/ACKEPOCH，并以固定源码为准。访问日不是规范发布日期，不编造其版本时间。
+
+3911、4646、4785串联说明恢复ACK的持久边界曾出现真实实现缺陷；当前3.9.6代码明确先保存事务再更新epoch和ACK，不能拿历史issue宣布当前仍丢数据。此次不是全面安全审计，也未执行旧版本漏洞复现。原论文正文§IV CEPOCH发送f.p，而§V.C叙述出现CEPOCH(f.a)术语不一致；讲算法时以§IV持久承诺规则与3.9.6 FOLLOWERINFO(acceptedEpoch)交叉核对，不把段落文字差异变成已证明协议失败。未发现足以宣称原论文整体证明被推翻的作者勘误，不做这种结论。
+
+## 可实施原创有限实验（设计，未运行）
+
+建议Python标准库离散事件模型，单独命名zab18，避免生成新临时二进制。它是从上述规则抽取的固定三投票节点教学模型，不调用真实Zab内核、不复用Raft冒充Zab。继承16显式调度/历史checker思想，保留每步事件、持久映像、ACK证书和delivered前缀。
+
+边界先写死：稳定存储是模型原子映像；每个连接FIFO，允许丢连接、断链队列清空、重连、节点映像恢复；epoch与事务数量有限。候选由明确leader oracle指定，不完整实现FLE，但必须执行discovery有效确认、currentEpoch/lastZxid历史选择、NEWLEADER持久quorum和ready屏障。模型消息名称可对齐论文，正文另表映射产品；不要用抽象模型的“任意候选拉取历史”声称当前Leader方法如此实现。
+
+1. 正常流水线：epoch1建立后连续提出A、B，两者是有依赖的增量；真实调度消息、保存再ACK、多数后COMMIT。独立检查每个节点delivered是同一序列前缀，每个ACK匹配持久映像，并拒绝ready前新广播。
+2. chosen但COMMIT未送达：A被两节点保存确认，旧leader在发/送COMMIT前故障；新discovery quorum恢复包含A的历史，NEWLEADER保存/确认后交付，随后才生成C。检查新primary基于含A状态产生C，不把客户端没收到回复说成A不存在。
+3. 少数分支被截断与未提交尾部保留各一轨迹：旧leader仅自己保存B后失联，另两节点恢复[A]，重连旧leader删除B；另一次让带[A,B]且合格更新历史的节点进入discovery并被选，B可随恢复保留。必须从模型动作达到这些状态，不直接捏磁盘数组；明确不是承诺所有未提交记录一个命运。
+4. 唯一变异为Phase2错误存储适配器：NEWLEADER的高currentEpoch已存盘而同步history遗漏，却回复ACK。具体可达调度：epoch1由节点1、2接受并提交A，节点3尚无A；epoch2由2、3同步[A]，2正常持久而3仅内存有A、磁盘currentEpoch=2但history为空，收到2、3确认后建立；随后2下线、3重启丢内存，再以1、3组成epoch3 discovery，3的currentEpoch=2高于1的currentEpoch=1，错误空历史被选中。正确分支中3持久[A]，完全相同调度会保留A。独立checker用跨重启保存的chosen/delivered事实检出，不能因history为空就把高currentEpoch自动降回旧值以掩盖变异。这是模拟违反持久合同，与3911/4646/4785属于恢复确认早于正确持久的同类边界；没有实际执行这些版本、DIFF代码或真实磁盘崩溃，不能声称复现其产品漏洞。若原轨迹不能达成反例，应报告设计失败而非伪造日志。
+5. 门槛与活性边界：只有单节点ACK不能ready；重复/错epoch ACK不能凑多数；一个节点恢复后只能经同步重入；永久失去多数时保持无进展且不破坏安全。这是有限安全轨迹，非活性证明、非BFS完备性/最短性结果。
+
+独立checker至少保存：按epoch的有效promise接受者、NEWLEADER历史及持久ACK证书、每条chosen与delivered事务、各primary开始新广播前交付的历史。数据结构不能直接信任被测模型的committed布尔值。图建议六张：增量依赖A→B与错误C→B；FLE/三阶段边界；acceptedEpoch/currentEpoch/zxid三轴；NEWLEADER持久ACK时序；切主两种尾部结局；三节点带证书实验轨迹。
+
+若后续另加真实三节点3.9.6切主演示，需要单独版本、日志、磁盘目录和恢复观察；此模型验收不能代替真实产品端到端。17的嵌入式单节点实验同样不能作为18的Zab多数派验证。
+
+## 父补充独立核查（2026-09-20）
+
+实际重读作者PDF §VI，p7–8：Chosen按quorum接受定义，不以leader收到ACK或COMMIT通知为定义；Invariant3要求提供历史前承诺拒绝旧epoch，Invariant4要求恢复传递保持事务完整与顺序。实验协议根据本地ACK提交，外部检查器根据实际接受证据计算chosen，二者不能混用。
+
+实际读取固定3.9.6 `LearnerHandler.syncFollower` 与 `queueCommittedProposals`（773–1050附近）：相同末尾可发空DIFF；本地历史覆盖区间可从缓存补齐；过老则尝试磁盘事务日志和缓存衔接，有缺口退回SNAP；TRUNC还有epoch边界限制，不能按日志条数机械选择同步方式。这里只完成静态核验，未启动多节点产品或触发这些分支。
+
+
+## 最终实现映射与核验范围
+
+固定源码背景：ZooKeeper3.9.6发布SHA a355171b081b5b60749db8f19cca1528b0df936f。原论文三阶段与产品恢复路径分别讲述；模型没有实现FLE或产品DIFF/TRUNC/SNAP。
+
+- local/global primary order、primary integrity与Agreement：原论文§III、VI独立读核，正文明确安全/活性区别。
+- acceptedEpoch promise与currentEpoch/history关系：原论文§IV，固定Learner/Leader/QuorumPeer核对。模型Disk赋值模拟原子稳定映像，不执行磁盘持久化。
+- chosen：Audit按(proposal epoch,Txn)收集持久接受者，leader尚未收到ACK的场景也达到二节点；不把COMMIT作为唯一证据，不跨epoch拼普通proposal证书。
+- 阶段门槛：一个promise不足发现，一个或重复ACKL不足ready；旧epoch和旧连接代次输入被拒或丢弃。此项为受限脚本，不构成并发leader候选证明。
+- 未确认尾部：两条可执行轨迹分别丢弃、继承，无直接写入初始磁盘历史。late join只作原子完整历史修复，不模拟完整重新入组。
+- 唯一Phase2变异：node3/epoch2保存新currentEpoch却未保存history；三轮真实模型事件继续到Y，跨crash审计保持旧X，检出不相容。实际读取每轮select_history/deliver_history，并与正常同调度对照。没有运行产品漏洞复现。
+- 父独立运行最终源码七场景及CLI；全部JSON与作者输出逐字相同。JSON只输出记录，未提供导入验证或回放解释器；重复运行同脚本可复现。
+- 七图依次依据增量before/after依赖、论文阶段、持久变量/固定FLE区别、论文Phase2保存顺序、两条尾部场景、固定产品恢复形态、实际三轮变异轨迹。没有用图暗示真实ZooKeeper运行。
+- 反向核验3911/4646/4785：仅历史材料，4646为Duplicate无独立修复版本；当前3.9.6已含保存后更新epoch/ACK顺序。

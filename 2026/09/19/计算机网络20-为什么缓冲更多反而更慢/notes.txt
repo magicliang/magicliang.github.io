@@ -1,0 +1,114 @@
+Real bounded Linux FIFO/FQ-CoDel comparison. Same A-R-B topology per round,
+new owned namespaces each time: A10.20.1.2/24, R10.20.1.1 and10.20.2.1,
+B10.20.2.2/24. TCP46020, independent UDP probe46021. Forwarding only in R.
+Dedicated podman-machine-default; no dependencies installed, host routes or
+production endpoints modified. Linux6.18.10-200.fc43.aarch64, Python3.14.3,
+iproute2 tc/ss6.14.0, available algorithms reno cubic. Sender explicitly sets
+TCP_CONGESTION=reno before connect and reads back reno in each result.
+
+Common R/right root handle1: TBF rate5mbit burst16kb limit64kb.
+Child parent1:1 handle10: either pfifo limit256, or fq_codel limit256
+memory_limit1048576 target5ms interval100ms ecn. Exact argv and tc -s -d
+readbacks are retained. Replacing the TBF child replaces its default queue;
+the TBF limit64kb/printed latency78.6ms is NOT an effective child queue bound.
+Both have256-packet limits; this is not equal memory, equal byte capacity or
+a single-variable AQM comparison. fq_codel also combines flow scheduling,
+CoDel and an explicit memory limit; skb/offload sizes affect packet accounting.
+No result-driven parameter changes or forced expected improvement.
+
+Three repeats alternate pfifo then fq_codel. B receiver creates one18s
+monotonic interval: baseline0..3s, TCP load3..18s, measured load6..18s (3s
+warmup). Client process is started at the target3s mark, so actual connect/send
+starts slightly later due to scheduling. B continuously services TCP and UDP
+with select; UDP has its own socket and A-side process but shares the path and
+B's event loop/CPU. It is not an isolated physical-wire RTT instrument.
+Receiver validates each actual TCP recv block is the prescribed x bytes;
+last12s counted bytes*8/12/1e6 gives application goodput. A receive block is
+assigned by the timestamp after recv; boundary-crossing bytes are not split.
+Timing, buffered delivery and short intervals mean an observed rate is not a
+bit-accurate proof of the configured physical-link rate. Sender accepted bytes
+are local socket input, not delivered bytes. Full stream delivery at close is
+not claimed because this is a finite measurement of ongoing traffic.
+
+Probe sends a4-byte sequence number; only the identical echoed number counts
+as a successful response. Connected UDP restricts the peer. Each request waits
+at most1s; stale replies from previous timed-out requests are discarded.
+Target spacing200ms, one outstanding request: long waits lower the actual
+probe frequency, with no catch-up burst. Last1s stops sending new probes to
+avoid deadline-close contamination. Actual per-request times and successful
+RTTs or null timeouts are all retained. Phase assignment uses send time.
+Loaded probe phase is6..18s, but last-second stop means sends cover6..17s;
+TCP goodput still covers the full6..18s. They are not identical sample coverage.
+A timeout cannot distinguish queueing beyond1s from packet loss or scheduling.
+Do not substitute1s for RTT or infer UDP packet-loss percentage from timeouts.
+p50 is the lower order-statistic median (even N uses the lower middle), p95 is
+nearest-rank ceil(.95*N), computed only over successful replies. All failures
+produce null quantiles. Sample counts must accompany comparisons; ignoring
+censored replies would bias a latency conclusion.
+
+Raw ss -tinm captures sender TCP RTT, cwnd, MSS, retransmissions and windows
+at nominal200ms with actual start/end stamps. TCP RTT is not the independent
+UDP echo RTT. TBF and child dropped counters can reflect the same dropped
+packet at both levels; do not sum them. overlimits is shaping, not packet loss.
+qdisc counters cover warmup and load/termination, while goodput excludes warmup.
+The pre-close queue backlog is preserved; namespace deletion ends that queue.
+
+Both endpoints set net.ipv4.tcp_ecn=1 inside owned namespaces only. Sysctl
+command readback is logged. B AF_PACKET starts before TCP connect; handshake
+raw frames require SYN ECE+CWR and SYNACK ECE. This checks classic ECN
+negotiation, not merely configuration. Capture counts observed TCP CE IP bits,
+non-SYN ECE and CWR flags, keeps first evidence for each plus handshake frames.
+Other full frames are intentionally not retained; this is sampled evidence,
+not complete pcap or proof of every packet/feedback pairing. Counter scan has
+50000-frame bound and25s deadline. Counts may reflect host/offload artifacts
+and capture loss; there is no kernel drop accounting for the AF_PACKET socket.
+A mark counter alone, or CWR alone, does not prove complete ECN response.
+Observed CE/ECE/CWR evidence can be reported individually without asserting a
+one-to-one causal mapping or proving an internal cwnd reaction/algorithm.
+Only controlled untaggedIPv4/TCP is decoded; no checksum/options validation.
+
+All resource lifetimes bounded: receiver18s, sender17s from start, send timeout
+1s, probes100 iterations maximum, capture25s, subprocess commands10s. At the
+common measurement end receiver closes while sender may still have data;
+BrokenPipeError/ConnectionResetError is recorded as termination, not invented
+as an experimental network outage. Finally terminates only owned children,
+removes only owned namespaces; enclosing shell EXIT trap stops the VM.
+CLI: --help0, --bad2, probe without positive end2, macOS default guard1 before
+network mutation. Python no-excuse checker zero violations. No commit/push.
+
+API references used with the parent chapter's current RFC review:
+https://man7.org/linux/man-pages/man8/tc-fq_codel.8.html
+https://man7.org/linux/man-pages/man8/tc-tbf.8.html
+https://docs.kernel.org/networking/ip-sysctl.html
+https://www.rfc-editor.org/rfc/rfc3168.html
+https://www.rfc-editor.org/rfc/rfc8289.html
+https://www.rfc-editor.org/rfc/rfc8290.html
+
+Final actual run: all6 scenarios succeeded on first execution; shell exit0,
+VM stopped successfully,18 owned namespaces deleted (six cleanup receipts).
+Round policy | goodput Mbit/s | loaded probes/timeouts | successful p50/p95 ms | drops | CE/ECE/CWR seen
+1 pfifo | 5.044832 | 11/11 | None/None | 282 | 0/0/1
+1 fq_codel | 4.774539 | 31/6 | 4.430275/10.590143 | 7 | 71/322/66
+2 pfifo | 5.098576 | 11/11 | None/None | 272 | 0/0/1
+2 fq_codel | 4.773573 | 30/6 | 5.144154/18.357229 | 8 | 70/326/65
+3 pfifo | 5.083131 | 11/11 | None/None | 289 | 0/0/1
+3 fq_codel | 4.772608 | 33/5 | 4.794201/19.032012 | 7 | 69/345/64
+Baseline successful p95 values were0.331168,0.879755,0.404044,0.551128,
+0.436670,1.120717ms in execution order;15 probes each with zero timeouts.
+All three pfifo loaded distributions are fully censored at the1s timeout;
+there is no measured loaded median or p95 for pfifo. FQ-CoDel quantiles also
+exclude5-6 timed-out samples per round and must be shown with those failures.
+pfifo goodput5.044832/5.098576/5.083131Mbit/s exceeds the5mbit configured
+number over the12s receive interval. These actual values are retained. A
+finite receive-goodput interval is not identical to long-term qdisc shaping
+rate; no single cause is assigned or rate rewritten to match expectations.
+FQ-CoDel ecn_mark readbacks71/70/69; retained samples independently show
+CE at A-to-B, ECE at B-to-A and later CWR at A-to-B. Counts and samples do
+not constitute complete per-mark-to-cwnd response tracing. No full ECT count
+was computed. Preserved CWR frames have ECT(0), but not every data frame is
+retained. pfifo CWR1 occurs without observed CE/ECE; RFC3168 section6.1.2
+permits CWR following a congestion-window reduction for any reason, so it
+must not be called proof of CE feedback. No recovery cause is asserted.
+Final qdisc parent/child counters are read while traffic can still drain;
+small parent/child sent-count differences are not an atomic snapshot defect
+to fix by editing the evidence. Raw statistics remain untouched.

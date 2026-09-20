@@ -1,0 +1,94 @@
+# 20：etcd Raft 与存储路径研究
+
+研究日期2026-09-20。已读AGENTS、蓝图20、既有13/14/15存储与API边界、19研究，以及旧文《etcd 与持久化：集群状态的唯一事实来源》。19已由父提交53df6357efd3f3a13ca28daf78d0a0ef7a408712。本研究仅写本文件；不运行实验、不编译程序、不写tmp、不改正文或共享台账。当前结论是资料/源码核验，非真实组件实验结果。
+
+## 固定版本与环境交接
+
+实际访问 [官方latest release](https://github.com/etcd-io/etcd/releases/latest)，当前指向 **v3.7.1，2026-07-23**；已打开tag所指[完整commit](https://github.com/etcd-io/etcd/commit/5e7fd0de9a57db03ecc11794dc40403a734c07bb)，SHA `5e7fd0de9a57db03ecc11794dc40403a734c07bb`。本文固定此版，不能沿用14研究中3.6.0而称当前；etcd是课程结构之外的工程桥接，不冒充MIT或Stanford原有指定讲次。
+
+[官方展开资产页](https://github.com/etcd-io/etcd/releases/expanded_assets/v3.7.1)实际列出Darwin arm64包，21.8MB，2026-07-23T19:36:22Z：
+
+- [etcd-v3.7.1-darwin-arm64.zip](https://github.com/etcd-io/etcd/releases/download/v3.7.1/etcd-v3.7.1-darwin-arm64.zip)，SHA256 `a3e839d9128e170c299b1592bed92d8327f258eb94923aea24a0ccf923cf27e9`。
+- [SHA256SUMS](https://github.com/etcd-io/etcd/releases/download/v3.7.1/SHA256SUMS)，该校验清单自身SHA256 `d04be4a0395c95410408c903b23a1ceac4154bb602e7fe02fb714571ec4ebcd6`。
+
+子代理只查看资产页，未下载。PATH中command -v未找到etcd/etcdctl/etcdutl；父随后已通过官方Google发布源下载并核对上述ZIP摘要，解压 `examples/distributed-systems/.build/etcd20/etcd-v3.7.1-darwin-arm64`，以仓库内TMPDIR执行官方 `etcd --version` 返回3.7.1、SHA5e7fd0d、go1.26.5、darwin/arm64，exit0。这是父报告的环境证据，尚未启动服务。可复用其二进制，不构建新Go程序。
+
+## 资料与核验矩阵
+
+所有网页访问日期2026-09-20；源码按上述commit固定。实际读取主要通过v3.7.1 tag raw URL，已核tag映射；正文永久链接改用完整SHA。下表源码路径均相对 `https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/`。
+
+| 标题/版本/URL | 具体论断与定位 | 核验状态 |
+|---|---|---|
+| [Data model，v3.7](https://etcd.io/docs/v3.7/learning/data_model/) | KV逻辑视图与多版本历史；事务修订、主/子修订 | 已读版本化官网；细节以固定MVCC源码核对 |
+| [API guarantees，v3.7](https://etcd.io/docs/v3.7/learning/api_guarantees/) | Durability及KV strict serializability；serializable读例外；Watch保证独立 | 已读；20只讲必要边界，Watch/Lease完整API留21 |
+| [Persistent storage files，v3.7](https://etcd.io/docs/v3.7/learning/persistent-storage-files/) | member/wal与member/snap/db；meta.consistent_index；快照文件类型 | 已读；页面表内仍有“as of3.5”、v2历史内容，不能将全部例子无条件当3.7.1实现 |
+| [server/go.mod](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/go.mod) | raft/v3 v3.7.0、bbolt v1.5.0，Go1.26/toolchain1.26.5 | 已读；不要把etcd3.7.1误写成raft3.7.1 |
+| [server/etcdserver/raft.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/etcdserver/raft.go) | Ready处理约214–297：leader可先发复制消息并行本地写；Save HardState/Entries；快照/WAL保存与释放顺序 | 已读；不要画成全部节点完全串行的单线程流程 |
+| [server/storage/wal/wal.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/storage/wal/wal.go) | Save900–939按MustSync条件保存；sync781–804调用Fdatasync，unsafeNoSync可绕过；SaveSnapshot942–962 | 已读；Save调用不等于每次必有一次新fsync，durability须有正常配置/存储前提 |
+| [server/etcdserver/server.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/etcdserver/server.go) | apply1761–1848按ConsistentIndex决定V3应用，noop与失败/无backend锁分支；2291–2297锁内CI hook；979–1001恢复时先换index backend再恢复lease/KV | 已读；内存应用游标与磁盘CI分开 |
+| [server/storage/hooks.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/storage/hooks.go)、[backend/batch_tx.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/storage/backend/batch_tx.go) | OnPreCommitUnsafe41保存CI；LockInsideApply85–95先锁再hook；buffered commit340附近同事务保存元数据与数据 | 已读；批量backend提交不与每个逻辑Txn一一对应 |
+| [server/storage/mvcc/kvstore_txn.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/storage/mvcc/kvstore_txn.go) | End195–206只有changes非空才currentRev++；put208–243生成(main,sub)及version；deleteRange273–285无匹配不变 | 已读，直接支持修订矩阵 |
+| [server/etcdserver/txn/txn.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/etcdserver/txn/txn.go)、[v3_server.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/etcdserver/v3_server.go) | txn76–107、128–190选择Success/Failure并执行同一TxnWrite；v3_server300–350只读快路径；982–1052提议/等待apply结果 | 已读；compare=false不是执行失败，timeout不是未写入证明 |
+| [server/lease/lessor.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/lease/lessor.go) | Grant保存lease；Revoke305–338在一个TxnDelete删除关联键与lease；Checkpoint344起；Renew370起 | 已读；租约元数据持久化不能直接推导KV revision改变 |
+| [maintenance.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/etcdserver/api/v3rpc/maintenance.go) | Status242–255：RaftIndex=CommittedIndex、RaftAppliedIndex=AppliedIndex | 已读；CLI列RAFT INDEX不是WAL末尾index或磁盘CI |
+| [mvcc/kvstore.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/storage/mvcc/kvstore.go) | restoreIntoIndex以1为初始revision；restore344–362以compact/scheduledCompact下界修正恢复修订 | 已读；空库基线须实测，不能照搬旧文0开始；compact不等于revision回退 |
+
+课程结构沿蓝图已核MIT2026复制/持久性/Raft与Stanford2024论文讨论，本篇是自行增加的产品实现剖析；其课程来源见既有13/14/18研究，不把课程讲义当当前etcd规格。
+
+## 五种位置与恢复不变量
+
+Raft entry的index记录复制日志位置，term区分任期；本地WAL包含已接受但未必已提交的条目。commit表示协议已确认可提交的前缀；apply表示该成员按序执行到哪一项。`endpoint status`提供的是后两者，不能冒充磁盘读取证据。KV revision是MVCC状态的逻辑版本，只有产生KV变更的写事务才递增。后台内部项、noop、lease元数据或无实际修改的操作可以占日志位置而不产生新revision，因此二者既不相等，也不存在固定差值。
+
+正常写请求进入Raft，提交后交给apply，在本地状态机执行并唤醒请求等待者；不是“多数ACK后不经apply就给客户端成功”。实现流水线允许复制与本地保存重叠；图应画约束和不同泳道，不按源码文本顺序误判数据尚未持久就对外成功。Raft3.7.0 Ready契约与历史单节点修复说明持久屏障重要，正文不应在未完整审计raft依赖所有路径时声称逐行证明全部成功回复。
+
+backend使用bbolt并批量提交，多个已应用命令可能在一个物理事务中保存。`storeTxnWrite.End`发布revision/解锁不意味着该逻辑事务独占一次bbolt fsync。WAL与已提交状态提供恢复材料，不能因此要求每次成功响应之前backend文件已经单独刷盘，也不能拿磁盘DB暂落后判定丢数据。
+
+关键不变量：持久DB状态与其持久`consistent_index`必须描述同一个已应用前缀。CI先保存、数据未保存便崩溃，恢复会错跳条目；数据保存、CI未保存则可能重放并重复生成revision。当前hook在backend写锁内推进CI，在同backend事务提交时保存，避免周期提交抢先只写新CI。apply根据条目index与CI比较决定是否再应用V3。内存CI会先推进，不能拿它与磁盘DB拼成一个“已持久快照”。noop/无backend锁的完成路径另补CI，正文不能说每项都调用MVCC写锁。
+
+恢复涉及snapshot、WAL与backend的匹配，不是“对WAL所有条目重放”。未提交尾部不能直接变成用户状态。`storage/backend.go:RecoverSnapshotBackend`检查snapshot index与DB CI，必要时使用收到的snapshot DB恢复；应用快照时先切换ConsistentIndexer backend，再恢复lessor，再恢复KV附着关系。存储文档中的`.snap`、`.snap.db`和运行backend `snap/db`不是同义词。
+
+## 修订矩阵：待真实实验核对
+
+| 操作 | KV revision预期 | Raft/边界 |
+|---|---|---|
+| 普通Put新键或旧键，包括相同value再次Put | +1 | 相同值也产生新版本，create_revision保留，mod_revision/version更新 |
+| 一个Txn成功分支写两个不同键 | 合计+1，两键mod_revision相同 | 内部subrevision区分同主修订内变更，不是两个Raft用户请求 |
+| Txn比较false，Failure只有读/空列表 | 不变 | 有写候选分支的请求仍可走Raft；Succeeded=false不是RPC错误 |
+| Txn比较false，Failure包含实际Put | +1 | 不能写“失败事务都不推进revision” |
+| DeleteRange没有匹配键 | 不变 | 删除请求可走Raft而无MVCC变化；删除多个存在键合计+1 |
+| 只读Range/只读Txn | 不变 | 通常走读路径；线性化读不等于追加每读一条用户日志，背景日志仍可能推进 |
+| LeaseGrant、KeepAlive、Checkpoint；空lease Revoke | 不因这些元数据动作增加KV修订 | Grant等可走Raft，KeepAlive和checkpoint关系不能泛化成每次都写日志 |
+| Revoke包含关联键，或到期最终执行撤销 | 一次撤销所删键共享一个新修订 | 定时器到期不等于立即删除完成；需复制/应用，TTL边界详细留21 |
+| 参数/权限/不存在lease等确定错误 | 需按失败阶段及错误类型判断 | 不笼统承诺所有错误“无副作用”：timeout结果不确定，quota有特殊历史与实现路径 |
+
+revision主版本不是键的version；create_revision为本轮创建，删除重建会更新；mod_revision是最近修改所在主修订。历史读取被compaction限制，后者不等同于Raft日志压缩。3.7源码初始恢复基线1，预期空库第一次Put得到2；以实际结果填写正文，不人为改成0基线。
+
+## 反向检索与修订边界
+
+已实际读取 [v3.5 data inconsistency postmortem](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/Documentation/postmortems/v3.5-data-inconsistency.md)，作者serathius，2022-04-20。原子CI缺陷来自共享内存CI被周期提交提前保存；崩溃使恢复跳过数据。父下载发行包内同报告亦已读取。它支持恢复不变量，不是指控3.7.1仍有原缺陷。
+
+[官方3.6发布说明](https://etcd.io/blog/2025/announcing-etcd-3.6/) Critical bug fixes实际核对三项：CI原子问题引入3.5.0、修复3.5.3（13766/13854）；单节点成功回复后立刻崩溃丢数据在3.4.21/3.5.5修复、raft侧14413进入3.6；defrag崩溃重复apply导致revision不一致在3.5.6修复（14685/14730）。这些是官方汇总的历史版本界限，未重跑原复现，不宣称它们穷尽所有持久性缺陷。
+
+反查还发现 [21636](https://github.com/etcd-io/etcd/issues/21636) 对alarm场景CI落后的报告，但其版本栏缺失；当前server.applyEntryNormal的defer会补推进CI。仅记录为提醒检查无backend锁分支，不据此声称已定位受影响/修复版本或3.7.1漏洞。kvstore恢复源码还链接17780有关compaction/tombstone修订下界，当前已读实现有scheduledCompact校正，未扩查整个issue适用历史。
+
+资料访问限制：部分cindex单文件路径经raw/web返回404或cache miss；GitHub API shell DNS失败，未变换认证。CI论证依据已成功读取server hook、backend lock/commit、官方报告和存储文档，不伪称读过不可达文件。版本化存储页含旧例子，固定源码优先。
+
+## 最小真实本地实验建议（未执行）
+
+沿父现有官方Darwin arm64程序，以既有Python标准库编排进程及JSON，不新编译Go。client/peer只监听127.0.0.1，独占随机端口、独占 `.build/etcd20/` 子目录，显式endpoint防误连默认2379；每次保存版本、完整启动参数、请求、响应、stdout/stderr与退出码。所有TMPDIR也指该目录。单成员只验证本机产品行为，不能证明quorum容错或掉电可靠性。
+
+1. 先采集空库 `endpoint status -w json` 和Range响应，随后依序Put、同值Put、多键Txn、compare=false只读Failure、compare=false写Failure、删不存在键。每步保存revision、raftIndex、raftAppliedIndex及键元数据。断言修订增量和多键同mod_revision；Raft index只检查合理关系/单调，不能假定每步精确+1，因为启动/后台项可能插入。
+2. Grant长TTL空lease，记录前后revision与index；再关联两个键并Revoke，检查一次撤销生成同revision删除事件或最终KV/修订；另做空lease Revoke。lease元数据提供最清楚的index增长而revision不动对照，避免只用index与revision数值不同这一弱断言。
+3. 保存已确认写后的状态，给**本次启动PID**发SIGKILL，等待退出再从同data-dir启动，检查值、create/mod/version和revision不重复推进；重启选举可使Raft index/term增长。记录WAL和backend文件存在/大小可帮助定位，但不能从这些统计证明某一准确fsync窗口。不得删除WAL、篡改db、关闭fsync来伪造通过。
+4. 如需DB观察，使用官方 `etcdctl snapshot save` 与 `etcdutl snapshot status` 记录一致快照revision；活跃backend直接文件复制不是一致备份。snapshot status并不暴露全部CI/WAL证据，不为追求CI数值另构建dump工具。正文把CI机制限定源码证明；产品实验验证公开API和重启可观察行为。
+
+不需要教学模型替代产品观察。若系统防护阻止官方程序，保留阻断与已核证据并上报；不得更名/复制绕过，不重试旧被拦截路径。建议图：WAL/commit/apply/backend四泳道；Raft index与revision多对非一对应；Txn main/sub及键版本；DB+CI原子恢复两个错误窗口；本地实验采样与SIGKILL边界。
+
+## 与旧文衔接
+
+June20旧文可作为Kubernetes控制面入口，本篇应明确补足而不复述：“每个put或delete必加revision”漏掉空删除和批事务；“多数ACK即回复”漏掉apply；“任意时刻只有一leader/任何故障不丢”需限定任期、quorum和存储故障模型。旧文Watch/exactly-once、resourceVersion等其他泛化留21或另批审校，当前不改旧文。所有实验预期尚待执行，不能把此研究文件计为20完成。
+
+独立交叉核验补记：父已通过GitHub blob完整SHA页面实际读取kvstore_txn.go，独立确认End仅changes非空才currentRev++、Put采用beginRev+1且version+1、空Delete不变、sub=len(changes)；父另从官方包swagger确认raftIndex为committed、raftAppliedIndex为applied，并已读2022-04-20CI复盘。此为独立源码/规范核验，不是实验结果。研究文件至此稳定交接，不再扩展检索。
+
+
+实施映射（2026-09-20）：按父批准收缩为7步API+主动SIGTERM后重启；研究建议的kill、额外lease事件、snapshot/dump均未实施。最终原始observations与verification为实测证据。6图分别依照Status字段、Ready与apply约束、MVCC main/sub、CI官方复盘、恢复材料、驱动采样顺序；图为机制示意，不是底层磁盘时间戳观测。

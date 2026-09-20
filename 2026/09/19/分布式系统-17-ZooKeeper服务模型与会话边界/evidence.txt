@@ -1,0 +1,92 @@
+第17篇论断—证据—核验记录
+核验日期：2026-09-20
+以下保留实施前研究，研究中的“尚未执行”仅指该研究阶段；最终实施映射见文末和verification.txt。
+
+# 17：ZooKeeper 服务模型研究
+
+研究日期：2026-09-20。只读核对蓝图第17篇、仓库 AGENTS 与既有16研究；开始时 main/HEAD 为 `d6836870f50edde8c71a3d1d15c6bcd991c9149f`，其他系列并行修改保留。本文是资料与实验设计记录，不是正文，不包含本代理执行真实产品实验的结果。
+
+## 固定版本与资料
+
+推荐固定 **ZooKeeper 3.9.6**：官网 News 记载2026-09-15发布；官方 releases 当前列3.9.6为 Current、3.8.7为 Stable。不要沿用蓝图3.9.2链接并称其当前版本。实际实验只能报告固定版本本身，不能推论所有版本。
+
+| 标题、版本/日期、URL | 定位与支持论断 | 核验状态 |
+|---|---|---|
+| [Apache ZooKeeper News](https://zookeeper.apache.org/news/)，2026-09-15 | 3.9.6发布日期 | 已实际读取 |
+| [官方3.9.6下载目录](https://downloads.apache.org/zookeeper/zookeeper-3.9.6/) | binary/source tar、SHA512、ASC；发布包来源 | 已读目录；父负责下载校验 |
+| [Programmer's Guide 3.9.6](https://zookeeper.apache.org/doc/r3.9.6/zookeeperProgrammers.html) | Data Model、Sequence Nodes、Stat、Sessions、Watches：状态树、会话、通知语义 | 已实际读取，核心论断再与论文/API/源码交叉核对 |
+| [ZooKeeper Java API 3.9.6](https://zookeeper.apache.org/doc/r3.9.6/apidocs/zookeeper-server/org/apache/zookeeper/ZooKeeper.html) | create/delete/setData/addWatch；expected version、-1、异常、模式 | 已读父下载包内同版HTML的create/delete部分；不把Javadoc的绝对措辞扩大到溢出场景 |
+| [Administrator's Guide 3.9.6](https://zookeeper.apache.org/doc/r3.9.6/zookeeperAdmin.html) | clientPortAddress、min/maxSessionTimeout、admin.enableServer、平台支持 | 已读，超时2/20倍tickTime是可配置默认值，并非不可更改协议常数；macOS列Development Only |
+| Hunt/Konar/Junqueira/Reed，[ZooKeeper: Wait-free coordination for Internet-scale systems](https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf)，USENIX ATC 2010 | §2.1–2.2，PDF第3–4页：session、one-shot watch、版本条件更新；§2.4配方 | 已读相关页。2010论文不包含3.6新增persistent watch；标题wait-free不等于任意故障下所有客户端请求必定完成 |
+| [MIT 6.5840 2026 Lecture9 ZooKeeper](https://pdos.csail.mit.edu/6.824/notes/l-zookeeper.txt) | 数据模型、超时与ephemeral、客户端FIFO与普通读可能陈旧 | 已实际读取。讲义Raft-like是类比，不能写成ZooKeeper使用Raft；讲义末尾multi事务建议不能替代3.9.6真实API核对 |
+| [Stanford CS244B Spring2024 Schedule](https://www.scs.stanford.edu/24sp-cs244b/sched/) | 首周ZooKeeper论文讨论 | 已实际读取；仅作课程结构依据，不照搬作业答案 |
+| [3.9.6累计Release Notes](https://zookeeper.apache.org/doc/r3.9.6/releasenotes.html) | 各版本标题下的watch修复、日志依赖变更 | 已读；不能把累计列表全部当3.9.6本次修复 |
+| [ZOOKEEPER-4698](https://issues.apache.org/jira/browse/ZOOKEEPER-4698)，创建2023-05-23，更新2025-07-27 | Persistent watch events lost after reconnection；标影响3.7.1/3.8.1、Open、无FixVersion | 已读问题及检索所得维护者2025评论；不能单凭issue标签推定3.9.6受影响，须固定源码/本地实验交叉核对 |
+
+父报告已校验官方binary SHA512为 `e999626df06de30dc8bb53bb51da9bb786b1658406adafc6b92f104d72ca25e869f70a57c83a726f8b9558cc0fb519fc20f201aa5d6da09884bc4be5fe6dd3b0`；父执行官方Version输出 `3.9.6-a355171b081b5b60749db8f19cca1528b0df936f`，built 2026-09-03 19:29UTC。该项为父现场证据，本代理没有运行Java。后续源码使用 `release-3.9.6` 或此SHA固定链接，不引用master冒充发布版。
+
+## 论断—证据—核验状态
+
+| 论断 | 证据及边界 | 状态 |
+|---|---|---|
+| znode同时具有完整byte[]数据、children和Stat；不是大对象存储 | Guide Data Model；论文§2.1；单次set替换整个数据 | 文档/论文交叉核对 |
+| version/cversion/aversion分别描述数据/孩子/ACL变化，不等于zxid | Guide Stat；同路径删除再创建会产生新节点，不能把旧version当永久身份 | 文档已核；CAS跨节点生命周期需单独边界，不承诺防ABA |
+| setData/delete的expected version在服务端检查，-1跳过条件 | API delete与论文§2.2；两个旧version更新至多一个成功，失败为BadVersion，不是CAS循环自动完成 | API/论文与固定源码checkAndIncVersion已核 |
+| ephemeral绑定创建session；短暂断连不直接删除，结束/过期删除，不允许children | Guide Ephemeral/Sessions与论文§2.1；ephemeralOwner不是“此进程当前有权写外部存储”的凭证 | 文档/论文交叉核对；外部fencing留19 |
+| 服务端决定会话失效与ephemeral删除；Java客户端也可本地终止handle并发Expired | Guide的“重连后才通知”不是3.9.6 Java客户端无条件保证；ClientCnxn本地expiration路径与服务端expire须区分 | 文档、固定源码及4508/4921修订已交叉核对；不能以客户端事件替代服务端删除证据 |
+| sequential为父节点范围计数，10位零填充只是格式 | Guide明确signed32 overflow到负数；父重建/长周期溢出使“全球永久唯一/无限单调”不成立 | 文档与固定源码parentCVersion已核；不跑数十亿次伪验溢出 |
+| 默认exists/getData/getChildren watch一次触发即移除 | Guide与2010论文一致；exists可监控不存在路径，getData不存在则失败 | 文档/论文交叉核对 |
+| watch是变化提示，事件无完整旧/新数据；再读并重装 | 论文§2.1、Guide Things to Remember；通知间可多次更新 | 已核；不是逐次变更日志 |
+| persistent与persistent_recursive不因触发自动移除，递归覆盖后代 | Guide自3.6.0新增addWatch；递归模式不发冗余NodeChildrenChanged | 版本化文档已核；勿与普通persistent事件种类混同 |
+| 断连无watch交付，重连须恢复状态视图 | Guide明确不存在节点在断连中create+delete可完全漏；4698另指出persistent重置可能不补离线数据事件 | 固定3.9.6 DataTree.setWatches已交叉核对；本地产品实测尚未执行 |
+| 写完成、另一客户端watch回调时间没有跨客户端固定先后 | Guide Sent to client与ordering；保证针对同一客户端的处理序列 | 已核；测试不能断言B写返回前A必已收到 |
+
+## 反向检索与版本陷阱
+
+已检索persistent watch lost/reconnection并找到4698；这比笼统的“Watch可靠重连”更重要。该issue引用维护者说明：普通watch恢复时对比状态，persistent watch仅重装。最终文章应区分“注册持久”与“事件持久”。即便固定版实测没在某次窗口复现，也不能将其升级为可重放日志。
+
+累计release notes包含 ZOOKEEPER-4466（同路径多watch模式）、4471（移除Children影响persistent事件）、4475（persistent recursive错误收到NodeChildrenChanged）等历史修复，必须按所属版本标题引用。3.9.4的SLF4J/Logback兼容变化说明官方客户端实验应沿用同一发行包依赖，不能随意混classpath。Guide中exists ACL检查又明确3.9.2/3.8.4/3.7.3修订，古老配方API描述不是所有版本安全合同。
+
+Java create Javadoc仍用“always fixed length”及“never file exists”概括sequential；Guide却明确int溢出。因此应描述通常范围与边界，不照抄绝对词。min/max timeout是可配置默认值，不把Guide的概述当唯一配置规则。
+
+源码获取边界：本代理尝试GitHub release tag及SHA的web读取失败（Internal Error/cache miss），shell curl raw域名DNS失败；未换认证或绕过限制。随后父下载官方source tar并校验SHA512，本代理从该本地发布源码完成下述核对；未因网络失败改用滚动master。
+
+## 固定发布源码交叉核对
+
+官方source tar SHA512（父实际校验）：`7f854c2ff24a20b1941facea90c70724de636bd59ef2208ab6c004f825e5dcf528ef2ce85adde0b351cc47b7bcc36c9b808ae302835ac367a08842a9c0a1c11a`。本代理实际读取 `.build/apache-zookeeper-3.9.6/zookeeper-server/src/main/java/org/apache/zookeeper/` 下文件；以下URL为固定发布SHA定位，网页抓取失败与本地源码已读必须区分。
+
+- [server/DataTree.java](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/DataTree.java#L1488)：`setWatches` 1488–1525行。普通data watch检查节点是否存在及mzxid，child watch检查pzxid，相比relativeZxid至多补一个对应通知；exists watch按当前存在性处理。persistent两类循环仅addWatch，没有比较旧zxid或回放事务日志。这在固定3.9.6直接支持4698所述恢复差异，父也独立读取。不是对所有watch代码的完整正确性证明。
+- [server/PrepRequestProcessor.java](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/PrepRequestProcessor.java#L668)：668–685行，顺序后缀来自父Stat.cversion，使用`%010d`，创建时记录newCversion；并非每个前缀专属计数器，普通兄弟创建也影响下一顺序号。737–742行`checkAndIncVersion`明确-1绕过比较，其他不匹配抛BadVersion，再用int加1；无限无重复version承诺不成立。363/388行分别为delete/setData调用。创建路径仍检查NodeExists，API的never措辞不能推广到用户预建同名路径或计数极限。
+- [server/SessionTrackerImpl.java](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/SessionTrackerImpl.java#L156)：run在156–170行轮询到期会话，setSessionClosing再expirer.expire。 [server/ZooKeeperServer.java](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/ZooKeeperServer.java#L728)的expire(Session)记录日志并close(sessionId)。本代理及父独立读，支持过期属于服务端执行路径，不用客户端本地倒计时冒充决定。
+
+- **客户端修订不能遗漏**：[ClientCnxn.java](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/ClientCnxn.java#L1244) 1244–1252行在已有session且接收空闲达到expirationTimeout时将handle置CLOSED并抛SessionTimeoutException；1327附近在非主动closing时排队Expired；1431行使用`negotiatedSessionTimeout * 4 / 3`。父先发现，本代理独立读取确认。它终止本地handle，不直接执行服务端ephemeral删除；因此A的Expired也不是服务端已清理的充分证据，必须另外看B/服务端。
+
+反查已实际读取 [ZOOKEEPER-4508](https://issues.apache.org/jira/browse/ZOOKEEPER-4508)（2022-04-01创建，2024-09-23解决，FixVersion含3.9.3）及 [ZOOKEEPER-4921](https://issues.apache.org/jira/browse/ZOOKEEPER-4921)（2025-04-23创建，2025-05-11解决，影响3.9.3，修复3.9.4）。前者修复所有服务器不可达时客户端无限循环、没有Expired的问题；后者修复相关新session重连回归。固定3.9.6累计release notes在对应3.9.3/3.9.4标题中也分别列这两项，且固定源码以`sessionId == 0`区分尚无session的分支。不能把这些修订简化成3.9.6仍有3.9.3的全部缺陷，也不能照抄Guide说客户端绝不本地发Expired。实验与正文必须显示“服务端清理状态”和“客户端handle生命周期”两条时间线。
+
+源码已足够交接，不再扩展其他版本。尚缺的证据仅是后续本机真实API运行与事件轨迹；此研究不把父Version命令当作服务实验通过。
+
+## 最小真实产品实验设计（尚未执行）
+
+使用父已固定的3.9.6官方类与Java17；可在单JVM中用官方ZooKeeperServer、NIOServerCnxnFactory启动仅绑定127.0.0.1的随机空闲端口，两个官方ZooKeeper客户端通过真实TCP访问。A经标准库TCP代理，B直接连服务。数据目录仅本批独占`.build/zk17`，禁生产地址，关闭不需要的管理HTTP服务。它属于真实产品API/真实本机TCP验证，不是三节点容错、跨机分区、掉电持久性或ZAB证明。
+
+1. **数据与CAS**：唯一根路径内创建persistent节点，读data/version；A成功setData(v)，B用相同v明确BadVersion，读回最终data/version；-1另作显式无条件更新对照。创建sequential节点保存返回的完整路径，不猜下一个编号，不假设getChildren排序；ephemeral下创建children应得到对应错误。无需高负荷溢出实验。
+2. **一次性/持久watch**：A装getData watch，B更新并等A匹配type/path事件，再次更新而A不重装；最终读确认两次更新都发生。默认watch只收第一次，重装后再更新可再收到。独立addWatch(PERSISTENT)重复两次更新，各等事件；recursive对子孙创建/更新并检查事件type，不把会话None事件算数据通知。回调只入队，不在事件线程同步等待其他事件。
+3. **短断链与同会话恢复**：代理关闭现有双向socket并拒绝新连接（只阻止新建连接不能中断旧心跳）。A观察Disconnected后尽快放行，等SyncConnected，比较sessionId与ephemeralOwner不变，B确认临时节点仍在。若实际发生过期，记录该轨迹而不能硬算通过短断链场景；设置足够宽超时并使用事件门控减少脆弱睡眠。
+4. **服务端过期**：新session创建ephemeral，B事先exists watch；阻断A全部连接，B等待NodeDeleted并exists=null，随后尽快放行A；检查Expired是恢复握手返回还是Java客户端已本地终止，允许放行前已有Expired。记录协商timeout、服务端日志、B观察、A通知各自时间线，不断言精确到毫秒或固定事件跨客户端先后。不能用A.close冒充过期，也不能停止整个server当作仅A分区。过期旧handle不能恢复成同session，新建session明确另一个身份。
+5. **断连遗漏对照**：A在不存在path上装一次性exists watch，阻断期间B create再delete，重连后读取仍不存在，观察窗口内无对应create/delete并列出有限观察边界。另对已存在节点装persistent watch，断连中B setData，重连后主动read确认新版本，记录是否补发；此项用于固定3.9.6核验4698，不以“没收到”单独证明永远不可能收到，结合源码。所有watch数量断言以事件类型/path与同步屏障限定，不能泛数整个会话队列。
+
+预计配图：znode树与Stat三类版本；会话服务端/客户端双时间线；一次性watch重装空窗；persistent注册与断连历史缺口对照；CAS两客户端竞争；本机server/代理/A/B实验拓扑。接18只引出服务内更新如何形成顺序，19再讨论普通读和外部fencing，不能在17把ephemeral解释为外部资源互斥证明。
+
+
+## 最终实施映射
+
+- Stat/CAS/顺序编号/临时节点约束：固定3.9.6官方API及源码事实；实际本机server/客户端已验收，CAS版本0/1/2和顺序0/2均输出断言。
+- 一次性Watch与重新读取注册：主路径实际运行通过；异步getData回调是本例单server、B写已完成且无后续并发写时的EventThread屏障，不是阻止未来事件的通用屏障。
+- persistent连续更新及recursive后代创建：实际通过。recursive不出现NodeChildrenChanged的直接断言只覆盖tree根路径；普遍语义依据官方API。
+- 短断连：真实TCP旧连接关闭、新连接拒绝；同session及ephemeral owner均保留。失联create-delete无通知、persistent离线两次更新不回放均为经过回调屏障的有限观察，并与固定DataTree.setWatches源码交叉核验。
+- 长断连：B自然观察NodeDeleted并exists=null，随后A恢复握手返回SessionExpiredException；旧handle终止，新handle不同session。未主动close或强制expire制造过期。
+- ClientCnxn内部4/3 expirationTimeout及本地Expired：固定源码与4508/4921修订核验，未在这两次实验中执行到本地计时终止分支；不能声称两种分支均已观察。
+- 正常close也结束session并删除临时节点，正文明确与本实验自然过期分开。
+- zxid不是per-znode version；multi子事务复用事务zxid：父独立读取固定DataTree1010–1030，正文未新增multi实测声称。
+- 图1 znode/Stat依据API；图2 CAS为已执行场景；图3分开server清理与client状态，允许本地先Expired；图4一次性Watch已执行；图5离线缺口已执行且以源码限制外推；图6实际单JVM/loopback拓扑。
+- 产品与模型边界：官方独立server、真实本机TCP和文件记录。没有quorum/ZAB、跨机、掉电、完整线性一致证明或性能数据。不是课程答案。

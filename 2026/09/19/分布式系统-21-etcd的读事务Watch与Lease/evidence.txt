@@ -1,0 +1,70 @@
+# 21：etcd API、完整 Watch 游标与 List 重建
+
+研究日期：2026-09-20。状态：资料与源码研究完成，以下实验均为待执行设计，不是观测结果。已读蓝图21、20研究与正文的revision/存储边界。仅修改本研究文件，不运行程序、不下载、不编译、不写系统临时文件。课程沿MIT2026与Stanford2024复制服务主线；etcd API是系列增加的工程内容，不声称是课程指定讲次。
+
+## 固定身份与资料矩阵
+
+固定etcd **v3.7.1，2026-07-23**，commit `5e7fd0de9a57db03ecc11794dc40403a734c07bb`；身份与官方包摘要沿20已核证据。现有官方包位于 `examples/distributed-systems/.build/etcd20/etcd-v3.7.1-darwin-arm64`，21可只读复用。源码实际读取v3.7.1 tag raw页面，以下给固定SHA永久链接；v3.7官网仍可能更新，不能冒充固定发行源码。访问日均为2026-09-20。
+
+| 标题、版本、URL与定位 | 支持的具体论断 | 核验状态 |
+|---|---|---|
+| [API guarantees，v3.7](https://etcd.io/docs/v3.7/learning/api_guarantees/)，KV/Watch/Lease小节 | 默认KV严格可串行化；serializable例外；Watch保序、窗口内可续传、完整revision、进度通知，不承诺线性化或有限延迟 | 本轮已读全文相关段；分片例外另以proto与客户端源码核对 |
+| [rpc.proto，v3.7.1](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/api/etcdserverpb/rpc.proto)，383–474、607起、704–809 | Range范围左闭右开、revision、limit/more、serializable；Txn条件分支；Watch起点包含指定revision，created与canceled含义，fragment可分割大revision；Lease TTL由服务端选择 | 本轮实际读；是协议字段而非客户端业务承诺 |
+| [v3_server.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/etcdserver/v3_server.go)，Range约125–140，Txn约300–350 | 非serializable Range先LinearizableReadNotify再读KV；只读事务与写事务路径分开 | Range本轮重读；Txn沿20已读源码交叉核对 |
+| [client/v3/watch.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/client/v3/watch.go)，549–592、739–820 | Go客户端先合并fragment再分发；nextRev取末事件ModRevision+1；created处理不同于进度响应 | 本轮实际读。Go客户端内部接收游标不是应用已落盘游标；Python gateway消费方须自行处理 |
+| [api/v3rpc/watch.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/etcdserver/api/v3rpc/watch.go)，sendFragments约542起 | 大响应可以按事件分片，单个事件并非任意切字节 | 本轮实际读入口；应用仍必须区别HTTP传输分块、JSON响应与逻辑完整事件批次 |
+| [kvstore_txn.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/storage/mvcc/kvstore_txn.go)，Range/End/put；[txn.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/etcdserver/txn/txn.go) | 历史快照读；一写Txn产生一个主revision，多键事件不能仅保留每revision第一项；false compare选择Failure而非RPC失败 | 20研究及父独立源码检查已核；21不重复声称做过运行 |
+| [lessor.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/lease/lessor.go)，Grant262–303、Revoke305–338、Renew370–425、Promote449起、runLoop582起 | TTL有服务端最小值；只有primary续租；到期可能等quorum撤销；关联键在一个删除事务中撤销；新primary调整expiry；500ms检查节拍不是精确删除时限 | 本轮实际读，交叉API字段；不把KeepAlive每次都说成新增Raft日志 |
+
+## 可写入正文的核心论证
+
+默认读保证一个调用到响应区间内的线性化点，并遵守先完成写、后开始读的实时时序。官网Linearizability段落关于返回时“most current”的例子过强，正文应采用原定义，不能要求包含所有并发写到响应最后一刻。serializable不是脏读：它读取成员本地的一致状态，但可能落后于已完成的跨成员写。单节点正常运行两种读得到同值，不能作为两者保证相同的实验结论；本篇用API与源码解释差别，三节点分区留22。
+
+Txn把比较与所选分支作为一个服务内原子操作；两次普通Get/Put之间插入比较不等价于Txn。可以用`mod_revision == observed`防止旧观察覆盖新修改，用`version == 0`判断当前不存在；删除再创建时仅value相等不足以识别代际。失败比较可以执行Failure中的写，不是自动无副作用。API不指定嵌套Txn的执行/事件顺序，本篇实验只用非嵌套事务。外部数据库或文件修改不属于etcd Txn原子范围，timeout也不能推导事务未发生。
+
+Watch给出匹配范围的变更流，不是“当前状态已最新”的读结果。建立成功的created响应只确认watch已注册；历史回放尚可能未送达，不能拿其header.revision跳过旧事件。接收普通事件时依据事件的mod_revision，不能无条件用响应header当业务游标。进度通知才证明对应watch此前的事件已送达；处理器仍须先完成此前事件的应用。初版教学客户端可不主动请求进度、忽略空进度而保守保持游标；禁止把created、canceled或任意空响应都当进度。
+
+### 从分页快照到Watch的无缺口交接
+
+1. 对固定前缀区间执行首个默认线性化Range，按KEY升序、limit分页，保存首屏header.revision为R。后续页必须始终显式`revision=R`；不可每页改成“最新”，也不可用后页header覆盖R。保持同一个range_end。下一页key使用末key追加零字节以排除该key且保留其扩展键；这与求前缀上界的“末可增字节加一”是不同算法。
+2. 每页检查more，直到全部完成；若中途ErrCompacted，丢弃整个未发布快照，重新从新R开始。不要把新revision页拼接到已有旧页。缓存与R应作为一次逻辑安装发布。
+3. 从`start_revision=R+1`建立同范围Watch。起点是包含式；List期间发生的更新由历史回放补齐。若保留窗口已消失，再做完整List，而不是直接从compact_revision+1盲跳。
+4. 对收到的完整逻辑批次先应用全部事件，再把已处理游标推进至末事件revision。一个revision有多个键，不能处理第一项就保存`r+1`。如果开启fragment，须等fragment=false完成重组；中途断流丢弃未发布分片并从上一完整游标重新请求。多个revision也可能同批返回，可按revision分组原子发布。
+5. 持久缓存和持久游标须共同提交，或者允许重放并幂等应用。先保存游标再保存缓存会漏数据；先业务副作用再保存游标可能重复副作用。Watch的Unique是流内事件保证，不是重连、进程崩溃后外部业务exactly-once。
+
+这里的“无缺口”以同一集群历史、范围不变、无过滤器、可用历史窗口、完整批次处理为前提。若需全局快照，多条独立watch不能仅凭各自收到某revision便拼成跨范围原子视图；教学采用单prefix单watch。snapshot restore可能改变revision域，不能把旧游标任意接到恢复后的另一段历史。
+
+### Lease与外部fencing
+
+LeaseKeepAlive回复TTL表示服务端此次续租结果；请求发出、连接尚在、本地计时未到都不能代替成功响应。反过来，响应丢失也不证明续租失败。停止续租到关联键删除包含服务端计时、撤销提议与应用，不能承诺精确TTL毫秒。断网旧线程仍可能继续访问外部资源；仅Lease或etcd事务检查再发外部写存在检查后暂停窗口。
+
+外部资源必须保存并检查新任期/代际token，拒绝比已接受代际小的请求。lease ID不是单调token。以创建revision作候选token时要限定同一不回退历史、资源对应关系和代际唯一性；同一Txn创建多个键可以共享revision，不能把revision当跨所有资源/候选者天然唯一ID。旧请求在外部资源接受新token之前仍可能被接受，不能说租约过期瞬间外部资源自动知晓。这承接19已验证边界，21无需重复构造另一个假生产资源。
+
+## 反向检索与未核范围
+
+本轮检索watch/fragment/resume/compaction已知反例，实际打开 [#19179 Missing delete event on watch opened on same revision as compaction request](https://github.com/etcd-io/etcd/issues/19179) 与 [#20221 Watch on future revision might receive old events or notifications](https://github.com/etcd-io/etcd/issues/20221)。前者涉及压缩边界漏删除，后者涉及多成员重连/未来起点，报告本身不能证明固定3.7.1仍有缺陷。本轮未完成修复提交到发行版映射，不写“3.7.1已完全修复”或“3.7.1存在该漏洞”；实现验收应严格检查漏删、回退游标、完整同revision，而不是只数收到几条。
+
+既有14已核 [raft#392](https://github.com/etcd-io/raft/issues/392)、[#397](https://github.com/etcd-io/raft/pull/397)，重复ReadIndex context与批量确认存在旧版反例；raft3.7.0已采用内部索引，etcd3.7.1依赖该版本。该事实来自14源码与父独立核对，不由PR日期推定整个产品正确。20的CI历史修复仍适用作持久化警示，本篇不再扩展持久性实验。
+
+待实现阶段确认：HTTP gateway逐JSON消息的实际 framing、EOF/超时关闭及fragment行为；这些不能仅由Go客户端源码推定Python客户端已实现。建议本篇小数据保持fragment默认false，遇fragment=true显式拒绝而不推进游标；正文解释生产重组算法。这样实测范围清楚，不假装小实验已覆盖超大响应/多watch复用/多成员重连。
+
+## 最小本地实验交接（尚未执行）
+
+复用20已核官方包与Python标准库，单实例、127.0.0.1随机端口、唯一数据目录，全部日志/临时数据/TMPDIR限 `examples/distributed-systems/.build/etcd21/`。不构建新Go二进制、不安装依赖；不读取生产endpoint。可参考20启动、超时、异常保存证据与清理本次进程逻辑，不能覆盖20证据。
+
+- **分页一致快照与并发变化**：种入至少五键，limit=2。首屏后修改尚未扫描的键、插入新键、删除一键；后续固定R仍等于R时完整参考集。故意不固定R的对照应得到不属于参考快照的混合结果；记录全部请求revision、页键和more。
+- **Txn与恢复游标**：同一非嵌套Txn更新两键，断言两个watch事件拥有同revision且完整应用；完成后主动关闭客户端watch连接，在离线期间再写，再从最后完整revision+1恢复。最终静默窗口用线性化Range比较缓存。另以只处理同revision首事件就推进游标的纯消费者错误策略演示漏键，明确不是服务器丢事件。
+- **compaction后重建**：离线时删除缓存中的键，推进并压缩越过旧游标；恢复必须实际收到压缩取消，而不是任意超时均判成功。完整分页List固定新R，整体替换缓存，再Watch R+1；验证旧键已移除和新写被收到。不要仅从压缩点后接流，否则错过删除会永久残留旧键。
+- **Lease实际到期**：Grant后绑定键，成功KeepAlive至少一次，记录服务端TTL；停止续租，通过真实Watch DELETE与线性化Range确认消失，设置宽裕有限测试deadline。未在deadline内观察到应失败/未验证，不改说精确TTL保证；无需SIGKILL或系统时钟修改。
+
+建议正文4–5图：默认读与本地读两条路径；分页固定R对比移动revision；List(R)到Watch(R+1)时间线；同revision多事件/fragment与游标提交；compaction重建状态机及Lease到外部fencing的边界。数字与时间线为教学示例，只有运行后填写现场revision。
+
+## 追加：两项历史问题的有界追踪
+
+2026-09-20追加，只读网页，未运行复现。保留前文作为首轮核验状态，本节更新能够进一步确定的部分；每问题最多追踪两轮链接，不扩展到整个版本缺陷审计。
+
+- **#19179仍未完成修复映射**：[官方issue](https://github.com/etcd-io/etcd/issues/19179)显示Closed，2025-01-13建立，但本轮可读页面未提供关闭修复PR，Development显示无关联分支/PR，Activity评论未展开。一次限定仓库检索仅找到官方robustness索引及后续测试改进issue #19189，没有得到可核的修复diff。Closed不能替代修复证据，故固定3.7.1的对应修复包含关系仍未定；没有据此认定3.7.1受影响。
+- **#20221中的“旧事件”分支已建立源码对应关系**：[issue正文](https://github.com/etcd-io/etcd/issues/20221)明确说明其实合并跟踪“旧事件”和“旧进度通知”两个不同问题，不能用一个修复概括两者。沿直接关联进入 [PR #20281](https://github.com/etcd-io/etcd/pull/20281)，标题为Avoid lowering revision of watchers in the future after restore，2025-07-04合并；再读[修复diff](https://github.com/etcd-io/etcd/pull/20281/files)，syncWatchers将无条件`w.minRev = curRev + 1`改为`w.minRev = max(curRev+1, w.minRev)`，防止restore后未来起点被降低。固定 [3.7.1 watchable_store.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/storage/mvcc/watchable_store.go#L352)第352行实际具有同一保护。可准确表述为“3.7.1源码包含该关键修复逻辑”，依据是diff与固定源码相符，而不是发布日期先后；本轮未证明完整提交祖先关系，未运行其回归测试。该issue另一“旧进度通知”分支的修复PR及3.7.1映射仍未定，停止继续追踪。
+
+
+2026-09-20 实施映射：3场景真实官方3.7.1已运行；消费中断仅内存模拟，非进程崩溃或持久检查点。fragment=false且遇fragment/同revision跨batch明确失败；分页中压缩报失败，不实现生产自动重建循环。6图分别依据默认Range源码、Txn协议、完整Watch修订、固定R分页、compaction恢复设计、Lease源码/API。最后图不表示已做外部fencing实验。运行记录以verification和observations.json.txt为准。
