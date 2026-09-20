@@ -1,0 +1,827 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>计算机体系结构 13：ROB 与精确异常 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="ROB 与精确异常 重命名允许年轻指令提前计算，也允许多个尚未提交的寄存器版本同时存在。程序仍需要一种可解释的异常状态：若某条指令失败，异常处理程序看到的状态应对应顺序执行到该指令之前，而不能是几条年轻指令已经生效、几条较老指令尚未完成的混合结果。 本篇的核心问题是：执行顺序被打乱以后，怎样让异常边界仍然对应一段完整的程序前缀？案例在长延迟操作之后注入异常，并让更年轻的 store 最先完成。验收">
+<meta property="og:type" content="article">
+<meta property="og:title" content="计算机体系结构 13：ROB 与精确异常">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-13-ROB-%E4%B8%8E%E7%B2%BE%E7%A1%AE%E5%BC%82%E5%B8%B8/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="ROB 与精确异常 重命名允许年轻指令提前计算，也允许多个尚未提交的寄存器版本同时存在。程序仍需要一种可解释的异常状态：若某条指令失败，异常处理程序看到的状态应对应顺序执行到该指令之前，而不能是几条年轻指令已经生效、几条较老指令尚未完成的混合结果。 本篇的核心问题是：执行顺序被打乱以后，怎样让异常边界仍然对应一段完整的程序前缀？案例在长延迟操作之后注入异常，并让更年轻的 store 最先完成。验收">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-6.jpg">
+<meta property="article:published_time" content="2026-09-18T16:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-20T11:27:44.359Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="ROB">
+<meta property="article:tag" content="精确异常">
+<meta property="article:tag" content="计算机体系结构">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-6.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "计算机体系结构 13：ROB 与精确异常",
+  "url": "https://magicliang.github.io/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-13-ROB-%E4%B8%8E%E7%B2%BE%E7%A1%AE%E5%BC%82%E5%B8%B8/",
+  "image": "https://magicliang.github.io/img/wall-paper-6.jpg",
+  "datePublished": "2026-09-18T16:00:00.000Z",
+  "dateModified": "2026-09-20T11:27:44.359Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-13-ROB-%E4%B8%8E%E7%B2%BE%E7%A1%AE%E5%BC%82%E5%B8%B8/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '计算机体系结构 13：ROB 与精确异常',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">920</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1068</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">37</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-6.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">计算机体系结构 13：ROB 与精确异常</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">计算机体系结构 13：ROB 与精确异常</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-18T16:00:00.000Z" title="Created 2026-09-19 00:00:00">2026-09-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-20T11:27:44.359Z" title="Updated 2026-09-20 19:27:44">2026-09-20</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84/">计算机体系结构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>9mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-20 19:27:44&quot;}" hidden></div><h1>ROB 与精确异常</h1>
+<p>重命名允许年轻指令提前计算，也允许多个尚未提交的寄存器版本同时存在。程序仍需要一种可解释的异常状态：若某条指令失败，异常处理程序看到的状态应对应顺序执行到该指令之前，而不能是几条年轻指令已经生效、几条较老指令尚未完成的混合结果。</p>
+<p>本篇的核心问题是：执行顺序被打乱以后，怎样让异常边界仍然对应一段完整的程序前缀？案例在长延迟操作之后注入异常，并让更年轻的 store 最先完成。验收同时检查寄存器和内存，尤其检查提前完成的 store 没有污染架构状态。</p>
+<p>证据等级为教学时序模型。四个条目的完成时刻是题设；模型运行后产生完成、提交和异常事件。它没有真实访存延迟、页表、RISC-V 陷阱 CSR 或异常处理程序。原始记录见 <a href="rob.json.txt" target="_blank" rel="noopener">rob.json.txt</a>，可独立执行的附件见 <a href="rob_model.py.txt" target="_blank" rel="noopener">rob_model.py.txt</a>。</p>
+<h2 id="架构状态需要对应一个程序前缀">架构状态需要对应一个程序前缀</h2>
+<p>设程序顺序为 A、B、C、D。A 需要很久，B 最终报告异常，C 是写内存的操作，D 写寄存器。异常处理时允许 A 已生效，不允许 B 自己的正常结果、C 的 store 或 D 的寄存器写入生效。</p>
+<p>“精确”描述的是这个边界。它不表示异常一被发现就立即进入处理程序，也不表示异常期间硬件内部没有任何推测活动。异常可以早于较老指令完成而被检测到，但体系结构可见状态仍要等到合适的提交位置。</p>
+<p><a target="_blank" rel="noopener" href="https://docs.boom-core.org/en/latest/sections/reorder-buffer.html">BOOM 的 ROB 文档</a>区分了完成与提交，并规定队首异常触发流水线清除，年轻指令的架构变化不成为可见结果。本篇用更小的条目模型展示这个条件；完成时刻和提交带宽并非 BOOM 的实测参数。</p>
+<h2 id="rob-保存程序顺序">ROB 保存程序顺序</h2>
+<p>ROB 是 Reorder Buffer，即重排序缓冲区。名称中的“重排序”容易让人只想到把结果重新排列，实际上它至少需要保存指令的程序先后、是否完成、是否异常，以及提交或恢复所需的信息。</p>
+<p>调度器可以先发射 C，再发射 B；ROB 的队列顺序仍然是 A、B、C、D。完成反馈只更新对应条目的状态。提交逻辑从队首检查：未完成就等待；完成且正常则提交；遇到队首异常就恢复到该位置对应的架构边界。不能因为 D 已经 ready 就跨过 B 提交 D。</p>
+<p>本模型的条目保存寄存器结果或 store 的地址和值，类似把结果保留到提交时再应用的简化设计。真实处理器也可以把值保存在物理寄存器文件里，让 ROB 主要保存状态和恢复信息。<a target="_blank" rel="noopener" href="https://docs.boom-core.org/en/latest/sections/rename-stage.html">BOOM 的 Rename Stage 文档</a>明确对比了显式物理寄存器设计和 data-in-ROB 设计；“有 ROB”不等于“所有执行结果都放在 ROB 内”。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs text">程序顺序   A → B → C → D<br>                 ↓<br>ROB        [A][B][C][D]    队首只能从左向右推进<br>完成反馈    ↑  ↑  ↑  ↑     完成次序可以不同<br>                 ↓<br>架构状态   仅应用已获准提交的前缀<br></code></pre></td></tr></table></figure>
+<p>第 12 篇的物理映射说明了旧值怎样继续存在，本篇的提交边界说明了哪个版本能够成为正式架构状态。两者结合以后，年轻指令提前完成不会迫使架构状态提前变化。</p>
+<h2 id="长延迟之后注入异常">长延迟之后注入异常</h2>
+<p>初始状态设为 <code>r1=0、r2=0、mem[128]=7</code>。四个条目按下表进入 ROB：</p>
+<table>
+<thead>
+<tr>
+<th>条目</th>
+<th>语义或事件</th>
+<th style="text-align:right">完成/异常已知时刻</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A_long</td>
+<td>r1 = 42</td>
+<td style="text-align:right">t=6</td>
+</tr>
+<tr>
+<td>B_fault</td>
+<td>产生同步异常</td>
+<td style="text-align:right">t=2</td>
+</tr>
+<tr>
+<td>C_store</td>
+<td>mem[128] = 99</td>
+<td style="text-align:right">t=1</td>
+</tr>
+<tr>
+<td>D_add</td>
+<td>r2 = 88</td>
+<td style="text-align:right">t=3</td>
+</tr>
+</tbody>
+</table>
+<p>条目已经在 t=0 前入队，模型每个整数时刻先接收完成反馈，再尝试一次队首提交。提交宽度固定为一；完成和提交允许在同一时刻发生。t=1 的 store 完成只表示地址和值可供提交，不能据此更新内存。</p>
+<p>实际输出中，t=1、2、3 分别记录 C_store、B_fault、D_add 完成。t=2 已经知道 B 异常，但 A 还没有完成，因而 t=2 不能把 A 跳过。到 t=6，A 完成并提交 r1=42；同一时刻提交额度已用完。t=7 队首变成 B，触发异常并清除 C、D。</p>
+<table>
+<thead>
+<tr>
+<th>时刻</th>
+<th>完成反馈</th>
+<th>提交或恢复</th>
+<th>架构状态变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>C_store ready</td>
+<td>队首 A 未完成</td>
+<td>无</td>
+</tr>
+<tr>
+<td>2</td>
+<td>B_fault 异常已知</td>
+<td>队首 A 未完成</td>
+<td>无</td>
+</tr>
+<tr>
+<td>3</td>
+<td>D_add ready</td>
+<td>队首 A 未完成</td>
+<td>无</td>
+</tr>
+<tr>
+<td>6</td>
+<td>A_long ready</td>
+<td>提交 A_long</td>
+<td>r1=42</td>
+</tr>
+<tr>
+<td>7</td>
+<td>无</td>
+<td>处理 B_fault，取消 C、D</td>
+<td>无</td>
+</tr>
+</tbody>
+</table>
+<p>最终记录为：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs json"><span class="hljs-punctuation">&#123;</span><br>  <span class="hljs-attr">&quot;registers&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">[</span><span class="hljs-punctuation">[</span><span class="hljs-string">&quot;r1&quot;</span><span class="hljs-punctuation">,</span> <span class="hljs-number">42</span><span class="hljs-punctuation">]</span><span class="hljs-punctuation">,</span> <span class="hljs-punctuation">[</span><span class="hljs-string">&quot;r2&quot;</span><span class="hljs-punctuation">,</span> <span class="hljs-number">0</span><span class="hljs-punctuation">]</span><span class="hljs-punctuation">]</span><span class="hljs-punctuation">,</span><br>  <span class="hljs-attr">&quot;memory&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">[</span><span class="hljs-punctuation">[</span><span class="hljs-number">128</span><span class="hljs-punctuation">,</span> <span class="hljs-number">7</span><span class="hljs-punctuation">]</span><span class="hljs-punctuation">]</span><br><span class="hljs-punctuation">&#125;</span><br></code></pre></td></tr></table></figure>
+<p>C 和 D 虽然都完成了，r2 仍为 0，地址 128 仍为 7。这里没有通过“先写入再把值改回去”恢复内存；它们的架构副作用从未被提交。</p>
+<h2 id="用顺序前缀检查恢复结果">用顺序前缀检查恢复结果</h2>
+<p>仅检查最终 r1=42 不够。一个坏实现也可能保留 r1，却漏掉年轻 store 的写入。顺序参考应同时覆盖所有被模型表示的架构状态。</p>
+<p>附件中的 <code>reference_prefix</code> 按程序顺序应用条目，遇到第一个 fault 立即停止。A 被应用，B 和后面的条目不被应用，因此参考状态恰好是上面的 r1、r2 和内存。ROB 运行结束后对整个状态比较，而不是只挑一个结果寄存器。</p>
+<p>这个参考函数与乱序时刻无关。把 C 的完成时刻从 t=1 改成 t=5，正确的异常状态仍然相同；把 A 的完成时刻推迟，则异常处理时间可能推迟。时间变化与语义变化应分别观察。</p>
+<p>验收还包含一个无异常的对照：A 在 t=3 完成，年轻 store S 在 t=1 完成。A 于 t=3 提交，S 于 t=4 提交，此时内存才变成 99。这样可以排除“模型从来不提交 store，所以异常测试通过”的错误实现。</p>
+<h2 id="提前写-store-的故障反例">提前写 store 的故障反例</h2>
+<p>故障模式 <code>early_store=True</code> 只修改一条规则：store 一完成就立即更新内存。其他 ROB 顺序和异常处理逻辑保持不变。于是 t=1 出现：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs json"><span class="hljs-punctuation">&#123;</span><span class="hljs-attr">&quot;cycle&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-number">1</span><span class="hljs-punctuation">,</span> <span class="hljs-attr">&quot;event&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;unsafe_memory_write&quot;</span><span class="hljs-punctuation">,</span> <span class="hljs-attr">&quot;name&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;C_store&quot;</span><span class="hljs-punctuation">&#125;</span><br></code></pre></td></tr></table></figure>
+<p>t=7 仍然出现 trap，C 和 D 也仍然被列为 squashed。单看“取消列表正确”会误判为恢复成功，但最终 <code>mem[128]=99</code>，与顺序参考的 7 不同，<code>matches_reference</code> 为 false。</p>
+<p>这说明检查恢复不能只检查控制信号，还必须检查可能已经传播出去的副作用。普通寄存器结果可以保留在未提交版本里；内存写若已经被其他观察者看见，再把值写回原值也未必能撤销先前影响。本篇只模拟单线程内存状态，尚未加入其他核或设备，因此没有测量这种外部观察。</p>
+<h2 id="store-提交与写入内存仍有距离">store 提交与写入内存仍有距离</h2>
+<p>本教学模型把“store 获准提交”和“更新内存数组”放在同一个动作里。这样可以用十几个事件解释异常隔离，但它省略了真实存储系统的队列和可见性。</p>
+<p>BOOM 文档中的 store 在提交后获得写内存许可，由 LSU 在后续时机排空。提交、store buffer 排空、缓存一致性完成，以及其他核何时观察到结果，不应被压成同一个时间点。第 14 篇只讨论单线程的 load/store 依赖；跨核顺序还需要后面的内存模型章节。</p>
+<p>同样，本篇的异常条目是人为注入的状态，不把它称为真机 page fault。若要实现真正的 RISC-V 异常，还需要依据特权规范保存异常 PC、原因、相关地址，并建立跳转和返回语义。当前模型的 trap 只是轨迹事件。</p>
+<h2 id="恢复时要清除哪些状态">恢复时要清除哪些状态</h2>
+<p>有限模型把寄存器结果保留在条目里，所以丢弃年轻条目就能阻止年轻寄存器结果生效。使用物理寄存器文件的实现还要恢复映射并处理年轻分配的位置；分支预测历史、未完成请求和执行单元中的条目也可能需要标记或取消。</p>
+<p>这些结构能否恢复应由各自的不变量验收。例如年轻 load 即使不能提交，发出的缓存访问也可能留下微架构痕迹；本模型没有缓存状态，不能由“架构状态正确”推出“所有内部痕迹都被清空”。侧信道选修将单独讨论这种边界。</p>
+<p>对于本文的条目模型，验收条件可以直接写成：异常位置之前的所有正常条目按序生效；异常条目及其后条目不产生架构写入；最终寄存器和内存与顺序前缀一致。这些条件比“ROB 里没有残留”更贴近程序可见语义。</p>
+<table>
+<thead>
+<tr>
+<th>检查问题</th>
+<th>对应记录</th>
+<th>本例结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>较老 A 是否先完成并生效</td>
+<td>complete、commit</td>
+<td>t=6 两事件</td>
+</tr>
+<tr>
+<td>异常是否在队首处理</td>
+<td>trap 的时刻与名字</td>
+<td>t=7 的 B_fault</td>
+</tr>
+<tr>
+<td>年轻寄存器是否泄漏</td>
+<td>最终 r2</td>
+<td>0</td>
+</tr>
+<tr>
+<td>年轻 store 是否泄漏</td>
+<td>最终 mem[128]</td>
+<td>7</td>
+</tr>
+<tr>
+<td>检查器能否发现已知错误</td>
+<td>early_store 对照</td>
+<td>状态比较失败</td>
+</tr>
+</tbody>
+</table>
+<h2 id="复跑与验收">复跑与验收</h2>
+<p>在仓库根目录执行累计回归：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">PYTHONDONTWRITEBYTECODE=1 python3 examples/computer-architecture/ooo/src/run_all.py<br></code></pre></td></tr></table></figure>
+<p>下载附件后可以独立执行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">python3 rob_model.py.txt<br></code></pre></td></tr></table></figure>
+<p>阅读 <code>outputs/rob.json</code> 中的 correct、broken_early_store 和 without_fault 三部分。正确模型必须与顺序前缀相等；故障模型必须不相等；无异常对照必须真正写入 99。三项合起来才覆盖这次实验的结论。</p>
+<p>本模型没有实现分支检查点、ROB 容量回压、不同提交宽度、物理寄存器回收、设备访问或跨核可见性。该测试也不验证第 07 篇执行器的特权异常语义，因为那一执行器并未实现它们。</p>
+<h2 id="两道练习">两道练习</h2>
+<p><strong>练习一：</strong> B 的异常在 t=2 已知，为什么不立即跳到处理程序，并让 A 以后完成？</p>
+<p>解答：若处理程序在 A 生效之前读取架构状态，会看见缺少一条较老指令的结果，不能对应异常前的顺序前缀。可以采用不同恢复机制，但必须补足这个状态条件。本模型通过等待 A 提交使条件成立；没有实现先回滚再重执行较老指令的其他方案。</p>
+<p><strong>练习二：</strong> 把提交宽度改为二，允许同一时刻依次检查两个队首条目，异常最早能否在 t=6 处理？年轻 store 能否一并提交？</p>
+<p>解答：按照这个新题设，t=6 可以先提交 A，再看到作为新队首的 B 异常，因此异常处理可提前一周期。C 仍在 B 之后，必须被取消，不能因为还有带宽就越过异常提交。这个推导是手算，当前附件只执行宽度为一的配置。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://docs.boom-core.org/en/latest/sections/reorder-buffer.html">BOOM：The Reorder Buffer and the Dispatch Stage</a>。2026-09-19 核查在线版；ROB State、Commit Stage、Exceptions and Flushes 支持按序提交、队首异常和 store 提交许可的区分。</li>
+<li><a target="_blank" rel="noopener" href="https://docs.boom-core.org/en/latest/sections/rename-stage.html">BOOM：The Rename Stage</a>。Explicit Renaming Design 与 Resets on Exceptions and Flushes 支持结果存储位置和映射恢复的不同设计。</li>
+<li><a href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-12-%E9%87%8D%E5%91%BD%E5%90%8D%E4%B8%8E%E4%B9%B1%E5%BA%8F%E6%89%A7%E8%A1%8C%E7%AA%97%E5%8F%A3/">第 12 篇：重命名与乱序执行窗口</a>。前一篇保存操作数版本，本篇检查这些版本怎样成为架构状态。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-13-ROB-%E4%B8%8E%E7%B2%BE%E7%A1%AE%E5%BC%82%E5%B8%B8/">https://magicliang.github.io/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-13-ROB-%E4%B8%8E%E7%B2%BE%E7%A1%AE%E5%BC%82%E5%B8%B8/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84/">计算机体系结构</a><a class="post-meta__tags" href="/tags/ROB/">ROB</a><a class="post-meta__tags" href="/tags/%E7%B2%BE%E7%A1%AE%E5%BC%82%E5%B8%B8/">精确异常</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-6.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-10-%E6%95%B0%E6%8D%AE%E4%B8%8E%E7%BB%93%E6%9E%84%E5%86%92%E9%99%A9/" title="计算机体系结构 10：数据与结构冒险"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-5.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 10：数据与结构冒险</div></div><div class="info-2"><div class="info-item-1">数据与结构冒险：为什么正确的指令会读到错误的值 下面四条指令顺序执行时，x2 应为 14，x3 应为 21，地址 160 最后保存 21。把它们直接放进五级流水线，若没有前递和互锁，第二条却可能用初始的 x1=0 算出 x2=0。 1234addi x1, x0, 7add  x2, x1, x1add  x3, x2, x1sw   x3, 160(x0) 中心问题是：一个源寄存器在当前拍应从哪里获得数值，又在什么时候必须等待？本篇在第 09 篇的执行器中故意关闭保护，保存真实错误输出，再用前递与停顿恢复正确行为。全部周期与数据均属于“教学时序模型”，没有使用真机 PMU 或 gem5。 RAW 依赖需要确定最新的生产者 RAW 指先写后读的真实数据依赖。第一条 addi 在第三拍 EX 已经计算出 7，但要第五拍 WB 才写入 x1。第二条 add 在第三拍 ID 读 x1，读到的仍是旧值。它在第四拍 EX 使用这个旧值，就会产生错误结果。 CS61C 数据冒险材料分别讨论了停顿、同拍先写后读寄存器堆，以及向 EX 前递的路径。本模型采用 WB 先写、ID 后读的约定：距离较...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-01-%E6%AF%94%E7%89%B9%E6%80%8E%E6%A0%B7%E8%A1%A8%E7%A4%BA%E6%95%B0/" title="计算机体系结构 01：比特怎样表示数"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-142.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 01：比特怎样表示数</div></div><div class="info-2"><div class="info-item-1">计算机体系结构 01：比特怎样表示数 同一串比特没有天然含义。0x3f800000 可以当作无符号整数 1065353216，也可以按 IEEE 风格单精度浮点格式解释为 1.0；0xffffffff 在无符号 32 位整数里是 4294967295，在二补码有符号解释里常被读作 -1。机器执行的是比特操作，程序语言和 ISA 给这些比特加上类型、宽度、对齐和舍入规则。 本篇回答三个问题：定宽整数为什么会回绕；字节序和对齐为什么影响内存解释；浮点加法为什么不能按实数代数随意换括号。证据等级为“手算”和“功能执行”。本篇的 C 程序只执行定义良好的 unsigned 运算、memcpy 对象表示复制、对齐查询和浮点分组；不执行有符号整数溢出。 整数：宽度先于意义 以 8 位为例，1111 1111 如果按无符号数解释，就是： 1128 + 64 + 32 + 16 + 8 + 4 + 2 + 1 = 255 如果按二补码有符号数解释，最高位权重是 -128，其余位仍为正： 1-128 + 64 + 32 + 16 + 8 + 4 + 2 + 1 = -1 同一比特串没有变，解释规则...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-03-ISA-%E6%98%AF%E6%9C%BA%E5%99%A8%E8%83%BD%E6%89%A7%E8%A1%8C%E7%9A%84%E5%A5%91%E7%BA%A6/" title="计算机体系结构 03：ISA 是机器能执行的契约"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-121.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 03：ISA 是机器能执行的契约</div></div><div class="info-2"><div class="info-item-1">ISA 是机器能执行的契约 本篇的核心问题是：给定一串 32 位比特，机器怎样知道这是加法、访存还是分支？ISA（Instruction Set Architecture，指令集架构）回答的不是“电路怎样做得快”，而是“软件交给硬件的这串比特，在架构状态上必须产生什么效果”。架构状态至少包括 PC、通用寄存器、内存中可见的字节，以及遇到不支持指令或非法访问时的处理边界。 本系列第一条实验线选择 RV32I 作为共同语言。RISC-V 官方非特权规范把 RV32I 定义为 32 位整数寄存器宽度的基础整数 ISA；基础整数 ISA 提供算术、load/store 和控制流指令，扩展如乘除法、压缩指令、原子操作和特权机制另行定义。本文只使用一个更小的教学子集：add/sub/and/or、addi/andi/ori、lw/sw、beq/bne/blt/bge。这个子集足够执行一个求和循环，但不能代表完整 RV32I，更不能代表一个操作系统可用的处理器。 证据等级：手算、功能执行。功能执行证据来自 examples/computer-architecture/base/ 中的 C11 ...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-02-%E6%80%8E%E6%A0%B7%E6%AF%94%E8%BE%83%E4%B8%A4%E5%8F%B0%E6%9C%BA%E5%99%A8/" title="计算机体系结构 02：怎样比较两台机器"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-37.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 02：怎样比较两台机器</div></div><div class="info-2"><div class="info-item-1">计算机体系结构 02：怎样比较两台机器 比较两台机器时，不能只问“主频多高”。一个程序的 CPU 时间可以粗略拆成： 12CPU 时间 = 指令数 × CPI × 时钟周期时间        = 指令数 × CPI ÷ 频率 这条式子不是万能测量工具，但能防止三类误判：指令少不一定快，CPI 低不一定快，频率高也不一定快。真正要比较的是同一工作负载、同一正确性条件、同一计时区间下的完成时间；再用指令数、CPI、缓存、分支和带宽解释原因。 本篇证据等级为“手算”和“真机测量”。本机实验使用 macOS 27.0、Apple M4 Pro、14 个逻辑 CPU、24 GiB 内存、Apple clang 21.0.0 和 C 程序重复计时；环境查询命令为 sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize，脚本可采集的环境记录见 intro-environment.txt。没有硬件性能计数器，没有隔离背景负载，也没有锁定频率，因此不声称测得真实指令数、CPI、CPU 频率、缓存 miss 或能耗。 延迟和吞吐不是同一个指标 延迟...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-07-%E6%9C%89%E9%99%90-RV32I-%E5%8F%82%E8%80%83%E6%89%A7%E8%A1%8C%E5%99%A8/" title="计算机体系结构 07：有限 RV32I 参考执行器"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-58.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 07：有限 RV32I 参考执行器</div></div><div class="info-2"><div class="info-item-1">有限 RV32I 参考执行器 本篇的核心问题是：怎样写一个足够小、边界清楚、后续还能复用的指令参考执行器？答案不是一次写完整 CPU，而是先固定状态、输入、输出和失败规则。参考执行器只回答“这条指令按声明的 ISA 子集提交后，架构状态是什么”。它不回答周期数、流水线冒险、缓存命中、异常恢复或操作系统交互。 本篇产出位于 examples/computer-architecture/base/。执行器用 C11 编写，输入是文本形式的 32 位机器码和数据字，输出是 JSONL 提交轨迹。后续 08–11 篇可以把这条提交轨迹作为正确性参照，再在 Python 时序模型里引入阶段、停顿和分支恢复。 证据等级：功能执行。已执行 bash examples/computer-architecture/base/scripts/run_all.sh，结果为 base regression: PASS。原始输出保存在 examples/computer-architecture/base/outputs/。 同名素材目录也保留了本篇可下载附件：rv32i_ref.c、run_all.sh...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-14-LSQ-%E4%B8%8E%E5%86%85%E5%AD%98%E4%BE%9D%E8%B5%96%E9%87%8D%E6%94%BE/" title="计算机体系结构 14：LSQ 与内存依赖重放"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-153.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 14：LSQ 与内存依赖重放</div></div><div class="info-2"><div class="info-item-1">LSQ 与内存依赖重放 寄存器重命名可以在译码附近确定每个源值对应的生产者，内存访问更难：两条不同形式的地址表达式可能在运行时指向同一位置。年轻 load 若绕过了一个尚未算出地址的较老 store，可能读到旧值；即使它所读的缓存行已经命中，程序结果仍然会错。 本篇的核心问题是：store 的数据先准备好、地址稍后才确定时，load 应等待，还是可以先推测执行？核心案例比较两种策略，要求最终结果与同一个顺序程序一致。例子还包含两个较老 store，避免把“找到一个同地址写”误当成“找到正确的写”。 证据等级为教学时序模型。实验限定单线程、四字节、自然对齐访问，没有缓存、地址翻译、多核、原子操作或部分字节重叠。实际事件见 lsq.json.txt，独立可执行模型见 lsq_model.py.txt。 store 有地址和数据两组依赖 一条 sw rs2,offset(rs1) 需要从 rs1 计算有效地址，也需要 rs2 提供待写数据。这两项可能分别依赖不同的较老指令。知道“要写 22”并不能确定应该阻塞哪一个 load；知道“要写地址 128”但数据仍未产生，则已经足以判断某个 ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">ROB 与精确异常</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9E%B6%E6%9E%84%E7%8A%B6%E6%80%81%E9%9C%80%E8%A6%81%E5%AF%B9%E5%BA%94%E4%B8%80%E4%B8%AA%E7%A8%8B%E5%BA%8F%E5%89%8D%E7%BC%80"><span class="toc-number">1.1.</span> <span class="toc-text">架构状态需要对应一个程序前缀</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#rob-%E4%BF%9D%E5%AD%98%E7%A8%8B%E5%BA%8F%E9%A1%BA%E5%BA%8F"><span class="toc-number">1.2.</span> <span class="toc-text">ROB 保存程序顺序</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%95%BF%E5%BB%B6%E8%BF%9F%E4%B9%8B%E5%90%8E%E6%B3%A8%E5%85%A5%E5%BC%82%E5%B8%B8"><span class="toc-number">1.3.</span> <span class="toc-text">长延迟之后注入异常</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E9%A1%BA%E5%BA%8F%E5%89%8D%E7%BC%80%E6%A3%80%E6%9F%A5%E6%81%A2%E5%A4%8D%E7%BB%93%E6%9E%9C"><span class="toc-number">1.4.</span> <span class="toc-text">用顺序前缀检查恢复结果</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%8F%90%E5%89%8D%E5%86%99-store-%E7%9A%84%E6%95%85%E9%9A%9C%E5%8F%8D%E4%BE%8B"><span class="toc-number">1.5.</span> <span class="toc-text">提前写 store 的故障反例</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#store-%E6%8F%90%E4%BA%A4%E4%B8%8E%E5%86%99%E5%85%A5%E5%86%85%E5%AD%98%E4%BB%8D%E6%9C%89%E8%B7%9D%E7%A6%BB"><span class="toc-number">1.6.</span> <span class="toc-text">store 提交与写入内存仍有距离</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%81%A2%E5%A4%8D%E6%97%B6%E8%A6%81%E6%B8%85%E9%99%A4%E5%93%AA%E4%BA%9B%E7%8A%B6%E6%80%81"><span class="toc-number">1.7.</span> <span class="toc-text">恢复时要清除哪些状态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%8D%E8%B7%91%E4%B8%8E%E9%AA%8C%E6%94%B6"><span class="toc-number">1.8.</span> <span class="toc-text">复跑与验收</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E9%81%93%E7%BB%83%E4%B9%A0"><span class="toc-number">1.9.</span> <span class="toc-text">两道练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">1.10.</span> <span class="toc-text">参考资料</span></a></li></ol></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

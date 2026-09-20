@@ -1,0 +1,150 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+# ─── How to run ───
+# python3 examples/computer-architecture/ooo/src/run_all.py
+"""Independent functional decoder for the declared base RV32I subset."""
+
+from pathlib import Path
+from typing import Final, TypedDict
+
+MASK: Final = 0xFFFFFFFF
+
+
+class Event(TypedDict, total=False):
+    step: int
+    pc: int
+    inst: str
+    op: str
+    rd: int
+    value: int
+    imm: int
+    addr: int
+    taken: bool
+    target: int
+    next_pc: int
+    x0: int
+    x1: int
+    halt: str
+    steps: int
+    x3: int
+    mem148: int
+    mem160: int
+    error: str
+
+
+def signed(value: int, width: int) -> int:
+    return value - (1 << width) if value & (1 << (width - 1)) else value
+
+
+def load(path: Path) -> tuple[bytearray, int]:
+    memory = bytearray(4096)
+    text_size = 0
+    data = False
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.split("#")[0].split(";")[0].strip()
+        if not line:
+            continue
+        if line.startswith("."):
+            data = line == ".data"
+            continue
+        numbers = [int(word, 0) for word in line.split()]
+        if data:
+            address, value = numbers
+        else:
+            address, value = text_size, numbers[0]
+            text_size += 4
+        assert address % 4 == 0 and 0 <= address <= 4092
+        memory[address:address + 4] = value.to_bytes(4, "little")
+    return memory, text_size
+
+
+def execute(path: Path, broken_x0: bool = False) -> list[Event]:
+    """Return complete commit/error/halt events; no timing semantics."""
+    memory, text_size = load(path)
+    registers = [0] * 32
+    pc = 0
+    events: list[Event] = []
+    for step in range(1000):
+        if pc == text_size:
+            events.append(Event(halt="pc_at_end", steps=step, x0=registers[0], x1=registers[1], x3=registers[3],
+                                mem148=int.from_bytes(memory[148:152], "little"),
+                                mem160=int.from_bytes(memory[160:164], "little")))
+            return events
+        if pc % 4 or not 0 <= pc < text_size:
+            events.append(Event(step=step, pc=pc, inst="0x00000000", error="pc_out_of_text"))
+            return events
+        word = int.from_bytes(memory[pc:pc + 4], "little")
+        opcode, rd = word & 127, (word >> 7) & 31
+        funct3, rs1, rs2, funct7 = (word >> 12) & 7, (word >> 15) & 31, (word >> 20) & 31, word >> 25
+        a, b = registers[rs1], registers[rs2]
+        imm = signed(word >> 20, 12)
+        following = pc + 4
+        event = Event(step=step, pc=pc, inst=f"0x{word:08x}")
+        value = None
+        error = ""
+        if opcode == 0x33:
+            arithmetic = {(0, 0): ("add", a + b), (0, 32): ("sub", a - b),
+                          (7, 0): ("and", a & b), (6, 0): ("or", a | b)}
+            result = arithmetic.get((funct3, funct7))
+            if result is None:
+                error = "unsupported_r_type"
+            else:
+                event["op"], value = result
+        elif opcode == 0x13:
+            result = {0: ("addi", a + imm), 7: ("andi", a & imm), 6: ("ori", a | imm)}.get(funct3)
+            if result is None:
+                error = "unsupported_i_type"
+            else:
+                event["op"], value = result
+                event["imm"] = imm
+        elif opcode in (0x03, 0x23):
+            store = opcode == 0x23
+            if store:
+                imm = signed(((word >> 25) << 5) | ((word >> 7) & 31), 12)
+            address = (a + imm) & MASK
+            operation = "store" if store else "load"
+            mnemonic = "sw" if store else "lw"
+            if funct3 != 2:
+                error = f"unsupported_{operation}"
+            elif address % 4:
+                error = f"misaligned_{mnemonic}"
+            elif address > 4092:
+                error = f"{operation}_out_of_bounds"
+            elif store and address < text_size:
+                error = "store_to_text"
+            else:
+                event.update(op=mnemonic, addr=address)
+                if store:
+                    memory[address:address + 4] = b.to_bytes(4, "little")
+                    event["value"] = b
+                else:
+                    value = int.from_bytes(memory[address:address + 4], "little")
+        elif opcode == 0x63:
+            offset = ((word >> 31) << 12) | (((word >> 7) & 1) << 11) | (((word >> 25) & 63) << 5) | (((word >> 8) & 15) << 1)
+            branch = {0: ("beq", a == b), 1: ("bne", a != b),
+                      4: ("blt", signed(a, 32) < signed(b, 32)),
+                      5: ("bge", signed(a, 32) >= signed(b, 32))}.get(funct3)
+            if branch is None:
+                error = "unsupported_branch"
+            else:
+                name, taken = branch
+                following = (pc + signed(offset, 13)) & MASK if taken else following
+                event.update(op=name, taken=taken, target=following)
+                if taken and (following % 4 or following > text_size):
+                    error = "branch_target_out_of_text"
+        else:
+            error = "unsupported_opcode"
+        if error:
+            events.append(Event(step=step, pc=pc, inst=f"0x{word:08x}", error=error))
+            return events
+        if value is not None:
+            if rd or broken_x0:
+                registers[rd] = value & MASK
+            event.update(rd=rd, value=registers[rd])
+        event.update(next_pc=following, x0=registers[0])
+        events.append(event)
+        pc = following
+    events.append(Event(step=1000, pc=pc, inst="0x00000000", error="step_limit"))
+    return events

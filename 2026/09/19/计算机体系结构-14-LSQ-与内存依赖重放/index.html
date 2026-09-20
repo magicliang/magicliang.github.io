@@ -1,0 +1,797 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>计算机体系结构 14：LSQ 与内存依赖重放 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="LSQ 与内存依赖重放 寄存器重命名可以在译码附近确定每个源值对应的生产者，内存访问更难：两条不同形式的地址表达式可能在运行时指向同一位置。年轻 load 若绕过了一个尚未算出地址的较老 store，可能读到旧值；即使它所读的缓存行已经命中，程序结果仍然会错。 本篇的核心问题是：store 的数据先准备好、地址稍后才确定时，load 应等待，还是可以先推测执行？核心案例比较两种策略，要求最终结果与">
+<meta property="og:type" content="article">
+<meta property="og:title" content="计算机体系结构 14：LSQ 与内存依赖重放">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-14-LSQ-%E4%B8%8E%E5%86%85%E5%AD%98%E4%BE%9D%E8%B5%96%E9%87%8D%E6%94%BE/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="LSQ 与内存依赖重放 寄存器重命名可以在译码附近确定每个源值对应的生产者，内存访问更难：两条不同形式的地址表达式可能在运行时指向同一位置。年轻 load 若绕过了一个尚未算出地址的较老 store，可能读到旧值；即使它所读的缓存行已经命中，程序结果仍然会错。 本篇的核心问题是：store 的数据先准备好、地址稍后才确定时，load 应等待，还是可以先推测执行？核心案例比较两种策略，要求最终结果与">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-153.png">
+<meta property="article:published_time" content="2026-09-18T16:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-20T11:27:44.359Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="LSQ">
+<meta property="article:tag" content="内存依赖">
+<meta property="article:tag" content="计算机体系结构">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-153.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "计算机体系结构 14：LSQ 与内存依赖重放",
+  "url": "https://magicliang.github.io/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-14-LSQ-%E4%B8%8E%E5%86%85%E5%AD%98%E4%BE%9D%E8%B5%96%E9%87%8D%E6%94%BE/",
+  "image": "https://magicliang.github.io/img/wall-paper-153.png",
+  "datePublished": "2026-09-18T16:00:00.000Z",
+  "dateModified": "2026-09-20T11:27:44.359Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-14-LSQ-%E4%B8%8E%E5%86%85%E5%AD%98%E4%BE%9D%E8%B5%96%E9%87%8D%E6%94%BE/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '计算机体系结构 14：LSQ 与内存依赖重放',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">920</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1068</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">37</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-153.png);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">计算机体系结构 14：LSQ 与内存依赖重放</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">计算机体系结构 14：LSQ 与内存依赖重放</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-18T16:00:00.000Z" title="Created 2026-09-19 00:00:00">2026-09-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-20T11:27:44.359Z" title="Updated 2026-09-20 19:27:44">2026-09-20</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84/">计算机体系结构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.1k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>10mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-20 19:27:44&quot;}" hidden></div><h1>LSQ 与内存依赖重放</h1>
+<p>寄存器重命名可以在译码附近确定每个源值对应的生产者，内存访问更难：两条不同形式的地址表达式可能在运行时指向同一位置。年轻 load 若绕过了一个尚未算出地址的较老 store，可能读到旧值；即使它所读的缓存行已经命中，程序结果仍然会错。</p>
+<p>本篇的核心问题是：store 的数据先准备好、地址稍后才确定时，load 应等待，还是可以先推测执行？核心案例比较两种策略，要求最终结果与同一个顺序程序一致。例子还包含两个较老 store，避免把“找到一个同地址写”误当成“找到正确的写”。</p>
+<p>证据等级为教学时序模型。实验限定单线程、四字节、自然对齐访问，没有缓存、地址翻译、多核、原子操作或部分字节重叠。实际事件见 <a href="lsq.json.txt" target="_blank" rel="noopener">lsq.json.txt</a>，独立可执行模型见 <a href="lsq_model.py.txt" target="_blank" rel="noopener">lsq_model.py.txt</a>。</p>
+<h2 id="store-有地址和数据两组依赖">store 有地址和数据两组依赖</h2>
+<p>一条 <code>sw rs2,offset(rs1)</code> 需要从 rs1 计算有效地址，也需要 rs2 提供待写数据。这两项可能分别依赖不同的较老指令。知道“要写 22”并不能确定应该阻塞哪一个 load；知道“要写地址 128”但数据仍未产生，则已经足以判断某个 load 是否必须等待。</p>
+<p><a target="_blank" rel="noopener" href="https://docs.boom-core.org/en/latest/sections/load-store-unit.html">BOOM 的 LSU 文档</a>将 store 的地址与数据有效状态分开，说明地址和数据可以分别送到 store queue。本例让数据先于地址就绪，是为了暴露地址未决造成的内存依赖问题，不是在声称所有程序都具有这种时序。</p>
+<p>LSQ（Load/Store Queue）通常包含 load queue 和 store queue。对于本篇问题，store 条目至少需要程序年龄、地址及其有效位、数据及其有效位；load 条目需要地址、是否执行、得到的值，以及推测所绕过的较老 store 信息。只保留“load 已完成”这一位，无法在地址随后解决时判断旧结果是否有效。</p>
+<h2 id="顺序语义先确定正确答案">顺序语义先确定正确答案</h2>
+<p>初始内存 <code>mem[128]=7</code>。程序顺序为：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">S0: store 11 -&gt; [128]<br>S1: store 22 -&gt; [unknown until t=4]<br>L2: load [128]<br></code></pre></td></tr></table></figure>
+<p>主案例中 S1 最终地址也是 128。按程序顺序执行后，L2 必须得到 22。S0 与 S1 都比 L2 老，但 S1 是距离 L2 最近的一次同地址写，因此 11 已被覆盖。</p>
+<p>模型固定如下事件：</p>
+<table>
+<thead>
+<tr>
+<th>条目</th>
+<th style="text-align:right">最终地址</th>
+<th style="text-align:right">数据</th>
+<th style="text-align:right">地址就绪</th>
+<th style="text-align:right">数据就绪</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>S0</td>
+<td style="text-align:right">128</td>
+<td style="text-align:right">11</td>
+<td style="text-align:right">t=0</td>
+<td style="text-align:right">t=0</td>
+</tr>
+<tr>
+<td>S1</td>
+<td style="text-align:right">128</td>
+<td style="text-align:right">22</td>
+<td style="text-align:right">t=4</td>
+<td style="text-align:right">t=1</td>
+</tr>
+<tr>
+<td>L2</td>
+<td style="text-align:right">128</td>
+<td style="text-align:right">由访存决定</td>
+<td style="text-align:right">t=0</td>
+<td style="text-align:right">不适用</td>
+</tr>
+</tbody>
+</table>
+<p>表中列出最终地址是为了让读者能检查答案；调度器在 <code>address_ready</code> 之前不能使用这个字段的值。教学实现通过显式时刻判断屏蔽尚未可用的信息。如果预测策略偷看“未来已知的地址”，就不再是地址推测实验。</p>
+<p>所有 store 在这个有限实验中都保留在队列内，没有在 load 验证之前排空到内存。load 因而可能直接从 store queue 取得数据。这种 store-to-load forwarding 与第 10 篇的寄存器前递都需要选择正确生产者，但匹配依据变成了运行时内存地址。</p>
+<h2 id="转发必须选择最近的较老-store">转发必须选择最近的较老 store</h2>
+<p>设 load 的程序序号为 L。同地址候选集合应满足三个条件：store 序号小于 L，地址已经确定，而且与 load 地址匹配。在本篇等宽对齐前提下，候选中的最大序号给出 load 应读取的版本：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">source = max_age(&#123;S | S.age &lt; L.age<br>                    and S.address_known<br>                    and S.address == L.address&#125;)<br></code></pre></td></tr></table></figure>
+<p>如果这个最近候选的数据未就绪，load 必须等它，不能转向更老但数据已就绪的 store。否则会读到已被顺序程序覆盖的版本。若没有匹配候选，可以读内存，但仍须处理地址未知的较老 store 带来的不确定性。</p>
+<p>本模型输入只包含比唯一 load 老的 store，序号检查确保条目按年龄排序；没有实现动态分配 load 序号。这个限制让选择规则可以逐项观察，也说明附件不能直接当作通用 LSQ 使用。</p>
+<p>地址完全相等的比较只在当前边界内足够。例如两字节 store 与四字节 load 可以部分重叠，届时需要按字节合并或等待，不能继续用单一整数值转发。本模型显式拒绝宽度二、地址 130 的四字节访问，以及负地址，不将这些情况静默当成不相关。</p>
+<h2 id="保守等待：等未知地址变成已知">保守等待：等未知地址变成已知</h2>
+<p>保守策略只在所有较老 store 的地址都已解决后执行 load。t=0 时 S0 已可转发 11，但 S1 地址未知，所以 L2 等待。t=1 仅新增 S1 数据=22，并未消除地址依赖。t=4 S1 地址确定为 128，L2 选择较年轻的 S1，读取 22。</p>
+<p>实际输出中的关键事件为：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">t=1  S1.data_ready<br>t=4  S1.address_ready<br>t=4  L2.execute  source=S1 value=22 speculative=false<br>t=4  L2.validated value=22<br></code></pre></td></tr></table></figure>
+<p>这个模型的读取与转发没有额外延迟，所以执行和验证可以在 t=4 同时发生。若改成需要一个周期的转发或缓存访问，应增加真实事件与状态，而不只把统计结果加一。</p>
+<p>保守策略没有错误推测，也不会重复执行这个 load；代价是可能等待一个最终与它地址不同的 store。它提供了正确性基线，但是否更快需要结合实际冲突概率、恢复代价和能够重叠的其他工作判断。</p>
+<h2 id="推测执行：先取已知版本-再检查晚到地址">推测执行：先取已知版本，再检查晚到地址</h2>
+<p>推测策略允许 load 绕过地址未决的较老 store。t=0，S0 的地址和数据已经就绪，L2 从 S0 转发 11，并把结果标记为 speculative。这个标签表示它还不是可提交的确定结果；S1 的地址仍可能推翻它。</p>
+<p>t=4，S1 的地址被解析为 128。S1 比 L2 老，又比 L2 原先使用的 S0 年轻，因此 L2 忽略了一次必须覆盖旧值的写。模型撤销 11，并从 S1 重新执行 load：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">t=0  L2.execute  source=S0 value=11 speculative=true<br>t=4  S1.address_ready address=128<br>t=4  L2.replay   discarded_value=11<br>t=4  L2.execute  source=S1 value=22 speculative=false<br>t=4  L2.validated value=22<br></code></pre></td></tr></table></figure>
+<p>实际记录 <code>replays=1</code>，最终结果仍是 22。故障发现与重放过程不能省略为一句“最后会纠正”；如果年轻计算已经使用过 11，还需要取消并重做那些受影响结果。本附件只有一个 load，没有模拟它的年轻消费者，因此只验证 load 自身的撤销和再执行。</p>
+<p><a target="_blank" rel="noopener" href="https://docs.boom-core.org/en/latest/sections/load-store-unit.html">BOOM LSU 文档的 Memory Ordering Failures 部分</a>描述了 store 地址解决后检测年轻 load 的错误执行，并通过恢复处理内存顺序推测失败。其完整流水线恢复范围比这个单 load 模型更大，不能把本例的一步重放代价当成 BOOM 或真实处理器的处罚周期。</p>
+<h2 id="已使用的较年轻写可以遮蔽更老写">已使用的较年轻写可以遮蔽更老写</h2>
+<p>检测条件不能简化为“任何晚到同地址 store 都导致重放”。假设某个 load 已经从序号 5 的较老 store 转发，而随后才解析出序号 3 的 store 同样写这个地址。只要二者都比 load 老，且没有部分重叠等额外情况，序号 3 的值已经被序号 5 覆盖，不应替代 load 的来源。</p>
+<p>本模型记录 <code>source_store</code>。新解析 store 必须比当前来源更年轻，才可能推翻那个值；如果 load 原先读的是内存，则来源使用哨兵 -1，任何匹配的较老 store 都可能成为遗漏的写。这个年龄判断与“寻找最近较老生产者”的规则一致。</p>
+<p>这项推导限定等宽单地址访问。附件只执行 S0→S1 的覆盖案例，没有穷举所有年龄排列，因而不构成形式证明。扩充输入时应同时检查最终值和是否发生必要的重放。</p>
+<h2 id="非别名与数据晚到的对照">非别名与数据晚到的对照</h2>
+<p>回归把 S1 的最终地址改为 132，其他时序不变。推测 load 在 t=0 仍从 S0 得到 11；t=4 发现 S1 与地址 128 不重叠，不发生重放，最终验证结果为 11。</p>
+<p>这个对照没有证明四周期的程序加速。本模型直到 t=4 才验证 load，也没有模拟能够提前使用 11 的消费者，因而只证明了“更早产生一个后来被证实正确的推测值”。要报告程序耗时收益，需要加入后续依赖工作、提交边界和资源约束。</p>
+<p>另一个对照让唯一较老 store 在 t=1 算出地址 128，数据到 t=4 才成为 33。此时地址依赖早已明确，load 仍需等待数据，最终 t=4 才执行。它防止实现把 <code>address_ready</code> 误当成整个 store 已 ready。</p>
+<table>
+<thead>
+<tr>
+<th>情形</th>
+<th style="text-align:right">首次执行值</th>
+<th style="text-align:right">重放次数</th>
+<th style="text-align:right">最终值</th>
+<th>可以得到的结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主案例保守等待</td>
+<td style="text-align:right">22</td>
+<td style="text-align:right">0</td>
+<td style="text-align:right">22</td>
+<td>未解决地址阻塞 load</td>
+</tr>
+<tr>
+<td>主案例地址推测</td>
+<td style="text-align:right">11</td>
+<td style="text-align:right">1</td>
+<td style="text-align:right">22</td>
+<td>冲突检测和重放恢复结果</td>
+</tr>
+<tr>
+<td>S1 改写地址 132</td>
+<td style="text-align:right">11</td>
+<td style="text-align:right">0</td>
+<td style="text-align:right">11</td>
+<td>非别名时旧推测得到验证</td>
+</tr>
+<tr>
+<td>地址早、数据晚</td>
+<td style="text-align:right">33</td>
+<td style="text-align:right">0</td>
+<td style="text-align:right">33</td>
+<td>匹配来源未有数据仍要等待</td>
+</tr>
+</tbody>
+</table>
+<h2 id="与-rob-和多核内存模型的连接">与 ROB 和多核内存模型的连接</h2>
+<p>ROB 限制架构提交，年轻 load 不能越过尚未解决的较老异常生效。LSQ 则检查 load 是否读到了程序顺序要求的内存版本。按序提交本身不能修复一个已经读错值、却被错误标记为正常完成的 load；LSQ 必须把推测失败反馈给恢复机制。</p>
+<p>单线程中同地址的转发与重放，也不足以说明跨核访问顺序。store buffer 何时排空、其他核何时可见、不同地址访问允许怎样观察，属于一致性和内存模型问题。本篇没有 RVWMO 或 C/C++ 原子语义实验，不用普通共享变量竞争来演示这些结论。</p>
+<h2 id="复跑与验收">复跑与验收</h2>
+<p>累计回归命令为：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">PYTHONDONTWRITEBYTECODE=1 python3 examples/computer-architecture/ooo/src/run_all.py<br></code></pre></td></tr></table></figure>
+<p>附件也可以执行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">python3 lsq_model.py.txt<br></code></pre></td></tr></table></figure>
+<p>检查 <code>outputs/lsq.json</code>：保守和推测主案例都等于顺序结果 22；推测记录中确实出现一次丢弃 11 的 replay；非别名对照为 11 且无重放；数据晚到案例在 t=4 执行；三个非法输入均被拒绝。这里的验证范围包括结果、时间事件和拒绝边界，不包括缓存命中率或真机延迟。</p>
+<h2 id="两道练习">两道练习</h2>
+<p><strong>练习一：</strong> 两个较老 store 都写地址 128，S0 数据已就绪，较年轻的 S1 地址已知但数据未就绪。load 可否先取 S0 的值，并把它标记为已经验证？</p>
+<p>解答：不能。S1 是顺序程序中覆盖 S0 的最近写；地址已经确认相同，结果不是“不确定但可能正确”，而是明确缺少应读取的数据。模型必须等待 S1 的数据，不能把 S0 当成可提交来源。</p>
+<p><strong>练习二：</strong> 保留主案例时序，把 S1 最终地址改为 132，能否只依据 load 在 t=0 得到 11，就宣称比保守策略快四周期？</p>
+<p>解答：不能。地址未决到 t=4 才消除，当前模型的最终验证时刻没有提前；也没有年轻消费者、队列压力或完整提交时间。可以确认推测值更早可用且无需重放，完整性能收益需要增加相应模型和测量区间。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://docs.boom-core.org/en/latest/sections/load-store-unit.html">BOOM：The Load/Store Unit</a>。2026-09-19 核查在线版；Store Instructions、Load Instructions、Memory Ordering Failures 支持地址与数据分离、转发和错误推测恢复。</li>
+<li><a target="_blank" rel="noopener" href="https://docs.boom-core.org/en/latest/sections/reorder-buffer.html">BOOM：The Reorder Buffer</a>。Commit Stage 与 Exceptions and Flushes 支持 store 获准提交和内存顺序推测失败的恢复接口。</li>
+<li><a href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-13-ROB-%E4%B8%8E%E7%B2%BE%E7%A1%AE%E5%BC%82%E5%B8%B8/">第 13 篇：ROB 与精确异常</a>。对比“结果算出”和“允许成为架构状态”的条件。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-14-LSQ-%E4%B8%8E%E5%86%85%E5%AD%98%E4%BE%9D%E8%B5%96%E9%87%8D%E6%94%BE/">https://magicliang.github.io/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-14-LSQ-%E4%B8%8E%E5%86%85%E5%AD%98%E4%BE%9D%E8%B5%96%E9%87%8D%E6%94%BE/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84/">计算机体系结构</a><a class="post-meta__tags" href="/tags/LSQ/">LSQ</a><a class="post-meta__tags" href="/tags/%E5%86%85%E5%AD%98%E4%BE%9D%E8%B5%96/">内存依赖</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-153.png" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-10-%E6%95%B0%E6%8D%AE%E4%B8%8E%E7%BB%93%E6%9E%84%E5%86%92%E9%99%A9/" title="计算机体系结构 10：数据与结构冒险"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-5.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 10：数据与结构冒险</div></div><div class="info-2"><div class="info-item-1">数据与结构冒险：为什么正确的指令会读到错误的值 下面四条指令顺序执行时，x2 应为 14，x3 应为 21，地址 160 最后保存 21。把它们直接放进五级流水线，若没有前递和互锁，第二条却可能用初始的 x1=0 算出 x2=0。 1234addi x1, x0, 7add  x2, x1, x1add  x3, x2, x1sw   x3, 160(x0) 中心问题是：一个源寄存器在当前拍应从哪里获得数值，又在什么时候必须等待？本篇在第 09 篇的执行器中故意关闭保护，保存真实错误输出，再用前递与停顿恢复正确行为。全部周期与数据均属于“教学时序模型”，没有使用真机 PMU 或 gem5。 RAW 依赖需要确定最新的生产者 RAW 指先写后读的真实数据依赖。第一条 addi 在第三拍 EX 已经计算出 7，但要第五拍 WB 才写入 x1。第二条 add 在第三拍 ID 读 x1，读到的仍是旧值。它在第四拍 EX 使用这个旧值，就会产生错误结果。 CS61C 数据冒险材料分别讨论了停顿、同拍先写后读寄存器堆，以及向 EX 前递的路径。本模型采用 WB 先写、ID 后读的约定：距离较...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-02-%E6%80%8E%E6%A0%B7%E6%AF%94%E8%BE%83%E4%B8%A4%E5%8F%B0%E6%9C%BA%E5%99%A8/" title="计算机体系结构 02：怎样比较两台机器"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-37.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 02：怎样比较两台机器</div></div><div class="info-2"><div class="info-item-1">计算机体系结构 02：怎样比较两台机器 比较两台机器时，不能只问“主频多高”。一个程序的 CPU 时间可以粗略拆成： 12CPU 时间 = 指令数 × CPI × 时钟周期时间        = 指令数 × CPI ÷ 频率 这条式子不是万能测量工具，但能防止三类误判：指令少不一定快，CPI 低不一定快，频率高也不一定快。真正要比较的是同一工作负载、同一正确性条件、同一计时区间下的完成时间；再用指令数、CPI、缓存、分支和带宽解释原因。 本篇证据等级为“手算”和“真机测量”。本机实验使用 macOS 27.0、Apple M4 Pro、14 个逻辑 CPU、24 GiB 内存、Apple clang 21.0.0 和 C 程序重复计时；环境查询命令为 sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize，脚本可采集的环境记录见 intro-environment.txt。没有硬件性能计数器，没有隔离背景负载，也没有锁定频率，因此不声称测得真实指令数、CPI、CPU 频率、缓存 miss 或能耗。 延迟和吞吐不是同一个指标 延迟...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-00-%E4%B8%80%E6%AC%A1%E6%95%B0%E7%BB%84%E6%B1%82%E5%92%8C%E7%BB%8F%E8%BF%87%E5%93%AA%E4%BA%9B%E5%B1%82/" title="计算机体系结构 00：一次数组求和经过哪些层"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-104.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 00：一次数组求和经过哪些层</div></div><div class="info-2"><div class="info-item-1">计算机体系结构 00：一次数组求和经过哪些层 一个程序从源代码变成结果，中间至少经过四层问题。ISA 规定软件能看见的寄存器、指令和内存效果；微架构决定这些指令怎样在一台具体处理器里重叠执行；实现工艺决定电路能以怎样的延迟、功耗和面积工作；系统软件负责把进程、虚拟地址、异常和设备组织成可用环境。把这四层混在一起，最常见的错误是用“CPU 很快”“缓存慢了”“编译器优化了”这种句子解释一切。 本篇只做入口：沿一个数组求和程序，把源代码、指令、硬件可见状态和结果检查分开标注。证据等级为“手算”“功能执行”。这里不声称得到流水线周期、缓存命中率或真实 CPU 的内部状态；第 07 篇的基础执行器只提交 RV32I 子集的架构状态，后续流水线和缓存章节再加入时序模型。 问题：同一个结果来自哪几种机制 示例工作负载是把 5 个 32 位整数相加： 12345uint32_t a[5] = &#123;3, 4, 5, 6, 7&#125;;uint32_t sum = 0;for (size_t i = 0; i &lt; 5; i++) &#123;    sum += a[i];&#1...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-03-ISA-%E6%98%AF%E6%9C%BA%E5%99%A8%E8%83%BD%E6%89%A7%E8%A1%8C%E7%9A%84%E5%A5%91%E7%BA%A6/" title="计算机体系结构 03：ISA 是机器能执行的契约"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-121.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 03：ISA 是机器能执行的契约</div></div><div class="info-2"><div class="info-item-1">ISA 是机器能执行的契约 本篇的核心问题是：给定一串 32 位比特，机器怎样知道这是加法、访存还是分支？ISA（Instruction Set Architecture，指令集架构）回答的不是“电路怎样做得快”，而是“软件交给硬件的这串比特，在架构状态上必须产生什么效果”。架构状态至少包括 PC、通用寄存器、内存中可见的字节，以及遇到不支持指令或非法访问时的处理边界。 本系列第一条实验线选择 RV32I 作为共同语言。RISC-V 官方非特权规范把 RV32I 定义为 32 位整数寄存器宽度的基础整数 ISA；基础整数 ISA 提供算术、load/store 和控制流指令，扩展如乘除法、压缩指令、原子操作和特权机制另行定义。本文只使用一个更小的教学子集：add/sub/and/or、addi/andi/ori、lw/sw、beq/bne/blt/bge。这个子集足够执行一个求和循环，但不能代表完整 RV32I，更不能代表一个操作系统可用的处理器。 证据等级：手算、功能执行。功能执行证据来自 examples/computer-architecture/base/ 中的 C11 ...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-12-%E9%87%8D%E5%91%BD%E5%90%8D%E4%B8%8E%E4%B9%B1%E5%BA%8F%E6%89%A7%E8%A1%8C%E7%AA%97%E5%8F%A3/" title="计算机体系结构 12：重命名与乱序执行窗口"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-138.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 12：重命名与乱序执行窗口</div></div><div class="info-2"><div class="info-item-1">重命名与乱序执行窗口 一条长延迟指令尚未完成时，后面的独立指令能否先执行？第 09–11 篇的顺序流水线通过前递、停顿和分支恢复保持正确，但遇到队首等待时，后面的就绪操作仍可能受阻。乱序执行把“按程序顺序进入机器”和“按操作数就绪情况开始计算”分开。寄存器重命名进一步区分不同指令产生的同名寄存器值，使多个版本可以同时存在。 本篇的核心问题是：哪些依赖必须等待，哪些只是寄存器名字重复造成的限制；消除后者以后，加宽发射是否就能缩短执行时间？核心案例只有六条算术操作，支持逐项手算和 Python 事件模型复跑。证据等级为教学时序模型，关键路径另有手算核对。它没有取指、缓存、分支、提交或操作系统，因此六周期的结果不能称为一台完整 CPU 的运行时间。 实验目录为 examples/computer-architecture/ooo/。完整轨迹见 rename.json.txt，独立可运行附件见 rename_model.py.txt。模型的算术语法是题设，不是新增的 RISC-V 指令。 同名寄存器可以表示不同版本的值 设初始架构寄存器满足 ri=i。程序按表中 A 到 F 的顺序执行；...</div></div></div></a><a class="pagination-related" href="/2025/07/29/MESI-%E5%8D%8F%E8%AE%AE%E4%B8%8E-Java-%E5%B9%B6%E5%8F%91%E5%8F%AF%E8%A7%81%E6%80%A7/" title="MESI 协议与 Java 并发可见性——从硬件到 JMM"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-07-29</div><div class="info-item-2">MESI 协议与 Java 并发可见性——从硬件到 JMM</div></div><div class="info-2"><div class="info-item-1">为什么 volatile 能保证可见性？为什么 synchronized 既保证原子性又保证可见性？答案藏在 CPU 缓存一致性协议和内存屏障中。本文将从硬件层面的 MESI 协议出发，逐步上升到 Java 内存模型（JMM），揭示并发可见性问题的完整因果链。  Part 1: CPU 缓存架构 为什么需要 CPU 缓存 现代 CPU 的运算速度远超内存访问速度，两者之间存在巨大的速度鸿沟：    操作 延迟 相对速度     CPU 寄存器访问 ~0.3 ns 1x   L1 Cache 访问 ~1 ns 3x   L2 Cache 访问 ~4 ns 13x   L3 Cache 访问 ~12 ns 40x   主内存访问 ~100 ns 333x    如果 CPU 每次都直接访问主内存，大部分时间都在等待数据。缓存利用了时间局部性和空间局部性，将最近和附近的数据保存在更快的存储中。 多级缓存架构 12345678910111213141516171819┌──────────────────────────────────────────────────────┐│    ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">LSQ 与内存依赖重放</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#store-%E6%9C%89%E5%9C%B0%E5%9D%80%E5%92%8C%E6%95%B0%E6%8D%AE%E4%B8%A4%E7%BB%84%E4%BE%9D%E8%B5%96"><span class="toc-number">1.1.</span> <span class="toc-text">store 有地址和数据两组依赖</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%A1%BA%E5%BA%8F%E8%AF%AD%E4%B9%89%E5%85%88%E7%A1%AE%E5%AE%9A%E6%AD%A3%E7%A1%AE%E7%AD%94%E6%A1%88"><span class="toc-number">1.2.</span> <span class="toc-text">顺序语义先确定正确答案</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%BD%AC%E5%8F%91%E5%BF%85%E9%A1%BB%E9%80%89%E6%8B%A9%E6%9C%80%E8%BF%91%E7%9A%84%E8%BE%83%E8%80%81-store"><span class="toc-number">1.3.</span> <span class="toc-text">转发必须选择最近的较老 store</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BF%9D%E5%AE%88%E7%AD%89%E5%BE%85%EF%BC%9A%E7%AD%89%E6%9C%AA%E7%9F%A5%E5%9C%B0%E5%9D%80%E5%8F%98%E6%88%90%E5%B7%B2%E7%9F%A5"><span class="toc-number">1.4.</span> <span class="toc-text">保守等待：等未知地址变成已知</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%8E%A8%E6%B5%8B%E6%89%A7%E8%A1%8C%EF%BC%9A%E5%85%88%E5%8F%96%E5%B7%B2%E7%9F%A5%E7%89%88%E6%9C%AC-%E5%86%8D%E6%A3%80%E6%9F%A5%E6%99%9A%E5%88%B0%E5%9C%B0%E5%9D%80"><span class="toc-number">1.5.</span> <span class="toc-text">推测执行：先取已知版本，再检查晚到地址</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%B2%E4%BD%BF%E7%94%A8%E7%9A%84%E8%BE%83%E5%B9%B4%E8%BD%BB%E5%86%99%E5%8F%AF%E4%BB%A5%E9%81%AE%E8%94%BD%E6%9B%B4%E8%80%81%E5%86%99"><span class="toc-number">1.6.</span> <span class="toc-text">已使用的较年轻写可以遮蔽更老写</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%9E%E5%88%AB%E5%90%8D%E4%B8%8E%E6%95%B0%E6%8D%AE%E6%99%9A%E5%88%B0%E7%9A%84%E5%AF%B9%E7%85%A7"><span class="toc-number">1.7.</span> <span class="toc-text">非别名与数据晚到的对照</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%8E-rob-%E5%92%8C%E5%A4%9A%E6%A0%B8%E5%86%85%E5%AD%98%E6%A8%A1%E5%9E%8B%E7%9A%84%E8%BF%9E%E6%8E%A5"><span class="toc-number">1.8.</span> <span class="toc-text">与 ROB 和多核内存模型的连接</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%8D%E8%B7%91%E4%B8%8E%E9%AA%8C%E6%94%B6"><span class="toc-number">1.9.</span> <span class="toc-text">复跑与验收</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E9%81%93%E7%BB%83%E4%B9%A0"><span class="toc-number">1.10.</span> <span class="toc-text">两道练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">1.11.</span> <span class="toc-text">参考资料</span></a></li></ol></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

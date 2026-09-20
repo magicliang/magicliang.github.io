@@ -1,0 +1,80 @@
+# 22：协议、协调服务与三成员故障研究
+
+研究日期2026-09-20。已读蓝图22及09、17–21研究，实际重读下列原始来源及固定源码。只写本文件；未启动、停止或运行任何实验，未下载、编译或创建系统临时文件。21已由父验收提交`2362355daeb0244e9298b856bfe15742c75dc802`。本篇实验选定真实三成员etcd；ZooKeeper作为固定文档/源码对照，不声称本篇实测三成员ZooKeeper。
+
+## 来源与核验矩阵
+
+源码版本沿前篇已校验官方包：ZooKeeper3.9.6，SHA `a355171b081b5b60749db8f19cca1528b0df936f`；etcd3.7.1，SHA `5e7fd0de9a57db03ecc11794dc40403a734c07bb`。etcd的raft依赖为3.7.0，不是3.7.1。网页访问日期均为2026-09-20；本地源码路径基于官方source tar且已由父校验，不把本地读取说成网页成功访问。
+
+| 资料标题、日期/版本、URL | 本轮实际定位与支持论断 | 状态/边界 |
+|---|---|---|
+| Lamport，*Paxos Made Simple*，2001-11-01，[PDF](https://lamport.azurewebsites.net/pubs/paxos-simple.pdf) | §2.1–2.5、§3：非拜占庭、持久承诺、跨轮选值、chosen与learned、稳定proposer与多数通信、状态机序列 | 已重读；单值安全不自动提供KV API、Watch或事务 |
+| Ongaro/Ousterhout，*In Search of an Understandable Consensus Algorithm (Extended Version)*，2014-05-20，[PDF](https://raft.github.io/raft.pdf) | §2、§5.4、§8：复制日志、Leader Completeness、读需本任期提交并确认领导权；lease读另有时间假设 | 已重读；原论文不是固定etcd逐行规格，不照搬其对Paxos易用性的主观评价 |
+| Junqueira/Reed/Serafini，*Zab: High-performance broadcast for primary-backup systems*，DSN2011，[作者PDF](https://marcoserafini.github.io/assets/pdf/zab.pdf) | §II、§III、§IV、§VI：稳定存储、FIFO迭代信道、primary order/integrity、发现/同步/广播、恢复保存历史 | 已重读；不是“Paxos不安全”或“只有Zab能流水线”的证据 |
+| [MIT6.5840 Spring2026日程](https://pdos.csail.mit.edu/6.824/schedule.html)、[ZooKeeper讲义](https://pdos.csail.mit.edu/6.824/notes/l-zookeeper.txt) | Paxos/Raft→协调服务→事务的课程结构；讲义客户端FIFO、本地读、session、旧协调者 | 本轮实际读；Raft-like是讲解类比，不等于ZK采用Raft；讲义旧multi措辞与性能数值不充作当前产品规格 |
+| [StanfordCS244B Spring2024日程](https://www.scs.stanford.edu/24sp-cs244b/sched/) | Apr1周ZooKeeper、Apr29周Raft、后续Dynamo/Spanner及拜占庭协议论文 | 本轮实际读；etcd工程比较是本系列补充，不伪造原课程讲次 |
+| ZooKeeper3.9.6 [Internals固定源码文档](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-docs/src/main/resources/markdown/zookeeperInternals.md)，Consistency Guarantees约272–280 | 更新线性化、普通读可旧、OSC(U)、sync不是quorum | 网页r3.9.6抓取失败，实际读已校验本地markdown。其前段“像2PC/不是MultiPaxos”不能代替协议定义；“write before read”须按19限定屏障区间 |
+| ZooKeeper3.9.6 [Admin固定文档](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-docs/src/main/resources/markdown/zookeeperAdmin.md)，Read Only Mode约1940 | ROM默认关闭，需要服务端及客户端支持；显式ROM可在脱离quorum时读旧视图 | 本地实际读；不能从本地读推导默认失去多数后仍可读 |
+| [QuorumPeer.java](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/quorum/QuorumPeer.java#L1473)、[Leader.java](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/quorum/Leader.java#L1336) | LOOKING时只有readonlymode.enabled才启只读服务；processSync无待定提议直接sendSync，否则挂lastProposed | 本地实际读，与Admin及1675独立交叉 |
+| [Learner.java](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/quorum/Learner.java#L746)、[SyncRequestProcessor.java](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/SyncRequestProcessor.java#L227)、[FileTxnLog.java](https://github.com/apache/zookeeper/blob/a355171b081b5b60749db8f19cca1528b0df936f/zookeeper-server/src/main/java/org/apache/zookeeper/server/persistence/FileTxnLog.java#L394) | NEWLEADER前恢复事务commit再currentEpoch；正常flush先commit再交ACK链；forceSync默认启用 | 本地重读；配置关闭或存储失信不在耐故障模型内，未做掉电测试 |
+| etcd [Failure modes，v3.7](https://etcd.io/docs/v3.7/op-guide/failures/)，Leader/Majority/Partition | 切主有中断，已提交写保留，未提交可能覆盖，多数恢复后可重新选主 | 本轮实际读；有限deadline失败不证明永不终止；页面lease文字不扩成所有故障下精确TTL保证 |
+| etcd [API guarantees，v3.7](https://etcd.io/docs/v3.7/learning/api_guarantees/) | 默认KV与serializable区别；Watch保序/保留窗口/非线性化；timeout结果不确定 | 本轮重读；不用该页L847“响应时最新”例子，沿线性化区间原定义；分片和应用游标沿21 |
+| etcd3.7.1 [v3_server.go](https://github.com/etcd-io/etcd/blob/5e7fd0de9a57db03ecc11794dc40403a734c07bb/server/etcdserver/v3_server.go#L96)，Range125–140 | 默认Range调用LinearizableReadNotify，serializable跳过该屏障再本地读取 | 本轮实际web读tag raw，对应固定SHA；少数可读是路径能力，不承诺任意故障中一定响应 |
+
+## 正文比较框架：先辨别对象
+
+Paxos、Zab、Raft是协议/算法族；ZooKeeper、etcd是包含客户端、持久层、管理面和具体API的产品。把五者放在一张“谁支持Watch”的平表会造成类别错误，应分协议表和服务表。
+
+| 协议层 | 安全不变量与恢复证据 | 不能顺手推出的保证 |
+|---|---|---|
+| 单值Paxos→Multi-Paxos | 已chosen值跨ballot保持；交叉quorum与持久promise/accepted、最高已接受值继承共同起作用。多slot需各slot安全并按连续chosen前缀apply，换leader回收接受状态/补空洞 | 一个多数交集不等于完整证明；不要求所有进程主观只认一个proposer；不天然提供读线性化、去重、KV、租约 |
+| Zab | primary产生状态增量前恢复必要前缀；发现与同步把历史传到新quorum；同epoch与跨epochprimary顺序；zxid对应确定事务 | FLE暂选出的leader不等于恢复完成；未提交尾部非一律删除；FIFO广播不等于跨资源事务2PC；primary order非通用因果序 |
+| Raft | Log Matching与Leader Completeness；选举限制阻止缺少已提交项者当选；当前term条目多数确认推进提交，之前前缀随之确定；冲突尾部按匹配规则修复 | 本地leader身份不是线性化读证书；commit不等于本地apply；CheckQuorum不是完整ReadIndex；协议安全不证明磁盘适配正确 |
+
+共同模型是非拜占庭节点与可信持久状态。固定三个投票者需要二票；两票集合必相交，但交点还须保存跨轮承诺/日志并执行各自恢复规则。安全性允许延迟和分区；活性需要多数可通信、足够稳定的领导者及调度/时序条件，不承诺纯异步下总能在有限时间完成。Raft常用随机超时，Paxos需竞争收敛，Zab需合格leader完成恢复；三者都不能把超时变成节点已永久死亡的证明。原Zab模型另有FIFO连接/迭代假设，不能和任意乱序信道混为一谈。
+
+| 服务层（固定版本） | ZooKeeper3.9.6 | etcd3.7.1 |
+|---|---|---|
+| 状态与位置 | 树状znode、data/version与zxid；顺序后缀域受父计数器影响 | 键区间、MVCC主revision与键version；Raftindex/revision非同轴 |
+| 更新与条件 | 线性化更新、version CAS、multi；条件与所保护资源须正确对应 | Txn Compare/Success/Failure；失败比较也可选择写分支 |
+| 普通读 | 本地读，结合客户端顺序的OSC(U)；sync不普遍等价新quorum确认 | 默认线性化，serializable显式允许成员本地旧视图 |
+| 变化通知 | 一次性watch或显式persistent watch，重装/重连仍需重读；persistent不是离线事件日志 | revision历史流；完整批次游标续传，compaction后固定R分页List再Watch(R+1) |
+| 生命周期 | session与ephemeral；服务端清理与客户端得知过期分离 | lease可关联多个键；KeepAlive/expiry/撤销分离，不是网络故障探测真相 |
+| 外部资源 | 两者均须外部执行者检查有效代际/fencing；服务内资格检查无法消除检查后暂停窗口 | 同左；leaseID不保证单调，revision token受集群历史域/恢复边界约束 |
+
+普通读可旧与锁安全并不矛盾：配方通过成功创建、同客户端顺序、CAS和重新检查建立具体不变量，而非要求任意读取始终最新。反之，共识层已安全，也不能替客户端保证观察/缓存游标、外部副作用与重试恰好一次。
+
+## 反向核查：只声明已建立的修订边界
+
+- Lamport[作者说明](https://lamport.azurewebsites.net/pubs/pubs.html#paxos-simple)本轮重读：2015发现PMS文字歧义会导出错误实现，作者要求参考1998精确协议；未公开定位该句。不是Paxos安全性被推翻。22仅比较不新增Paxos实现。
+- [ZOOKEEPER-1675](https://issues.apache.org/jira/browse/ZOOKEEPER-1675)本轮页面仍Open/Unresolved/无FixVersion；Leader1336与固定Internals提供当前无新quorum路径证据。不能仅凭旧Affects列表断言当前漏洞复现，也不能写sync+read无条件线性化。
+- [ZOOKEEPER-4785](https://issues.apache.org/jira/browse/ZOOKEEPER-4785)本轮核FixVersion3.8.4/3.9.2/3.10.0；固定3.9.6 Learner实际有先commit同步事务再currentEpoch/ACK顺序。它说明实现持久屏障会出错，不是此次切主将复现旧数据丢失。
+- [etcd3.6官方发布说明](https://etcd.io/blog/2025/announcing-etcd-3.6/)本轮核Critical bug fixes：CI与数据非原子、单成员成功回复后丢数据、defrag重复apply历史修复；固定3.7.1不据此宣称仍受旧缺陷影响，也不把论文证明当产品所有路径已验证。
+- 21刚完成的Watch反查继续有效：#20221旧事件分支的#20281保护在3.7.1 `watchable_store.go`可见；同issue旧进度分支以及#19179完整修复映射未定。22不再次无限追踪、不把三成员停进程实验称为上述issue复现。14的ReadIndex重复context修订同理，需固定依赖而非按日期猜。
+
+## 三成员真实etcd最小实验（待实现、未执行）
+
+使用已有官方包 `examples/distributed-systems/.build/etcd20/etcd-v3.7.1-darwin-arm64`，Python标准库控制三个独立etcd进程。实验文件、日志、数据、TMPDIR全部位于仓库 `examples/distributed-systems/.build/etcd22/` 下的唯一run目录。无需下载、Go编译或Java辅助程序。节点有独立name/data目录、client/peer回环端口，固定三投票成员和唯一cluster token；禁force-new-cluster、member remove/re-add、删除旧数据来“修复”恢复。认证/TLS、安全生产部署不属于此loopback教学环境。
+
+启动时先为三成员准备好完整initial-cluster映射并launch全部进程，再整体等待就绪；不能逐个调用20的“start后等线性化Range”而卡在第一个节点没有quorum。只保留本次spawn的进程句柄进行停机和清理，不能pkill同名程序。已有目录重启保持成员身份。父已独立读取官方clustering说明：initial-cluster类参数在既有数据重启时被忽略；不据此改换新token或新身份。
+
+1. **健康基线**：保存每成员maintenance/status（version、cluster/member ID、leader、term、commit/applied），核三个不同成员属于同集群。写唯一baseline值获得成功；分别读回，记录revision。按status识别当前leader，不能假设node1是leader。status仅本地观察，最终以已成功业务读写作为进展证据。
+2. **失去一个成员/切主**：停止已确认leader并wait其进程退出，记录实际信号与退出码（选择SIGTERM是进程不可用实验，不是掉电持久性测试）。对仍运行两成员有界等待一致的新leader/业务写成功；可用唯一标记键做成功屏障。请求重试必须保存每次结果，固定幂等值不等于内部只执行一次，不用revision精确增量推断重试次数。检查baseline仍在，新写成功。这覆盖三成员失一且发生领导更换，不能推广为任何性能数值或所有调度进展证明。
+3. **失去两个成员/少数观察**：再停两个存活者中的一个并wait退出，确保真正仅一进程存活后再开始请求。向这个仍可连的endpoint尝试新唯一Put和默认Range，分别记录开始/结束、请求、HTTP/gRPC错误或timeout。不能把ConnectionRefused到已经停掉endpoint冒充无quorum验证。串行化读也发给存活endpoint，若成功则核它只返回已确认本地状态；若失败则如实记录。它的可能可用不代表默认读承诺变弱，也不证明现场陈旧读取，因为本调度没有另一个多数继续推进。
+4. **同目录恢复多数**：恢复一个原成员形成两票，等待实际业务barrier成功，再读取baseline、失一阶段成功写与少数阶段不确定键。先前成功写必须保留；不确定写最终可有可无，不允许把一种结果硬编码成正确。若有，说明无成功响应不等于未执行；若无，仅说明该次后验查询未见，不能证明请求从未进入Raft。关闭原请求连接/记录deadline并不自动保证服务端已撤销。需要“结果已稳定”的论断时必须增加请求完成/服务端处理边界，单次读不存在不能排除迟到请求稍后提交。
+5. **恢复第三成员与收尾**：同目录恢复原leader，等待追平并读已确认标记。核member ID不变，数据正确；index/term可增加，revision不要求与index相等。清理只停本次进程，保留原始日志与数据供审计；finally失败也保留错误和已观察结果，不把cleanup异常藏掉。
+
+每个网络结果至少区分：成功回应、明确API拒绝、transport错误、客户端deadline、解析/断言错误。少数阶段有限时间内无成功只算本轨迹观察，协议“不形成新quorum无法新提交”依据模型与实现资料；不能从实验超时证明普遍安全性。无需为看到特定结果而修改选举超时、暂停系统时钟、造磁盘损坏、重试被防护阻止的程序。
+
+## 运维与观测边界
+
+同机三进程证明真实成员通信与选举路径能在该调度下运行，不能证明跨机故障域独立、网络分区、跨AZ延迟、掉电fsync或灾难恢复。停进程不是网络隔离旧leader，不能声称出现过双leader分区或成功复现stale read。若多数成员永久丢盘，普通重启不是恢复方案；快照恢复可能改集群/修订历史域，watch与fencing必须重新评估。日常恢复原进程与灾难恢复重建集群要分开画。
+
+ZooKeeper文档显示默认ROM关闭，LOOKING不保证服务普通读；只有显式启用服务端ROM且客户端接受对应模式才讨论少数只读。本篇不运行其三节点、不对其性能或失效时间作产品实测比较。Watch/session/lease对照来自17/19/21分别已验收的有限实验与此处固定来源，不伪装成本篇新运行。
+
+建议八张窄图：①协议→存储→API→配方四层；②三节点两quorum交点及其必须保留的证据；③Paxos回收slot、Zab历史同步、Raft选举/补日志三列恢复；④ZK本地读、etcd默认屏障读/serializable读；⑤一次性通知与revision历史流；⑥会话/lease过期到外部fencing的两条时间线；⑦三成员3→2→1→2→3实测状态机；⑧成功、确定拒绝、不确定结果及恢复后查询的证据分类。图中理论与实测数据用明确标签区分，未运行前不填成功耗时。
+
+研究已足够交接。剩余必须由实现验收确认的事项：具体三进程启动参数、故障动作后的实际状态/响应、恢复后值、退出清理与原始证据。没有待补资料阻止上述最小实验；不扩大到独立产品漏洞复现或双产品性能比较。
+
+
+2026-09-20 实施映射：正式驱动etcd22/check.py，实际产物目录.build/etcd22（研究中coordination22为前置命名，未使用）。真实三成员etcd3.7.1已运行3→2→1→2→3；未运行三成员ZooKeeper。8图依据四层责任、quorum交点证据、三协议恢复、固定API读路径、Watch语义、外部fence先前边界、实际五阶段、请求结果分类；理论图与有限观察不互相替代。最终运行证据见verification及observations.json.txt。

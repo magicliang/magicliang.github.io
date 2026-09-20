@@ -1,0 +1,87 @@
+# 24：分片与在线迁移研究
+
+研究日期2026-09-20。已读蓝图24与23研究；23验收提交为`aaab6301d302865222f6b14dd48eedf81337c216`。本文件仅研究及实验设计，未运行、编译、下载、创建临时程序，未修改共享台账。验收是控制器失败后恢复迁移，并保持每个分片最多一个有效服务归属；不是要求每一瞬间恰好一个可用服务者。
+
+## 来源与论断核验
+
+| 来源、日期/版本、URL | 本轮实际读取位置与具体支持内容 | 状态/限制 |
+|---|---|---|
+| MIT6.5840 *Lab5: Sharded Key/Value Service*，Spring2026，[公开任务说明](https://pdos.csail.mit.edu/6.824/labs/lab-shard1.html) | Introduction L18–23区分分片归属与Raft成员；PartA L97–105迁移顺序、Num及RSM；PartB L149–153 current/next恢复；PartC L170–175并发控制器CAS | 实际阅读全文相关段，只读公开规格，不读学生代码/解答，不复刻作业接口实现 |
+| [MIT2026日程](https://pdos.csail.mit.edu/6.824/schedule.html)、[StanfordCS244B Spring2024日程](https://www.scs.stanford.edu/24sp-cs244b/sched/) | MIT Lab5作为累计实现依据；Stanford Dynamo/Spanner为存储论文横向结构 | 两日程实际打开；不伪称Stanford有相同迁移实验。猜测的MIT `notes/l-shard.txt`、`notes/l-bigtable.txt`读取失败，不用作证据 |
+| Chang等，*Bigtable: A Distributed Storage System for Structured Data*，OSDI2006，[USENIX原文](https://www.usenix.org/legacy/event/osdi06/tech/chang/chang.pdf) | §2行键排序、range/tablet作为分布单元；§5.2 PDF第5页：旧server失锁停服、master拿锁删除文件后重分配、恢复先查存活server与metadata | 本代理已实际读§2及§5.2全文；父另读[原文HTML](https://static.usenix.org/event/osdi06/tech/chang/chang_html/)§5.2及§6两次compaction间停服的迁移优化。原系统用Chubby/GFS，不是本篇Raft协议或现云产品规格 |
+| Karger等，*Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web*，STOC1997，[原论文课程镜像](https://www.cs.princeton.edu/courses/archive/fall09/cos518/papers/chash.pdf) | §4.1–4.3，Theorem4.1/4.4：monotonicity、balance与view改变的期望重映射 | 实际读取原论文定义/定理段；父独立读[作者PDF](https://people.csail.mit.edu/karger/Papers/web.pdf)§4与Theorem4.4。对象数均衡不等于字节/请求负载均衡；consistent不等于线性一致；原论文random trees热点复制是另一个工具 |
+| Redis *Cluster specification*，滚动官方文档，读取2026-09-20，[规范](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) | Live reconfiguration L329–364：按key迁移、MIGRATING/IMPORTING、ASK/ASKING/MOVED；L409–412：迁移期间部分多键命令TRYAGAIN | 实际读；仅作不同粒度协议反例，不绑定Redis某发布版本、不做产品实验、不以Redis证明本文方案 |
+| Dynamo，SOSP2007，[作者PDF](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf) | 前篇已核§4.2–4.3虚拟节点与跳过重复物理节点的preference list | 沿23已完成研究，不把历史Dynamo的sloppy归属套入本篇单归属强一致模型 |
+
+反向检索：查MIT Lab5的旧RPC、ErrMaybe、控制器分区边界；公开说明本身明确列重复、乱序、同Num竞争，这些即需要处理的反例，不是已发现课程漏洞。搜索Bigtable errata/tablet assignment未得到可核作者勘误页，不宣称无勘误。检索Redis迁移问题只用官方规范确认“在线”不等于所有请求无错误；搜索出现学生解答及旧问题链接均未打开，不借用其代码或未经核实的当前漏洞结论。
+
+## 关键推导与隐含前提
+
+**映射函数与迁移协议分开。** 范围分片保持相邻键局部性；哈希打散键空间但范围扫描需跨分片；一致性哈希在其前提下限制扩缩容重映射，不能自动搬数据或阻挡旧请求。热点单键仍映射一个服务单元，更多虚拟节点不自动拆分该键的写负载。此结论由映射定义推导，不是本地性能数据。
+
+**不变量是服务权限，不是物理副本数。** 迁移期间旧组冻结副本、新组安装副本可以同时存在。令`serve(g,s)`表示组g会接受分片s的新业务读写，核心要求`sum_g serve(g,s) <= 1`。源冻结后、目标可服务前允许等于0；不能在无副本可用时仍承诺活性。配置目录的当前映射也可能暂时指向冻结源，它是路由提示，不能代替组内权限检查。
+
+**写与冻结必须共享顺序。** 组内RSM将成功写及freeze排成唯一顺序：在freeze前应用的写必须进入迁移快照，之后到达的写拒绝。最小模型将整个分片的读写同时冻结，比公开说明“拒绝Put”的局部措辞更保守；若源继续返回旧读，而目标已接受新写，会构成跨组陈旧读反例。生产方案可设计读重定向/屏障，但不能凭空省略。
+
+**配置序号必要但不充分。** 每次迁移身份绑定`(shard, epoch, source, destination)`及唯一已批准配置；相同epoch却不同目标必须拒绝。各组持久保存见过的迁移身份与阶段，删除数据不删epoch墓碑。相同epoch不同阶段不是一概拒绝：冻结、安装、删除有不同前置状态；同阶段重试应返回原完成结果且不重复产生副作用。高epoch也不能无条件接受任意来源安装，必须验证授权迁移与输入完整性。
+
+**未知结果不是未执行。** 例如目标安装成功但回复丢失，控制器不能清空目标重来；若目标之后已经处理新写，相同epoch的Install必须幂等返回原安装收据，不能覆盖为旧快照。freeze重试返回同一冻结映像；delete重试保留墓碑。一个回复丢失的业务请求在源已完成，迁移应携带请求去重记录及原结果，目标重试按原request ID返回，不再执行。模型选Add/Append这种非幂等操作，避免Put同值把重复执行掩盖。
+
+**恢复依赖持久意图，而非死控制器内存。** 配置存储先持久化唯一next方案，再执行各组转换；新控制器读current/next，并检查组内迁移收据继续未完成阶段。只有所有必要迁移完成后才能发布current。旧控制器恢复时仍受epoch、同身份幂等及配置CAS约束。多个控制器可以帮助同一迁移，不允许同一epoch指向两个不同目的地。控制器超时无权解冻源以求可用，否则目标可能已安装并服务。
+
+**迁移不是Raft成员变更。** 这里从固定成员组A把数据交给另一个固定成员组B，两组分别拥有自己的日志和quorum；不是把A的Raft peer列表改成B，也不能靠两个组分别形成多数就得到跨组唯一归属。控制器协议串起“源撤权→数据证据→目标授权”的跨组先后关系。
+
+## 原创最小实验建议：持久状态机与真实控制器进程恢复
+
+正式源码建议`examples/distributed-systems/sharding24/check.py`，所有运行文件仅`.build/sharding24/run-UUID/`。使用已有Python解释器执行同一正式脚本的controller子模式，不创建临时程序或二进制。以下均为预期，未运行。
+
+模型范围：两个组A/B、两个分片s/t。只迁移s；t始终正常服务。配置服务及每个组用不同持久JSON表示一次原子状态转换的结果，显式抽象组内已正确实现的共识，不重做Raft、不声称文件模型就是多节点分布式系统。为了验证控制器恢复，真实启动控制器子进程；组状态持久文件是实验状态接口，不宣称MIT作业允许共享文件通信。
+
+每个分片状态至少包括`epoch, migration_id, phase, kv, dedup, install_receipt`；配置包括`version, current, next`。每步只改一个服务的状态，禁止一次全局JSON原子替换同时撤源权并授目标权，那会把关键协议问题隐藏为单事务。父驱动串行调度服务转换；若多个子进程可能竞争同一JSON，必须使用明确互斥或由唯一父状态服务串行化，不能假设`os.replace`提供CAS。
+
+持久写可用同目录新JSON、flush/fsync、原子replace；目录fsync若实现需如实记录平台支持。只能称进程崩溃恢复，不称断电耐久性。持久文件、日志、临时替换文件、子进程TMPDIR全部放仓库该运行目录，不使用系统tmp。崩溃点选保存完成之后，避免把文件撕裂恢复另开成大型课题。
+
+### 场景1：冻结后控制器被杀，新进程完成迁移
+
+先在A对s执行带request ID的Add并保存结果，故意丢弃客户端回复。控制器写next后freeze A，保存冻结映像及去重表，在一个确定握手点告知父驱动；父确认freeze事实后杀该子进程并wait取得退出状态。此时驱动应断言s没有可接受读写的组，t仍可处理新业务；此处不是用sleep猜测崩溃点。
+
+新控制器进程只读已有持久状态，不继承内存计划，恢复freeze/transfer/install/delete/publish。目标安装完成后，原客户端使用同request ID在B重试，结果不变且Add只发生一次；另发不同ID请求应生效。旧客户端继续访问A必须被拒绝或返回明确重定向，不能在A新增成功写。
+
+### 场景2：安装回复丢失与旧控制消息
+
+让B保存Install但控制器未记录成功/未收到回复，随后模拟控制器重启。模型可直接对已获授权的B发新业务写（即使目录尚未发布，作为知道目标地址的延迟/绕路客户端），再重发同Install；断言新写不丢失、旧快照不重置状态。控制器查询B收据后能继续，源已delete时也不能强制要求重新取源KV才恢复。
+
+完成A→B后再做B→A的下一epoch迁移。此时投递第一轮迟到的Freeze/Install/Delete，必须拒绝且当前数据/服务归属不变。这样实际检验墓碑/epoch，不只是调用一个`old_epoch`辅助函数。再投递同epoch不同destination计划，必须被配置CAS或迁移身份检查拒绝。不同request ID但重复业务值不能被误当同一请求。
+
+### 场景3：变异与独立观察器
+
+观察器在每个服务状态转换后统计所有组的真实`SERVING`状态，不通过配置目录推算；若实现给旧组偷偷接受写，观察器还应根据客户端成功操作的实际执行组校验权限。维护已确认请求结果及效果次数，跨恢复不清空历史。
+
+至少一个故意变异：跳过freeze就install，使A/B同时SERVING，观察器必须检出。另一个小变异可让重复Install无条件覆盖快照，借场景2明确检出目标新写丢失；可选漏迁移dedup导致Add重复，两者不必全部实现。变异不得仅修改观察器期望以制造失败。
+
+日志记录子进程PID、握手状态、实际终止结果、新PID、每步服务状态与响应，结论限定在已跑调度。历史检查若沿用15/23有限线性化检查器，应适配Add规格、明确超时pending处理；最低验收也可用跨恢复的request ID效果计数加唯一归属不变量，但不能据此宣称所有执行线性一致。
+
+## 图示与待核边界
+
+建议七图：范围/哈希/一致性哈希映射；单个热键不被虚拟节点拆开；组间迁移与组内成员变更；源/目标权限状态图（中间允许0）；freeze/install/delete/publish时间线；控制器断点恢复及持久收据；迟到旧epoch请求被拒绝。机制图要区分“数据已复制”“可接受新请求”“目录已发布”三件事。
+
+主线资料已经足够开始设计；Bigtable/Redis只作交叉与范围边界，不扩大到部署产品。MIT页面是Spring2026滚动网页，未固定源码SHA，也未读公开任务之外的解答。对上述原创协议只给安全归纳与实验预期，真实结果必须等作者运行后补证据。
+
+## 父审后的实现选择
+
+源码独立复核（运行前）：当前实现的旧管理请求首先被全局`cfg.next == migration`授权检查拒绝，因此旧请求测试不能独立证明组内epoch或墓碑检查足够。各管理方法同步读取配置、源和目标文件，是可信串行模型的状态访问，不验证分区中的证书传输。安装切点位于安装函数返回之后，验证后续控制步骤尚未完成时的恢复，不模拟真实网络丢ACK；业务`reply-dropped`也只是驱动丢弃逻辑返回。初版仅Add/Put，已要求补Get与冻结/迁出后读取拒绝断言，再运行。
+
+父全文研究审阅通过。实现仍为原创有限教学模型，采用三个独立服务状态JSON、一个串行控制器，不验证并行控制器或真实Raft共识。最终故障注入使用正式脚本子进程在四个持久步骤后主动`os._exit`约定码，再由父等待并启动全新子进程恢复，替代上文初拟SIGKILL握手方案；明确记录为真实受控进程退出，非SIGKILL/断电。两分片之一迁移，另一个应继续服务；skip-freeze真实变异由各组状态观察器检出双SERVING。当前已授权源码实现，尚未运行。
+
+独立设计复核补充：安装收据绑定(shard,epoch,source,destination)及首次快照身份；同身份不同快照拒绝。目标已迁出或更高epoch时，历史收据不能触发重新SERVING。删除源前必须读取/校验目标同次迁移持久收据，不只相信控制器进度。dedup身份限定分片及client/seq并保存完整payload和首次结果；不能把跨分片全局最高seq随一个分片搬走。当前current可能暂指冻结源；服务授权依据已批准next与迁移状态，超时不能令源自行解冻。可信串行controller模型不证明任意伪造管理RPC安全。
+
+## 最终源码与实测核验（2026-09-20）
+
+前述“尚未运行”为研究阶段状态。父报告作者与父全场景实际通过；本代理只读核对最终`sharding24/check.py`增量及父运行目录`.build/sharding24/run-3522e73a194a4337bfd2e1a2484f4318/`的`observations.json`、freeze完整事件与delete恢复关键事件，未自行执行模型。汇总记录四个切点各有不同的新旧PID，最终值50、原请求重试结果5；移回后epoch2值81；skip-freeze确实留下A/B双SERVING并被观察器检出。
+
+新增Get通过阶段和epoch判定权限。freeze事件实际记录A/B两次Get均拒绝、提前Delete被拒且组状态不变；恢复后迁出A拒读、B返回50。freeze控制器55884以73退出，新控制器55892以0完成；delete切点55896退出后55949从目标安装收据恢复，未依赖已删除源映像。提前Delete的事件只记录通用expected-rejection，具体原因由源码前置检查定位，日志本身没有异常文本。
+
+仍保留边界：旧控制消息首先被全局`next`授权检查拒绝，不能据此独立证明组内epoch/墓碑充分；服务之间直接可信读取JSON，无网络分区、并行控制器CAS或真实Raft；四切点为保存后受控`os._exit`，不是SIGKILL/掉电；安装切点不模拟网络ACK丢失，业务reply-dropped是驱动丢弃结果。新增Get验证有限顺序读与拒绝，不构成完整并发线性化证明。本次只收尾24，不开展25研究。
+
+2026-09-20 实施映射：上文为实施前研究，实际选择受控 os._exit(73)，没有采用父进程kill/握手备选；没有控制器进度日志，恢复读取 next 和各组收据。正式代码 sharding24/check.py 使用独立 config/A/B JSON，单控制器串行；不把 JSON 服务称为 Raft 共识。八图依据原始研究和正式模型，不增加产品事实。
+父及MR静态审阅通过。逻辑返回丢弃不是真实网络丢包；旧RPC先由cfg.next拒绝，没有证明仅靠墓碑的隔离。Get与无安装收据Delete拒绝均纳入实际场景。全文补全量传输与预复制取舍，Bigtable2006§6仅作历史对照。真实执行见verification.txt。

@@ -1,0 +1,94 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+# ─── How to run ───
+# python3 examples/computer-architecture/ooo/src/run_all.py
+"""Bounded ROB trace: younger ready store must not pass an older fault."""
+
+from dataclasses import asdict, dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Entry:
+    name: str
+    ready: int
+    register: str | None = None
+    value: int = 0
+    address: int | None = None
+    fault: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class State:
+    registers: tuple[tuple[str, int], ...]
+    memory: tuple[tuple[int, int], ...]
+
+
+def reference_prefix(entries: tuple[Entry, ...]) -> State:
+    """Apply only the sequential instruction prefix before the first fault."""
+    registers = {"r1": 0, "r2": 0}
+    memory = {128: 7}
+    for entry in entries:
+        if entry.fault:
+            break
+        if entry.register is not None:
+            registers[entry.register] = entry.value
+        if entry.address is not None:
+            memory[entry.address] = entry.value
+    return State(tuple(registers.items()), tuple(memory.items()))
+
+
+def run(entries: tuple[Entry, ...], early_store: bool = False) -> dict:  # noqa: DICT_OK
+    """One commit per cycle; unsafe mode intentionally writes stores early."""
+    registers = {"r1": 0, "r2": 0}
+    memory = {128: 7}
+    events = []
+    head = 0
+    for cycle in range(20):
+        for entry in entries:
+            if entry.ready == cycle:
+                events.append({"cycle": cycle, "event": "complete", "name": entry.name})
+                if early_store and entry.address is not None:
+                    memory[entry.address] = entry.value
+                    events.append({"cycle": cycle, "event": "unsafe_memory_write", "name": entry.name})
+        current = entries[head]
+        if current.ready > cycle:
+            continue
+        if current.fault:
+            events.append({"cycle": cycle, "event": "trap", "name": current.name,
+                           "squashed": [entry.name for entry in entries[head + 1:]]})
+            break
+        if current.register is not None:
+            registers[current.register] = current.value
+        if current.address is not None:
+            memory[current.address] = current.value
+        events.append({"cycle": cycle, "event": "commit", "name": current.name})
+        head += 1
+        if head == len(entries):
+            break
+    state = State(tuple(registers.items()), tuple(memory.items()))
+    return {"events": events, "state": asdict(state), "matches_reference": state == reference_prefix(entries)}
+
+
+def cases() -> dict:  # noqa: DICT_OK
+    entries = (
+        Entry("A_long", 6, register="r1", value=42),
+        Entry("B_fault", 2, fault=True),
+        Entry("C_store", 1, value=99, address=128),
+        Entry("D_add", 3, register="r2", value=88),
+    )
+    correct, broken = run(entries), run(entries, early_store=True)
+    assert correct["matches_reference"]
+    assert not broken["matches_reference"]
+    commits = [row["name"] for row in correct["events"] if row["event"] == "commit"]
+    assert commits == ["A_long"]
+    successful = (Entry("A", 3, register="r1", value=42), Entry("S", 1, address=128, value=99))
+    assert run(successful)["matches_reference"]
+    return {"evidence": "教学时序模型", "entries": [asdict(entry) for entry in entries],
+            "reference": asdict(reference_prefix(entries)), "correct": correct, "broken_early_store": broken,
+            "without_fault": run(successful)}
+
+if __name__ == "__main__":
+    import json
+    print(json.dumps(cases(), ensure_ascii=False, indent=2))

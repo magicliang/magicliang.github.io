@@ -1,0 +1,100 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+# ─── How to run ───
+# python3 examples/computer-architecture/ooo/src/run_all.py
+"""Single-thread, aligned four-byte stores and one younger load; no cache."""
+
+from dataclasses import asdict, dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Store:
+    sequence: int
+    address: int
+    value: int
+    address_ready: int
+    data_ready: int
+    width: int = 4
+
+
+class UnsupportedAccess(ValueError):
+    def __init__(self, address: int, width: int) -> None:
+        self.address, self.width = address, width
+        super().__init__(f"only aligned width=4 accesses: address={address}, width={width}")
+
+
+def validate(address: int, width: int) -> None:
+    if width != 4 or address < 0 or address % 4:
+        raise UnsupportedAccess(address, width)
+
+
+def run(stores: tuple[Store, ...], predict: bool, load_address: int = 128) -> dict:  # noqa: DICT_OK
+    """Validate a speculative load after every older store address resolves."""
+    validate(load_address, 4)
+    for store in stores:
+        validate(store.address, store.width)
+    assert tuple(store.sequence for store in stores) == tuple(sorted(store.sequence for store in stores))
+    events = []
+    load_value = None
+    source = -1
+    executed = False
+    replays = 0
+    for cycle in range(20):
+        for store in stores:
+            if store.data_ready == cycle:
+                events.append({"cycle": cycle, "event": "store_data_ready", "store": store.sequence})
+            if store.address_ready == cycle:
+                events.append({"cycle": cycle, "event": "store_address_ready", "store": store.sequence})
+                if executed and store.address == load_address and store.sequence > source:
+                    events.append({"cycle": cycle, "event": "replay", "store": store.sequence,
+                                   "discarded_value": load_value})
+                    executed = False
+                    replays += 1
+        unresolved = any(store.address_ready > cycle for store in stores)
+        matching = [store for store in stores if store.address_ready <= cycle and store.address == load_address]
+        latest = max(matching, key=lambda store: store.sequence) if matching else None
+        data_pending = latest is not None and latest.data_ready > cycle
+        if not executed and (predict or not unresolved) and not data_pending:
+            source = latest.sequence if latest else -1
+            load_value = latest.value if latest else 7
+            executed = True
+            events.append({"cycle": cycle, "event": "load_execute", "source_store": source,
+                           "value": load_value, "speculative": unresolved})
+        if executed and not unresolved:
+            events.append({"cycle": cycle, "event": "load_validated", "value": load_value})
+            break
+    sequential = 7
+    for store in stores:
+        if store.address == load_address:
+            sequential = store.value
+    assert executed and load_value == sequential
+    return {"predict": predict, "stores": [asdict(store) for store in stores], "load_address": load_address,
+            "events": events, "result": load_value, "replays": replays, "sequential": sequential}
+
+
+def cases() -> dict:  # noqa: DICT_OK
+    alias = (Store(0, 128, 11, 0, 0), Store(1, 128, 22, 4, 1))
+    distinct = (alias[0], Store(1, 132, 22, 4, 1))
+    conservative, predicted = run(alias, False), run(alias, True)
+    assert conservative["result"] == predicted["result"] == 22
+    assert conservative["replays"] == 0 and predicted["replays"] == 1
+    separate = run(distinct, True)
+    assert separate["result"] == 11 and separate["replays"] == 0
+    wait_data = run((Store(0, 128, 33, 1, 4),), False)
+    assert wait_data["events"][-2]["cycle"] == 4
+    rejected = []
+    for address, width in ((130, 4), (128, 2), (-4, 4)):
+        try:
+            validate(address, width)
+        except UnsupportedAccess as error:
+            rejected.append(str(error))
+        else:
+            raise AssertionError("unsupported access accepted")
+    return {"evidence": "教学时序模型", "conservative": conservative, "predicted": predicted,
+            "non_alias": separate, "wait_for_data": wait_data, "rejected": rejected}
+
+if __name__ == "__main__":
+    import json
+    print(json.dumps(cases(), ensure_ascii=False, indent=2))

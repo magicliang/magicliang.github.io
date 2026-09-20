@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>计算机图形学25：WebGPU三角形</title>
+<style>
+body{font:16px/1.6 system-ui,sans-serif;max-width:850px;margin:24px auto;padding:0 16px;color:#172331;background:#f4f6f8}canvas{display:block;width:min(100%,512px);height:auto;background:#101820;border:1px solid #607080;margin:16px 0}button{font:inherit;margin:4px;padding:8px 12px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;padding:16px;border:1px solid #ccd4df}label{display:block}
+</style>
+<h1>WebGPU 三角形</h1>
+<p>初始化后由 GPU 绘制。资源错误仅作用于本页新建的小缓冲；释放按钮只销毁本实验的逻辑设备。</p>
+<button id="init">初始化 / 恢复</button><button id="draw" disabled>重绘并读回像素</button>
+<button id="bad" disabled>测试缺少 COPY_DST</button><button id="release" disabled>释放本实验设备</button>
+<label><input id="simulate" type="checkbox">模拟适配器返回空值（仅验证提示，不改变浏览器）</label>
+<canvas width="512" height="512" aria-label="GPU三角形绘制区域"></canvas>
+<pre id="status" role="status" aria-live="polite">尚未初始化</pre>
+<pre id="history" aria-label="实验记录"></pre>
+<script type="module">
+const canvas=document.querySelector('canvas'),status=document.querySelector('#status'),history=document.querySelector('#history');
+const buttons=['init','draw','bad','release'].map(id=>document.getElementById(id));
+let active=null,busy=false;
+function enabled(){buttons.forEach((b,i)=>b.disabled=busy||(i>0&&!active));}
+function record(label,value){history.textContent+=`${label}: ${JSON.stringify(value)}\n`;}
+async function action(fn){if(busy)return;busy=true;enabled();try{await fn();}catch(e){status.textContent=`失败：${e.message}`;record('exception',String(e));}finally{busy=false;enabled();}}
+const vertices=new Float32Array([0,.75,1,0,0, -.75,-.75,0,1,0, .75,-.75,0,0,1]);
+const code=`
+struct Output { @builtin(position) position:vec4f, @location(0) color:vec3f }
+@vertex fn vs(@location(0) position:vec2f,@location(1) color:vec3f)->Output {
+  var out:Output; out.position=vec4f(position,0.5,1); out.color=color; return out;
+}
+fn encode(v:vec3f)->vec3f {
+  return select(12.92*v,1.055*pow(v,vec3f(1.0/2.4))-0.055,v>vec3f(0.0031308));
+}
+@fragment fn fs(in:Output)->@location(0) vec4f {return vec4f(encode(in.color),1);}
+`;
+async function draw(){
+  const s=active;if(!s)throw Error('设备不可用，请重新初始化');
+  const {device,context,format,pipeline,buffer}=s;
+  device.pushErrorScope('validation');
+  let read;
+  try{
+    const texture=context.getCurrentTexture();
+    read=device.createBuffer({size:512*512*4,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+    const encoder=device.createCommandEncoder();
+    const pass=encoder.beginRenderPass({colorAttachments:[{view:texture.createView(),clearValue:{r:0,g:0,b:0,a:1},loadOp:'clear',storeOp:'store'}]});
+    pass.setPipeline(pipeline);pass.setVertexBuffer(0,buffer);pass.draw(3);pass.end();
+    encoder.copyTextureToBuffer({texture},{buffer:read,bytesPerRow:2048},{width:512,height:512});
+    device.queue.submit([encoder.finish()]);
+    await read.mapAsync(GPUMapMode.READ);
+    const bytes=new Uint8Array(read.getMappedRange());
+    const pixel=(x,y)=>{const i=(y*512+x)*4;return format==='bgra8unorm'?[bytes[i+2],bytes[i+1],bytes[i],bytes[i+3]]:[...bytes.slice(i,i+4)];};
+    const center=pixel(256,256),outside=pixel(0,0);
+    // Pixel-center barycentrics for this w=1 triangle, independent of GPU interpolation.
+    const x=2*256.5/512-1,y=1-2*256.5/512;
+    const red=(y+.75)/1.5,blue=(1-red+x/.75)/2,green=1-red-blue;
+    const encode=v=>Math.round(255*(v<=.0031308?12.92*v:1.055*v**(1/2.4)-.055));
+    const expected=[red,green,blue].map(encode).concat(255);
+    const passCheck=center.every((v,i)=>Math.abs(v-expected[i])<=1)&&outside.join(',')==='0,0,0,255';
+    read.unmap();
+    const error=await device.popErrorScope();s.scopeClosed=true;
+    if(error)throw Error(error.message);
+    if(active!==s||s.lost)throw Error('绘制期间设备已丢失');
+    if(!passCheck)throw Error(`像素检查失败：${center}, expected ${expected}; outside ${outside}`);
+    status.textContent='绘制完成：中心像素与解析插值相差不超过1，背景为黑色。';
+    record('draw',{center,expected,outside,validationError:null});
+  }finally{
+    read?.destroy();
+    if(!s.scopeClosed){const error=await device.popErrorScope();if(error)record('draw validation',error.message);}
+    s.scopeClosed=false;
+  }
+}
+async function init(){
+  if(active){const previous=active;active=null;previous.context.unconfigure();previous.device.destroy();}
+  status.textContent='正在请求设备…';
+  if(!isSecureContext)throw Error('WebGPU需要安全上下文，请使用localhost或HTTPS');
+  if(!navigator.gpu)throw Error('此浏览器未提供WebGPU，请使用支持WebGPU的浏览器');
+  const simulated=document.querySelector('#simulate').checked;
+  const adapter=simulated?null:await navigator.gpu.requestAdapter();
+  if(!adapter){status.textContent=simulated?'模拟：适配器不可用。取消勾选后重新初始化。':'适配器不可用。请检查浏览器与GPU支持，再重新初始化。';record('adapter unavailable',{simulated});return;}
+  const device=await adapter.requestDevice();
+  const context=canvas.getContext('webgpu');if(!context){device.destroy();throw Error('无法创建WebGPU canvas context');}
+  const s={device,context,lost:false};
+  device.lost.then(info=>{s.lost=true;record('device lost',{reason:info.reason,message:info.message});if(active===s){active=null;status.textContent='设备不可用：'+info.reason+'。点击初始化 / 恢复重新创建资源。';enabled();}});
+  device.addEventListener('uncapturederror',e=>{record('uncaptured',e.error.message);status.textContent='未捕获GPU错误：'+e.error.message;});
+  device.pushErrorScope('validation');
+  try{
+    const format=navigator.gpu.getPreferredCanvasFormat();
+    context.configure({device,format,alphaMode:'opaque',usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
+    const buffer=device.createBuffer({size:vertices.byteLength,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+    device.queue.writeBuffer(buffer,0,vertices);
+    const module=device.createShaderModule({code});
+    const compilation=await module.getCompilationInfo();
+    if(compilation.messages.some(m=>m.type==='error'))throw Error(compilation.messages.map(m=>m.message).join('\n'));
+    const pipeline=await device.createRenderPipelineAsync({layout:'auto',vertex:{module,entryPoint:'vs',buffers:[{arrayStride:20,attributes:[{shaderLocation:0,offset:0,format:'float32x2'},{shaderLocation:1,offset:8,format:'float32x3'}]}]},fragment:{module,entryPoint:'fs',targets:[{format}]},primitive:{topology:'triangle-list'}});
+    Object.assign(s,{format,buffer,pipeline});
+  }catch(e){context.unconfigure();device.destroy();throw e;}
+  finally{const error=await device.popErrorScope();if(error){context.unconfigure();device.destroy();throw Error(error.message);}}
+  if(s.lost){context.unconfigure();device.destroy();throw Error('设备在初始化期间丢失');}
+  active=s;
+  record('environment',{date:new Date().toISOString(),userAgent:navigator.userAgent,secureContext:isSecureContext,adapter:{vendor:adapter.info.vendor,architecture:adapter.info.architecture,device:adapter.info.device,description:adapter.info.description},format:s.format});
+  await draw();
+}
+async function bad(){
+  const s=active;s.device.pushErrorScope('validation');
+  const buffer=s.device.createBuffer({size:4,usage:GPUBufferUsage.VERTEX});
+  s.device.queue.writeBuffer(buffer,0,new Uint32Array([7]));
+  const error=await s.device.popErrorScope();buffer.destroy();
+  if(s.lost||active!==s)throw Error('测试期间设备丢失');
+  if(!error)throw Error('预期的COPY_DST验证错误未出现');
+  status.textContent='已捕获预期资源错误：'+error.message;record('expected validation',{name:error.constructor.name,message:error.message});
+}
+buttons[0].onclick=()=>action(init);buttons[1].onclick=()=>action(draw);buttons[2].onclick=()=>action(bad);
+buttons[3].onclick=()=>action(async()=>{if(active){status.textContent='已请求释放本实验设备，等待device.lost通知';active.device.destroy();}});
+</script>
+</html>
