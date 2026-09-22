@@ -1,0 +1,60 @@
+# 25 分布式事务：研究与核验记录
+
+研究日期：2026-09-22。范围对应蓝图 25：2PC、阻塞、Saga/Outbox 与幂等；验收是订单与消息双写失败时间线。此文件是资料与实验设计，不是完成的文章或实验记录。本轮未运行实验、未下载软件、未主动创建系统临时文件或程序；研究写入仅限本文件。工具宿主可能自动记录 hook 日志，不能据此宣称宿主没有任何临时写入。第 26 篇不在本次范围。
+
+## 来源、定位与状态
+
+| 来源及版本/日期 | 实际阅读位置 | 支持的论断与核验状态 |
+|---|---|---|
+| [MIT 6.5840 Spring 2026 Schedule](https://pdos.csail.mit.edu/6.824/schedule.html)，2026 课程页面；[Two-phase commit lecture](https://pdos.csail.mit.edu/6.824/notes/l-2pc.txt)，滚动讲义，访问 2026-09-22 | 讲义 PREPARE/recovery/blocking 段，网页行 225–292 | YES 前保存状态，决定 COMMIT 后先保存再发送；prepared 等待最终决定；复制与跨参与者原子提交职责不同。已实际读取，并与 Gray/Lamport 原文交叉。不能把讲义的锁实现当成所有 2PC 的必需隔离实现。未查阅课程作业答案。 |
+| [Stanford CS244b Spring 2024 Schedule](https://www.scs.stanford.edu/24sp-cs244b/sched/)，2024 | 课程日程中的 Two-phase Commit、Spanner 材料安排 | 支持课程结构由复制/共识进入事务。已实际读取；日程不是事务保证的证明，技术结论以下列原论文为依据。 |
+| Jim Gray / Leslie Lamport，[Consensus on Transaction Commit](https://lamport.azurewebsites.net/video/consensus-on-transaction-commit.pdf)，MSR-TR-2003-96；TODS 31(1), 2006；作者副本最后修订 2017-07-05 | 封面；§2；§3.1–3.3；§4.2；附录 Decide 与最终 refinement statement | 实际读取：稳定存储与 crash/recovery 模型、提交须所有 RM prepared、经典 2PC 的阻塞、按 RM 分别执行 Paxos 的 Paxos Commit。安全性不靠超时；进展需要文中 nonfaulty/及时通信等条件。与 MIT 交叉核验。 |
+| Hector Garcia-Molina / Kenneth Salem，[Sagas](https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf)，SIGMOD 1987，pp.249–259 | 原文 p.250（PDF 第 2 页）；§6 Other Errors，p.254–255 | 实际读取：局部事务可交错、补偿不是恢复旧快照、外部观察不能追溯撤销；补偿自身可能失败而需要替代实现/人工干预。不是现代框架的具体版本保证。 |
+| AWS，[Transactional outbox pattern](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html)，滚动官方指南，访问 2026-09-22 | Intent、Issues and considerations、RDS/outbox relay 示例 | 实际读取：业务记录和待发事件同一数据库事务；重复消息要求幂等。页面中的 FIFO/exactly-once 简写不可外推为业务端到端一次执行，示例也不是可直接照搬的生产实现。 |
+| AWS，[SendMessageBatch API](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html)，滚动 API，访问 2026-09-22 | 开头以及 Failed/Successful 响应字段 | 实际读取：HTTP 200 可同时包含成功和失败项目。交叉核验 Outbox 批量发布：必须按项目判断确认，不能整批标记已发送。 |
+| Chris Richardson，[Idempotent Consumer](https://microservices.io/patterns/communication-style/idempotent-consumer.html)，作者模式说明，页面无固定发布日期，访问 2026-09-22 | Solution，网页行 15–20 | 实际读取：事务中插入 `(subscriberId,messageID)` 唯一键，重复处理可回滚并忽略。支持消费端 inbox 设计；不证明外部支付/邮件也进入这个数据库事务。 |
+| SQLite，[Transaction](https://sqlite.org/lang_transaction.html)，滚动官方文档，访问 2026-09-22 | §2、§2.1–2.2 | 实际读取：显式 BEGIN/COMMIT/ROLLBACK；单写事务；BEGIN IMMEDIATE 可能 BUSY。运行时 SQLite/Python 版本须由作者实验另行采集，本研究没有运行版本命令。 |
+| SQLite，[Atomic Commit In SQLite](https://sqlite.org/atomiccommit.html)，滚动官方文档含历史实现说明，访问 2026-09-22 | §1–2、rollback journal 机制 | 实际读取：该文解释 rollback 模式，不是 WAL 模式算法；持久性依赖文件系统、flush/fsync 与存储假设。不能用本地正常关闭/进程退出测试替代掉电证明。 |
+
+## 论断—证据—核验状态
+
+| 论断 | 证据 | 核验及边界 |
+|---|---|---|
+| 跨两个业务资源的原子提交不同于复制同一个决定。 | Gray/Lamport §2、§4；MIT 讲义末段 | 已交叉核对。不能把“多数参与者 YES”当成“所有参与者 prepared”；参与者可能分别负责扣款、库存，少数任务不能被跳过。 |
+| prepared 的参与者不能因超时自行 abort。 | Gray/Lamport §3.3；MIT 行 249–255 | 已交叉核对。它不知道其他参与者是否已收到 COMMIT。尚未投 YES 的参与者与尚未决定的协调器，处在不同知识状态。 |
+| 协调器失败可能阻塞，不等于任意协调器崩溃都必定阻塞。 | §3.1–3.3 持久决定与消息轨迹 | 已核原协议；若能取得可信终局决定可继续。prepared 且没有决定证据时不能靠等待时长补出证据。 |
+| 原子提交不自动给出全局隔离或可串行化。 | 原论文 §2 的提交规范与 MIT 的锁讨论 | 规范推导：提交协议约束结果一致，读写冲突还需要并发控制。不要用 ACID 一词替代四项分别说明。 |
+| Saga 补偿不能抹去中间结果的可见性。 | Sagas p.250 与 §6 | 原文明确支持。补偿是新的业务事务，保留并发合法更新；补偿失败不保证无条件最终恢复。 |
+| Outbox 只把业务变更与发送意图原子化。 | AWS Outbox；SQLite 事务；发送与标记之间的故障推导 | 已核。发布成功后标记前故障会重复；先标记后发布故障会丢失。broker 确认、消费者效果与生产者提交是不同事件。 |
+| inbox 去重记录与业务效果必须在同一消费端事务中。 | Richardson pattern + SQLite 原子事务 | 已核模式并推导两个错误顺序：先记去重再单独写效果会丢；先写效果再单独记去重会重复。稳定事件 ID 还须绑定不可变语义。 |
+| ACK 不等于端到端业务恰好一次。 | AWS 批量 API；消费者事务边界 | 已核并限定：可验证某数据库内的重复投递无重复效果；未把邮件/第三方 API 纳入该保证。 |
+
+## 反向检索、修订与反例
+
+- Gray/Lamport 作者副本封面明确列出 2017-07-05 修订，并说明修正最后页一处小错误。实际读取最后页的 `PCSpec ⇒ TC!TCSpec`。本轮未逐字取得 2006 版本进行 diff，因此不臆测错误的精确历史文本；文章引用修订副本，不声称原始附录未经修订。作者 `/pubs/transaction-commit.pdf` 访问失败，实际成功路径为上表 `/video/` 链接。
+- Saga 原论文 §6 已主动讨论补偿代码错误使恢复卡住；“Saga 总能补偿成功”直接被原论文反例否定。不得把退款当成擦除支付历史，或把库存恢复成旧数值覆盖其他订单。
+- AWS Outbox 页面里的批发送示例不能作为“函数返回就全部发出”的依据；官方 SendMessageBatch 明确允许 200 加逐项失败。研究未调用 AWS，也不声称复现了 AWS 产品缺陷。
+- SQLite atomiccommit 文档包含特定历史版本的硬件说明。本篇只引用明确的事务与持久性前提，不把其中版本 3.5.0 的 VFS 细节伪装成当前运行源码。实验须记录实际运行版本与 journal/synchronous 设置。
+- 本轮没有找到或验证可据此声称推翻上述协议安全性的正式新勘误。这里的否定结论仅指本轮已读资料，不能表述成不存在其他勘误。
+
+## 最小实验方案（设计，未执行）
+
+采用已有 Python 标准库与 SQLite，正式脚本及所有数据库/日志放在仓库内；不生成临时程序或新二进制，不连接真实 broker。各证据分清“真实 SQLite 事务”和“有限协议/投递模型”。
+
+1. **2PC 知识状态模型。** 两参与者和一个协调器，明确 durable prepared/decision 字段与消息轨迹。准备完成后隐藏协调器：同样的参与者局部状态分别可来自尚未决定和已 commit 但回复未到的轨迹；正确方保持 uncertain，错误超时 abort 在第二条轨迹产生 commit/abort 分裂。再恢复读取 durable decision 并重复投递，验证终局不会改变。不冒充完整 XA、实际网络故障或 Paxos Commit 实现。
+2. **真实本地 Outbox 事务。** producer 数据库同一事务插入订单和 event；在提交前故障回滚，两行都无；提交后两行都有。relay 模型先接受事件再故障于 mark-sent 前，恢复重投。consumer 独立数据库在单一事务插入 inbox 唯一键并更新业务数值；两次投递只有一次效果。补充错误实现“inbox 先独立提交”或“effect 先独立提交”的一条区分性反例。不要用跨库 ATTACH 一次事务偷偷把消息链路变成原子操作。
+3. **Saga 交错。** 初始库存 10，订单 A 预留 2 后库存 8，订单 B 预留 3 后库存 5；A 后续失败，语义补偿释放 A 的 2，结果应为 7。错误快照恢复成 10 会撤销 B 的合法占用。重复补偿须按 saga/step 身份记录一次，不能连续增加库存；明确 B 已观察到 A 的中间结果没有被追溯撤回。
+
+SQLite 可用显式事务控制，避免依赖 Python 版本默认 autocommit 行为；建议 producer/consumer 各自连接、`BEGIN IMMEDIATE`，记录实际 `sqlite_version`。使用独立运行目录及 rollback journal；`synchronous=FULL` 是配置证据，不是掉电实测。只针对预期唯一键冲突做重复判定，不能把任意 IntegrityError/I/O 错误吞成已处理；同 ID 不同 payload 应报错。
+
+尚未验证：真实数据库分布式 prepare、协调器 HA、真实 broker/网络故障、磁盘掉电、生产级重试公平性、去重保留期/GC。若父代理选择进程故障注入，必须记录实际退出点与新进程恢复证据；若只调用模型状态转移，则只称有限轨迹。
+
+## 正文图示建议
+
+建议 6–8 图：订单/消息双写两种丢失窗口；2PC 持久点与消息时序；prepared 不可区分的两条历史；复制层与跨资源提交层；Saga 与并发 B 的库存时间线；Outbox 生产者事务边框与 relay 窗口；consumer inbox/effect 同事务；三个方案的原子边界对照。所有图须标注模型或实际 SQLite，不添加尚未运行的结果。
+
+## 最终实现与核验（2026-09-22）
+
+原设计仅为设计记录。最终2PC模型构造全YES提交与Q投NO中止两世界，检查P相同Prepared视图及两种错误超时决定；未实现决定重放恢复。Saga改用余额100、扣30、其他加20、补偿30。三独立SQLite库、13场景、9组退出73到新PID正常0实际通过；作者Python3.9.6/SQLite3.54.0与父Python3.14.4/SQLite3.51.3忽略PID后JSON一致。
+
+独立正文审阅针对草稿SHA256 cf2b6b90744e4a5e1e6be2515ab579919f47c2585aa20e1f33ec6992745ad94e：发现共同提交与同时可见混淆，最终稿已拆开说明原子提交与隔离/读规则；其余关键论断和9图无实质协议问题。之后补入实际实验结果，顺序anti-ai-tone（0错误0提醒）再anti-persona-fabrication（人工全文+关键词0命中）。实际进程退出不等于断电；2PC仅有限内存协议模型；未运行XA/真实broker/外部支付API/并发Relay。

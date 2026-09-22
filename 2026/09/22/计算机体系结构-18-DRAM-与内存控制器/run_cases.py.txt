@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+from pathlib import Path
+
+from cache_model import (
+    Cache,
+    CacheConfig,
+    ClassifiedCache,
+    DramConfig,
+    DramController,
+    DramRequest,
+    MemoryRequest,
+    hierarchy_amat,
+    latency_function,
+    run_next_line_prefetch,
+    simulate_mshr,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUTS = ROOT / "outputs"
+
+
+def write_json(name: str, value: object) -> None:
+    path = OUTPUTS / name
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def mapping_case() -> dict[str, object]:
+    addresses = [0, 16, 32, 0, 64, 16, 80, 0]
+    direct = ClassifiedCache.create(CacheConfig("direct", sets=4, ways=1, block_size=16))
+    two_way = ClassifiedCache.create(CacheConfig("two-way-lru", sets=2, ways=2, block_size=16))
+    direct_events = [asdict(direct.access(addr)) for addr in addresses]
+    two_way_events = [asdict(two_way.access(addr)) for addr in addresses]
+    assert [e["miss_kind"] for e in direct_events] == ["cold", "cold", "cold", "hit", "cold", "hit", "cold", "conflict"]
+    assert [e["hit"] for e in two_way_events].count(True) > [e["hit"] for e in direct_events].count(True)
+    return {
+        "evidence": "功能执行",
+        "addresses": addresses,
+        "direct": direct_events,
+        "two_way_lru": two_way_events,
+    }
+
+
+def writeback_amat_case() -> dict[str, object]:
+    cache = ClassifiedCache.create(CacheConfig("wb-wa", sets=1, ways=2, block_size=16, hit_latency=1, fill_latency=10))
+    ops = [("read", 0), ("write", 0), ("write", 16), ("read", 32), ("read", 0)]
+    events = [asdict(cache.access(addr, kind)) for kind, addr in ops]
+    assert events[1]["hit"] is True
+    assert any(e["dirty_eviction"] for e in events), events
+    assert cache.cache.stats.fill_bytes == 64
+    assert cache.cache.stats.writeback_bytes == 32
+    amat = hierarchy_amat(l1_hit=1, l1_miss_rate=0.25, l2_hit=8, l2_local_miss_rate=0.5, memory_penalty=80)
+    assert amat == 13.0
+
+    class Access:
+        address = 48
+        write = False
+        size = 4
+
+    class CrossBlockAccess:
+        address = 12
+        write = False
+        size = 8
+
+    interface_cache = ClassifiedCache.create(CacheConfig("pipeline-interface", sets=1, ways=1, block_size=16))
+    pipeline_latency_fn = latency_function(interface_cache)
+    pipeline_latency = pipeline_latency_fn(Access())
+    assert isinstance(pipeline_latency, int) and pipeline_latency >= 1
+    try:
+        pipeline_latency_fn(CrossBlockAccess())
+        raise AssertionError("non-4-byte pipeline access must be rejected")
+    except ValueError as exc:
+        assert "4-byte" in str(exc)
+
+    no_allocate = Cache(CacheConfig("wb-no-write-allocate", sets=1, ways=1, block_size=16, write_back=True, write_allocate=False))
+    no_allocate_event = no_allocate.access(0, "write")
+    assert no_allocate_event.fill_bytes == 0
+    assert no_allocate_event.lower_write_bytes == 4
+    assert no_allocate.stats.lower_write_bytes == 4
+    return {
+        "evidence": "功能执行",
+        "operations": [{"kind": kind, "address": addr} for kind, addr in ops],
+        "events": events,
+        "stats": asdict(cache.cache.stats),
+        "hierarchy_amat_cycles": amat,
+        "pipeline_memory_latency_interface": {
+            "callable": "latency_function(classified_cache)",
+            "sample_latency_cycles": pipeline_latency,
+        },
+        "write_back_no_write_allocate_counterexample": {
+            "event": asdict(no_allocate_event),
+            "stats": asdict(no_allocate.stats),
+        },
+    }
+
+
+def dram_case() -> dict[str, object]:
+    controller = DramController(DramConfig(banks=2, row_size=64, block_size=16, t_rcd=3, t_cl=2, t_rp=3, t_rfc=8, t_refi=20))
+    requests = [
+        DramRequest("row-open", 0, 0),
+        DramRequest("row-hit", 32, 7),
+        DramRequest("row-conflict", 128, 10),
+        DramRequest("after-refresh", 144, 21),
+    ]
+    events = [asdict(controller.issue(req)) for req in requests]
+    assert [event["row_event"] for event in events[:3]] == ["empty", "hit", "conflict"]
+    assert events[1]["wait"] == 0 and events[1]["service"] == 2
+    assert events[2]["service"] == 8
+    assert events[3]["refresh_wait"] > 0
+
+    try:
+        DramConfig(t_rfc=10, t_refi=10)
+        raise AssertionError("teaching DRAM model must reject t_rfc >= t_refi")
+    except ValueError as exc:
+        assert "t_rfc" in str(exc)
+
+    refresh_controller = DramController(DramConfig(banks=1, row_size=64, block_size=16, t_rcd=3, t_cl=2, t_rp=3, t_rfc=8, t_refi=10))
+    before_refresh = asdict(refresh_controller.issue(DramRequest("same-row-before-refresh", 0, 0)))
+    after_refresh = asdict(refresh_controller.issue(DramRequest("same-row-after-refresh", 16, 11)))
+    assert before_refresh["row_event"] == "empty"
+    assert after_refresh["refresh_wait"] > 0
+    assert after_refresh["row_event"] == "empty"
+    assert after_refresh["service"] == refresh_controller.config.t_rcd + refresh_controller.config.t_cl
+    return {
+        "evidence": "教学时序模型",
+        "config": asdict(controller.config),
+        "events": events,
+        "refresh_closes_rows_counterexample": {
+            "before_refresh": before_refresh,
+            "after_refresh": after_refresh,
+        },
+    }
+
+
+def mshr_prefetch_case() -> dict[str, object]:
+    try:
+        simulate_mshr([MemoryRequest("bad", 0)], mshr_entries=0)
+        raise AssertionError("MSHR model must reject zero entries")
+    except ValueError as exc:
+        assert "mshr_entries" in str(exc)
+
+    independent = simulate_mshr([MemoryRequest(f"ind-{i}", i * 16) for i in range(4)], mshr_entries=2)
+    dependent = simulate_mshr([MemoryRequest(f"dep-{i}", i * 16) for i in range(4)], mshr_entries=2, dependent=True)
+    merged = simulate_mshr([MemoryRequest("a", 0), MemoryRequest("b", 4), MemoryRequest("c", 32)], mshr_entries=2)
+    assert independent[-1].done == 20
+    assert dependent[-1].done == 40
+    assert merged[1].merged is True
+    prefetch_events, prefetch_stats = run_next_line_prefetch(
+        [0, 16, 0],
+        CacheConfig("prefetch-pollution", sets=2, ways=1, block_size=16, hit_latency=1, fill_latency=10),
+    )
+    assert prefetch_stats.useful_prefetches == 1
+    assert prefetch_stats.useless_prefetches == 1
+    assert prefetch_stats.fill_bytes == 64
+    assert any(event.kind == "read" and event.address == 0 and not event.hit for event in prefetch_events[2:])
+
+    repeated_use = Cache(CacheConfig("prefetch-repeated-use", sets=2, ways=1, block_size=16))
+    repeated_use.access(16, "prefetch")
+    repeated_use.access(16, "read")
+    repeated_use.access(16, "read")
+    assert repeated_use.stats.useful_prefetches == 1
+
+    reloaded_after_evict = Cache(CacheConfig("prefetch-evict-reload", sets=1, ways=1, block_size=16))
+    reloaded_after_evict.access(0, "prefetch")
+    reloaded_after_evict.access(16, "read")
+    reloaded_after_evict.access(0, "read")
+    reloaded_after_evict.access(0, "read")
+    assert reloaded_after_evict.stats.useless_prefetches == 1
+    assert reloaded_after_evict.stats.useful_prefetches == 0
+    return {
+        "evidence": "教学时序模型",
+        "independent": [asdict(event) for event in independent],
+        "dependent": [asdict(event) for event in dependent],
+        "merged_same_block": [asdict(event) for event in merged],
+        "next_line_prefetch": {
+            "events": [asdict(event) for event in prefetch_events],
+            "stats": asdict(prefetch_stats),
+        },
+        "prefetch_repeated_use_counterexample": asdict(repeated_use.stats),
+        "prefetch_evict_reload_counterexample": asdict(reloaded_after_evict.stats),
+    }
+
+
+def summary_md(cases: dict[str, object]) -> str:
+    mapping = cases["mapping"]["direct"]
+    writeback = cases["writeback_amat"]["stats"]
+    dram = cases["dram"]["events"]
+    mshr = cases["mshr_prefetch"]
+    return "\n".join([
+        "# Cache 教学模型原始输出摘要",
+        "",
+        "- 证据：功能执行 + 教学时序模型。",
+        f"- 映射案例 direct 命中数：{sum(1 for e in mapping if e['hit'])} / {len(mapping)}。",
+        f"- 写回案例 fill_bytes={writeback['fill_bytes']}，writeback_bytes={writeback['writeback_bytes']}。",
+        f"- DRAM 行事件：{', '.join(event['row_event'] for event in dram)}；最后请求 refresh_wait={dram[-1]['refresh_wait']}。",
+        f"- MSHR 独立请求完成周期={mshr['independent'][-1]['done']}，依赖链完成周期={mshr['dependent'][-1]['done']}。",
+        f"- 预取 useful={mshr['next_line_prefetch']['stats']['useful_prefetches']}，useless={mshr['next_line_prefetch']['stats']['useless_prefetches']}。",
+        "",
+    ])
+
+
+def main() -> None:
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    cases = {
+        "mapping": mapping_case(),
+        "writeback_amat": writeback_amat_case(),
+        "dram": dram_case(),
+        "mshr_prefetch": mshr_prefetch_case(),
+    }
+    for name, value in cases.items():
+        write_json(f"{name}.json", value)
+    (OUTPUTS / "summary.md").write_text(summary_md(cases))
+    print(OUTPUTS)
+
+
+if __name__ == "__main__":
+    main()

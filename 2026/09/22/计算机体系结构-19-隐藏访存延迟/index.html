@@ -1,0 +1,794 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>计算机体系结构 19：隐藏访存延迟 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="隐藏访存延迟 一次 cache miss 的原始延迟可能很长，但程序不一定完全停住。若后面还有独立 miss，非阻塞 cache 可以让多个请求同时在路上；若后面的地址依赖前一次 load 的结果，处理器只能等。预取则尝试在需求访问前把数据带来，但它也会消耗带宽、占 cache line，甚至挤掉后续需要的数据。 本篇的核心问题是：MSHR 怎样让独立 miss 重叠，同一 block 的 mis">
+<meta property="og:type" content="article">
+<meta property="og:title" content="计算机体系结构 19：隐藏访存延迟">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-19-%E9%9A%90%E8%97%8F%E8%AE%BF%E5%AD%98%E5%BB%B6%E8%BF%9F/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="隐藏访存延迟 一次 cache miss 的原始延迟可能很长，但程序不一定完全停住。若后面还有独立 miss，非阻塞 cache 可以让多个请求同时在路上；若后面的地址依赖前一次 load 的结果，处理器只能等。预取则尝试在需求访问前把数据带来，但它也会消耗带宽、占 cache line，甚至挤掉后续需要的数据。 本篇的核心问题是：MSHR 怎样让独立 miss 重叠，同一 block 的 mis">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-150.jpg">
+<meta property="article:published_time" content="2026-09-21T16:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-22T13:09:10.492Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="MSHR">
+<meta property="article:tag" content="计算机体系结构">
+<meta property="article:tag" content="预取">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-150.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "计算机体系结构 19：隐藏访存延迟",
+  "url": "https://magicliang.github.io/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-19-%E9%9A%90%E8%97%8F%E8%AE%BF%E5%AD%98%E5%BB%B6%E8%BF%9F/",
+  "image": "https://magicliang.github.io/img/wall-paper-150.jpg",
+  "datePublished": "2026-09-21T16:00:00.000Z",
+  "dateModified": "2026-09-22T13:09:10.492Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-19-%E9%9A%90%E8%97%8F%E8%AE%BF%E5%AD%98%E5%BB%B6%E8%BF%9F/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '计算机体系结构 19：隐藏访存延迟',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">935</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1078</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-150.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">计算机体系结构 19：隐藏访存延迟</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">计算机体系结构 19：隐藏访存延迟</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-21T16:00:00.000Z" title="Created 2026-09-22 00:00:00">2026-09-22</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-22T13:09:10.492Z" title="Updated 2026-09-22 21:09:10">2026-09-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84/">计算机体系结构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">1.9k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>6mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-22 21:09:10&quot;}" hidden></div><h1>隐藏访存延迟</h1>
+<p>一次 cache miss 的原始延迟可能很长，但程序不一定完全停住。若后面还有独立 miss，非阻塞 cache 可以让多个请求同时在路上；若后面的地址依赖前一次 load 的结果，处理器只能等。预取则尝试在需求访问前把数据带来，但它也会消耗带宽、占 cache line，甚至挤掉后续需要的数据。</p>
+<p>本篇的核心问题是：MSHR 怎样让独立 miss 重叠，同一 block 的 miss 怎样合并，依赖链为什么无法重叠；预取命中率之外还要统计什么流量和污染？核心案例使用两个 MSHR entry、10 周期 miss latency 和 next-line prefetch。证据等级为教学时序模型，关键反例由功能断言保护。</p>
+<p>实验目录为 <code>examples/computer-architecture/cache/</code>。本文附件包括 <a href="mshr_prefetch.json.txt" target="_blank" rel="noopener">mshr_prefetch.json.txt</a>、<a href="cache_model.py.txt" target="_blank" rel="noopener">cache_model.py.txt</a> 和 <a href="run_cases.py.txt" target="_blank" rel="noopener">run_cases.py.txt</a>。</p>
+<h2 id="非阻塞-cache-保存-还没回来-的-miss">非阻塞 cache 保存“还没回来”的 miss</h2>
+<p>MSHR（Miss Status Holding Register）可以理解成未完成 miss 的记录。它保存目标 block、完成时刻和等待这个 block 的请求。gem5 的 classic cache 文档也把默认 cache 描述为带 MSHR 和 write buffer 的 non-blocking cache。</p>
+<p>本文模型把每个新 block miss 占用一个 MSHR entry，10 个周期后完成。若新请求访问的 block 已经在 outstanding 表里，它不再发起第二个下层请求，而是 merge 到已有 miss，完成时刻相同。若 MSHR entry 已满，新 miss 必须等最早的 outstanding 完成。</p>
+<p>这套模型没有端口、仲裁、写缓冲、乱序提交或 cache coherence。它只回答一个问题：当 miss latency 固定时，独立性和 entry 数怎样影响完成时间。</p>
+<p>隐藏延迟的第一步是把“发出请求”和“等待返回”分离。模型用 <code>outstanding[block] = done_time</code> 保存未完成 miss；同一 block 的后续请求可以合并到已有完成时间，独立 block 则受 MSHR entry 数量限制。</p>
+<h2 id="独立-miss-和依赖-miss-的时间表">独立 miss 和依赖 miss 的时间表</h2>
+<p>四个独立请求分别访问 <code>0, 16, 32, 48</code>，block size 为 16B，MSHR entry 数为 2。模型结果为：</p>
+<table>
+<thead>
+<tr>
+<th>请求</th>
+<th style="text-align:right">block</th>
+<th style="text-align:right">issue</th>
+<th style="text-align:right">done</th>
+<th>merged</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ind-0</td>
+<td style="text-align:right">0</td>
+<td style="text-align:right">0</td>
+<td style="text-align:right">10</td>
+<td>false</td>
+</tr>
+<tr>
+<td>ind-1</td>
+<td style="text-align:right">1</td>
+<td style="text-align:right">0</td>
+<td style="text-align:right">10</td>
+<td>false</td>
+</tr>
+<tr>
+<td>ind-2</td>
+<td style="text-align:right">2</td>
+<td style="text-align:right">10</td>
+<td style="text-align:right">20</td>
+<td>false</td>
+</tr>
+<tr>
+<td>ind-3</td>
+<td style="text-align:right">3</td>
+<td style="text-align:right">10</td>
+<td style="text-align:right">20</td>
+<td>false</td>
+</tr>
+</tbody>
+</table>
+<p>前两个 miss 同时在路上，后两个等 entry 腾出。总完成时间是 20，而不是 <code>4 × 10 = 40</code>。</p>
+<p>依赖链使用同样四个地址，但每个请求的 ready time 依赖前一个结果。模型结果最后完成时刻为 40。MSHR entry 仍有 2 个，但没有独立工作可填满第二个 entry。</p>
+<p>因此，内存级并行不是 cache 的单方面能力，而是硬件能力和程序依赖图的交集。数组分块、结构体布局、指针追逐和编译器调度都会改变可见的独立请求数量。</p>
+<h2 id="同一-block-的-miss-应当合并">同一 block 的 miss 应当合并</h2>
+<p>请求 <code>a</code> 访问地址 0，请求 <code>b</code> 访问地址 4。二者属于同一 block。若 a 的 miss 尚未回来，b 不应再发一个相同 block 的下层请求；它可以挂在同一个 MSHR 上等待。</p>
+<p>模型输出中 <code>b.merged = true</code>，done 与 a 相同。这一步很小，但它防止把“同一 cache line 内的多个 word”误计成多次下层流量。第 16 篇讲过 block 粒度；MSHR 也应按 block 合并，而不是按字节地址合并。</p>
+<p>合并有边界。两个请求同 block 但权限、写入语义、原子操作或一致性状态不同，真实系统可能需要更复杂的处理。本文只覆盖普通读 miss 的教学场景。</p>
+<h2 id="预取要同时看-useful-useless-和-fill-bytes">预取要同时看 useful、useless 和 fill bytes</h2>
+<p>next-line prefetch 的规则很简单：每次 demand read 后，预取下一个 block。需求地址序列为 <code>0, 16, 0</code>，cache 为 2 sets × 1 way × 16B。</p>
+<p>事件顺序可以压成六步：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:right">步骤</th>
+<th>事件</th>
+<th>结果</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:right">1</td>
+<td>read 0</td>
+<td>demand miss</td>
+<td>装入 block 0</td>
+</tr>
+<tr>
+<td style="text-align:right">2</td>
+<td>prefetch 16</td>
+<td>prefetch miss</td>
+<td>装入 block 1</td>
+</tr>
+<tr>
+<td style="text-align:right">3</td>
+<td>read 16</td>
+<td>demand hit</td>
+<td>首次消费预取，useful +1</td>
+</tr>
+<tr>
+<td style="text-align:right">4</td>
+<td>prefetch 32</td>
+<td>prefetch miss</td>
+<td>装入 block 2</td>
+</tr>
+<tr>
+<td style="text-align:right">5</td>
+<td>read 0</td>
+<td>demand miss</td>
+<td>逐出未消费的预取 block 2，useless +1；重新装入 block 0</td>
+</tr>
+<tr>
+<td style="text-align:right">6</td>
+<td>prefetch 16</td>
+<td>prefetch hit</td>
+<td>block 1 仍在 cache 中，不产生 fill</td>
+</tr>
+</tbody>
+</table>
+<p>最终预取统计为 <code>prefetches=3</code>、<code>useful_prefetches=1</code>、<code>useless_prefetches=1</code>、<code>fill_bytes=64</code>。<code>fill_bytes</code> 包含 demand fill 和 prefetch fill；若只写命中率变好，就会漏掉下层带宽已经被预取消耗。</p>
+<p>模型还保留两个反例。第一，预取 line 被 demand 首次命中后，<code>prefetched</code> 标记被清除，重复 demand 不会重复计 useful。第二，未消费的预取 line 被逐出后，再次装入同一 block 不会沿用旧的预取状态；否则会把后来的普通命中误算成预取收益。</p>
+<p>预取收益需要和成本一起记录。本文案例的收益是 <code>useful_prefetches=1</code>；成本包括 <code>fill_bytes=64</code>、<code>useless_prefetches=1</code>，以及 block 2 被未使用就逐出的污染。只看 useful 数，会漏掉下层带宽和 cache 容量代价。</p>
+<h2 id="mlp-预取和乱序执行的关系">MLP、预取和乱序执行的关系</h2>
+<p>MSHR 提供硬件容器，乱序执行提供寻找独立工作的机会，预取提供提前发请求的猜测。三者可以叠加，也可以互相限制。若 MSHR 很少，预取可能占掉 demand miss 的 entry；若预取太激进，cache 被污染；若程序是严格依赖链，乱序窗口再大也找不到足够的独立 load。</p>
+<p>第 12–14 篇讨论过乱序窗口、ROB 和 LSQ。本篇没有把 cache 模型接回那套 OOO 模型，只给出接口层面的理解：一个 load miss 发出后，后续能否继续推进，取决于是否还有已知地址、无真依赖、资源可用的操作。</p>
+<p>这也解释了为什么“降低 miss latency”和“隐藏 miss latency”不是同一个优化。前者让每个 miss 更快回来；后者让等待期间有别的工作可做。性能报告应分清二者，否则同一个周期下降可能被错误归因。</p>
+<h2 id="复跑与验收">复跑与验收</h2>
+<p>执行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">bash examples/computer-architecture/cache/scripts/run_all.sh<br></code></pre></td></tr></table></figure>
+<p>本篇关注 <code>outputs/mshr_prefetch.json</code>。验收应检查：四个独立 miss 在两个 MSHR entry 下最后 done 为 20；四个依赖 miss 最后 done 为 40；同 block 的第二个请求 <code>merged=true</code>；预取统计中 <code>fill_bytes=64</code>、<code>useful_prefetches=1</code>、<code>useless_prefetches=1</code>；重复 demand 不重复计 useful，逐出后重装不沿用旧状态；模型拒绝 <code>mshr_entries &lt;= 0</code>。</p>
+<p>这些记录证明的是有限教学模型。它不等同 gem5 classic cache 的完整 MSHR 行为，不包含真实硬件预取器，也没有带宽计数器或性能计数器测量。</p>
+<h2 id="两道练习">两道练习</h2>
+<p><strong>练习一：</strong> miss latency 仍为 10，MSHR entry 从 2 增到 4。四个独立 miss 的完成时刻是多少？四个依赖 miss 呢？</p>
+<p>解答：独立 miss 可以在 t=0 全部发出，完成时刻都是 10，最后 done 为 10。依赖 miss 仍要一个接一个，完成时刻为 10、20、30、40。entry 增加只帮助可并行的请求。</p>
+<p><strong>练习二：</strong> 某预取器产生 100 次预取，其中 80 次后来被 demand 命中。能否直接说它一定提升性能？</p>
+<p>解答：不能。还要知道 100 次预取带来的 fill bytes、是否挤出 demand 会用的 line、是否占满 MSHR 或带宽、是否把关键 demand miss 推迟。高 useful 数说明方向可能对，但成本账没算完。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://www.gem5.org/documentation/general_docs/memory_system/classic_caches/">gem5：Classic Caches</a>。2026-09-22 核查；支持 classic cache 默认含 MSHR、write buffer 和可启用 prefetch 的口径。</li>
+<li><a target="_blank" rel="noopener" href="https://www.gem5.org/documentation/general_docs/memory_system/replacement_policies/">gem5：Replacement Policies</a>。2026-09-22 核查；用于说明 invalid line 与 LRU victim 选择的模型来源。</li>
+<li><a target="_blank" rel="noopener" href="https://github.com/magicliang/hexo-blog/tree/main/examples/computer-architecture/cache">本系列 cache 教学模型</a>。本文实际附件来自本地工作区当前输出，不声称 GitHub 链接已经包含本轮未提交文件。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-19-%E9%9A%90%E8%97%8F%E8%AE%BF%E5%AD%98%E5%BB%B6%E8%BF%9F/">https://magicliang.github.io/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-19-%E9%9A%90%E8%97%8F%E8%AE%BF%E5%AD%98%E5%BB%B6%E8%BF%9F/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84/">计算机体系结构</a><a class="post-meta__tags" href="/tags/MSHR/">MSHR</a><a class="post-meta__tags" href="/tags/%E9%A2%84%E5%8F%96/">预取</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-150.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-16-%E7%BC%93%E5%AD%98%E5%9F%BA%E7%A1%80/" title="计算机体系结构 16：缓存基础"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-85.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-22</div><div class="info-item-2">计算机体系结构 16：缓存基础</div></div><div class="info-2"><div class="info-item-1">缓存基础 同一个求和循环里，处理器不断访问相邻数组元素，也会反复取循环体那几条指令。若每一次都从更慢的下层存储取数据，流水线前几篇讨论的前递、停顿和分支恢复很快就被访存等待淹没。缓存的基本承诺很小：把最近用过或附近可能要用的一块数据放在更靠近处理器的位置，下一次地址命中时少走一段路。 本篇的核心问题是：给定一串地址，怎样判断每一次访问落在哪个 set、比较哪个 tag、替换哪一行，以及一次 miss 是冷缺失、容量缺失还是冲突缺失？核心案例使用 16B block、4 个 cache line 的有限模型，对同一地址序列分别跑直接映射和两路组相联。证据等级为功能执行，所有数字来自可复跑 Python 模型；它不是 gem5 仿真，也不是本机硬件计数器。 实验目录为 examples/computer-architecture/cache/。本文附件包括 mapping.json.txt、cache_model.py.txt 和 run_cases.py.txt。附件扩展名使用 .txt，便于博客直接下载查看。 从地址到 block、set 和 tag 缓存不按单个字节管理数据，而...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-10-%E6%95%B0%E6%8D%AE%E4%B8%8E%E7%BB%93%E6%9E%84%E5%86%92%E9%99%A9/" title="计算机体系结构 10：数据与结构冒险"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-160.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 10：数据与结构冒险</div></div><div class="info-2"><div class="info-item-1">数据与结构冒险：为什么正确的指令会读到错误的值 下面四条指令顺序执行时，x2 应为 14，x3 应为 21，地址 160 最后保存 21。把它们直接放进五级流水线，若没有前递和互锁，第二条却可能用初始的 x1=0 算出 x2=0。 1234addi x1, x0, 7add  x2, x1, x1add  x3, x2, x1sw   x3, 160(x0) 中心问题是：一个源寄存器在当前拍应从哪里获得数值，又在什么时候必须等待？本篇在第 09 篇的执行器中故意关闭保护，保存真实错误输出，再用前递与停顿恢复正确行为。全部周期与数据均属于“教学时序模型”，没有使用真机 PMU 或 gem5。 RAW 依赖需要确定最新的生产者 RAW 指先写后读的真实数据依赖。第一条 addi 在第三拍 EX 已经计算出 7，但要第五拍 WB 才写入 x1。第二条 add 在第三拍 ID 读 x1，读到的仍是旧值。它在第四拍 EX 使用这个旧值，就会产生错误结果。 CS61C 数据冒险材料分别讨论了停顿、同拍先写后读寄存器堆，以及向 EX 前递的路径。本模型采用 WB 先写、ID 后读的约定：距离较...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-08-%E5%A4%9A%E5%91%A8%E6%9C%9F%E6%89%A7%E8%A1%8C/" title="计算机体系结构 08：多周期执行"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-26.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 08：多周期执行</div></div><div class="info-2"><div class="info-item-1">多周期执行：怎样在几拍之间保存一条指令 一条 lw 要取指、读基址、计算地址、读取内存，最后写回寄存器。若这些动作必须在一拍里结束，时钟周期就要覆盖整条路径。把它拆成几拍可以缩短每拍必须完成的组合路径，也允许同一硬件部件在不同拍承担不同任务。代价是指令要占用更多周期，控制器还必须保存中间结果。 中心问题是：拆开的每一拍究竟保存什么，下一拍怎样知道继续做哪一步？本篇用第 07 篇相同的 .hex 求和程序，构建实际推进状态的多周期解释器。证据等级包括“教学时序模型”和带明确题设的“手算”。模型没有门级网表、综合时钟或面积数据，因此不能据此断言某块硬件变快或变小。 保存状态以后，组合逻辑才能跨拍复用 单周期通路中的某个中间值在该拍内一直可见。进入多周期设计后，组合逻辑输入可能在下一拍改变；后续仍要使用的值必须写进寄存器。指令字需要 IR，寄存器堆的读出值需要 A/B，地址或算术结果需要 ALUOut，读取内存的结果需要 MDR。实际实现可以合并或重新命名这些寄存器，所保存的信息不能凭空消失。 Berkeley CS152 的多周期数据通路讲义展示了这些跨周期寄存器及控制状态。讲义使用...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-15-%E4%BB%BF%E7%9C%9F%E7%BB%93%E6%9E%9C%E6%80%8E%E6%A0%B7%E5%8F%AF%E4%BF%A1/" title="计算机体系结构 15：仿真结果怎样可信"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-123.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 15：仿真结果怎样可信</div></div><div class="info-2"><div class="info-item-1">仿真结果怎样可信 一个模型输出“程序结果为 25，耗时 100 周期”，包含两类不同的断言。结果为 25 需要检查指令语义；100 周期需要检查阶段、端口、队列和延迟假设。即使两者都符合模型定义，仍不能直接推出某台真实处理器也会耗时 100 周期。 本篇的核心问题是：怎样把功能正确、模型内部一致和硬件拟合分开验收？已执行的核心案例是同一批 RV32I 程序的独立解释器差分，并通过故意破坏 x0 规则验证检查器确实能发现错误。统计口径另用第 13 篇事件记录手算。gem5 部分提供指定版本的待运行配置，状态为 NOT_RUN，没有本系列的 gem5 仿真结果。 实验目录为 examples/computer-architecture/ooo/。可下载 差分结果、统计口径记录、运行环境 和 Python 功能解释器。这些文件对应功能执行或手算证据，不是硬件测量。 三个验证问题分别需要什么证据 功能验证关心给定输入是否产生规定的架构状态变化。对第 07 篇的有限执行器，可以逐条比较 PC、目标寄存器和值、内存地址和值、分支方向，以及正常结束或拒绝原因。 时序验证关心程序在声明的资源和事...</div></div></div></a><a class="pagination-related" href="/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-18-DRAM-%E4%B8%8E%E5%86%85%E5%AD%98%E6%8E%A7%E5%88%B6%E5%99%A8/" title="计算机体系结构 18：DRAM 与内存控制器"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-165.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-22</div><div class="info-item-2">计算机体系结构 18：DRAM 与内存控制器</div></div><div class="info-2"><div class="info-item-1">DRAM 与内存控制器 cache miss 以后，请求并不是掉进一个统一的“主存延迟”黑箱。DRAM 有 bank、row buffer、列访问、预充电、刷新和总线仲裁。同样是读取 16B，命中已经打开的 row、换到同一 bank 的另一行、撞上 refresh，等待和服务时间都不同。 本篇的核心问题是：怎样在公开声明的教学时序模型里区分 row hit、row conflict、refresh wait，以及请求等待时间和服务时间？核心案例使用 2 个 bank、64B row、16B block 的小型控制器。证据等级为教学时序模型；参数名参考 gem5 DRAMInterface，但数值是本文题设，不是某款 DRAM 器件。 实验目录为 examples/computer-architecture/cache/。本文附件包括 dram.json.txt、cache_model.py.txt 和 run_cases.py.txt。 地址先映射到 bank 和 row 本文映射函数很小： 123block = address // 16bank  = block % 2ro...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E4%BD%93%E7%B3%BB%E7%BB%93%E6%9E%84-03-ISA-%E6%98%AF%E6%9C%BA%E5%99%A8%E8%83%BD%E6%89%A7%E8%A1%8C%E7%9A%84%E5%A5%91%E7%BA%A6/" title="计算机体系结构 03：ISA 是机器能执行的契约"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-80.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机体系结构 03：ISA 是机器能执行的契约</div></div><div class="info-2"><div class="info-item-1">ISA 是机器能执行的契约 本篇的核心问题是：给定一串 32 位比特，机器怎样知道这是加法、访存还是分支？ISA（Instruction Set Architecture，指令集架构）回答的不是“电路怎样做得快”，而是“软件交给硬件的这串比特，在架构状态上必须产生什么效果”。架构状态至少包括 PC、通用寄存器、内存中可见的字节，以及遇到不支持指令或非法访问时的处理边界。 本系列第一条实验线选择 RV32I 作为共同语言。RISC-V 官方非特权规范把 RV32I 定义为 32 位整数寄存器宽度的基础整数 ISA；基础整数 ISA 提供算术、load/store 和控制流指令，扩展如乘除法、压缩指令、原子操作和特权机制另行定义。本文只使用一个更小的教学子集：add/sub/and/or、addi/andi/ori、lw/sw、beq/bne/blt/bge。这个子集足够执行一个求和循环，但不能代表完整 RV32I，更不能代表一个操作系统可用的处理器。 证据等级：手算、功能执行。功能执行证据来自 examples/computer-architecture/base/ 中的 C11 ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">隐藏访存延迟</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%9E%E9%98%BB%E5%A1%9E-cache-%E4%BF%9D%E5%AD%98-%E8%BF%98%E6%B2%A1%E5%9B%9E%E6%9D%A5-%E7%9A%84-miss"><span class="toc-number">1.1.</span> <span class="toc-text">非阻塞 cache 保存“还没回来”的 miss</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%8B%AC%E7%AB%8B-miss-%E5%92%8C%E4%BE%9D%E8%B5%96-miss-%E7%9A%84%E6%97%B6%E9%97%B4%E8%A1%A8"><span class="toc-number">1.2.</span> <span class="toc-text">独立 miss 和依赖 miss 的时间表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%90%8C%E4%B8%80-block-%E7%9A%84-miss-%E5%BA%94%E5%BD%93%E5%90%88%E5%B9%B6"><span class="toc-number">1.3.</span> <span class="toc-text">同一 block 的 miss 应当合并</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%A2%84%E5%8F%96%E8%A6%81%E5%90%8C%E6%97%B6%E7%9C%8B-useful-useless-%E5%92%8C-fill-bytes"><span class="toc-number">1.4.</span> <span class="toc-text">预取要同时看 useful、useless 和 fill bytes</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#mlp-%E9%A2%84%E5%8F%96%E5%92%8C%E4%B9%B1%E5%BA%8F%E6%89%A7%E8%A1%8C%E7%9A%84%E5%85%B3%E7%B3%BB"><span class="toc-number">1.5.</span> <span class="toc-text">MLP、预取和乱序执行的关系</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%8D%E8%B7%91%E4%B8%8E%E9%AA%8C%E6%94%B6"><span class="toc-number">1.6.</span> <span class="toc-text">复跑与验收</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E9%81%93%E7%BB%83%E4%B9%A0"><span class="toc-number">1.7.</span> <span class="toc-text">两道练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">1.8.</span> <span class="toc-text">参考资料</span></a></li></ol></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
