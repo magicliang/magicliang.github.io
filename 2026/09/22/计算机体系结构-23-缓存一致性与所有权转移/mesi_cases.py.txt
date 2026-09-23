@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+I, S, E, M = "I", "S", "E", "M"
+
+
+@dataclass
+class Line:
+    memory: int = 0
+    cache: dict[str, str] = field(default_factory=lambda: {"C0": I, "C1": I, "C2": I})
+    values: dict[str, int | None] = field(default_factory=lambda: {"C0": None, "C1": None, "C2": None})
+    trace: list[dict[str, object]] = field(default_factory=list)
+
+    def _snapshot(self) -> dict[str, object]:
+        return {"states": dict(self.cache), "values": dict(self.values), "memory": self.memory}
+
+    def _assert_swmr(self) -> None:
+        writers = [c for c, st in self.cache.items() if st in (M, E)]
+        sharers = [c for c, st in self.cache.items() if st == S]
+        assert len(writers) <= 1, f"multiple writer-capable copies: {writers}"
+        assert not (writers and sharers), f"writer {writers} overlaps readers {sharers}"
+
+    def _event(self, op: str, **extra: object) -> None:
+        self._assert_swmr()
+        ev = {"op": op, **extra, **self._snapshot()}
+        self.trace.append(ev)
+
+    def read(self, core: str) -> int:
+        st = self.cache[core]
+        if st in (S, E, M):
+            value = self.values[core]
+            assert value is not None
+            self._event("read_hit", core=core, value=value, source=core)
+            return value
+
+        dirty = [c for c, s in self.cache.items() if s == M]
+        exclusive = [c for c, s in self.cache.items() if s == E]
+        if dirty:
+            owner = dirty[0]
+            value = self.values[owner]
+            assert value is not None
+            self.memory = value
+            self.cache[owner] = S
+            self.cache[core] = S
+            self.values[core] = value
+            self._event("read_miss_shared_dirty_source", core=core, source=owner, value=value)
+            return value
+        if exclusive:
+            owner = exclusive[0]
+            value = self.values[owner]
+            assert value is not None
+            self.cache[owner] = S
+            self.cache[core] = S
+            self.values[core] = value
+            self._event("read_miss_shared_clean_source", core=core, source=owner, value=value)
+            return value
+
+        has_any = any(s != I for s in self.cache.values())
+        self.cache[core] = S if has_any else E
+        self.values[core] = self.memory
+        self._event("read_miss_memory", core=core, value=self.memory, new_state=self.cache[core])
+        return self.memory
+
+    def write(self, core: str, value: int) -> None:
+        st = self.cache[core]
+        invalidated: list[str] = []
+        source = core if st in (E, M) else "memory"
+        if st == S:
+            source = core
+        if st == I:
+            dirty = [c for c, s in self.cache.items() if s == M]
+            if dirty:
+                owner = dirty[0]
+                dirty_value = self.values[owner]
+                assert dirty_value is not None
+                self.memory = dirty_value
+                source = owner
+        for other, other_state in list(self.cache.items()):
+            if other != core and other_state != I:
+                self.cache[other] = I
+                self.values[other] = None
+                invalidated.append(other)
+        self.cache[core] = M
+        self.values[core] = value
+        self._event("write_getm", core=core, value=value, source=source, invalidation_acks=invalidated)
+
+
+def run() -> dict[str, object]:
+    line = Line()
+    assert line.read("C0") == 0
+    assert line.read("C1") == 0
+    line.write("C0", 7)
+    assert line.read("C1") == 7
+    line.write("C2", 9)
+    assert line.read("C0") == 9
+    assert line.memory == 9
+    return {"case": "mesi_swmr_dirty_source", "events": line.trace, "final": line._snapshot()}
+
+
+def main() -> None:
+    root = Path(__file__).resolve().parents[1]
+    out = root / "outputs"
+    out.mkdir(parents=True, exist_ok=True)
+    result = run()
+    (out / "mesi_trace.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    (out / "mesi_summary.txt").write_text(
+        "mesi_swmr_dirty_source: PASS\n"
+        "checks: invalidation acks, dirty source transfer, SWMR after every event\n",
+        encoding="utf-8",
+    )
+    print("coherence cases: PASS")
+
+
+if __name__ == "__main__":
+    main()

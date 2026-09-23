@@ -1,0 +1,717 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>计算机网络 27：QUIC 为什么重新实现传输机制，包号、流、恢复、拥塞与迁移 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="HTTP&#x2F;2 已经把一个 TCP 连接里的 HTTP 消息拆成多条流。它解决了 HTTP&#x2F;1.1 响应必须排队返回的问题，却没有解决 TCP 字节流自己的等待：一个 TCP 段丢失后，内核不能把后面的字节先交给上层，即使那些字节只属于另一条 HTTP&#x2F;2 流。应用层分帧已经知道“这几个字节属于流 3”，TCP 仍然只看到“前面的字节没齐”。 QUIC 的入口问题就在这里：如果应用已经需要多流、加密">
+<meta property="og:type" content="article">
+<meta property="og:title" content="计算机网络 27：QUIC 为什么重新实现传输机制，包号、流、恢复、拥塞与迁移">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C27-QUIC%E4%B8%BA%E4%BB%80%E4%B9%88%E9%87%8D%E6%96%B0%E5%AE%9E%E7%8E%B0%E4%BC%A0%E8%BE%93%E6%9C%BA%E5%88%B6/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="HTTP&#x2F;2 已经把一个 TCP 连接里的 HTTP 消息拆成多条流。它解决了 HTTP&#x2F;1.1 响应必须排队返回的问题，却没有解决 TCP 字节流自己的等待：一个 TCP 段丢失后，内核不能把后面的字节先交给上层，即使那些字节只属于另一条 HTTP&#x2F;2 流。应用层分帧已经知道“这几个字节属于流 3”，TCP 仍然只看到“前面的字节没齐”。 QUIC 的入口问题就在这里：如果应用已经需要多流、加密">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-10.jpg">
+<meta property="article:published_time" content="2026-09-22T10:40:00.000Z">
+<meta property="article:modified_time" content="2026-09-23T03:57:49.865Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="QUIC">
+<meta property="article:tag" content="传输层">
+<meta property="article:tag" content="计算机网络">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-10.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "计算机网络 27：QUIC 为什么重新实现传输机制，包号、流、恢复、拥塞与迁移",
+  "url": "https://magicliang.github.io/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C27-QUIC%E4%B8%BA%E4%BB%80%E4%B9%88%E9%87%8D%E6%96%B0%E5%AE%9E%E7%8E%B0%E4%BC%A0%E8%BE%93%E6%9C%BA%E5%88%B6/",
+  "image": "https://magicliang.github.io/img/wall-paper-10.jpg",
+  "datePublished": "2026-09-22T10:40:00.000Z",
+  "dateModified": "2026-09-23T03:57:49.865Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C27-QUIC%E4%B8%BA%E4%BB%80%E4%B9%88%E9%87%8D%E6%96%B0%E5%AE%9E%E7%8E%B0%E4%BC%A0%E8%BE%93%E6%9C%BA%E5%88%B6/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '计算机网络 27：QUIC 为什么重新实现传输机制，包号、流、恢复、拥塞与迁移',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">949</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1085</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">45</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-10.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">计算机网络 27：QUIC 为什么重新实现传输机制，包号、流、恢复、拥塞与迁移</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">计算机网络 27：QUIC 为什么重新实现传输机制，包号、流、恢复、拥塞与迁移</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-22T10:40:00.000Z" title="Created 2026-09-22 18:40:00">2026-09-22</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-23T03:57:49.865Z" title="Updated 2026-09-23 11:57:49">2026-09-23</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C%EF%BC%9A%E4%BB%8E%E6%8A%A5%E6%96%87%E5%88%B0%E5%8D%8F%E8%AE%AE%E4%B8%8E%E5%B7%A5%E7%A8%8B/">计算机网络：从报文到协议与工程</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.7k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>12mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-23 11:57:49&quot;}" hidden></div><p>HTTP/2 已经把一个 TCP 连接里的 HTTP 消息拆成多条流。它解决了 HTTP/1.1 响应必须排队返回的问题，却没有解决 TCP 字节流自己的等待：一个 TCP 段丢失后，内核不能把后面的字节先交给上层，即使那些字节只属于另一条 HTTP/2 流。应用层分帧已经知道“这几个字节属于流 3”，TCP 仍然只看到“前面的字节没齐”。</p>
+<p>QUIC 的入口问题就在这里：如果应用已经需要多流、加密、恢复、拥塞控制和连接迁移，为什么还要把这些能力放在内核 TCP 之上，再在上层补一套绕不过去的状态？QUIC 的选择是把传输机制搬到 UDP 之上，由端点实现包号、流、恢复、拥塞控制、TLS 集成和路径变化处理。许多实现选择用户态，这是部署方式，不是 QUIC 规范要求。UDP 在这里不是可靠传输，只是报文承载；它也可能被网络策略阻断。</p>
+<p>前置是第 17 篇超时与重传、第 18 篇流量控制、第 19 篇拥塞控制、第 24 篇 TLS 身份验证和第 25 篇会话恢复。本篇只讨论 QUIC 传输机制。HTTP/3 怎样把请求、响应、控制流和 QPACK 映射到 QUIC，放到下一篇。文中的验证是 RFC 9000、RFC 9001、RFC 9002 的规范核查和有限手算；没有运行成熟 QUIC 实现，也没有抓包验证丢包恢复或路径迁移。手算可以检查概念关系，不能替代真实端到端行为。</p>
+<h2 id="包号不是字节序号">包号不是字节序号</h2>
+<p>TCP 的序号标识字节流位置。QUIC 的包号标识“这个包在某个包号空间里的发送次序”。这两个编号不承担同一件事。</p>
+<p>QUIC 包里可以装一个或多个帧。STREAM 帧再带 stream id、offset、length 和数据。包号用于确认、丢包检测和恢复决策；流偏移用于把同一条流里的字节排回应用可读的顺序。一个包被判定丢失后，恢复层关注的是其中哪些信息需要在新包中再次发送；STREAM 数据还可能重新分帧。应用交付层关注的是每条流各自缺了哪段 offset。</p>
+<p>RFC 9000 §12.3 和 RFC 9002 §2 把 QUIC 包号分成三个空间：Initial、Handshake、Application Data。每个发送方向、每个包号空间分别分配严格递增且在连接内不复用的包号；ACK 只确认同一空间里的包。0-RTT 与所有 1-RTT 密钥代际共享 Application Data 包号空间，而不是各用一套包号。这样的拆分让握手阶段和应用数据阶段分别确认与判断丢包。</p>
+<p>一个最小手算如下：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">Initial:    packet 0, packet 1<br>Handshake:  packet 0<br>Application packet 0: STREAM 0 offset 0 length 6<br>Application packet 1: STREAM 4 offset 0 length 5<br>Application packet 3: STREAM 0 offset 6 length 4<br></code></pre></td></tr></table></figure>
+<p>这里同时出现了三个“packet 0”，并不冲突，因为它们位于不同包号空间。Application 空间跳过 packet 2 也不表示 stream 0 缺了字节；stream 0 是否连续，要看 STREAM 帧里的 offset。最终 stream 0 有 <code>[0, 10)</code>，stream 4 有 <code>[0, 5)</code>。包号只回答“哪些包被确认或疑似丢失”，不回答“某条流可交付到哪个字节”。</p>
+<p>这也是 QUIC 不能被简化成“TCP 换成 UDP”的原因。TCP 的可靠交付围绕一条字节流；QUIC 用包号跟踪发送尝试，用流偏移组织多条字节流。两层状态分开后，发送端能在新包中恢复已丢失信息，接收端能让没有缺口的流继续前进。</p>
+<h2 id="流独立不等于拥塞独立">流独立不等于拥塞独立</h2>
+<p>QUIC stream 是有序字节流。每条流有自己的 offset、FIN 和流量控制窗口；一条流缺少 offset 6 到 10 的字节，不会阻止另一条已经连续到 offset 5 的流被交给应用。这个“独立”指的是流内重组和应用交付边界。</p>
+<p>它不表示每条流都有独立的网络拥塞控制。RFC 9002 §7 定义的拥塞控制限制路径上的发送量，而且拥塞控制与 RTT 估计跨包号空间统一维护。多个 QUIC 流复用同一条连接、同一路径时，共享拥塞窗口和在途字节预算。某条流可以在语义上不被另一条流的缺口卡住，但发送端仍要服从同一路径的容量判断。</p>
+<p>一个小例子能把两个层次拆开：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">已收到 stream 0: [0,6), [10,14)   =&gt; 缺 [6,10)，只能交付到 6<br>已收到 stream 4: [0,5)            =&gt; 可交付到 5<br><br>cwnd = 12000 bytes<br>bytes_in_flight = 9000 bytes<br>当前可再发送 = 3000 bytes<br>待补数据 = 3500 bytes<br></code></pre></td></tr></table></figure>
+<p>stream 4 不需要等待 stream 0 的缺口，这是多流交付层面的独立。示例把拥塞窗口与在途量都记为受控字节，包括 QUIC 包头和包保护开销，不等同于纯 STREAM 载荷。常规发送只剩 3000 字节预算，待恢复信息对应 3500 字节受控数据，不能一次全部发送；RFC 9002 §7.2 对 PTO 探测包另有有限例外。把前者写成“每流独立拥塞控制”就是错位。</p>
+<p>流量控制还要再分一层。QUIC 有每条流的流量控制，也有连接级流量控制。流量控制保护接收端缓冲，拥塞控制保护网络路径。一个流被自己的 MAX_STREAM_DATA 卡住，是接收端不允许这条流继续占用更多缓冲；整个连接被 MAX_DATA 卡住，是连接级接收缓冲预算用完；拥塞窗口卡住，则是发送端认为路径上在途数据已经够多。这三种等待现象都可能表现为“发不出去”，原因不同。</p>
+<h2 id="恢复看-ack-区间-不重发原包">恢复看 ACK 区间，不重发原包</h2>
+<p>QUIC ACK 帧确认的是包号区间。接收端可以表示 Application 空间里 packet 0、1、3 已到达，packet 2 未被确认。发送端结合 ACK 进展、包阈值和时间阈值判定丢包，再把需要恢复的信息放进新包；新包使用新包号。PTO 是缺少 ACK 进展时触发探测的另一条路径，PTO 到期本身不得把此前的包直接标记为丢失。</p>
+<p>这个设计和“包号不等于字节序号”配套。packet 2 如果装的是 stream 0 offset 6 length 4，恢复时可以把同一段流信息重新分帧并放进 packet 4。接收端最后看到的是 stream 0 的缺口被补齐；它不要求 packet 2 本身后来出现。包号确认发送尝试，stream offset 负责流数据的去重与重组。</p>
+<p>PTO 也容易被写错。RFC 9002 给出的基础公式是：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">PTO = smoothed_rtt + max(4*rttvar, kGranularity) + max_ack_delay<br></code></pre></td></tr></table></figure>
+<p>若握手已经确认，正在计算 Application Data 空间的第一次 PTO，且尚未发生指数退避，<code>smoothed_rtt = 40ms</code>、<code>rttvar = 8ms</code>、<code>kGranularity = 1ms</code>、对端通告的 <code>max_ack_delay = 25ms</code>，结果为 <code>40 + max(32, 1) + 25 = 97ms</code>。Initial 和 Handshake 空间不加入 <code>max_ack_delay</code>。这个数值只表示探测计时器，不表示 97ms 后就能断言包永久丢失或必须降低拥塞窗口。</p>
+<h2 id="tls-是传输状态的一部分">TLS 是传输状态的一部分</h2>
+<p>QUIC 没有再把 TLS 当成 TCP 连接里的字节流协议。RFC 9001 定义 QUIC 如何使用 TLS 1.3；握手消息由 QUIC CRYPTO 帧承载，密钥阶段和 QUIC 包保护直接绑定。这样做的结果是，传输层从一开始就知道哪些包属于 Initial、Handshake 或 Application Data 阶段，丢包恢复也按对应包号空间处理。</p>
+<p>0-RTT 的边界也必须放在这里说清楚。0-RTT 不是“第一次连接就少一次往返”。它依赖已有会话恢复材料、服务器接受早期数据的策略，以及应用能承受重放风险的请求语义。客户端第一次连接一个服务器时没有可用恢复票据，也就没有符合条件的 0-RTT。即使有恢复材料，服务器也可以拒绝早期数据；应用也不能把所有请求都当成可重放安全。</p>
+<p>QUIC 把 TLS 握手和传输恢复绑在一起，并不表示应用认证问题消失。RFC 9001 还明确限制了 TLS post-handshake client authentication，因为 QUIC 的多路复用会让客户端难以把证书请求和触发它的应用层事件对应起来。传输层合并了加密状态，不等于所有应用层身份问题都在传输层得到解决。</p>
+<h2 id="迁移依赖连接-id-和路径验证">迁移依赖连接 ID 和路径验证</h2>
+<p>TCP 连接通常用源 IP、源端口、目的 IP、目的端口识别。移动网络切换、NAT 重新绑定或客户端端口变化，都可能让这组地址变化。QUIC 用 connection ID 把连接身份从地址上拆出来，使端点有机会在地址变化后继续识别同一条连接。连接 ID 只能帮助识别连接，不能证明新路径可达。</p>
+<p>这不是无条件迁移。RFC 9000 §8.2 定义 PATH_CHALLENGE/PATH_RESPONSE 做路径验证：PATH_CHALLENGE 携带 8 字节数据，匹配的 PATH_RESPONSE 才能证明对端从该路径收到挑战。端点在握手确认前不得主动迁移。<code>disable_active_migration</code> 限制主动迁移，但不把 NAT rebinding 当成同一件事。</p>
+<p>迁移还有拥塞与隐私边界。RFC 9000 §9.4 要求端点在新路径上重置拥塞控制器和 RTT 估计，只有对端端口变化而地址不变时可以保留；旧路径发送的包不能用于建立新路径的拥塞状态。连接 ID 的复用可能让观察者关联多段活动，更新 ID 又要求两端管理可用 ID 与退休状态。实现是否启用主动迁移、何时切换路径以及如何配合负载均衡，属于部署策略。</p>
+<h2 id="条件和反例">条件和反例</h2>
+<p>第一个反例是“QUIC 消除了所有队头阻塞”。QUIC 消除的是 TCP 字节流在传输层造成的跨流交付等待；它没有消除流内有序交付等待。某条流自己的 offset 缺口没补齐，这条流仍然不能把后续字节按序交给应用。到了 HTTP/3，还会出现 QPACK 动态表依赖导致的等待；那属于应用映射和头压缩层，不能提前算成 QUIC 传输层已解决。</p>
+<p>第二个反例是“QUIC 每条流独立拥塞控制”。QUIC 流有独立 offset 和流量控制窗口，但拥塞控制通常作用于连接使用的网络路径。多条流共享路径容量；一个大下载流占满在途预算时，小请求流即使语义上可独立交付，也可能要等待发送调度和拥塞窗口释放。</p>
+<p>第三个反例是“UDP 上实现就能绕过网络限制”。QUIC 使用 UDP 承载，是为了在现有网络中部署新的传输语义；它仍然要面对丢包、MTU、NAT、限速、UDP 阻断和负载均衡。网络把 UDP 限得很狠时，QUIC 不会凭空得到更好的路径。</p>
+<p>第四个反例是“0-RTT 等于免费加速”。0-RTT 需要恢复前提，携带重放风险，并受服务器和应用策略限制。写性能结论时至少要区分首次连接、恢复连接、服务器接受早期数据、服务器拒绝早期数据、应用请求是否幂等这几种情况。</p>
+<h2 id="可复现手算">可复现手算</h2>
+<p>同名素材目录里的 <code>handcalc.py</code> 只用 Python 标准库，验证三件事：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash">python3 <span class="hljs-built_in">source</span>/_posts/2026-09-22-计算机网络27-QUIC为什么重新实现传输机制/handcalc.py --<span class="hljs-built_in">help</span><br>python3 <span class="hljs-built_in">source</span>/_posts/2026-09-22-计算机网络27-QUIC为什么重新实现传输机制/handcalc.py<br></code></pre></td></tr></table></figure>
+<p>素材包括<a href="/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C27-QUIC%E4%B8%BA%E4%BB%80%E4%B9%88%E9%87%8D%E6%96%B0%E5%AE%9E%E7%8E%B0%E4%BC%A0%E8%BE%93%E6%9C%BA%E5%88%B6/handcalc.py" title="手算脚本">手算脚本</a>、<a href="/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C27-QUIC%E4%B8%BA%E4%BB%80%E4%B9%88%E9%87%8D%E6%96%B0%E5%AE%9E%E7%8E%B0%E4%BC%A0%E8%BE%93%E6%9C%BA%E5%88%B6/handcalc.json" title="固定输出">固定输出</a>和<a href="/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C27-QUIC%E4%B8%BA%E4%BB%80%E4%B9%88%E9%87%8D%E6%96%B0%E5%AE%9E%E7%8E%B0%E4%BC%A0%E8%BE%93%E6%9C%BA%E5%88%B6/notes.txt" title="资料核查记录">资料核查记录</a>。</p>
+<p>脚本断言三个有限例子。第一，Initial、Handshake、Application Data 可以各自有 packet 0，Application 空间还可以有意跳过 packet 2；stream byte range 另按 stream offset 计算。第二，stream 0 有缺口时只能交付到 offset 6，stream 4 可以交付到 offset 5，但两个流共享 3000 字节拥塞预算。第三，PTO 公式在给定数值下得到 97ms。</p>
+<p>这类手算能检查文章里的概念边界：包号空间不等于流字节序号，流独立交付不等于独立拥塞控制，PTO 是计时器计算而不是端到端实测。它不能证明某个实现的调度公平性、某条公网路径上的性能，也不能证明路径迁移在具体负载均衡环境里可用。</p>
+<h2 id="练习">练习</h2>
+<p>练习一：某 QUIC 连接的 Application Data 空间收到 ACK 区间 <code>[0, 1]</code> 和 <code>[3, 3]</code>，packet 2 里有 stream 8 offset 100 length 20。后来发送端在 packet 4 里重新发送 stream 8 offset 100 length 20。接收端最终应按哪个编号去重，按哪个编号更新 ACK 状态？说明 packet 2 和 packet 4 是否能同时对应同一段 stream 数据。</p>
+<p>练习二：一条连接上有 stream 0 和 stream 4。stream 0 已收到 <code>[0, 8)</code> 和 <code>[12, 20)</code>，stream 4 已收到 <code>[0, 6)</code>；连接级可用发送预算为 1000 字节，stream 0 的缺口需要 4 字节，stream 4 还有 1500 字节新数据待发。分别写出应用可交付位置、每条流的缺口、发送调度会受哪个共享条件限制。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9000.html">RFC 9000 §2、§5.1、§8.2、§9、§9.4、§12.3、§13.3：QUIC Transport</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9001.html">RFC 9001 §4、§4.4、§4.6、§9.2：Using TLS to Secure QUIC</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9002.html">RFC 9002 §2、§4、§6、§7：Loss Detection and Congestion Control</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9114.html">RFC 9114：HTTP/3</a>，仅用于界定下一篇的 HTTP 映射范围</li>
+</ul>
+<h2 id="验证边界">验证边界</h2>
+<p>已验证：当次核查 RFC 9000、RFC 9001、RFC 9002 的相关章节；<code>handcalc.py</code> 用断言复算包号空间、流缺口、共享拥塞预算和 PTO 算术。Hexo 构建与页面检查只验证内容和素材可生成、可访问，不构成 QUIC 协议行为验证。</p>
+<p>未验证：没有运行 ngtcp2、quiche、msquic、OpenSSL QUIC API 或浏览器实现；没有抓取 QUIC 包、qlog 或 TLS key log；没有在隔离网络中注入真实丢包、重排、限速、NAT rebinding 或地址迁移；没有比较 HTTP/2 与 HTTP/3 的同内容传输。成熟实现多流传输、丢包恢复和路径验证仍是计划验收项，本篇只把未运行部分标为 <code>NOT_RUN</code>，不把手算、静态检查、HTTP 200 或构建成功写成真实端到端验证。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C27-QUIC%E4%B8%BA%E4%BB%80%E4%B9%88%E9%87%8D%E6%96%B0%E5%AE%9E%E7%8E%B0%E4%BC%A0%E8%BE%93%E6%9C%BA%E5%88%B6/">https://magicliang.github.io/2026/09/22/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C27-QUIC%E4%B8%BA%E4%BB%80%E4%B9%88%E9%87%8D%E6%96%B0%E5%AE%9E%E7%8E%B0%E4%BC%A0%E8%BE%93%E6%9C%BA%E5%88%B6/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C/">计算机网络</a><a class="post-meta__tags" href="/tags/QUIC/">QUIC</a><a class="post-meta__tags" href="/tags/%E4%BC%A0%E8%BE%93%E5%B1%82/">传输层</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-10.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/02/07/TLS-%E6%8F%A1%E6%89%8B%E4%B8%8E%E5%8A%A0%E5%AF%86%E9%80%9A%E4%BF%A1/" title="TLS 握手与加密通信"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-ops-reliability.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-02-07</div><div class="info-item-2">TLS 握手与加密通信</div></div><div class="info-2"><div class="info-item-1">为什么需要 TLS HTTP 协议最初设计为明文传输协议，所有通信内容都以纯文本形式在网络中传输。这种设计在互联网早期是合理的，但随着网络应用的普及和敏感数据的增多，明文传输带来了严重的安全风险。 窃听风险 在明文传输模式下，任何能够访问网络链路的攻击者都可以轻易读取通信内容。这包括：  同一局域网内的其他用户 网络服务提供商（ISP） 恶意的路由器或交换机 公共 Wi-Fi 网络的运营者  攻击者可以使用诸如 Wireshark、tcpdump 等网络抓包工具捕获数据包，直接查看其中的内容。这意味着用户名、密码、信用卡号、私密消息等敏感信息都会暴露在攻击者面前。 篡改风险 明文传输不仅允许攻击者读取内容，还允许他们修改传输的数据。攻击者可以在数据包经过的任何位置插入、删除或修改内容，而接收方难以察觉。例如：  将银行转账金额从 100 元改为 10000 元 修改电子邮件的内容 在网页中插入恶意脚本 替换下载的软件包  冒充风险 由于缺乏身份验证机制，攻击者可以冒充合法的服务器与客户端通信。客户端无法确认与之通信的服务器是否真实可信。这使得钓鱼攻击成为可能：攻击者搭建一个与真实...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C10-%E8%B7%AF%E7%94%B1%E5%99%A8%E5%86%85%E9%83%A8%E6%80%8E%E6%A0%B7%E8%BD%AC%E5%8F%91/" title="计算机网络 10：路由器内部怎样转发，RIB&#x2F;FIB、控制面、数据面与查表"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-2.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机网络 10：路由器内部怎样转发，RIB&#x2F;FIB、控制面、数据面与查表</div></div><div class="info-2"><div class="info-item-1">路由计算已经选中了新的下一跳，为什么同一个目的地址仍然沿旧路径转发？如果配置接口返回成功，是否足以说明所有后续报文都会使用新路径？这两个问题都要求区分计算结果、已安装状态和实际查询结果。 第 07 篇给定一张表，验证最长前缀匹配。本篇继续使用那份教学转发器，但不再直接把候选路由全部交给它。候选信息先经过选择，再显式安装为转发快照。实验只输出决策，不配置内核路由，不发送真实报文。 同一目的前缀为何有两种信息 Routing Information Base（RIB）与 Forwarding Information Base（FIB）描述不同用途的信息。路由信息可以包含可供选择的候选路径；转发查询需要取得当前应使用的下一跳、出口等信息。两者有关联，但不能因为都包含前缀就将它们视为同一份状态。 RFC 3222 §5.3–5.4在路由器基准测试语境中说明 RIB 与 FIB。使用这些术语时应保留文档范围：它不是要求每台路由器必须采用两张物理表，也不能由其中对次选路径的描述推导出现代实现不能支持等价多路径。 设目的前缀为 10.6.2.0/24，候选 A 的下一跳为 192.0.2.1、...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C09-%E5%B0%8F%E5%8C%85%E8%83%BD%E9%80%9A%E8%80%8C%E5%A4%A7%E5%8C%85%E5%A4%B1%E8%B4%A5/" title="计算机网络 09：小包能通而大包失败，ICMP、MTU、MSS、PMTUD 与黑洞"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-24.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机网络 09：小包能通而大包失败，ICMP、MTU、MSS、PMTUD 与黑洞</div></div><div class="info-2"><div class="info-item-1">短请求可以返回，稍长的请求却一直等待。这个现象能否证明链路存在 MTU 黑洞？如果在发送端看到了一个大包，而接收端没有看到它，又能否立即认定中间路由器按 MTU 丢弃了报文？ 第 07 篇解释了下一跳选择，第 08 篇区分了 IPv4 与 IPv6 的邻居发现和分片职责。本篇在路径中加入一个更小的出口，沿着报文长度、错误反馈与应用结果逐项判断。需要证明的不是“大包失败”这句话，而是哪个长度超过哪个限制、在哪里停止，以及发送者得到了什么信息。 先统一长度的口径 链路 MTU 限制的是该链路承载的网络层报文大小。在本篇的普通以太网/IP 实验中，接口配置的 MTU 与 IP 包长比较，不把以太网首部或帧校验序列加到 IP 长度里。应用写入的字节数也不是 IP 包长，还要加上传输层与 IP 首部。 设 IPv4 没有选项，UDP 首部为 8 字节，应用载荷为 D 字节，则 IP 总长度为 20 + 8 + D。IPv6 没有扩展首部时，对应长度为 40 + 8 + D。这两式的条件决定了计算结果；增加首部后不能继续套用原来的载荷上限。    中间出口 MTU IP 条件 UDP 载荷上...</div></div></div></a><a class="pagination-related" href="/2026/02/07/HTTP-1-1-%E5%88%B0-HTTP-3-%E7%9A%84%E6%BC%94%E8%BF%9B/" title="HTTP&#x2F;1.1 到 HTTP&#x2F;3 的演进"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-web-network.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-02-07</div><div class="info-item-2">HTTP&#x2F;1.1 到 HTTP&#x2F;3 的演进</div></div><div class="info-2"><div class="info-item-1">引言 HTTP 协议作为现代互联网的基石，自 1991 年诞生以来经历了多次重大演进。从最初简单的请求-响应模型，到如今高效、安全的 HTTP/3，每一次版本更新都针对前一版本的局限性进行了针对性的改进。本文将系统性地梳理 HTTP/1.0、HTTP/1.1、HTTP/2 和 HTTP/3 的核心技术特性和演进路径，深入分析每一代协议的设计理念、性能优化以及面临的挑战。 HTTP/1.0 的局限性 HTTP/1.0 于 1996 年发布，奠定了现代 Web 通信的基础框架。然而，随着互联网应用的快速发展，HTTP/1.0 的局限性逐渐显现。 每个 TCP 连接只能处理一个请求 HTTP/1.0 采用最简单的请求-响应模型：客户端发起请求，建立 TCP 连接，服务器返回响应后关闭连接。对于包含多个资源（如 HTML、CSS、JavaScript、图片等）的网页，浏览器需要为每个资源建立独立的 TCP 连接。这种模式带来了严重的性能问题：  TCP 连接建立和关闭需要消耗系统资源 三次握手和慢启动机制增加了延迟 无法充分利用网络带宽  缺乏 Host 头字段 HTTP/1.0 最初设...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C06-%E5%9C%B0%E5%9D%80%E4%BB%8E%E5%93%AA%E9%87%8C%E6%9D%A5/" title="计算机网络 06：地址从哪里来，ARP、DHCP、默认网关与邻居缓存"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-141.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机网络 06：地址从哪里来，ARP、DHCP、默认网关与邻居缓存</div></div><div class="info-2"><div class="info-item-1">一台刚配置好地址的主机准备访问另一子网的服务。目的 IP 已经确定，但邻居表还是空的。此时需要查询远端服务器的 MAC，还是默认网关的 MAC？如果地址来自 DHCP，提供租约的服务器是否必须承担这次转发？ 这几个地址属于不同决策：地址配置确定本机可使用的参数，路由选择确定当前报文的下一跳，邻居解析把下一跳 IP 对应到当前链路上的地址。第 04 篇已经解释了以太网转发，本篇沿着这三个决策，观察一个真正跨越两段隔离链路的请求。  目的地、下一跳与配置来源 设 A 的接口地址为 10.6.1.2/24，R 的两个接口分别为 10.6.1.1/24 和 10.6.2.1/24，B 为 10.6.2.2/24。A 的默认路由经 R 的左侧接口，B 的默认路由经 R 的右侧接口。这里的 /24 表示前二十四位是前缀，具体路由匹配留到第 07 篇。 123A                         R                          B10.6.1.2/24 ─── 10.6.1.1/24  10.6.2.1/24 ─── 10.6.2.2/24    默认下一跳...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C08-IPv6%E6%94%B9%E4%BA%86%E4%BB%80%E4%B9%88/" title="计算机网络 08：IPv6 改了什么，地址、NDP、SLAAC、链路本地与双栈"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-165.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">计算机网络 08：IPv6 改了什么，地址、NDP、SLAAC、链路本地与双栈</div></div><div class="info-2"><div class="info-item-1">目的地址变成 IPv6 后，主机还会广播 ARP 查询网关吗？一个接口已经有 fe80:: 开头的地址，是否说明它拿到了可跨网络通信的地址？收到路由器通告，又是否等于同时获得地址、直连前缀和默认路由？ 这些问题不能仅用“地址从三十二位增加到一百二十八位”回答。第 07 篇建立了前缀与下一跳的关系，本篇保持这一关系，观察 IPv6 如何表达地址范围、发现邻居和取得配置。真实实验使用静态地址，SLAAC 与路由器通告另以规范和条件表解释。  地址文本与作用范围 IPv6 地址通常写成八组十六位十六进制数。连续的零可以按规则压缩，但压缩只改变文本表示，不改变地址本身。例如 2001:db8:8:1::2 与展开后的八组写法是同一个一百二十八位值；前缀长度仍表示固定多少位。 本篇的 2001:db8:8:1::/64 与 2001:db8:8:2::/64 是两个不同的文档示例地址块，来自 RFC 3849 保留的范围，仅用于隔离实验。不会把它们配置到公网，也不因名字中出现 IPv6 就声称它们可被全球路由。 RFC 4291 §2.5.6定义链路本地地址范围 fe80::/10。这类地...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8C%85%E5%8F%B7%E4%B8%8D%E6%98%AF%E5%AD%97%E8%8A%82%E5%BA%8F%E5%8F%B7"><span class="toc-number">1.</span> <span class="toc-text">包号不是字节序号</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%B5%81%E7%8B%AC%E7%AB%8B%E4%B8%8D%E7%AD%89%E4%BA%8E%E6%8B%A5%E5%A1%9E%E7%8B%AC%E7%AB%8B"><span class="toc-number">2.</span> <span class="toc-text">流独立不等于拥塞独立</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%81%A2%E5%A4%8D%E7%9C%8B-ack-%E5%8C%BA%E9%97%B4-%E4%B8%8D%E9%87%8D%E5%8F%91%E5%8E%9F%E5%8C%85"><span class="toc-number">3.</span> <span class="toc-text">恢复看 ACK 区间，不重发原包</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#tls-%E6%98%AF%E4%BC%A0%E8%BE%93%E7%8A%B6%E6%80%81%E7%9A%84%E4%B8%80%E9%83%A8%E5%88%86"><span class="toc-number">4.</span> <span class="toc-text">TLS 是传输状态的一部分</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%BF%81%E7%A7%BB%E4%BE%9D%E8%B5%96%E8%BF%9E%E6%8E%A5-id-%E5%92%8C%E8%B7%AF%E5%BE%84%E9%AA%8C%E8%AF%81"><span class="toc-number">5.</span> <span class="toc-text">迁移依赖连接 ID 和路径验证</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9D%A1%E4%BB%B6%E5%92%8C%E5%8F%8D%E4%BE%8B"><span class="toc-number">6.</span> <span class="toc-text">条件和反例</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%AF%E5%A4%8D%E7%8E%B0%E6%89%8B%E7%AE%97"><span class="toc-number">7.</span> <span class="toc-text">可复现手算</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">8.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">9.</span> <span class="toc-text">参考资料</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%AA%8C%E8%AF%81%E8%BE%B9%E7%95%8C"><span class="toc-number">10.</span> <span class="toc-text">验证边界</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

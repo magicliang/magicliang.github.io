@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import itertools
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+
+Op = tuple[str, str, str | int]
+
+
+def interleavings(a: list[Op], b: list[Op]) -> Iterable[list[Op]]:
+    if not a:
+        yield b
+    elif not b:
+        yield a
+    else:
+        for rest in interleavings(a[1:], b):
+            yield [a[0], *rest]
+        for rest in interleavings(a, b[1:]):
+            yield [b[0], *rest]
+
+
+def run_sc(program: list[list[Op]]) -> dict[str, object]:
+    outcomes: dict[str, list[list[str]]] = {}
+    for order in interleavings(program[0], program[1]):
+        mem = {"x": 0, "y": 0}
+        regs = {"r0": None, "r1": None}
+        trace: list[str] = []
+        for kind, loc, arg in order:
+            if kind == "store":
+                mem[loc] = int(arg)
+                trace.append(f"store {loc}={arg}")
+            else:
+                regs[str(arg)] = mem[loc]
+                trace.append(f"{arg}=load {loc}->{mem[loc]}")
+        key = f"r0={regs['r0']},r1={regs['r1']}"
+        outcomes.setdefault(key, []).append(trace)
+    assert "r0=0,r1=0" not in outcomes
+    return {"model": "SC", "outcomes": outcomes, "forbidden": "r0=0,r1=0"}
+
+
+@dataclass
+class StoreBufferState:
+    mem: dict[str, int] = field(default_factory=lambda: {"x": 0, "y": 0})
+    buf: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: {"T0": [], "T1": []})
+    regs: dict[str, int | None] = field(default_factory=lambda: {"r0": None, "r1": None})
+    trace: list[str] = field(default_factory=list)
+
+    def store(self, tid: str, loc: str, value: int) -> None:
+        self.buf[tid].append((loc, value))
+        self.trace.append(f"{tid}: buffer {loc}={value}")
+
+    def load(self, tid: str, loc: str, reg: str) -> None:
+        for b_loc, b_val in reversed(self.buf[tid]):
+            if b_loc == loc:
+                self.regs[reg] = b_val
+                self.trace.append(f"{tid}: {reg}=forward {loc}->{b_val}")
+                return
+        self.regs[reg] = self.mem[loc]
+        self.trace.append(f"{tid}: {reg}=load memory {loc}->{self.mem[loc]}")
+
+    def flush_one(self, tid: str) -> None:
+        loc, value = self.buf[tid].pop(0)
+        self.mem[loc] = value
+        self.trace.append(f"{tid}: flush {loc}={value}")
+
+
+def run_store_buffer() -> dict[str, object]:
+    s = StoreBufferState()
+    s.store("T0", "x", 1)
+    s.store("T1", "y", 1)
+    s.load("T0", "y", "r0")
+    s.load("T1", "x", "r1")
+    assert s.regs == {"r0": 0, "r1": 0}
+    s.flush_one("T0")
+    s.flush_one("T1")
+    return {
+        "model": "explicit_store_buffer",
+        "allowed_outcome": dict(s.regs),
+        "trace": s.trace,
+        "note": "Shows coherence per location does not imply cross-address sequential consistency.",
+    }
+
+
+def closure(edges: set[tuple[str, str]]) -> set[tuple[str, str]]:
+    reach = set(edges)
+    changed = True
+    while changed:
+        changed = False
+        additions = {(a, d) for a, b in reach for c, d in reach if b == c and (a, d) not in reach}
+        if additions:
+            reach |= additions
+            changed = True
+    return reach
+
+
+def derive_release_acquire_case(flag_source: str, include_sw: bool = True, payload_atomic: bool = False) -> dict[str, object]:
+    payload_op = "atomic_relaxed_write" if payload_atomic else "plain_write"
+    events = {
+        "payload_init": {"thread": "init", "op": payload_op, "object": "payload", "value": 0},
+        "flag_init": {"thread": "init", "op": "write", "object": "flag", "value": 0},
+        "payload_store_42": {"thread": "producer", "op": payload_op, "object": "payload", "value": 42},
+        "flag_store_release_1": {"thread": "producer", "op": "release_store", "object": "flag", "value": 1},
+        "flag_load_acquire": {"thread": "consumer", "op": "acquire_load", "object": "flag"},
+    }
+    rf_source = "flag_store_release_1" if flag_source == "release_store" else "flag_init"
+    flag_value = int(events[rf_source]["value"])
+    payload_executed = flag_value == 1
+    if payload_executed:
+        events["payload_load"] = {"thread": "consumer", "op": "atomic_relaxed_read" if payload_atomic else "plain_read", "object": "payload"}
+    po = {("payload_store_42", "flag_store_release_1")}
+    if payload_executed:
+        po.add(("flag_load_acquire", "payload_load"))
+    rf = {(rf_source, "flag_load_acquire")}
+    sw = set()
+    if include_sw and rf_source == "flag_store_release_1":
+        sw.add(("flag_store_release_1", "flag_load_acquire"))
+    hb = closure(po | sw)
+    payload_hb = payload_executed and ("payload_store_42", "payload_load") in hb
+    data_race_if_plain = payload_executed and not payload_atomic and not payload_hb
+    if not payload_executed:
+        payload_read: int | str | list[int] = "not_executed"
+    elif payload_hb:
+        payload_read = 42
+    elif payload_atomic:
+        payload_read = [0, 42]
+    else:
+        payload_read = "undefined_data_race_if_plain_payload"
+    return {
+        "flag_source": rf_source,
+        "flag_value": flag_value,
+        "payload_atomic": payload_atomic,
+        "events": events,
+        "po": sorted([list(edge) for edge in po]),
+        "rf": sorted([list(edge) for edge in rf]),
+        "sw": sorted([list(edge) for edge in sw]),
+        "hb": sorted([list(edge) for edge in hb]),
+        "payload_read": payload_read,
+        "payload_store_happens_before_payload_load": payload_hb,
+        "data_race_if_plain_payload": data_race_if_plain,
+    }
+
+
+def run_release_acquire() -> dict[str, object]:
+    initial = derive_release_acquire_case("initial")
+    release = derive_release_acquire_case("release_store")
+    broken_plain = derive_release_acquire_case("release_store", include_sw=False)
+    relaxed_atomic = derive_release_acquire_case("release_store", include_sw=False, payload_atomic=True)
+    assert initial["payload_read"] == "not_executed"
+    assert not initial["payload_store_happens_before_payload_load"]
+    assert release["payload_read"] == 42
+    assert release["payload_store_happens_before_payload_load"]
+    assert not release["data_race_if_plain_payload"]
+    assert broken_plain["payload_read"] == "undefined_data_race_if_plain_payload"
+    assert broken_plain["data_race_if_plain_payload"]
+    assert relaxed_atomic["payload_read"] == [0, 42]
+    assert not relaxed_atomic["data_race_if_plain_payload"]
+    return {
+        "model": "release_acquire_event_graph",
+        "program": "producer: payload=42; store_release(flag,1) / consumer: r=load_acquire(flag); if r==1 read payload",
+        "cases": [
+            {"name": "acquire_reads_initial_flag", **initial},
+            {"name": "acquire_reads_release_flag", **release},
+        ],
+        "counterexamples": [
+            {
+                "name": "delete_synchronizes_with_edge_for_plain_payload",
+                "case": broken_plain,
+                "expected_check": "plain payload read must be ordered by happens-before to avoid a C data race",
+                "result": "FAILS as intended: this is undefined, not a legal stale-value case",
+            },
+            {
+                "name": "initial_flag_does_not_read_payload",
+                "wrong_claim": "payload_read is 0 when flag load reads the initial 0",
+                "actual": initial["payload_read"],
+                "result": "FAILS as intended",
+            },
+        ],
+        "variant_boundary": {
+            "if_payload_were_an_independent_atomic_relaxed_load_without_sw": {
+                "case": relaxed_atomic,
+                "allowed_payload_values": [0, 42],
+                "reason": "atomic relaxed removes the C data race but still has no synchronizes-with edge ordering producer payload before the consumer read",
+            }
+        },
+        "claim": "The acquire load carries a plain producer payload write to the consumer only when it reads from the release store and creates sw; without sw the plain-payload example is a data race, while a separate atomic-relaxed payload variant may read either value without ordering.",
+    }
+
+
+def run_lrsc() -> dict[str, object]:
+    value = 0
+    reservation: tuple[str, int] | None = None
+    trace: list[dict[str, object]] = []
+    attempts = 0
+    t0_done = False
+    while not t0_done:
+        attempts += 1
+        read = value
+        reservation = ("T0", read)
+        trace.append({"attempt": attempts, "op": "lr", "hart": "T0", "read": read, "intended_sc_value": read + 1})
+        if attempts == 1:
+            old = value
+            value = old + 1
+            reservation = None
+            trace.append({"attempt": attempts, "op": "interfering_atomic_rmw", "hart": "T1", "read": old, "write": value, "invalidates_t0_reservation": True})
+        if reservation == ("T0", read) and value == read:
+            value = read + 1
+            t0_done = True
+            trace.append({"attempt": attempts, "op": "sc", "hart": "T0", "success": True, "write": value})
+        else:
+            trace.append({"attempt": attempts, "op": "sc", "hart": "T0", "success": False, "observed_value": value})
+    no_retry_counterexample = {
+        "initial": 0,
+        "t0_lr_read": 0,
+        "t1_atomic_rmw_write": 1,
+        "t0_sc_success": False,
+        "final_without_retry": 1,
+        "lost_t0_increment": True,
+    }
+    assert attempts == 2 and value == 2
+    assert no_retry_counterexample["final_without_retry"] == 1
+    return {
+        "model": "lrsc_atomic_increment_retry",
+        "trace": trace,
+        "final": {"value": value, "attempts": attempts, "successful_t0_increment": True},
+        "no_retry_counterexample": no_retry_counterexample,
+        "claim": "The retry loop preserves the intended increment after one interfering atomic RMW; this finite success does not prove lock-free progress for arbitrary executions.",
+        "boundaries": [
+            "SC failure after interference is allowed and must be retried when the operation is meant to complete.",
+            "Atomicity of the increment comes from the successful LR/SC pair or an AMO/CAS-style read-modify-write, not from a plain load followed by a plain store.",
+            "Ordering and forward-progress guarantees are separate from this single-location atomicity case.",
+        ],
+    }
+
+
+def main() -> None:
+    root = Path(__file__).resolve().parents[1]
+    out = root / "outputs"
+    out.mkdir(parents=True, exist_ok=True)
+    program = [
+        [("store", "x", 1), ("load", "y", "r0")],
+        [("store", "y", 1), ("load", "x", "r1")],
+    ]
+    cases = {
+        "litmus_sc": run_sc(program),
+        "litmus_store_buffer": run_store_buffer(),
+        "release_acquire": run_release_acquire(),
+        "lrsc_retry": run_lrsc(),
+    }
+    for name, data in cases.items():
+        (out / f"{name}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    (out / "summary.txt").write_text(
+        "memory model cases: PASS\n"
+        "SC forbids SB (0,0); explicit store buffers allow SB (0,0); "
+        "release/acquire separates plain data-race and atomic-relaxed variants; LR/SC retry preserves one atomic increment after interference.\n",
+        encoding="utf-8",
+    )
+    print("memory model cases: PASS")
+
+
+if __name__ == "__main__":
+    main()
