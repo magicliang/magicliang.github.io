@@ -1,0 +1,833 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>从零编写操作系统 24 - 管道：让两个进程通过字节流协作 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="第 23 篇的 Shell 已经能启动 cat 和 wc，却只能让它们各自连接终端。管道要解决的问题，是把一个进程的 fd 1 接到另一个进程的 fd 0，同时让双方在速度不一致、提前退出和创建失败时都能结束。 本篇加入一个 64 字节有界管道和 pipe 系统调用。Shell 现在可以执行一条两段流水线： 12# cat readme.txt | wc27 1479 README.TXT 有 1">
+<meta property="og:type" content="article">
+<meta property="og:title" content="从零编写操作系统 24 - 管道：让两个进程通过字节流协作">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/20/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-24-%E7%AE%A1%E9%81%93/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="第 23 篇的 Shell 已经能启动 cat 和 wc，却只能让它们各自连接终端。管道要解决的问题，是把一个进程的 fd 1 接到另一个进程的 fd 0，同时让双方在速度不一致、提前退出和创建失败时都能结束。 本篇加入一个 64 字节有界管道和 pipe 系统调用。Shell 现在可以执行一条两段流水线： 12# cat readme.txt | wc27 1479 README.TXT 有 1">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/09/20/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-24-%E7%AE%A1%E9%81%93/cover.svg">
+<meta property="article:published_time" content="2026-09-20T15:58:00.000Z">
+<meta property="article:modified_time" content="2026-09-23T04:00:24.492Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="x86">
+<meta property="article:tag" content="操作系统">
+<meta property="article:tag" content="进程间通信">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/09/20/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-24-%E7%AE%A1%E9%81%93/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "从零编写操作系统 24 - 管道：让两个进程通过字节流协作",
+  "url": "https://magicliang.github.io/2026/09/20/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-24-%E7%AE%A1%E9%81%93/",
+  "image": "https://magicliang.github.io/2026/09/20/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-24-%E7%AE%A1%E9%81%93/cover.svg",
+  "datePublished": "2026-09-20T15:58:00.000Z",
+  "dateModified": "2026-09-23T04:00:24.492Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/20/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-24-%E7%AE%A1%E9%81%93/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '从零编写操作系统 24 - 管道：让两个进程通过字节流协作',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">965</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1089</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">53</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="not-top-img" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">从零编写操作系统 24 - 管道：让两个进程通过字节流协作</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav></header><main class="layout" id="content-inner"><div id="post"><div id="post-info"><h1 class="post-title">从零编写操作系统 24 - 管道：让两个进程通过字节流协作</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-20T15:58:00.000Z" title="Created 2026-09-20 23:58:00">2026-09-20</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-23T04:00:24.492Z" title="Updated 2026-09-23 12:00:24">2026-09-23</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%9F%BA%E7%A1%80%E8%AE%BE%E6%96%BD/">基础设施</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>10mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-23 12:00:24&quot;}" hidden></div><p>第 23 篇的 Shell 已经能启动 <code>cat</code> 和 <code>wc</code>，却只能让它们各自连接终端。管道要解决的问题，是把一个进程的 fd 1 接到另一个进程的 fd 0，同时让双方在速度不一致、提前退出和创建失败时都能结束。</p>
+<p>本篇加入一个 64 字节有界管道和 <code>pipe</code> 系统调用。Shell 现在可以执行一条两段流水线：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text"># cat readme.txt | wc<br>27 1479<br></code></pre></td></tr></table></figure>
+<p><code>README.TXT</code> 有 1479 字节，远大于缓冲区。这个样本会反复经历写满、阻塞、读出和唤醒，不能靠一次复制碰巧通过。专项实验还覆盖读端早退、第二个子进程创建失败、坏用户指针、对象耗尽和重复回收。</p>
+<span id="more"></span>
+<h2 id="管道不只是一段共享内存">管道不只是一段共享内存</h2>
+<p>环形缓冲只能保存字节。一个可用的管道还要回答四个问题：</p>
+<ol>
+<li>缓冲为空时，读者应该等待还是收到 EOF？</li>
+<li>缓冲已满时，写者怎样让出 CPU？</li>
+<li>哪一次 <code>close</code> 才表示一侧真的消失？</li>
+<li>Shell 在哪一步关闭自己的端点，失败时按什么顺序回收？</li>
+</ol>
+<p>本篇的完整路径如下：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs text">Shell fd 3 ──► read endpoint ─┐<br>                              │<br>                         64-byte ring<br>                              │<br>Shell fd 4 ──► write endpoint ┘<br><br>spawn cat: fd 1 → write endpoint<br>spawn wc : fd 0 → read endpoint<br>Shell close(3), close(4)<br>wait(cat), wait(wc)<br></code></pre></td></tr></table></figure>
+<p>fd 表、open-file 和管道对象分成三层。fd 是进程内的整数；open-file 保存引用计数和读写能力；管道对象保存字节与等待状态。把三层混在一起，最常见的结果是某个继承 fd 一关闭，整个管道就被误判为没有 writer。</p>
+<h2 id="两个端点共享一个有界对象">两个端点共享一个有界对象</h2>
+<p>内核只提供一个固定管道槽，足够完成本篇的一条前台流水线：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-meta">#<span class="hljs-keyword">define</span> PIPE_CAPACITY 64u</span><br><br><span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">pipe</span> &#123;</span><br>    <span class="hljs-type">unsigned</span> used, read_at, write_at;<br>    <span class="hljs-type">unsigned</span> readers, writers;<br>    <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">wait_queue</span> <span class="hljs-title">read_waiters</span>, <span class="hljs-title">write_waiters</span>;</span><br>    <span class="hljs-type">uint8_t</span> bytes[PIPE_CAPACITY];<br>&#125;;<br></code></pre></td></tr></table></figure>
+<p>创建时同时占用两个 open-file 槽。读端只设置 <code>readable</code>，写端只设置 <code>writable</code>，二者都指向同一个 <code>struct pipe</code>。当前实现每一侧只有一个 open-file 对象，所以 <code>readers</code> 和 <code>writers</code> 是 0/1 状态；父子进程共享端点时增加的是 open-file 的 <code>refs</code>。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">Shell fd 4 ─┐<br>            ├─► write open-file (refs=2) ─► pipe.writers=1<br>cat fd 1 ───┘<br></code></pre></td></tr></table></figure>
+<p>Shell 关闭 fd 4 后，写端引用从 2 变成 1，<code>writers</code> 仍为 1。只有 <code>cat</code> 的 fd 1 也关闭，open-file 的最终引用才消失，管道才把 <code>writers</code> 改成 0。</p>
+<p>这个层次延续了第 22 篇的句柄所有权：复制句柄增加中间对象的引用，底层资源只响应最后一次释放。</p>
+<h2 id="空缓冲不一定是-eof">空缓冲不一定是 EOF</h2>
+<p>读写规则可以压缩成一张状态表：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>条件</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>read</td>
+<td><code>used &gt; 0</code></td>
+<td>取出 <code>min(length, used)</code>，唤醒一个 writer</td>
+</tr>
+<tr>
+<td>read</td>
+<td><code>used == 0 &amp;&amp; writers &gt; 0</code></td>
+<td>进入读等待队列</td>
+</tr>
+<tr>
+<td>read</td>
+<td><code>used == 0 &amp;&amp; writers == 0</code></td>
+<td>返回 0，也就是 EOF</td>
+</tr>
+<tr>
+<td>write</td>
+<td>有空间且 <code>readers &gt; 0</code></td>
+<td>写入可用空间，唤醒一个 reader</td>
+</tr>
+<tr>
+<td>write</td>
+<td>缓冲满且 <code>readers &gt; 0</code></td>
+<td>进入写等待队列</td>
+</tr>
+<tr>
+<td>write</td>
+<td><code>readers == 0</code></td>
+<td>返回本项目的 <code>EPIPE</code> 错误</td>
+</tr>
+</tbody>
+</table>
+<p>读者不能只检查 <code>used == 0</code>。producer 还活着时，空只表示“字节尚未到达”；最后一个写端已经关闭时，空才表示后续永远不会再有数据。</p>
+<p>等待过程沿用第 15 篇的单 CPU 协议。内核关闭中断后检查条件，把当前任务登记进对象的等待队列，再切换任务。唤醒后用 <code>while</code> 重查：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-keyword">while</span> (!pipe-&gt;used &amp;&amp; pipe-&gt;writers)<br>    task_block_locked(&amp;pipe-&gt;read_waiters);<br><br><span class="hljs-keyword">if</span> (!pipe-&gt;used)<br>    <span class="hljs-keyword">return</span> <span class="hljs-number">0</span>;<br></code></pre></td></tr></table></figure>
+<p>条件检查和入队处在同一个不可抢占区间，写者无法在两步之间写入并发送一次无人接收的唤醒。醒来仍重查条件，则不依赖“每次唤醒只对应一个确定事件”。</p>
+<h2 id="短传输把背压送回用户态">短传输把背压送回用户态</h2>
+<p>一次系统调用最多接收 256 字节，而管道只有 64 字节。写者发现还有空间时，只提交当前能容纳的部分并返回短计数。<code>cat</code> 的 <code>write_all</code> 必须继续发送剩余字节：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-keyword">while</span> (done &lt; length) &#123;<br>    <span class="hljs-type">int32_t</span> n = write(fd, bytes + done, length - done);<br>    <span class="hljs-keyword">if</span> (n &lt;= <span class="hljs-number">0</span>) <span class="hljs-keyword">return</span> <span class="hljs-number">-1</span>;<br>    done += (<span class="hljs-type">uint32_t</span>)n;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>若缓冲已经满，writer 进入 <code>write_waiters</code>，不在循环里消耗 CPU。reader 取走数据后唤醒一个 writer。反方向也一样：<code>wc</code> 在空缓冲上阻塞，producer 写入后再恢复。</p>
+<p>这里没有承诺 POSIX 的 <code>PIPE_BUF</code> 原子性。多个 writer、原子小写入和信号语义都不属于当前 ABI；短写是用户程序必须处理的正常结果。</p>
+<h2 id="close-负责传播永久条件"><code>close</code> 负责传播永久条件</h2>
+<p>普通读写只需要唤醒一个对端，因为缓冲中的一次变化未必足够满足所有等待者。端点关闭不同：最后一个 reader 消失后，“无读者”不会再恢复；所有 writer 都应醒来观察错误。最后一个 writer 消失后，所有 reader 也应醒来观察 EOF。</p>
+<p>因此本篇在原有 <code>wake_one_locked</code> 旁增加 <code>wake_all_locked</code>：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs c"><span class="hljs-type">unsigned</span> <span class="hljs-title function_">wake_all_locked</span><span class="hljs-params">(<span class="hljs-keyword">struct</span> wait_queue *q)</span><br>&#123;<br>    <span class="hljs-type">unsigned</span> count = <span class="hljs-number">0</span>;<br>    <span class="hljs-keyword">while</span> (wake_one_locked(q)) ++count;<br>    <span class="hljs-keyword">return</span> count;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p><code>file_put</code> 把 open-file 引用减到零时，才关闭对应 pipe side 并唤醒对面。进程退出仍沿用第 19、22 篇的顺序：先关闭全部 fd，再发布 ZOMBIE。若把关闭推迟到 <code>wait</code>，已经退出却未被回收的 writer 会让 reader 永远等不到 EOF。</p>
+<h2 id="pipe-必须一次交付两个-fd"><code>pipe()</code> 必须一次交付两个 fd</h2>
+<p><code>SYS_PIPE=11</code> 接收一个可写的二元素数组。实现先验证完整的 8 字节用户范围，再准备资源：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs text">验证用户输出范围<br>  → 找到一个空 pipe slot<br>  → 找到两个空 open-file slot<br>  → 初始化读端和写端<br>  → 原子找到两个进程 fd slot 并安装<br>  → copy_to_user([read_fd, write_fd])<br></code></pre></td></tr></table></figure>
+<p>用户地址在分配前验证，因此坏指针不会留下任何对象。两个 fd 在一次关中断临界区内安装；如果槽位不足，两个端点逆序释放。用户态不会看到“只成功了一半”的管道。</p>
+<p>专项命令 <code>pipetest</code> 先传入未映射地址 <code>0x1000</code>，再执行四轮创建、第二次创建、关闭。一个管道存活时再次创建返回 <code>ENFILE</code>；关闭两端后下一轮又能成功。最终输出：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">PIPE API OK<br></code></pre></td></tr></table></figure>
+<h2 id="shell-的顺序决定流水线能否结束">Shell 的顺序决定流水线能否结束</h2>
+<p>Shell 的主路径固定为：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs text">pipe<br>spawn producer(stdin=Shell stdin, stdout=pipe write)<br>yield once<br>spawn consumer(stdin=pipe read, stdout=Shell stdout)<br>Shell close(pipe read)<br>Shell close(pipe write)<br>wait producer<br>wait consumer<br></code></pre></td></tr></table></figure>
+<p>主动让出一次 CPU 是本实验的确定性探针。producer 在 consumer 发布前运行，1479 字节输出会填满 64 字节缓冲并阻塞；Shell 随后恢复并创建 consumer。它没有等待 producer 完成，因此不会形成“producer 等空间、Shell 等 producer、consumer 尚未启动”的环形等待。</p>
+<p>两个子进程都发布后，Shell 必须关闭自己的两个 fd。若保留父写端，即使 producer 已退出，<code>writers</code> 仍不为零，consumer 读空后只能继续睡眠。</p>
+<p>第二个 <code>spawn</code> 失败时，顺序更敏感：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">producer 已在满缓冲上阻塞<br>  → Shell 关闭 read end，唤醒 producer<br>  → Shell 关闭 write end<br>  → producer 返回 EPIPE 并退出<br>  → Shell wait/reap producer<br></code></pre></td></tr></table></figure>
+<p>若先 <code>wait</code> 再关闭读端，producer 没有机会从永久满缓冲中退出。</p>
+<h2 id="解析器只增加一个明确语法">解析器只增加一个明确语法</h2>
+<p>Day 23 把所有元字符都拒绝。现在扫描器把一个 <code>|</code> 识别为分隔符，左右两侧分别构造 <code>argv</code>；<code>echo abc|wc</code> 与带空格写法等价。缺少任一侧或出现第二个管道符都会整行拒绝：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text"># echo x || wc<br>shell: invalid pipeline<br></code></pre></td></tr></table></figure>
+<p>引号、反斜杠、tab、<code>;</code>、<code>&amp;</code>、<code>&lt;</code> 和 <code>&gt;</code> 仍未实现。多段管道也没有被半支持。解析成功后，两侧命令名分别经过原有 8.3 转换和 FAT 查找。</p>
+<h2 id="运行结果把成功与残留区分开">运行结果把成功与残留区分开</h2>
+<p>正常路径的结果与宿主 <code>wc</code> 一致：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text"># cat readme.txt | wc<br>27 1479<br># echo abc|wc<br>1 4<br></code></pre></td></tr></table></figure>
+<p>读端早退使用 <code>head</code> 只取一个字节。producer 已经在满缓冲上等待；consumer 退出关闭最终读端后，producer 被唤醒并收到 broken-pipe：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text"># cat readme.txt | head<br>B<br>shell: left command failed<br></code></pre></td></tr></table></figure>
+<p>第二个程序不存在时也能恢复：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text"># cat readme.txt | nosuch<br>shell: command not found<br># echo recovered<br>recovered<br></code></pre></td></tr></table></figure>
+<p>最终串口统计为：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">PIPE STATS creates=8 releases=8 rblock=22 wblock=6 eof=2 broken=2 read=1484 written=1612<br>SHELL OK prompts=8 pages=16048<br></code></pre></td></tr></table></figure>
+<p><code>creates == releases</code> 说明八次成功创建全部回收。<code>wblock=6</code> 证明缓冲容量确实施加了回压；<code>eof=2</code> 对应两条完整消费的流水线；<code>broken=2</code> 对应读端早退和 consumer 创建失败。读出的 1484 字节等于完整文件 1479 字节、<code>echo</code> 的 4 字节和早退探针的 1 字节。失败流水线留下的已提交字节使 written 大于 read，这是预期清理路径，不是伪造的完整消费。</p>
+<p>GDB 在 Shell 退出后的内核循环中再次读取对象状态：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">STATE creates=8 releases=8 rblock=22 wblock=6 eof=2 broken=2 used=0 readers=0 writers=0<br>PASS: GDB observed blocking, EOF, broken-pipe wakeup and final reclamation<br></code></pre></td></tr></table></figure>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="day24-pipe-screen.png" alt="两段管道、早退和失败恢复"></p>
+<p><a href="day24-pipe-serial.txt">完整串口记录</a>、<a href="day24-pipe-gdb.txt">GDB 资源现场</a>与<a href="day24-pipe-input.txt">键盘注入序列</a>保留了本次真实运行数据。专项完成后，Day 23 至 Day 16 的十项相关回归也全部退出 0，见<a href="day24-cumulative.txt">累计回归记录</a>。</p>
+<h2 id="当前边界">当前边界</h2>
+<p>本篇只有一个固定管道槽和一个 64 字节缓冲区，只支持 <code>cmd1 | cmd2</code>。没有多级流水线、重定向、后台任务、命名管道、非阻塞 I/O、<code>select/poll</code>、SIGPIPE 或多 writer 原子写保证。</p>
+<p>等待队列是四任务槽的位图，调度和临界区针对单 CPU。关闭路径实现了 wake-all，但没有承诺等待顺序或公平性。测试环境是 QEMU 8.2.2、SeaBIOS 1.16.3、<code>pc-i440fx-7.2</code>、TCG、qemu32、1 CPU 和 64 MiB；没有据此声称真实硬件或 SMP 已验证。</p>
+<h2 id="机制速查">机制速查</h2>
+<table>
+<thead>
+<tr>
+<th>遇到的问题</th>
+<th>可迁移做法</th>
+<th>本篇落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>一个逻辑资源有多个句柄</td>
+<td>分离句柄引用与底层端点状态</td>
+<td>fd → open-file → pipe</td>
+</tr>
+<tr>
+<td>空状态可能暂时也可能永久</td>
+<td>把生产者存活状态纳入条件</td>
+<td>空且有 writer 时等待；无 writer 时 EOF</td>
+</tr>
+<tr>
+<td>等待者可能错过状态变化</td>
+<td>在同一临界区检查、入队，醒后重查</td>
+<td>pipe 的两条 wait queue</td>
+</tr>
+<tr>
+<td>创建要同时返回多个资源</td>
+<td>延迟发布并统一回滚</td>
+<td><code>pipe()</code> 的两个 fd</td>
+</tr>
+<tr>
+<td>并发流程中途失败</td>
+<td>先解除依赖，再等待退出</td>
+<td>consumer spawn 失败先 close 后 wait</td>
+</tr>
+</tbody>
+</table>
+<h2 id="下载与复现">下载与复现</h2>
+<p><a href="os-day-24.zip">下载第 24 篇完整源码</a>。附件 SHA-256：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">fa86c15e1ea6721ea9f7d01550dcc1a8ae731937b60c26e68d916474d59a71c6<br></code></pre></td></tr></table></figure>
+<p>解压后执行：</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><code class="hljs sh">unzip os-day-24.zip<br><span class="hljs-built_in">cd</span> os-day-24<br>make build<br>make check-pipe<br>make check-shell<br>make check-fd<br>make check-fat<br>make check-block<br>make check-process<br>make check-syscall<br>make check-elf<br>make check-memory<br>make check-runtime-limit<br>make check-keyboard<br></code></pre></td></tr></table></figure>
+<p>附件包含第 01–24 篇的累计工程和打包前形成的 <code>docs/day24-*</code> 证据，不含 <code>build/</code> 产物。冻结后会在新的空目录中重新构建并复跑专项与累计回归；复验收据不反向写回它描述的 ZIP。</p>
+<h2 id="练习">练习</h2>
+<ol>
+<li>暂时保留 Shell 的写端，运行 <code>echo x | wc</code>，用 GDB 找出 consumer 为何无法观察 EOF，再恢复正确关闭顺序。</li>
+<li>把 64 字节容量改成 1、63、65 和 256，比较 <code>rblock/wblock</code>；不要用阻塞次数推导调度公平性。</li>
+<li>将固定单管道槽扩展为小型对象池，补充“两个管道同时存活”和中途分配失败的事务测试。</li>
+</ol>
+<p>上一篇：<a href="/2026/09/20/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-23-%E7%94%A8%E6%88%B7%E6%80%81-Shell/">23 - 用户态 Shell</a>。</p>
+<p>下一篇：25 - 从字符到像素。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://github.com/mit-pdos/xv6-riscv/blob/9e3161a9abf5f51ea402562d1874caf6c4926597/kernel/pipe.c#L11-L143">xv6-riscv <code>kernel/pipe.c</code></a>：固定提交的管道对象、关闭唤醒和满空等待对照；本项目使用自己的单 CPU 等待队列与系统调用 ABI。</li>
+<li><a target="_blank" rel="noopener" href="https://github.com/mit-pdos/xv6-riscv/blob/9e3161a9abf5f51ea402562d1874caf6c4926597/user/sh.c#L101-L123">xv6-riscv <code>user/sh.c</code></a>：用于对照父进程启动两侧、关闭端点再等待的所有权顺序；本项目没有 <code>fork/dup</code>。</li>
+<li><a target="_blank" rel="noopener" href="https://github.com/mit-pdos/xv6-riscv/blob/9e3161a9abf5f51ea402562d1874caf6c4926597/kernel/file.c#L28-L83">xv6-riscv <code>kernel/file.c</code></a>：用于对照 open-file 引用与底层端点关闭的分层。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/20/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-24-%E7%AE%A1%E9%81%93/">https://magicliang.github.io/2026/09/20/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-24-%E7%AE%A1%E9%81%93/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F/">操作系统</a><a class="post-meta__tags" href="/tags/x86/">x86</a><a class="post-meta__tags" href="/tags/%E8%BF%9B%E7%A8%8B%E9%97%B4%E9%80%9A%E4%BF%A1/">进程间通信</a></div><div class="post-share"><div class="social-share" data-image="/2026/09/20/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-24-%E7%AE%A1%E9%81%93/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-04-%E8%BF%9B%E5%85%A5%E4%BF%9D%E6%8A%A4%E6%A8%A1%E5%BC%8F/" title="从零编写操作系统 04 - 进入保护模式：建立第一份运行环境"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-04-%E8%BF%9B%E5%85%A5%E4%BF%9D%E6%8A%A4%E6%A8%A1%E5%BC%8F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 04 - 进入保护模式：建立第一份运行环境</div></div><div class="info-2"><div class="info-item-1">第 03 篇已经让第一阶段启动扇区加载第二阶段，也让第二阶段读取载荷并检查边界。它仍然停留在实模式。实模式下可以方便调用 BIOS，也能通过操作数前缀使用 32 位寄存器；后续内核需要的平坦地址空间和权限隔离仍要建立在保护模式上。 本篇完成第一次处理器模式切换：在进入保护模式前收集 E820 内存图，打开 A20，建立 GDT，设置 CR0.PE，再用远跳转刷新代码段。切换完成后，32 位代码直接写 VGA 文本显存，GDB 能观察到保护模式状态。BIOS 调用到这里为止，后面的内核不能再按实模式方式直接调用 int 10h 或 int 13h。  为什么先把 BIOS 调用做完 BIOS 服务是实模式时代的接口。第 03 篇依赖它读盘；本篇还要依赖它查询内存图。进入保护模式后，CPU 的段解释、地址宽度和中断入口都变了。没有虚拟 8086 模式、实模式回跳或专门 BIOS 调用桥时，内核不能继续把 int 15h 当作普通函数使用。 切换前后的准备顺序如下： 1234567891011real mode  ├─ read disk through BIOS EDD  ├─ pr...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/" title="从零编写操作系统 09 - 键盘与事件队列：把中断接收和字符处理分开"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-09-%E9%94%AE%E7%9B%98%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%98%9F%E5%88%97/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 09 - 键盘与事件队列：把中断接收和字符处理分开</div></div><div class="info-2"><div class="info-item-1">键盘接入后，内核需要同时处理两种节奏：设备产生扫描码时必须及时接收，字符转换、退格和整行输出则可以留在前台执行。把打印放进 IRQ1 会延长关中断时间，也会让输入设备直接依赖控制台。 本篇在已有异常入口和 PIC 重映射上接入 PS/2 键盘。IRQ1 只接收原始字节并放进队列；主循环负责 US set 1 解析与简单行编辑。输入回车后显示 LINE: ...，尚未执行命令，也没有 shell。  IRQ1 接到已有中断入口 第 08 篇把主 PIC 的向量起点设为 0x20。键盘接主片 IRQ1，因此向量为 0x21，即十进制 33。 123456789PS/2 键盘扫描码    ↓i8042 输出缓冲区 → IRQ1    ↓主 PIC → IDT[33] → 公共汇编入口    ↓trap_dispatch → keyboard_irq    ↓ 原始字节入队，主 PIC EOIiret 恢复前台 → 出队 → 解析 → 行编辑 kernel/exceptions.c 现在初始化前 34 个 IDT 表项，0—31 为异常，32 为时钟，33 为键盘。其余表项仍不在场，不能...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-21-%E5%8F%AA%E8%AF%BB-FAT16/" title="从零编写操作系统 21 - 只读 FAT16：从扇区追到文件字节"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/19/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-21-%E5%8F%AA%E8%AF%BB-FAT16/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">从零编写操作系统 21 - 只读 FAT16：从扇区追到文件字节</div></div><div class="info-2"><div class="info-item-1">第 20 篇已经能从 ATA 设备读出指定 LBA 的 512 字节，但用户程序仍然来自内核里的 ELF 字节数组。块设备只回答“某个扇区里是什么”；要回答“README.TXT 在哪里、有多长、怎样读出来”，还需要文件系统层。 本篇在已有 ATA PIO 接口上增加只读 FAT16。内核从 MBR 取第一分区，校验 BPB（BIOS Parameter Block）并计算卷布局，在固定根目录中查找 8.3 短名，再沿 FAT 簇链读取文件。测试文件故意存在 2 -&gt; 9 -&gt; 4 三个不连续簇中，因此“刚好读到一段连续数据”不能冒充 FAT 实现。 本篇还真实撞到了旧的 64 KiB 内核文件上限。扩容同时修改了镜像保留区、头部生产器、stage2 读取与校验、链接边界和失败镜像，并用精确 128 KiB/128 KiB+1 的实验区分成功边界和拒绝边界。  FAT16 分区需要真实的数据簇 原镜像只有 4096 个扇区，FAT 分区预定从 LBA 2048 开始。后半段总共只有 2048 个扇区，即使每簇只用一个扇区，扣除引导扇区、FAT 和根目录后也不可能得到 ...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-01-%E5%87%86%E5%A4%87%E5%B7%A5%E5%85%B7%E9%93%BE/" title="从零编写操作系统 01 - 准备工具链：源代码怎样变成磁盘里的字节"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-01-%E5%87%86%E5%A4%87%E5%B7%A5%E5%85%B7%E9%93%BE/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 01 - 准备工具链：源代码怎样变成磁盘里的字节</div></div><div class="info-2"><div class="info-item-1">在普通应用项目里，编译成功后通常可以直接运行可执行文件。自制操作系统还缺少一段工作：谁把文件里的指令放进内存，谁准备栈，CPU 又从哪里开始执行？ 本篇先把这些问题拆开验证。第一条实验生成 ELF32/i386 文件，检查源代码、符号、链接地址和机器指令的对应关系。第二条实验把一块全零磁盘接到 QEMU，观察固件启动失败，再用 GDB 停住并单步执行 CPU。 两条实验还没有连接起来。sample.elf 不会被写进空磁盘，也不会由 BIOS 加载。本篇完成后得到的是可用的编译与调试环境；第 02 篇才开始写 BIOS 能执行的启动扇区。  宿主、目标与固件 本次实验的宿主链路是 ARM macOS 上的 Podman Linux 虚拟机，容器内运行 Debian 12 aarch64。交叉编译器本身是一段 ARM Linux 程序，它生成的指令却属于 32 位 x86。QEMU 再通过 TCG 动态翻译运行这个 x86 客体，不要求宿主 CPU 支持直接执行 x86 指令，机制见 QEMU TCG 文档。 12345678ARM macOS  └─ Podman Linux V...</div></div></div></a><a class="pagination-related" href="/2026/09/22/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-28-%E7%AA%97%E5%8F%A3%E7%AE%A1%E7%90%86/" title="从零编写操作系统 28 - 窗口管理：Z 序、焦点与拖动"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/22/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-28-%E7%AA%97%E5%8F%A3%E7%AE%A1%E7%90%86/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-22</div><div class="info-item-2">从零编写操作系统 28 - 窗口管理：Z 序、焦点与拖动</div></div><div class="info-2"><div class="info-item-1">Day 27 已经把鼠标字节变成坐标、按键和边沿，但屏幕上仍然只有一个直接重绘的字符终端。窗口管理要再回答三件事：重叠位置显示谁，点击交给谁，拖动过程中谁持续拥有指针。 本篇实现一个固定双窗口管理器。窗口表保存几何和文本，Z 序单独保存遮挡关系；命中从顶向底查找，绘制从底向顶执行。左键按下标题栏后建立拖动捕获，键盘字符只写入焦点窗口。每次状态变化仍重建完整 320×200 画面，以最小机制先验证所有权和遮挡恢复。  窗口表与 Z 序承担不同职责 两个窗口的内容放在固定表中： 1234567891011121314struct demo_window &#123;    int32_t x, y;    uint32_t width, height;    uint8_t body_color;    char name;    char text[8];    uint32_t text_length;&#125;;struct demo_window windows[2] = &#123;    &#123;20, 40, 150, 100, 1, &#x27;A&#x27;,...</div></div></div></a><a class="pagination-related" href="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-12-%E5%86%85%E6%A0%B8%E5%A0%86/" title="从零编写操作系统 12 - 内核堆：在物理页内分配、分裂与合并"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/05/%E4%BB%8E%E9%9B%B6%E7%BC%96%E5%86%99%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-12-%E5%86%85%E6%A0%B8%E5%A0%86/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-05</div><div class="info-item-2">从零编写操作系统 12 - 内核堆：在物理页内分配、分裂与合并</div></div><div class="info-2"><div class="info-item-1">物理页分配器每次交出 4096 字节，队列节点、字符串和小结构体却通常用不满一页。 本篇在已经建立恒等映射的物理页内实现 kmalloc 和 kfree，按请求长度分配空间，并在释放时合并相邻空闲块。 堆最多持有四个独立页面，返回地址按 16 字节对齐，单次请求上限为 4076 字节。 实验继续运行在单 CPU、64 MiB RAM 的 qemu32 环境中，所有代码位于 ring 0。 正常镜像验证不同大小的读写、真实耗尽和回收；独立故障镜像破坏对象尾部标记，记录拒绝结果后主动进入诊断停机。 尾部标记由软件检查，越界写入发生时不会因此自动产生硬件异常。  页分配和字节分配各自管理什么 page_alloc() 依据 E820 和保留区规则选择可用物理页，返回物理地址。 它只记录页面归属，不知道页内有几个对象，也不知道其中某个对象申请了多少字节。 如果一个 17 字节对象独占一页，剩余空间仍然被这次页分配占用。 堆从页分配器取得整页，再用块头描述页内区间。 同一页可以同时容纳多个对象，释放一个对象后，其他对象继续有效。 分页还提供了另一项必要条件：这些物理字节必须能被当前虚拟地址...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%AE%A1%E9%81%93%E4%B8%8D%E5%8F%AA%E6%98%AF%E4%B8%80%E6%AE%B5%E5%85%B1%E4%BA%AB%E5%86%85%E5%AD%98"><span class="toc-number">1.</span> <span class="toc-text">管道不只是一段共享内存</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E4%B8%AA%E7%AB%AF%E7%82%B9%E5%85%B1%E4%BA%AB%E4%B8%80%E4%B8%AA%E6%9C%89%E7%95%8C%E5%AF%B9%E8%B1%A1"><span class="toc-number">2.</span> <span class="toc-text">两个端点共享一个有界对象</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%A9%BA%E7%BC%93%E5%86%B2%E4%B8%8D%E4%B8%80%E5%AE%9A%E6%98%AF-eof"><span class="toc-number">3.</span> <span class="toc-text">空缓冲不一定是 EOF</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%9F%AD%E4%BC%A0%E8%BE%93%E6%8A%8A%E8%83%8C%E5%8E%8B%E9%80%81%E5%9B%9E%E7%94%A8%E6%88%B7%E6%80%81"><span class="toc-number">4.</span> <span class="toc-text">短传输把背压送回用户态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#close-%E8%B4%9F%E8%B4%A3%E4%BC%A0%E6%92%AD%E6%B0%B8%E4%B9%85%E6%9D%A1%E4%BB%B6"><span class="toc-number">5.</span> <span class="toc-text">close 负责传播永久条件</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#pipe-%E5%BF%85%E9%A1%BB%E4%B8%80%E6%AC%A1%E4%BA%A4%E4%BB%98%E4%B8%A4%E4%B8%AA-fd"><span class="toc-number">6.</span> <span class="toc-text">pipe() 必须一次交付两个 fd</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#shell-%E7%9A%84%E9%A1%BA%E5%BA%8F%E5%86%B3%E5%AE%9A%E6%B5%81%E6%B0%B4%E7%BA%BF%E8%83%BD%E5%90%A6%E7%BB%93%E6%9D%9F"><span class="toc-number">7.</span> <span class="toc-text">Shell 的顺序决定流水线能否结束</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%A7%A3%E6%9E%90%E5%99%A8%E5%8F%AA%E5%A2%9E%E5%8A%A0%E4%B8%80%E4%B8%AA%E6%98%8E%E7%A1%AE%E8%AF%AD%E6%B3%95"><span class="toc-number">8.</span> <span class="toc-text">解析器只增加一个明确语法</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%BF%90%E8%A1%8C%E7%BB%93%E6%9E%9C%E6%8A%8A%E6%88%90%E5%8A%9F%E4%B8%8E%E6%AE%8B%E7%95%99%E5%8C%BA%E5%88%86%E5%BC%80"><span class="toc-number">9.</span> <span class="toc-text">运行结果把成功与残留区分开</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%BD%93%E5%89%8D%E8%BE%B9%E7%95%8C"><span class="toc-number">10.</span> <span class="toc-text">当前边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%BA%E5%88%B6%E9%80%9F%E6%9F%A5"><span class="toc-number">11.</span> <span class="toc-text">机制速查</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%8B%E8%BD%BD%E4%B8%8E%E5%A4%8D%E7%8E%B0"><span class="toc-number">12.</span> <span class="toc-text">下载与复现</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">13.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">14.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

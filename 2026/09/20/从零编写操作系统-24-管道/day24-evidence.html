@@ -1,0 +1,119 @@
+<h1>Day 24 evidence</h1>
+<p>Date: 2026-09-20</p>
+<h2>Source baseline</h2>
+<ul>
+<li>Implementation commit: <code>1232e13cf73c099bb8b859c9ec470d3e19c11b24</code></li>
+<li>Kernel image SHA-256: <code>13d578c4e459bacfb8cad29d0634ba5cb25b8ed520b849cea719cf1180e903cf</code></li>
+<li>Shell kernel image SHA-256: <code>c64704e5b77db1428a657ed23762e02bb77a25a5ecf61e6dbf6e855e2464ceb9</code></li>
+<li>Shell disk image SHA-256: <code>8d12036762b5937b9a7db28bb85efe9fe7c9d8e7b724e937758b1a315ec58b35</code></li>
+<li>User ELF SHA-256: <code>b44b54cef5743aaa2c8423492cc5d15e96f567802256cbcd25186a7b493bc8b9</code></li>
+<li><code>README.TXT</code> SHA-256: <code>25fc6f4ce8493714e7056d2896c47e6a9f4c4db91a4b860dd474035542804798</code></li>
+</ul>
+<p>The implementation commit contains the pipe object, endpoint open-files,<br>
+syscall, Shell assembly, user commands, and the QEMU/GDB check. The article,<br>
+persisted logs, archive hash, and standalone verification are recorded in the<br>
+following documentation commit.</p>
+<h2>Environment</h2>
+<ul>
+<li>QEMU 8.2.2 (<code>Debian 1:8.2.2+ds-0ubuntu1.18</code>)</li>
+<li>SeaBIOS 1.16.3 package image</li>
+<li>GDB 15.1</li>
+<li>GCC 13.3.0</li>
+<li>GNU Binutils 2.42</li>
+<li>NASM 2.16.01</li>
+<li>Machine: <code>pc-i440fx-7.2</code>, TCG, <code>qemu32</code>, 1 CPU, 64 MiB</li>
+</ul>
+<p>The unpacked toolchain under <code>/tmp/build-an-os-tools</code> is not part of the<br>
+delivery archive.</p>
+<h2>Command</h2>
+<pre><code class="language-sh">PATH=/tmp/build-an-os-tools/bin:$PATH \
+LD_LIBRARY_PATH=/tmp/build-an-os-tools/root2/usr/lib/x86_64-linux-gnu:\
+/tmp/build-an-os-tools/root2/lib/x86_64-linux-gnu \
+QEMU_MODULE_DIR=/tmp/build-an-os-tools/root2/usr/lib/x86_64-linux-gnu/qemu \
+make check-pipe \
+  QEMU=/tmp/build-an-os-tools/bin/qemu-system-i386 \
+  GDB=/tmp/build-an-os-tools/bin/gdb-multiarch \
+  BIOS=/tmp/build-an-os-tools/root2/usr/share/seabios/bios-256k.bin \
+  QEMU_DATA=/tmp/build-an-os-tools/root2/usr/share/qemu
+</code></pre>
+<p>Exit status: 0.</p>
+<h2>Runtime observations</h2>
+<p>The HMP keyboard sequence runs:</p>
+<pre><code class="language-text">cat readme.txt | wc
+echo abc|wc
+cat readme.txt | head
+cat readme.txt | nosuch
+pipetest
+echo x || wc
+echo recovered
+exit
+</code></pre>
+<p>The first command reports <code>27 1479</code>, matching the host file’s line and byte<br>
+counts. The parser also accepts a pipe token without surrounding spaces. The<br>
+<code>head</code> probe consumes one byte and exits; its producer receives the custom<br>
+broken-pipe error and the Shell reports <code>left command failed</code>. When the second<br>
+spawn names a missing executable, the Shell closes both parent endpoints before<br>
+waiting for the already-blocked producer, then returns to a prompt.</p>
+<p><code>pipetest</code> first supplies an unmapped output pointer to <code>pipe</code>, then performs<br>
+four create/second-create/close cycles. The invalid pointer returns <code>EFAULT</code><br>
+before allocation. While one pipe is live the second call returns <code>ENFILE</code>;<br>
+after both fds close the next creation succeeds. Its visible success marker is<br>
+<code>PIPE API OK</code>.</p>
+<p>The final serial counters are:</p>
+<pre><code class="language-text">PIPE STATS creates=8 releases=8 rblock=22 wblock=6 eof=2 broken=2 read=1484 written=1612
+SHELL OK prompts=8 pages=16048
+</code></pre>
+<p>The 1484 consumed bytes are 1479 from the complete file, four from <code>echo</code>, and<br>
+one from the early-exit probe. More bytes were committed by the two failed<br>
+pipelines and deliberately remained unread. Six writer blocks prove the 64-byte<br>
+buffer applied backpressure; 22 reader blocks show empty-buffer waits rather<br>
+than polling. Two complete pipelines reached EOF, and two producers observed a<br>
+closed read side. Every one of the eight successful pipe creations was released.</p>
+<p>After <code>SHELL OK</code>, GDB attached to the still-running kernel and read the debug<br>
+symbols directly:</p>
+<pre><code class="language-text">STATE creates=8 releases=8 rblock=22 wblock=6 eof=2 broken=2 used=0 readers=0 writers=0
+PASS: GDB observed blocking, EOF, broken-pipe wakeup and final reclamation
+</code></pre>
+<p>The final pipe slot has no bytes and neither endpoint is open. The shell exit<br>
+assertion also checks zero live open-files, zero file references, and recovery<br>
+to the original free-page count.</p>
+<h2>Implemented contract</h2>
+<ul>
+<li>One fixed 64-byte pipe and one read/write endpoint pair may exist at a time.</li>
+<li>fd inheritance increments endpoint open-file references. The pipe side closes<br>
+only when the endpoint’s final open-file reference disappears.</li>
+<li>Empty with a writer means block; empty without writers means EOF.</li>
+<li>Full with a reader means block; no readers means the custom <code>EPIPE</code> result.</li>
+<li>Reads and writes may be short. User programs loop until the requested transfer<br>
+completes or an error occurs.</li>
+<li>Closing the final reader wakes all writers; closing the final writer wakes all<br>
+readers. Every wake returns to a <code>while</code> condition check.</li>
+<li><code>pipe()</code> validates the output pointer before allocating and installs both fd<br>
+entries atomically. Allocation or fd failure rolls back both endpoint objects.</li>
+<li>The Shell starts both children before waiting and closes both parent copies.<br>
+If the consumer spawn fails, it closes both copies before waiting for the<br>
+producer.</li>
+</ul>
+<h2>Boundaries</h2>
+<p>This is a teaching ABI, not a POSIX implementation. It has no SIGPIPE,<br>
+<code>PIPE_BUF</code> atomicity guarantee, nonblocking mode, <code>select</code>/<code>poll</code>, named pipes,<br>
+multiple simultaneous pipe objects, multi-stage pipelines, redirection,<br>
+background jobs, or job control. A write that finds some room may return a<br>
+short count; the user program must continue it.</p>
+<p>The scheduler and wait queues assume one CPU. Interrupt masking protects the<br>
+condition check, queue insertion, ring indices, and endpoint state. The design<br>
+does not claim SMP safety or FIFO wake fairness.</p>
+<h2>Cumulative regression</h2>
+<p>After the specialized run, the current tree passed <code>check-shell</code>, <code>check-fd</code>,<br>
+<code>check-fat</code>, <code>check-block</code>, <code>check-process</code>, <code>check-syscall</code>, <code>check-elf</code>,<br>
+<code>check-memory</code>, <code>check-runtime-limit</code>, and <code>check-keyboard</code>. These are runtime<br>
+QEMU/GDB checks. The target list is recorded in <code>docs/day24-cumulative.txt</code>.</p>
+<h2>Standalone attachment verification</h2>
+<p>The frozen <code>os-day-24.zip</code> has SHA-256<br>
+<code>fa86c15e1ea6721ea9f7d01550dcc1a8ae731937b60c26e68d916474d59a71c6</code>.<br>
+It contains no <code>build/</code> directory. The archive was extracted into a fresh<br>
+temporary directory, rebuilt from scratch, and passed <code>check-pipe</code> plus all ten<br>
+cumulative targets listed above. Rebuilt <code>kernel.bin</code>, <code>kernel-shell.bin</code>,<br>
+<code>mbr-shell.img</code>, and <code>day23-user.elf</code> hashes match the source-tree values. The<br>
+concise receipt is <code>docs/day24-zipcheck.txt</code>; it was created after the archive<br>
+was frozen and is intentionally not embedded back into that archive.</p>

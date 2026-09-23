@@ -1,0 +1,129 @@
+<h1>Day 27 evidence</h1>
+<p>Date: 2026-09-21</p>
+<h2>Source baseline</h2>
+<ul>
+<li>Mouse implementation commits: <code>967ffaa</code> and <code>b8a6fc0</code></li>
+<li>Text kernel SHA-256: <code>5468e046b0325a91be4d9b38a3e88e52da80e27992c69da9fa180634bb6f6371</code></li>
+<li>Mouse kernel SHA-256: <code>7df69117138b4f0ba6a6d1356596f447478e2eb6b077138e5457e8d9235f50fd</code></li>
+<li>Mouse disk image SHA-256: <code>4e2ce99606f0b9882d8d010be3ed61329a90f8cf680554400bfbe0ac564b4e8c</code></li>
+<li>Screenshot SHA-256: <code>7d955d855929569da7d6d40cbaebb7e6b969d36046bd9cffe33e45b7ab0d4743</code></li>
+</ul>
+<p>The Day 27 image is separate from the historical text, graphics and graphics<br>
+text images. It keeps the Day 25 BootInfo v2 framebuffer contract and the Day<br>
+26 paged surface, then enables the 8042 auxiliary port and IRQ12.</p>
+<h2>Environment</h2>
+<ul>
+<li>QEMU 8.2.2 (<code>Debian 1:8.2.2+ds-0ubuntu1.18</code>)</li>
+<li>SeaBIOS 1.16.3 package image</li>
+<li>GDB 15.1</li>
+<li>GCC 13.3.0 and GNU Binutils 2.42</li>
+<li>NASM 2.16.01</li>
+<li>Machine: <code>pc-i440fx-7.2</code>, TCG, <code>qemu32</code>, 1 CPU, 64 MiB</li>
+</ul>
+<p>The unpacked toolchain under <code>/tmp/build-an-os-tools</code> is an execution dependency<br>
+of this environment and is not included in the attachment.</p>
+<h2>Specialized command</h2>
+<pre><code class="language-sh">PATH=/tmp/build-an-os-tools/bin:$PATH \
+LD_LIBRARY_PATH=/tmp/build-an-os-tools/root2/usr/lib/x86_64-linux-gnu:\
+/tmp/build-an-os-tools/root2/lib/x86_64-linux-gnu \
+QEMU_MODULE_DIR=/tmp/build-an-os-tools/root2/usr/lib/x86_64-linux-gnu/qemu \
+make check-mouse \
+  QEMU=/tmp/build-an-os-tools/bin/qemu-system-i386 \
+  GDB=/tmp/build-an-os-tools/bin/gdb-multiarch \
+  BIOS=/tmp/build-an-os-tools/root2/usr/share/seabios/bios-256k.bin \
+  QEMU_DATA=/tmp/build-an-os-tools/root2/usr/share/qemu
+</code></pre>
+<p>Exit status: 0.</p>
+<h2>Controller initialization and shared routing</h2>
+<p>The controller was configured with keyboard translation disabled, IRQ1 and<br>
+IRQ12 enabled, the auxiliary port open, and both device sources still sharing<br>
+the single <code>0x60</code> output buffer. Mouse reset returned ACK <code>0xfa</code>, BAT <code>0xaa</code> and<br>
+ID <code>0x00</code>. The test deliberately converted the first enable-reporting ACK into<br>
+a RESEND response after consuming it, then sent <code>0xf4</code> again and received the<br>
+second ACK:</p>
+<pre><code class="language-text">INIT ack=2 bat=0xaa id=0 resend=1 selftest=2/3/1
+</code></pre>
+<p>The IRQ receiver reads status once and data once, routes by status bit 5, and<br>
+never gives keyboard and mouse handlers independent reads from <code>0x60</code>. During<br>
+the final run, six keyboard bytes produced the requested <code>kbd</code> string while 147<br>
+mouse bytes were routed separately; neither keyboard byte was dropped:</p>
+<pre><code class="language-text">D27 SHARED keyboard=kbd kirq=6 krouted=6 kdropped=0 meoi=147/147
+</code></pre>
+<h2>Packet state and recovery</h2>
+<p>The host parser test and guest self-test cover signed X/Y decoding, screen-Y<br>
+inversion, a lost second byte, a byte with bit 3 clear at packet start, an<br>
+inserted <code>0xfa</code>, an overflow flag and a following legal packet. The guest<br>
+self-test records two accepted packets, three synchronization losses and one<br>
+overflow rejection.</p>
+<p>The live QEMU run paused the consumer while HMP injected movement. Its 64-byte<br>
+raw queue overflowed after 78 mouse IRQs:</p>
+<pre><code class="language-text">QUEUE dropped=12 irqs=78 routed=78
+</code></pre>
+<p>Resuming the consumer discarded the incomplete queue, reset the packet state<br>
+once, and accepted later packets. The final observation was:</p>
+<pre><code class="language-text">STATE pos=319,199 edges=0xf buttons=0x7 changes=6 packets=23 reset=1 irq=147 route=147 eoi=147/147 keys=kbd
+</code></pre>
+<p>The retained edge mask proves the pointer reached left, right, top and bottom.<br>
+The final coordinate is deliberately the lower-right corner; the crosshair is<br>
+drawn through the same signed clipping primitive as other Day 26 shapes. Button<br>
+mask <code>7</code> and six changes cover press and release for left, middle and right.</p>
+<h2>IRQ12 frame and cascaded EOI</h2>
+<p>The IDT and assembly stub table extend through vector 44. GDB stopped in the<br>
+real IRQ12 handler and checked the existing 68-byte same-CPL frame:</p>
+<pre><code class="language-text">IRQ frame vector=44 error=0 cs=8 saved_if=1 handler_if_df=0
+</code></pre>
+<p>The normal handler sent one EOI to the slave and one to the master for every<br>
+IRQ12. <code>info pic</code> then showed both ISR registers clear. Two isolated fault<br>
+images establish why both writes are required:</p>
+<pre><code class="language-text">STALLED irq=1 slave_eoi=0 master_eoi=1
+pic1: irr=10 imr=ef isr=10
+
+STALLED irq=1 slave_eoi=1 master_eoi=0
+pic0: irr=05 imr=f9 isr=04
+</code></pre>
+<p>In each image a second HMP movement produced no second IRQ12. Omitting the<br>
+slave EOI left IRQ12 in the slave ISR; omitting the master EOI left the cascade<br>
+IRQ2 in the master ISR.</p>
+<h2>Display result</h2>
+<p>The 320x200 surface is redrawn and flushed after accepted keyboard or mouse<br>
+events. QEMU’s doubled legacy scanout produced a 640x400 PNG. The final frame<br>
+shows <code>kbd</code> from the keyboard path and the clipped yellow crosshair at the<br>
+lower-right mouse boundary. The screenshot hash is listed above.</p>
+<h2>Cumulative regression</h2>
+<p>After the specialized check, the following targets all exited zero on the<br>
+final source:</p>
+<pre><code class="language-text">check-graphics-text
+check-graphics
+check-pm
+check-pipe
+check-shell
+check-fd
+check-fat
+check-block
+check-process
+check-syscall
+check-elf
+check-memory
+check-runtime-limit
+check-keyboard
+</code></pre>
+<p>The combined receipt is <code>docs/day27-cumulative.txt</code>. A prior exploratory run<br>
+hit the existing timing-sensitive Day 22 guest assertion once; rerunning the<br>
+specialized test and the complete final regression produced the recorded clean<br>
+results. No source change was made to hide or bypass that assertion.</p>
+<h2>Evidence boundary</h2>
+<ul>
+<li>The controller behavior is verified only for the fixed QEMU/SeaBIOS machine.<br>
+Real 8042-compatible controllers may require different timing and recovery.</li>
+<li>The parser accepts only standard three-byte ID 0 packets. It does not enable<br>
+wheel or five-button extensions.</li>
+<li>Bit 3 identifies a candidate first byte only while the parser is waiting for<br>
+a new packet. A raw byte stream cannot always recover uniquely after arbitrary<br>
+loss because data bytes may also have bit 3 set. Queue overflow therefore<br>
+resets the whole partial packet and discards the queued fragment.</li>
+<li>The test’s overflow-bit and stray-ACK cases are deterministic injections.<br>
+QEMU’s normal relative movement path limits deltas and does not generate the<br>
+classic overflow bits for these HMP events.</li>
+<li>Redrawing still copies the full 64,000-byte frame and does not synchronize to<br>
+vertical retrace. Day 27 measures correctness, not input-to-photon latency.</li>
+</ul>

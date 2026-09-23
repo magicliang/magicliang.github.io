@@ -1,0 +1,140 @@
+<h1>Day 29 evidence</h1>
+<p>Date: 2026-09-20</p>
+<h2>Source baseline</h2>
+<ul>
+<li>Window-terminal implementation commit: <code>9fea4ca</code></li>
+<li>Text kernel SHA-256: <code>26f1bc26360ddf4c9b7d984d4fc6706eaa445207ee4095a2386bda2dd7cf8386</code></li>
+<li>Window-terminal kernel SHA-256: <code>5b5a68d52f37d4c768abb1f3b5e0fb6d30910b00d32b5ae55be9f58d7a354e42</code></li>
+<li>Window-terminal disk image SHA-256: <code>8c23eefb8b9583945a3f521b91906aec7da5441fdab9f2ced4016a3a59414b81</code></li>
+<li><code>SHELL.EXE</code>/<code>day23-user.elf</code> SHA-256: <code>b44b54cef5743aaa2c8423492cc5d15e96f567802256cbcd25186a7b493bc8b9</code></li>
+<li>Screenshot SHA-256: <code>cd4d73c40366d24c621ca1081e09e1fef3fa99b6bcd15e99a5f44ce50c0403a2</code></li>
+</ul>
+<p>The Day 29 image uses the graphics stage2 and overlays the same<br>
+<code>fat16-shell.bin</code> used by Day 23. The historical text Shell and Day 28 window<br>
+images remain separate test entrypoints.</p>
+<h2>Environment</h2>
+<ul>
+<li>QEMU 8.2.2 (<code>Debian 1:8.2.2+ds-0ubuntu1.18</code>)</li>
+<li>SeaBIOS 1.16.3 package image</li>
+<li>GDB 15.1</li>
+<li>GCC 13.3.0 and GNU Binutils 2.42</li>
+<li>NASM 2.16.01</li>
+<li>Machine: <code>pc-i440fx-7.2</code>, TCG, <code>qemu32</code>, 1 CPU, 64 MiB</li>
+</ul>
+<p>The unpacked tools under <code>/tmp/build-an-os-tools</code> are an execution dependency<br>
+of this environment and are not included in the attachment.</p>
+<h2>Specialized command</h2>
+<pre><code class="language-sh">PATH=/tmp/build-an-os-tools/bin:$PATH \
+LD_LIBRARY_PATH=/tmp/build-an-os-tools/root2/usr/lib/x86_64-linux-gnu:\
+/tmp/build-an-os-tools/root2/lib/x86_64-linux-gnu \
+QEMU_MODULE_DIR=/tmp/build-an-os-tools/root2/usr/lib/x86_64-linux-gnu/qemu \
+make check-window-shell \
+  QEMU=/tmp/build-an-os-tools/bin/qemu-system-i386 \
+  GDB=/tmp/build-an-os-tools/bin/gdb-multiarch \
+  BIOS=/tmp/build-an-os-tools/root2/usr/share/seabios/bios-256k.bin \
+  QEMU_DATA=/tmp/build-an-os-tools/root2/usr/share/qemu
+</code></pre>
+<p>Exit status: 0.</p>
+<h2>Executable identity and privilege</h2>
+<p>The test stopped at <code>disk_spawn_published</code> and then at the first Shell prompt.<br>
+It checked the ELF size against <code>build/day23-user.elf</code>, recorded the same<br>
+SHA-256 as the FAT image source, and observed the saved user return state:</p>
+<pre><code class="language-text">LOADED size=3792 sha256=b44b54cef5743aaa2c8423492cc5d15e96f567802256cbcd25186a7b493bc8b9 cs=1b eip=400000c7 prompts=1 refs=3
+</code></pre>
+<p><code>CS=0x1b</code> is the existing user code selector. The EIP lies in the loaded user<br>
+window. At the prompt there is one live Shell process, two open-file objects<br>
+and three references for stdin/stdout/stderr. No command parser was added to<br>
+the kernel or UI.</p>
+<h2>Input, output and backpressure</h2>
+<p>The graphical terminal owns two independent 64-byte rings. The UI pushes<br>
+parsed keyboard characters into the input ring and drains at most 16 output<br>
+bytes per pass. A Shell <code>read</code> blocks while the input ring is empty. A writer<br>
+blocks while the output ring is full, allowing the UI bootstrap task to drain<br>
+bytes and process pointer packets before waking it.</p>
+<p>HMP injected this command sequence:</p>
+<pre><code class="language-text">echo hello
+cat readme.txt
+cat readme.txt | wc
+exit
+</code></pre>
+<p>During the 1479-byte direct <code>cat</code>, the test also injected six relative mouse<br>
+movements. The final GDB observation was:</p>
+<pre><code class="language-text">FINAL input=51 output=1552 high=2/64 block=49/89 mouse=6 redraws=146 pipe=1/1 pblock=21/3 log=1552
+</code></pre>
+<p>The output high-water mark reached the exact capacity of 64 and writers<br>
+blocked 89 times. All 1552 accepted bytes were consumed. Six mouse packets<br>
+were handled and the cursor ended at <code>(260,93)</code> while output was being drained;<br>
+the UI produced 146 redraws. These are deterministic counters for this run,<br>
+not latency or throughput measurements.</p>
+<p>The retained terminal stream contains the command echoes and results:</p>
+<pre><code class="language-text"># echo hello
+hello
+...
+# cat readme.txt | wc
+27 1479
+# exit
+</code></pre>
+<p>The screenshot was taken from the real Mode 13h framebuffer at the final<br>
+marker, before the 16-page surface was released.</p>
+<h2>Pipe and lifecycle</h2>
+<p><code>cat README.TXT | wc</code> reused the Day 24 pipe path. It created and released one<br>
+pipe, with 21 read blocks and 3 write blocks. The Shell and its four command<br>
+processes were reaped. On Shell exit, the two terminal open-file objects closed<br>
+their input/output endpoints; the output queue was then fully drained.</p>
+<p>The serial summary agrees with the GDB state:</p>
+<pre><code class="language-text">D29 UI mouse=6 at=260,93 redraws=146 chars=1552 wraps=28 scrolls=41
+D29 TERMINAL input=51 output=1552 consumed=1552 high=2/64 block=49/89 endpoints=2
+D29 ELF size=3792 reads=15 prompts=4 pipe=1/1 rblock=21 wblock=3
+WINDOW SHELL OK FAT ELF, bounded terminal and responsive UI
+</code></pre>
+<p>At the final marker, live open-file objects and references were both zero,<br>
+pipe creation equaled release, and the Shell page baseline was restored. The<br>
+UI then released its 16 surface pages and checked the pre-UI page count.</p>
+<h2>Cumulative regression</h2>
+<p>After the specialized check, these targets all exited zero:</p>
+<pre><code class="language-text">check-window-shell
+check-window
+check-mouse
+check-graphics-text
+check-graphics
+check-pm
+check-pipe
+check-shell
+check-fd
+check-fat
+check-block
+check-process
+check-syscall
+check-elf
+check-memory
+check-runtime-limit
+check-keyboard
+</code></pre>
+<p>The combined receipt is <code>docs/day29-cumulative.txt</code>.</p>
+<p>The source archive SHA-256 is<br>
+<code>ecbdd9cd4fbd740c7ad968094c1f5d995ac1b599b1ac54f0fbd5bd699c441fdc</code>.<br>
+It contains no <code>build/</code> directory. A fresh extraction rebuilt the project and<br>
+passed the same specialized plus cumulative target set; the four rebuilt<br>
+kernel/image/screenshot hashes matched this record. The external receipt is<br>
+<code>docs/day29-zipcheck.txt</code> and was intentionally not written back into the ZIP.</p>
+<p>The repository-wide legacy <code>make check</code> was also attempted. Its Day 7<br>
+<code>check-exceptions</code> script rejected the cumulative IDT because it still expects<br>
+all vectors from 34 upward to be absent, while the current kernel intentionally<br>
+installs IRQ12 at vector 44 and the DPL3 syscall gate at vector 128. This stale<br>
+expectation is outside the current 17-target cumulative set and is not reported<br>
+as a passing check.</p>
+<h2>Evidence boundary</h2>
+<ul>
+<li>The implementation has one fixed full-screen terminal window. It does not<br>
+create or close windows dynamically. Endpoint cleanup is exercised when the<br>
+Shell exits; close-during-blocked-read, close-during-blocked-write and<br>
+repeated open/close window cycles remain unimplemented.</li>
+<li>Keyboard input is lossless only while the UI can transfer it before the<br>
+existing PS/2 raw queue overflows. The terminal input ring reports drops;<br>
+this run observed zero. There is no canonical line discipline or Ctrl-D.</li>
+<li>The output queue applies backpressure and does not silently discard bytes.<br>
+The UI still uses full-frame copies and has no <code>poll/select</code>, dirty rectangle,<br>
+dedicated user-space display server or multi-CPU synchronization.</li>
+<li>HMP input and QEMU screenshots make the regression deterministic. They do<br>
+not validate physical VGA/PS/2 hardware or subjective interaction quality.</li>
+</ul>
