@@ -1,0 +1,817 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>分布式系统（27）：FaRM 的乐观验证、RDMA 与提交路径 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="两笔事务都读到 x&#x3D;0，随后都想把 x 写成 1。锁住其中一个写者并不难。更麻烦的是，两笔事务分别写 x 和 y，同时读取对方正在修改的对象。它们没有争抢同一个写锁，仍可能一起通过不完整的验证，留下任何串行顺序都解释不了的结果。 分布式系统（26）：Spanner 的时间区间、提交等待与一致快照 FaRM 把这类冲突检测放在内存事务的提交路径上，又用 RDMA 把读取和日志复制做得很轻。低 CPU">
+<meta property="og:type" content="article">
+<meta property="og:title" content="分布式系统（27）：FaRM 的乐观验证、RDMA 与提交路径">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/25/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-27-FaRM%E7%9A%84%E4%B9%90%E8%A7%82%E9%AA%8C%E8%AF%81RDMA%E4%B8%8E%E6%8F%90%E4%BA%A4%E8%B7%AF%E5%BE%84/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="两笔事务都读到 x&#x3D;0，随后都想把 x 写成 1。锁住其中一个写者并不难。更麻烦的是，两笔事务分别写 x 和 y，同时读取对方正在修改的对象。它们没有争抢同一个写锁，仍可能一起通过不完整的验证，留下任何串行顺序都解释不了的结果。 分布式系统（26）：Spanner 的时间区间、提交等待与一致快照 FaRM 把这类冲突检测放在内存事务的提交路径上，又用 RDMA 把读取和日志复制做得很轻。低 CPU">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg">
+<meta property="article:published_time" content="2026-09-25T02:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-27T10:54:53.657Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="FaRM">
+<meta property="article:tag" content="RDMA">
+<meta property="article:tag" content="分布式事务">
+<meta property="article:tag" content="分布式系统">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "分布式系统（27）：FaRM 的乐观验证、RDMA 与提交路径",
+  "url": "https://magicliang.github.io/2026/09/25/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-27-FaRM%E7%9A%84%E4%B9%90%E8%A7%82%E9%AA%8C%E8%AF%81RDMA%E4%B8%8E%E6%8F%90%E4%BA%A4%E8%B7%AF%E5%BE%84/",
+  "image": "https://magicliang.github.io/img/cover-distributed-systems.svg",
+  "datePublished": "2026-09-25T02:00:00.000Z",
+  "dateModified": "2026-09-27T10:54:53.657Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/25/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-27-FaRM%E7%9A%84%E4%B9%90%E8%A7%82%E9%AA%8C%E8%AF%81RDMA%E4%B8%8E%E6%8F%90%E4%BA%A4%E8%B7%AF%E5%BE%84/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '分布式系统（27）：FaRM 的乐观验证、RDMA 与提交路径',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">999</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1159</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">53</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-distributed-systems.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">分布式系统（27）：FaRM 的乐观验证、RDMA 与提交路径</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">分布式系统（27）：FaRM 的乐观验证、RDMA 与提交路径</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-25T02:00:00.000Z" title="Created 2026-09-25 10:00:00">2026-09-25</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-27T10:54:53.657Z" title="Updated 2026-09-27 18:54:53">2026-09-27</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.3k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>14mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-27 18:54:53&quot;}" hidden></div><p>两笔事务都读到 <code>x=0</code>，随后都想把 x 写成 1。锁住其中一个写者并不难。更麻烦的是，两笔事务分别写 x 和 y，同时读取对方正在修改的对象。它们没有争抢同一个写锁，仍可能一起通过不完整的验证，留下任何串行顺序都解释不了的结果。</p>
+<a href="/2026/09/22/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-26-Spanner%E7%9A%84%E6%97%B6%E9%97%B4%E5%8C%BA%E9%97%B4%E6%8F%90%E4%BA%A4%E7%AD%89%E5%BE%85%E4%B8%8E%E4%B8%80%E8%87%B4%E5%BF%AB%E7%85%A7/" title="分布式系统（26）：Spanner 的时间区间、提交等待与一致快照">分布式系统（26）：Spanner 的时间区间、提交等待与一致快照</a>
+<p>FaRM 把这类冲突检测放在内存事务的提交路径上，又用 RDMA 把读取和日志复制做得很轻。低 CPU 的数据搬运并没有消除事务协议：乐观并发控制要回答“这组读写能否串行化”，复制要回答“故障后写值还在不在”，原子提交要回答“多个 region 是否形成同一个终局”。本文以 <a target="_blank" rel="noopener" href="https://doi.org/10.1145/2815400.2815425">SOSP 2015 论文</a>为主，2014 年版本只用于解释协议演进。</p>
+<h2 id="先固定论文的系统模型">先固定论文的系统模型</h2>
+<p>FaRM 面向单数据中心的内存驻留数据。全局地址空间被切成 2 GiB 的 region；每个 region 有一个 primary 和 <code>f</code> 个 backups，并放到不同的 failure domains。对象只从 primary 读取：本地对象用普通 load，远端对象可用 one-sided RDMA。应用线程与存储服务运行在同一批机器上。[SOSP 2015 §2–§3]</p>
+<pre><code class="hljs mermaid">flowchart LR
+  C[事务协调线程] --&gt;|本地 load / one-sided RDMA read| PA[region A primary]
+  C --&gt;|one-sided RDMA read| PB[region B primary]
+  PA --&gt; BA[A backups]
+  PB --&gt; BB[B backups]
+  CM[配置管理器 + ZooKeeper + 租约] -.成员关系.-&gt; PA
+  CM -.成员关系.-&gt; PB</code></pre>
+<p>论文讨论 crash failure，不包括 Byzantine 节点。安全性依赖时钟漂移有界，活性依赖消息延迟最终有界。可用性还要求某个网络分区同时拥有 FaRM 机器多数、能够访问 ZooKeeper 多数，并且每个对象至少留有一个副本。把这些条件删掉，再说“网络分区时仍然可用”，已经不是论文结论。[SOSP 2015 §5]</p>
+<p>论文所谓 NVRAM 是一套具体设计：断电时由电池或机架 UPS 继续供电，把 DRAM 内容写入 SSD。它既不是普通易失内存，也不能不加说明地替换成今天泛称的 persistent memory。后文谈 NIC hardware ACK，含义也被这个持久域前提约束。</p>
+<h2 id="执行期可以暂时看到不一致">执行期可以暂时看到不一致</h2>
+<p>事务从 primary 读取对象，保存地址与版本号；写值先留在协调者的本地缓冲区。单个对象读取是原子的，只返回已提交值，同一事务再次读取同一对象也稳定。可是跨对象读集未必来自一个原子快照。</p>
+<p>假设约束是 <code>x=0 或 y=0</code>。T1 先读 x=0，再读 y；两次读取之间，另一个事务可能改变 y。FaRM 不要求正在执行的应用始终看到一个可串行化快照。它保证的是：如果这笔事务最终成功提交，验证必须证明它的读写能够放进一个 strict-serializable 的历史。</p>
+<p>这一区别常被 opacity 掩盖。本文讨论的 2015 FaRM（后称 FaRMv1）不为中止事务提供 opacity：事务代码必须能够承受临时不一致并继续走到 commit 或 abort，不能因为看见组合上古怪的中间状态就越界、崩溃或产生不可撤回的外部副作用。[SOSP 2015 §3–§4]</p>
+<p>2019 年的 FaRMv2 已经改变了这条边界：它引入全局时间、时间戳排序与多版本，为提交和中止事务提供 opacity。FaRMv2 又允许逐事务选择 snapshot isolation 或 non-strict 模式，所以也不能把默认保证无条件套到所有事务上。本文余下协议步骤仍专指 2015 版本。[FaRMv2 §1–§2、§4.2]</p>
+<h2 id="lock-和-validate-共同完成-occ-认证">LOCK 和 VALIDATE 共同完成 OCC 认证</h2>
+<p>读写事务提交时，协调者先处理写集。它给每个写对象的 primary 发送 <code>LOCK</code> 记录，其中包含事务 ID、涉及的 region，以及该 primary 上对象的地址、旧版本和新值。primary 的 CPU 轮询日志，再用 CAS 检查版本并加锁。版本已变化或对象已被锁住，事务就失败。</p>
+<p>取得全部写锁以后，协调者进入 <code>VALIDATE</code>：重新读取那些“读过但不写”的对象，检查版本和锁位。写对象不在这里重复验证，因为 LOCK 已经核对过它们的版本。</p>
+<pre><code class="hljs mermaid">flowchart TB
+  E[执行：读取版本，缓冲写值] --&gt; L[LOCK 写对象]
+  L --&gt; C&#123;版本相同且未加锁？&#125;
+  C --&gt;|否| A[ABORT 并释放已取锁]
+  C --&gt;|是| V[VALIDATE 只读集合]
+  V --&gt; R&#123;版本相同且未被别人锁住？&#125;
+  R --&gt;|否| A
+  R --&gt;|是| S[OCC 认证完成]</code></pre>
+<p>为什么既查版本又查锁？看一组 write skew：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">初始：x=0, y=0；约束：不能同时为 1<br>T1：读 x,y；写 x=1<br>T2：读 x,y；写 y=1<br></code></pre></td></tr></table></figure>
+<p>T1 锁 x，T2 锁 y，两者都能完成 LOCK。此时新值尚未安装，x、y 的版本也尚未增加。如果 VALIDATE 只看版本，双方都会误以为读集没有变化，然后一起提交，得到 <code>(1,1)</code>。正确验证还会看到对方持有的锁，至少一笔事务中止。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+  participant T1
+  participant X as primary(x)
+  participant Y as primary(y)
+  participant T2
+  T1-&gt;&gt;X: LOCK x，成功
+  T2-&gt;&gt;Y: LOCK y，成功
+  T1-&gt;&gt;Y: VALIDATE y 的版本与锁位
+  Y--&gt;&gt;T1: y 被 T2 锁住，失败
+  T1-&gt;&gt;X: ABORT，释放 x
+  T2-&gt;&gt;X: VALIDATE x
+  X--&gt;&gt;T2: 版本未变且已解锁，通过</code></pre>
+<p>在这个固定验证顺序里，T1 中止，T2 提交，终态为 <code>(0,1)</code>。也可能由另一种调度留下 <code>(1,0)</code>；关键不是必须谁赢，而是 <code>(1,1)</code> 不能由两笔成功事务产生。</p>
+<p>读写事务的序列化点取在“全部写锁取得”的时刻。LOCK 证明写对象从先前读取到这个点没有改变，VALIDATE 证明其余读对象在这个点仍有效。只读事务没有写锁，其序列化点取最后一次读取。[SOSP 2015 §4]</p>
+<h2 id="五个阶段不是五种同义的-提交">五个阶段不是五种同义的“提交”</h2>
+<p>通过 OCC 认证后，还没有解决副本故障和跨 region 原子性。2015 年论文的完整路径是：</p>
+<pre><code class="hljs mermaid">flowchart LR
+  L[LOCK&lt;br/&gt;写 primary 加锁] --&gt; V[VALIDATE&lt;br/&gt;认证纯读集合]
+  V --&gt; B[COMMIT-BACKUP&lt;br/&gt;完整 redo 到所有 backups]
+  B --&gt; P[COMMIT-PRIMARY&lt;br/&gt;决定证据到 primaries]
+  P --&gt; T[TRUNCATE&lt;br/&gt;懒惰清理日志]</code></pre>
+<p><code>COMMIT-BACKUP</code> 把与 LOCK 相同的完整写值写入所有 backups 的 NVRAM 日志。协调者必须等待所有目标 NIC 的 hardware ACK，但不等待 backup CPU 处理记录。只有这道屏障完成后，才能发送 <code>COMMIT-PRIMARY</code>。</p>
+<p><code>COMMIT-PRIMARY</code> 只需要事务 ID。primary 消费它后安装新值、版本加一并解锁，写入才变得可见。协调者收到至少一个 primary 的 ACK，就可以向应用报告成功；收到全部 primary ACK 后，再懒惰发送或捎带 <code>TRUNCATE</code>。backup 到处理 truncate 时才把 redo 安装到对象副本。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+  participant C as coordinator
+  participant P1 as primary A
+  participant P2 as primary B
+  participant B1 as backups A
+  participant B2 as backups B
+  C-&gt;&gt;P1: LOCK + 写值
+  C-&gt;&gt;P2: LOCK + 写值
+  P1--&gt;&gt;C: locked
+  P2--&gt;&gt;C: locked
+  C-&gt;&gt;C: VALIDATE 纯读集合
+  par 完整 redo
+    C-&gt;&gt;B1: COMMIT-BACKUP
+    B1--&gt;&gt;C: NIC ACK
+  and
+    C-&gt;&gt;B2: COMMIT-BACKUP
+    B2--&gt;&gt;C: NIC ACK
+  end
+  C-&gt;&gt;P1: COMMIT-PRIMARY(txid)
+  C-&gt;&gt;P2: COMMIT-PRIMARY(txid)
+  P1--&gt;&gt;C: ACK，至少一个即可答复应用
+  P2--&gt;&gt;C: ACK
+  C--&gt;&gt;P1: 稍后 TRUNCATE
+  C--&gt;&gt;P2: 稍后 TRUNCATE</code></pre>
+<p>这条时间线里至少有四个不同事件：OCC 的序列化点、恢复协议能够推导出的 commit decision、应用收到成功、backup 把值安装到原位。把它们统称为“提交完成”，很容易在故障切点上得出错误结论。</p>
+<p>提交前还要预留 primary 与 backup 日志中后续记录所需的全部空间。backup 的前台路径没有一个由 CPU 执行、可以拒绝资源不足的传统 prepare 处理器；如果锁住数据后才发现日志无处可写，协议可能失去活性。[SOSP 2015 §4]</p>
+<h2 id="两道-ack-屏障分别保护什么">两道 ACK 屏障分别保护什么</h2>
+<p>假设事务同时修改 region A、B。如果只把 redo 写到 A 的 backup，就让两个 primary 安装并暴露新值，随后协调者与两个 primary 故障，恢复时 B 的新值无处可找。系统曾向外暴露 <code>(A=1,B=1)</code>，却只能恢复 <code>(A=1,B=?)</code>。所以全部 <code>COMMIT-BACKUP</code> ACK 是写集完整性的屏障。</p>
+<p>为什么应用成功之前还要一个 <code>COMMIT-PRIMARY</code> ACK？读集只保存在协调者。若协调者通过 VALIDATE 后直接回答成功，却在任何 primary 记录提交证据前与 backups 一起故障，幸存 primary 可能只剩 LOCK，无法区分“验证已成功、应提交”和“验证前崩溃、应中止”。至少一个提交证据进入论文定义的持久域，恢复才不会否定已经报告的成功。</p>
+<pre><code class="hljs mermaid">flowchart TB
+  X[故障切点] --&gt; Q&#123;任一 region 有&lt;br/&gt;COMMIT-PRIMARY / COMMIT-RECOVERY？&#125;
+  Q --&gt;|是| C[恢复为 commit]
+  Q --&gt;|否| B&#123;至少一处 COMMIT-BACKUP，&lt;br/&gt;其他写 region 证据兼容？&#125;
+  B --&gt;|是| C
+  B --&gt;|否| A[恢复为 abort]</code></pre>
+<p>论文 §5.3 的恢复过程会汇总各副本日志。任一写 region 看见 <code>COMMIT-PRIMARY</code> 或恢复期提交记录，就投提交；没有这类记录时，完整的 backup 证据与其他 region 的兼容状态仍可推出提交。只有 LOCK 的事务可以中止。恢复可能替一笔尚未答复应用的事务选择 commit 或 abort，但不能撤销已经暴露或已经确认的结果。</p>
+<h2 id="occ-复制-原子提交和-rdma-各管一段">OCC、复制、原子提交和 RDMA 各管一段</h2>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>负责的问题</th>
+<th>单靠它解决不了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LOCK + VALIDATE</td>
+<td>检测写写与读写冲突，建立可串行化的序列化点</td>
+<td>故障后找回写值、跨 region 共同终局</td>
+</tr>
+<tr>
+<td>primary-backup 日志</td>
+<td>保存 redo 与决定证据，在论文故障范围内恢复</td>
+<td>读集验证、并发事务的串行化</td>
+</tr>
+<tr>
+<td>原子提交路径</td>
+<td>约束所有写 region 对同一事务形成共同终局</td>
+<td>保证没有并发异常，或让网络分区必然进展</td>
+</tr>
+<tr>
+<td>RDMA + NIC ACK</td>
+<td>低 CPU 地读取 primary、搬运日志，并给出特定持久域完成信号</td>
+<td>事务认证、决定、成员关系、租约或 Byzantine 容错</td>
+</tr>
+</tbody>
+</table>
+<p>2014 年 FaRM 论文明确把路径称为 OCC 加 optimized 2PC，当时 prepare/lock 也会发到 backups。2015 版把协议与复制内存进一步融合：LOCK 只到 primaries，验证后才向 backups 写完整 redo，再通知 primaries 提交。[NSDI 2014 §3.4；SOSP 2015 §1、§7]</p>
+<p>因此，“FaRM 不用 2PC”和“FaRM 就是教科书 2PC”都太粗糙。更准确的说法是：它仍承担原子提交的职责，但把 prepare、冲突认证、复制屏障和提交通知按 RDMA/NVRAM 数据路径重新组合。RDMA 是运输方式，不是正确性协议。</p>
+<h2 id="超时-分区和恢复时不能承诺什么">超时、分区和恢复时不能承诺什么</h2>
+<p>客户端超时只说明没有收到结果。事务可能还停在 LOCK、已经复制全部 backup 日志，或者已经有 primary 提交证据；调用者不能根据超时自行推断 abort，再用一个新的业务身份盲目重做。实际 API 需要事务状态查询或应用层幂等设计，本文没有把 FaRM 研究原型扩写成产品接口。</p>
+<p>网络分区时，幸存分区要同时满足成员多数、ZooKeeper 多数和每个对象至少一个副本等条件，重配置与短租约还要阻止旧成员继续发 RDMA。失去这些条件，安全做法可能是停止进展，而不是靠 one-sided write 穿过配置边界。</p>
+<p>时钟漂移界服务于租约和 precise membership 的安全性，最终有界消息延迟服务于活性。任一前提被破坏，都不能仅用“多重试几次”修复。论文也不处理恶意节点伪造日志、ACK 或成员身份；拜占庭模型要到后续第 33 篇再讨论。</p>
+<h2 id="本地有限模型：让职责边界变成可检查输出">本地有限模型：让职责边界变成可检查输出</h2>
+<p>实验源码位于 <code>examples/distributed-systems/farm27/check.py</code>，只使用 Python 标准库。它不是 FaRM 实现，也不发送 RDMA。模型固定执行三类轨迹：写写冲突、write skew 及其错误变体、四个恢复证据切点。</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs sh"><span class="hljs-built_in">mkdir</span> -p examples/distributed-systems/.build/farm27/tmp<br><span class="hljs-built_in">export</span> TMPDIR=<span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>/examples/distributed-systems/.build/farm27/tmp&quot;</span><br><span class="hljs-built_in">export</span> TMP=<span class="hljs-string">&quot;<span class="hljs-variable">$TMPDIR</span>&quot;</span> TEMP=<span class="hljs-string">&quot;<span class="hljs-variable">$TMPDIR</span>&quot;</span> PYTHONDONTWRITEBYTECODE=1<br>python3 -B examples/distributed-systems/farm27/check.py \<br>  --output examples/distributed-systems/.build/farm27/observations.json<br></code></pre></td></tr></table></figure>
+<p>Python 3.12.3 的正式运行观察到：写同一对象时 T1 取得锁并提交，T2 中止；正确 write-skew 验证得到 T1 中止、T2 提交和 <code>(x=0,y=1)</code>；忽略锁位的变异让两者都提交，得到不可串行化的 <code>(1,1)</code>。恢复模型分别得到 LOCK-only 中止、全部 backup 记录提交、一个 primary 提交证据存活时提交，并检出“漏写 B 的 backup 后先暴露再丢 primary”无法保持原子耐久。</p>
+<p>第一次运行还抓到了实验自身的错误断言：模型原先误以为正确验证会令两笔事务都中止。实际固定顺序下，T1 中止并释放 x 锁，T2 随后可以通过。修正预期后才得到正式通过结果。失败过程没有被计作协议反例。</p>
+<p>运行记录见<a href="/2026/09/25/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-27-FaRM%E7%9A%84%E4%B9%90%E8%A7%82%E9%AA%8C%E8%AF%81RDMA%E4%B8%8E%E6%8F%90%E4%BA%A4%E8%B7%AF%E5%BE%84/evidence.txt" title="实验证据">实验证据</a>，结构化结果见<a href="/2026/09/25/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-27-FaRM%E7%9A%84%E4%B9%90%E8%A7%82%E9%AA%8C%E8%AF%81RDMA%E4%B8%8E%E6%8F%90%E4%BA%A4%E8%B7%AF%E5%BE%84/observations.json.txt" title="观察数据">观察数据</a>，验证边界见<a href="/2026/09/25/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-27-FaRM%E7%9A%84%E4%B9%90%E8%A7%82%E9%AA%8C%E8%AF%81RDMA%E4%B8%8E%E6%8F%90%E4%BA%A4%E8%B7%AF%E5%BE%84/verification.txt" title="验证说明">验证说明</a>。这些结果不覆盖真实 RDMA/NIC、NVRAM 掉电、ZooKeeper、租约、任意调度、网络分区或性能。</p>
+<h2 id="两个推演练习">两个推演练习</h2>
+<p><strong>锁位为什么不能省。</strong> T1 已锁 x、T2 已锁 y，但两者都还没有增加版本。若 VALIDATE 只比较版本，两个事务各会看到什么？仅仅把“提交后版本加一”提前到什么时候，才可能挡住异常，又会引入什么未提交值和恢复问题？</p>
+<p>在原协议的时点，两边都看到旧版本，所以都会错误通过。提前发布版本会把未决定事务的状态暴露给读取和恢复，不能只移动一行代码；必须重新定义锁、可见性、abort 回滚和恢复证据。检查锁位直接表达“这个读对象正在被并发写者占用”。</p>
+<p><strong>哪个 ACK 可以晚一点。</strong> 某事务写 A、B 两个 region。A 的 backup 已 ACK，B 的 backup 未 ACK；两个 primary 都健康。此时能否让 primary 安装？若所有 backup 都 ACK，但还没有任何 <code>COMMIT-PRIMARY</code> ACK，能否向应用报告成功？</p>
+<p>两个答案都是否。前者在 primary 故障后可能丢失 B 的 redo；后者在协调者及相关副本故障后可能只留下无法证明验证成功的 LOCK。第一道屏障保护完整写集，第二道屏障保护已经向应用确认的决定。</p>
+<h2 id="工程结论">工程结论</h2>
+<p>FaRM 的关键并不是把“网络调用”换成“远程内存访问”，而是让正确性协议贴合硬件完成语义：读走 one-sided RDMA，写锁仍由 primary CPU 检查，backup 日志等待 NIC ACK，事务决定在 primary 留下足够的恢复证据。省掉远端 CPU 工作，并不等于省掉验证、复制或原子终局。</p>
+<p>这种设计适合单数据中心、数据可驻留内存、故障域与时钟条件可控、愿意为专门硬件和恢复协议付出复杂度的环境。跨地域高延迟、恶意参与者、普通易失内存，或无法维持 precise membership 的部署，不能直接套用论文结论。</p>
+<p>下一篇转向缓存一致性。那里没有事务提交协议替应用兜底：一次先失效、后旧值回填的竞态，就足以让数据库已经更新而缓存重新变旧。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Dragojević 等，2015，<a target="_blank" rel="noopener" href="https://doi.org/10.1145/2815400.2815425">No compromises: distributed transactions with consistency, availability, and performance</a>：§2–§5 为系统、提交与恢复主依据，§6–§7 仅作实验环境与版本对照。</li>
+<li>Dragojević 等，2014，<a target="_blank" rel="noopener" href="https://www.usenix.org/system/files/conference/nsdi14/nsdi14-paper-dragojevic.pdf">FaRM: Fast Remote Memory</a>：§2、§3.2、§3.4，用于 RDMA 与早期 optimized 2PC 路径。</li>
+<li>Kung 与 Robinson，1981，<a target="_blank" rel="noopener" href="https://doi.org/10.1145/319566.319567">On Optimistic Methods for Concurrency Control</a>：OCC 验证与串行历史的基础对照。</li>
+<li>Gray 与 Lamport，<a target="_blank" rel="noopener" href="https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-2003-96.pdf">Consensus on Transaction Commit</a>：§2–§5，用于 2PC 的共同决定与阻塞边界。</li>
+<li>Dragojević 等，2019，<a target="_blank" rel="noopener" href="https://www.microsoft.com/en-us/research/publication/fast-general-distributed-transactions-with-opacity/">FaRMv2: Fast, General, Distributed Transactions with Opacity</a>：§1–§2、§4.2，用于后续版本边界。</li>
+<li><a target="_blank" rel="noopener" href="https://pdos.csail.mit.edu/6.824/notes/l-farm.txt">MIT 6.5840 Spring 2026 FaRM lecture notes</a>及<a target="_blank" rel="noopener" href="https://pdos.csail.mit.edu/6.824/schedule.html">课程日程</a>：OCC 反例、机制边界和课程结构的独立教学核验。</li>
+<li><a target="_blank" rel="noopener" href="https://pdos.csail.mit.edu/6.824/papers/farm-faq.txt">MIT 6.5840 FaRM FAQ</a>：研究系统与适用边界。资料版本、实际阅读位置、反向检索和不能支持的结论见 <code>writing-plans/distributed-systems/research/27-farm.md</code>。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/25/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-27-FaRM%E7%9A%84%E4%B9%90%E8%A7%82%E9%AA%8C%E8%AF%81RDMA%E4%B8%8E%E6%8F%90%E4%BA%A4%E8%B7%AF%E5%BE%84/">https://magicliang.github.io/2026/09/25/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-27-FaRM%E7%9A%84%E4%B9%90%E8%A7%82%E9%AA%8C%E8%AF%81RDMA%E4%B8%8E%E6%8F%90%E4%BA%A4%E8%B7%AF%E5%BE%84/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/">分布式事务</a><a class="post-meta__tags" href="/tags/RDMA/">RDMA</a><a class="post-meta__tags" href="/tags/FaRM/">FaRM</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-distributed-systems.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/22/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-26-Spanner%E7%9A%84%E6%97%B6%E9%97%B4%E5%8C%BA%E9%97%B4%E6%8F%90%E4%BA%A4%E7%AD%89%E5%BE%85%E4%B8%8E%E4%B8%80%E8%87%B4%E5%BF%AB%E7%85%A7/" title="分布式系统（26）：Spanner 的时间区间、提交等待与一致快照"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-22</div><div class="info-item-2">分布式系统（26）：Spanner 的时间区间、提交等待与一致快照</div></div><div class="info-2"><div class="info-item-1">一笔转账同时修改两个分片。两边最终都提交，只解决了共同终局；报表还需要在一次读取中看到完整的转账结果。如果转账已经向客户端报告成功，随后发起的强一致读取也不能因为选择了较慢的时钟而退回转账之前。 分布式系统（25）：分布式事务的决定、补偿与消息边界 Spanner 把这些要求组合在同一个数据库里：每个复制组保存可恢复的状态，跨组事务决定共同结果，并发控制约束冲突操作，时间戳和多版本读取决定快照内容。TrueTime 提供带误差边界的时间区间，提交等待把时间戳顺序与真实先后连接起来。机制推导以 OSDI 2012 原论文为准，课程结构对应 MIT 6.5840 和 Stanford CS244b；现行云产品的隔离级别单独说明。 复制、事务与时间各自约束什么 设账户 x 位于组 A，账户 y 位于组 B。一次事务要从 x 扣款并向 y 加款。每个组内部有多个副本，通过 Paxos 复制状态；A、B 作为两个业务参与组，通过两阶段提交协调这笔转账。组内复制多数与跨组全部参与者是两个不同集合：A 的多数派确认，不能代替 B 的准备结果。 flowchart TB   T[跨分片转账 T]...</div></div></div></a><a class="pagination-related" href="/2026/09/22/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-25-%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1%E7%9A%84%E5%86%B3%E5%AE%9A%E8%A1%A5%E5%81%BF%E4%B8%8E%E6%B6%88%E6%81%AF%E8%BE%B9%E7%95%8C/" title="分布式系统（25）：分布式事务的决定、补偿与消息边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-22</div><div class="info-item-2">分布式系统（25）：分布式事务的决定、补偿与消息边界</div></div><div class="info-2"><div class="info-item-1">订单记录已经提交，支付消息却没有发出。把顺序反过来，支付消息可能已经被处理，订单事务随后回滚。两个系统各自正确地完成一次操作，仍然不能保证这两次操作具有共同的结果。 分布式系统（24）：分片与在线迁移的归属边界 前篇解决一个分片迁移后由谁服务。跨分片下单还需要回答另一件事：订单、库存和支付分别位于不同资源时，哪些变化必须一起提交，哪些中间结果允许出现，失败后还剩什么义务。站内既有的分布式事务覆盖更多方案名称；这里沿同一条订单链路推导失败路径，再用本地实验检查原子边界。 两次成功调用之间存在失败窗口 先限定业务含义。订单服务创建的是“待支付订单”，消息是“请求扣款”，消费者在自己的账本里扣款。订单创建成功不代表支付完成。若业务要求两个资源共同提交或共同中止，需要跨资源原子提交；若还要求读者看不到部分结果，还必须设计跨资源的隔离与读规则。若允许订单先进入待处理状态，则可以持久保存后续动作，由工作流继续推进。这是对可观察行为的选择。 sequenceDiagram   participant S as 订单服务   participant D as 订单库   participant ...</div></div></div></a><a class="pagination-related" href="/2026/06/26/%E6%80%A7%E8%83%BD%E6%A8%A1%E5%9E%8B-%E6%90%9C%E7%B4%A2%E5%BB%B6%E8%BF%9F-%E5%86%99%E5%85%A5%E5%90%9E%E5%90%90%E4%B8%8E%E8%B0%83%E4%BC%98%E6%80%9D%E8%B7%AF/" title="深入 Elasticsearch（14）：搜索延迟、写入吞吐与调优思路"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/%E6%80%A7%E8%83%BD%E6%A8%A1%E5%9E%8B-%E6%90%9C%E7%B4%A2%E5%BB%B6%E8%BF%9F-%E5%86%99%E5%85%A5%E5%90%9E%E5%90%90%E4%B8%8E%E8%B0%83%E4%BC%98%E6%80%9D%E8%B7%AF/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（14）：搜索延迟、写入吞吐与调优思路</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 segment 和索引的生命周期管理——merge 控制 segment 数量，ILM 管理索引的存储分层。这一篇进入 ES 的性能瓶颈在哪里、调优的思维框架是什么。 性能调优不是背参数表。参数是工具，瓶颈定位才是方法。ES 的性能受搜索延迟和写入吞吐两个维度的独立因素影响，先确定瓶颈在哪个维度的哪个因素上，再针对性调整。 本文只抓一个问题：ES 的性能模型——搜索延迟和写入吞吐分别受什么因素影响，用什么工具定位瓶颈。  搜索延迟的关键因素 1搜索延迟 = f(segment数, query复杂度, shard数, cache命中率, 数据结构选择)    因素 影响机制 观察方式     Segment 数量 每个 segment 独立搜索，结果合并 _segments API   Query 复杂度 深层嵌套 bool、wildcard、regexp 代价高 _search?profile=true   Shard 数量 scatter-gather 开销随 shard 数线性增长 _cat/shards   Filesystem cache Lucene 文件...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-21-etcd%E7%9A%84%E8%AF%BB%E4%BA%8B%E5%8A%A1Watch%E4%B8%8ELease/" title="分布式系统 21：etcd 的读、事务、Watch 与 Lease"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 21：etcd 的读、事务、Watch 与 Lease</div></div><div class="info-2"><div class="info-item-1">Watch 恢复时，保存“刚收到的 revision”还不够。一笔事务在修订 2 同时改了两个键，消费者只应用第一个事件就把续传位置记成 3，重连后会永久漏掉第二个键。服务端已经完整发送，错误发生在消费端的检查点。 分布式系统 20：etcd 的 Raft 与存储路径 前篇区分了 Raft 位置与 KV revision。本篇使用同一官方 etcd 3.7.1，讨论默认读、条件事务、Watch 恢复与 Lease。核心问题是：一次 API 响应究竟证明了什么，客户端需要补上哪些状态管理，才能把产品保证变成正确的业务行为。  默认读与 serializable 读 默认 KV 操作保证严格可串行化，并遵守实时时序。写已经成功完成，随后发起的读不能返回该写之前的状态，除非又发生了合法的后续修改。对于单次读，可以在调用与响应之间选择一个线性化点。与读并发的写可以排在这个点前或后，不能要求返回值包含直到响应最后一刻才完成的所有写入。API guarantees etcd 的默认 Range 先执行 LinearizableReadNotify，再读取 KV；serializable=tr...</div></div></div></a><a class="pagination-related" href="/2021/01/29/EBS/" title="EBS 分布式块存储技术解析"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2021/01/29/EBS/EBS-volume-chunk-server.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-01-29</div><div class="info-item-2">EBS 分布式块存储技术解析</div></div><div class="info-2"><div class="info-item-1">EBS 的定义 EBS（Elastic Block Storage）是一种高可用、高性能、弹性可扩展的分布式块存储服务。对于业务来说，它就像是一块普通的磁盘——使用方式和访问本地磁盘一样，但数据实际上存储于远端的网络节点上。 EBS 主要应用于以下场景：  有状态容器的状态存储：解决容器重启后数据丢失的问题 海量数据存储：邮件系统、监控平台、数据库、用户录音、集成测试平台、MySQL 备份等  EBS 的文件系统结构 在 EBS 分布式块存储系统中，ChunkServer 是最终存储业务写入数据的核心服务。 核心组件 123456789101112131415161718192021┌─────────────────────────────────────────┐│              Volume (逻辑卷)              ││  ┌─────────┐ ┌─────────┐ ┌─────────┐   ││  │  Chunk  │ │  Chunk  │ │  Chunk  │   ││  │   #1    │ │   #2    │ │   #N...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-11-Raft%E4%BB%BB%E6%9C%9F%E6%8A%95%E7%A5%A8%E4%B8%8E%E9%80%89%E4%B8%BE%E5%AE%89%E5%85%A8/" title="分布式系统 11：Raft 任期、投票与选举安全"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 11：Raft 任期、投票与选举安全</div></div><div class="info-2"><div class="info-item-1">三台服务器 A、B、C 同时竞选。A 得到自己和 C 的票，成为领导者；随后 C 重启，忘掉已经投给 A 的记录，又投给 B。B 加上自己的票，也达到了多数。每次计票都没有算错，集群却在同一轮选出了两个领导者。 问题出在投票承诺没有跨越重启。一次选举能否安全，不只取决于票数，还取决于票属于哪一轮、由谁投出，以及已经回复成功的投票是否还能被遗忘。 第 10 篇 将稳定领导者与多槽日志联系起来。本篇开始构建另一条可累计的实现：先完成 Raft 的选举状态转换，下一篇再加入日志复制与提交。本篇的 Go 核心会继续复用；当前尚不能存储客户端命令，也不提供完整 Raft 服务。 任期把局部观察分开 采用一个固定成员配置，成员身份在实验期间不变。进程可能崩溃恢复，消息可能延迟、丢失、重复或乱序；节点不伪造身份、不发送任意错误内容。多数指完整配置中超过一半的成员，三节点需要两票，五节点需要三票，不能因两台暂时不可达就缩小分母。 每个节点保存自己的 currentTerm，即已经知道的最高任期。任期是逻辑轮次，不是由统一时钟切出的时间段。A 已经进入 term 4，隔离中的 B 仍可能只知道 t...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%88%E5%9B%BA%E5%AE%9A%E8%AE%BA%E6%96%87%E7%9A%84%E7%B3%BB%E7%BB%9F%E6%A8%A1%E5%9E%8B"><span class="toc-number">1.</span> <span class="toc-text">先固定论文的系统模型</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%89%A7%E8%A1%8C%E6%9C%9F%E5%8F%AF%E4%BB%A5%E6%9A%82%E6%97%B6%E7%9C%8B%E5%88%B0%E4%B8%8D%E4%B8%80%E8%87%B4"><span class="toc-number">2.</span> <span class="toc-text">执行期可以暂时看到不一致</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#lock-%E5%92%8C-validate-%E5%85%B1%E5%90%8C%E5%AE%8C%E6%88%90-occ-%E8%AE%A4%E8%AF%81"><span class="toc-number">3.</span> <span class="toc-text">LOCK 和 VALIDATE 共同完成 OCC 认证</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E4%B8%AA%E9%98%B6%E6%AE%B5%E4%B8%8D%E6%98%AF%E4%BA%94%E7%A7%8D%E5%90%8C%E4%B9%89%E7%9A%84-%E6%8F%90%E4%BA%A4"><span class="toc-number">4.</span> <span class="toc-text">五个阶段不是五种同义的“提交”</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E9%81%93-ack-%E5%B1%8F%E9%9A%9C%E5%88%86%E5%88%AB%E4%BF%9D%E6%8A%A4%E4%BB%80%E4%B9%88"><span class="toc-number">5.</span> <span class="toc-text">两道 ACK 屏障分别保护什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#occ-%E5%A4%8D%E5%88%B6-%E5%8E%9F%E5%AD%90%E6%8F%90%E4%BA%A4%E5%92%8C-rdma-%E5%90%84%E7%AE%A1%E4%B8%80%E6%AE%B5"><span class="toc-number">6.</span> <span class="toc-text">OCC、复制、原子提交和 RDMA 各管一段</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%B6%85%E6%97%B6-%E5%88%86%E5%8C%BA%E5%92%8C%E6%81%A2%E5%A4%8D%E6%97%B6%E4%B8%8D%E8%83%BD%E6%89%BF%E8%AF%BA%E4%BB%80%E4%B9%88"><span class="toc-number">7.</span> <span class="toc-text">超时、分区和恢复时不能承诺什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%AC%E5%9C%B0%E6%9C%89%E9%99%90%E6%A8%A1%E5%9E%8B%EF%BC%9A%E8%AE%A9%E8%81%8C%E8%B4%A3%E8%BE%B9%E7%95%8C%E5%8F%98%E6%88%90%E5%8F%AF%E6%A3%80%E6%9F%A5%E8%BE%93%E5%87%BA"><span class="toc-number">8.</span> <span class="toc-text">本地有限模型：让职责边界变成可检查输出</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E4%B8%AA%E6%8E%A8%E6%BC%94%E7%BB%83%E4%B9%A0"><span class="toc-number">9.</span> <span class="toc-text">两个推演练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E7%BB%93%E8%AE%BA"><span class="toc-number">10.</span> <span class="toc-text">工程结论</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">11.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

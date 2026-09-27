@@ -1,0 +1,788 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>分布式系统（E02）：GFS/HDFS 与 Bigtable/HBase 的存储架构 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="GFS 与 HDFS 面向大文件和顺序吞吐，Bigtable 与 HBase 面向按键查找的稀疏有序表。后两者把前者一类分布式文件系统当成持久层，却没有因此变成“文件系统加一层索引”。它们增加了 row range、写前日志、内存表、不可变文件和 Region 分配，故障恢复的单位也从块副本变成可服务的键范围。 本篇沿三条路径比较四个系统：控制面保存什么，用户数据经过哪里，节点失效后凭什么恢复。论">
+<meta property="og:type" content="article">
+<meta property="og:title" content="分布式系统（E02）：GFS&#x2F;HDFS 与 Bigtable&#x2F;HBase 的存储架构">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/27/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E02-%E6%96%87%E4%BB%B6%E5%9D%97%E4%B8%8E%E6%9C%89%E5%BA%8F%E8%A1%A8%E7%9A%84%E5%AD%98%E5%82%A8%E6%9E%B6%E6%9E%84/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="GFS 与 HDFS 面向大文件和顺序吞吐，Bigtable 与 HBase 面向按键查找的稀疏有序表。后两者把前者一类分布式文件系统当成持久层，却没有因此变成“文件系统加一层索引”。它们增加了 row range、写前日志、内存表、不可变文件和 Region 分配，故障恢复的单位也从块副本变成可服务的键范围。 本篇沿三条路径比较四个系统：控制面保存什么，用户数据经过哪里，节点失效后凭什么恢复。论">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg">
+<meta property="article:published_time" content="2026-09-27T09:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-27T10:54:53.660Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Bigtable">
+<meta property="article:tag" content="HBase">
+<meta property="article:tag" content="HDFS">
+<meta property="article:tag" content="分布式系统">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "分布式系统（E02）：GFS/HDFS 与 Bigtable/HBase 的存储架构",
+  "url": "https://magicliang.github.io/2026/09/27/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E02-%E6%96%87%E4%BB%B6%E5%9D%97%E4%B8%8E%E6%9C%89%E5%BA%8F%E8%A1%A8%E7%9A%84%E5%AD%98%E5%82%A8%E6%9E%B6%E6%9E%84/",
+  "image": "https://magicliang.github.io/img/cover-distributed-systems.svg",
+  "datePublished": "2026-09-27T09:00:00.000Z",
+  "dateModified": "2026-09-27T10:54:53.660Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/27/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E02-%E6%96%87%E4%BB%B6%E5%9D%97%E4%B8%8E%E6%9C%89%E5%BA%8F%E8%A1%A8%E7%9A%84%E5%AD%98%E5%82%A8%E6%9E%B6%E6%9E%84/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '分布式系统（E02）：GFS/HDFS 与 Bigtable/HBase 的存储架构',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">999</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1159</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">53</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-distributed-systems.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">分布式系统（E02）：GFS/HDFS 与 Bigtable/HBase 的存储架构</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">分布式系统（E02）：GFS/HDFS 与 Bigtable/HBase 的存储架构</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-27T09:00:00.000Z" title="Created 2026-09-27 17:00:00">2026-09-27</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-27T10:54:53.660Z" title="Updated 2026-09-27 18:54:53">2026-09-27</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.1k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>7mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-27 18:54:53&quot;}" hidden></div><p>GFS 与 HDFS 面向大文件和顺序吞吐，Bigtable 与 HBase 面向按键查找的稀疏有序表。后两者把前者一类分布式文件系统当成持久层，却没有因此变成“文件系统加一层索引”。它们增加了 row range、写前日志、内存表、不可变文件和 Region 分配，故障恢复的单位也从块副本变成可服务的键范围。</p>
+<p>本篇沿三条路径比较四个系统：控制面保存什么，用户数据经过哪里，节点失效后凭什么恢复。论文模型、当前产品文档与本地有限模型分别陈述。</p>
+<a href="/2026/09/27/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E01-CRDT%E5%A4%9A%E4%B8%BB%E5%86%99%E5%85%A5%E4%B8%8E%E6%94%B6%E6%95%9B%E8%BE%B9%E7%95%8C/" title="分布式系统（E01）：CRDT、多主写入与收敛边界">分布式系统（E01）：CRDT、多主写入与收敛边界</a>
+<h2 id="共同骨架：元数据只负责找到数据">共同骨架：元数据只负责找到数据</h2>
+<p>文件路径或 row key 先经过一个权威元数据视图，再落到保存字节的节点。元数据控制面决定命名、位置和归属；数据面承载大块内容。把两者拆开，才能让控制面保持较小状态，同时让客户端或服务节点直接传输大量数据。</p>
+<pre><code class="hljs mermaid">flowchart LR
+  C[客户端] --&gt; M[元数据控制面]
+  M --&gt;|块位置或Region位置| C
+  C --&gt; D[数据节点]
+  D --&gt; P[复制文件块或写WAL/StoreFile]
+  M -.不承载全部用户字节.-&gt; P</code></pre>
+<p>这也给出第一个恢复边界。控制面知道 <code>block-7</code> 在哪些节点，不能凭这个列表重新创造 <code>block-7</code> 的内容；它必须找到仍然正确的副本。表系统知道 Region 的起止 key，也仍要读取持久 StoreFile，并重放尚未刷入文件的 WAL 编辑。</p>
+<p>可迁移的模式是“元数据定位，数据证据恢复”：目录、路由表或租约告诉请求去哪里，真正恢复仍依赖副本、日志、快照或不可变文件。</p>
+<h2 id="gfs-与-hdfs：文件被拆成可复制的块">GFS 与 HDFS：文件被拆成可复制的块</h2>
+<p>GFS 原论文把文件分成固定大小 chunk。master 保存命名空间、文件到chunk的映射和chunk位置，并为修改选择带租约的primary；client从master取得位置后，数据直接流向chunkserver。第03篇已经展开GFS写入次序，这里只保留架构位置。</p>
+<p>HDFS 的相似边界是 NameNode 与 DataNode。NameNode 管理目录树、权限和文件到block的映射，DataNode保存block并周期报告。客户端创建文件时先向NameNode申请命名与目标，随后把数据写入DataNode pipeline。复制因子表达希望保留多少份，不表示任意时刻所有副本都健康，也不单独定义同步到物理介质的层次。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+  participant C as Client
+  participant N as NameNode
+  participant D1 as DataNode1
+  participant D2 as DataNode2
+  participant D3 as DataNode3
+  C-&gt;&gt;N: create /logs/a
+  N--&gt;&gt;C: block与目标pipeline
+  C-&gt;&gt;D1: packet
+  D1-&gt;&gt;D2: packet
+  D2-&gt;&gt;D3: packet
+  D3--&gt;&gt;D2: ack
+  D2--&gt;&gt;D1: ack
+  D1--&gt;&gt;C: ack</code></pre>
+<p>一个DataNode停止汇报后，控制面可以把它视为不可用，从剩余副本向其他节点补复制。安全性依赖至少一个正确副本仍存在、校验与元数据没有共同损坏；活性还依赖控制面可用、网络恢复和目标节点有容量。全部副本丢失时，重新分配位置不能恢复字节。</p>
+<p>现代HDFS可配置active/standby NameNode、JournalNode和fencing，不能再用“NameNode必然是单点”概括所有部署。HA解决的是元数据服务切换；DataNode上的块复制仍是另一层故障证据。</p>
+<h2 id="bigtable-与-hbase：row-range-是服务和恢复单位">Bigtable 与 HBase：row range 是服务和恢复单位</h2>
+<p>Bigtable把表按连续row range切成tablet。tablet server服务读写；写入先进入commit log和内存中的memtable，随后形成不可变SSTable。master负责tablet分配和负载管理，但数据内容在日志与SSTable中。</p>
+<p>HBase沿用相似谱系，名称换成Region、RegionServer、WAL、MemStore与HFile。row key的字典序决定Region范围，因此表设计会直接影响热点：时间单调递增的前缀可能让新写集中到单个Region，增加Region数量不会自动消掉单热区。</p>
+<pre><code class="hljs mermaid">flowchart TD
+  K[row key] --&gt; R&#123;Region边界&#125;
+  R --&gt;|a..m| R1[RegionServer 1]
+  R --&gt;|m..z| R2[RegionServer 2]
+  R1 --&gt; W1[WAL]
+  R1 --&gt; M1[MemStore]
+  M1 --&gt; H1[HFile]
+  R2 --&gt; W2[WAL]
+  R2 --&gt; M2[MemStore]
+  M2 --&gt; H2[HFile]</code></pre>
+<p>RegionServer崩溃后，协调层先确认失效并撤销旧服务资格，master再把Region分配给其他服务器。新持有者打开持久文件，并重放需要恢复的WAL编辑。这里至少有三个阶段：判定旧节点失效、选择新位置、恢复数据到可服务状态。只看到“新RegionServer已分配”还不足以回复读取。</p>
+<p>HBase使用ZooKeeper参与活动master、RegionServer存活和关键位置协调；业务表数据不因此复制进ZooKeeper。ZooKeeper会话和watch属于控制面信号，HFile/WAL的耐久性由存储路径承担。</p>
+<h2 id="四个系统不能按名称一一对应">四个系统不能按名称一一对应</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>GFS</th>
+<th>HDFS</th>
+<th>Bigtable</th>
+<th>HBase</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>逻辑单位</td>
+<td>file/chunk</td>
+<td>file/block</td>
+<td>table/tablet</td>
+<td>table/Region</td>
+</tr>
+<tr>
+<td>控制面</td>
+<td>master</td>
+<td>NameNode</td>
+<td>master + 元数据层</td>
+<td>HMaster + ZooKeeper/元数据表</td>
+</tr>
+<tr>
+<td>主要数据节点</td>
+<td>chunkserver</td>
+<td>DataNode</td>
+<td>tablet server</td>
+<td>RegionServer</td>
+</tr>
+<tr>
+<td>持久数据形态</td>
+<td>chunk replica</td>
+<td>block replica</td>
+<td>log、memtable、SSTable</td>
+<td>WAL、MemStore、HFile</td>
+</tr>
+<tr>
+<td>常见恢复动作</td>
+<td>找副本、补复制</td>
+<td>找block、补复制</td>
+<td>重分配tablet、读文件/重放log</td>
+<td>重分配Region、恢复WAL/StoreFile</td>
+</tr>
+</tbody>
+</table>
+<p>表中的相似项是职责类比，不是协议等价。GFS的lease与HDFS写pipeline不同；Bigtable的Chubby依赖与HBase的ZooKeeper使用也不能逐API替换。论文描述的历史系统更不能覆盖当前产品的HA、运维和版本行为。</p>
+<h2 id="一次节点故障要穿过两层状态">一次节点故障要穿过两层状态</h2>
+<p>有限实验固定文件 <code>/logs/a</code> 的两个block，每个有三个副本。<code>dn2</code>失效后，每个block仍有两个副本，读取可继续；控制面随后从存活副本把 <code>b0</code>补到<code>dn4</code>、把<code>b1</code>补到<code>dn1</code>，恢复三副本。该过程没有模拟pipeline、校验和或机架策略。</p>
+<p>表场景固定两个Region。<code>rs1</code>失效后，低range暂时无服务者；控制面把它交给<code>rs3</code>，数据恢复仍明确列出<code>sf0</code>和<code>w1</code>。模型特意拒绝“元数据有映射，所以数据已经恢复”的偷换。</p>
+<pre><code class="hljs mermaid">stateDiagram-v2
+  [*] --&gt; Serving
+  Serving --&gt; Suspect: 心跳缺失
+  Suspect --&gt; Unassigned: 失效判定与旧资格隔离
+  Unassigned --&gt; Recovering: 新节点取得归属
+  Recovering --&gt; Serving: 打开持久文件并重放日志</code></pre>
+<p>安全性要求同一Region不能让两个未隔离的节点同时接受冲突写，且恢复不能漏掉已承诺记录。活性需要协调服务、master、底层文件系统和足够RegionServer最终可用。网络分区中旧节点仍运行时，fencing比“新节点已经被选中”更重要。</p>
+<h2 id="运行有限模型">运行有限模型</h2>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs sh"><span class="hljs-built_in">mkdir</span> -p examples/distributed-systems/.build/e02/tmp<br><span class="hljs-built_in">export</span> TMPDIR=<span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>/examples/distributed-systems/.build/e02/tmp&quot;</span><br><span class="hljs-built_in">export</span> TMP=<span class="hljs-string">&quot;<span class="hljs-variable">$TMPDIR</span>&quot;</span> TEMP=<span class="hljs-string">&quot;<span class="hljs-variable">$TMPDIR</span>&quot;</span> PYTHONDONTWRITEBYTECODE=1<br>python3 -B examples/distributed-systems/storage-e02/check.py \<br>  --output examples/distributed-systems/.build/e02/observations.json<br></code></pre></td></tr></table></figure>
+<p>实验门槛是文件在单节点失效后仍可读、补复制恢复到三份，Region改由新服务器承载且恢复材料同时包含WAL和StoreFile。完整结果见<a href="/2026/09/27/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E02-%E6%96%87%E4%BB%B6%E5%9D%97%E4%B8%8E%E6%9C%89%E5%BA%8F%E8%A1%A8%E7%9A%84%E5%AD%98%E5%82%A8%E6%9E%B6%E6%9E%84/observations.json.txt" title="观察结果">观察结果</a>，命令与来源见<a href="/2026/09/27/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E02-%E6%96%87%E4%BB%B6%E5%9D%97%E4%B8%8E%E6%9C%89%E5%BA%8F%E8%A1%A8%E7%9A%84%E5%AD%98%E5%82%A8%E6%9E%B6%E6%9E%84/evidence.txt" title="实验证据">实验证据</a>，验证范围见<a href="/2026/09/27/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E02-%E6%96%87%E4%BB%B6%E5%9D%97%E4%B8%8E%E6%9C%89%E5%BA%8F%E8%A1%A8%E7%9A%84%E5%AD%98%E5%82%A8%E6%9E%B6%E6%9E%84/verification.txt" title="验证说明">验证说明</a>。</p>
+<p>它不启动真实HDFS/HBase，不覆盖控制面多数派丢失、磁盘损坏、并发写、Region split、compaction、rack-aware placement或性能。有限字典中的状态转换只是架构核对，不是产品恢复证明。</p>
+<h2 id="两个推演练习">两个推演练习</h2>
+<p><strong>NameNode已经知道某block的三个位置，为什么仍可能永久丢文件？</strong></p>
+<p>位置表只是索引。若三个DataNode上的内容都损坏或丢失，控制面没有第四份字节可复制。元数据HA与数据副本故障域必须分别设计。</p>
+<p><strong>Region已经重新分配给新RegionServer，为什么还不能立刻声明恢复完成？</strong></p>
+<p>归属变化只解决谁有资格服务。新节点还要打开持久文件、处理WAL并达到可读写状态；旧节点也必须被隔离。三个条件缺一不可。</p>
+<p>E03进入开放网络。中心控制面不再天然可信，内容寻址、fork consistency和工作量证明会分别处理不同的信任问题。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>Ghemawat、Gobioff、Leung，2003，<a target="_blank" rel="noopener" href="https://research.google/pubs/the-google-file-system/">The Google File System</a>。</li>
+<li>Chang 等，2006，<a target="_blank" rel="noopener" href="https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/">Bigtable: A Distributed Storage System for Structured Data</a>。</li>
+<li>Apache Hadoop 3.4.1，<a target="_blank" rel="noopener" href="https://hadoop.apache.org/docs/r3.4.1/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html">HDFS Architecture</a>。</li>
+<li>Apache Hadoop 3.4.1，<a target="_blank" rel="noopener" href="https://hadoop.apache.org/docs/r3.4.1/hadoop-project-dist/hadoop-hdfs/HDFSHighAvailabilityWithQJM.html">HDFS High Availability with QJM</a>。</li>
+<li>Apache HBase 2.6，<a target="_blank" rel="noopener" href="https://hbase.apache.org/book.html">Apache HBase Reference Guide</a>。</li>
+<li>MIT 6.5840 Spring 2026，<a target="_blank" rel="noopener" href="https://pdos.csail.mit.edu/6.824/schedule.html">课程日程与GFS资料</a>。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/27/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E02-%E6%96%87%E4%BB%B6%E5%9D%97%E4%B8%8E%E6%9C%89%E5%BA%8F%E8%A1%A8%E7%9A%84%E5%AD%98%E5%82%A8%E6%9E%B6%E6%9E%84/">https://magicliang.github.io/2026/09/27/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E02-%E6%96%87%E4%BB%B6%E5%9D%97%E4%B8%8E%E6%9C%89%E5%BA%8F%E8%A1%A8%E7%9A%84%E5%AD%98%E5%82%A8%E6%9E%B6%E6%9E%84/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/HDFS/">HDFS</a><a class="post-meta__tags" href="/tags/HBase/">HBase</a><a class="post-meta__tags" href="/tags/Bigtable/">Bigtable</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-distributed-systems.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-01-HDFS-%E6%9E%B6%E6%9E%84%E4%B8%8E%E4%B8%89%E5%B1%82%E5%88%87%E5%88%86/" title="深入 Hadoop 01 - HDFS 架构与三层切分"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-01-HDFS-%E6%9E%B6%E6%9E%84%E4%B8%8E%E4%B8%89%E5%B1%82%E5%88%87%E5%88%86/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 01 - HDFS 架构与三层切分</div></div><div class="info-2"><div class="info-item-1">上一篇把 Hadoop 整体压成一句话：以&quot;节点总会失败&quot;为前提，HDFS 切大文件、YARN 切资源、MapReduce 切计算。本篇进入 HDFS。 HDFS 常被介绍为&quot;分布式文件系统&quot;。这个说法没错但不够准确。准确的说法是：HDFS 是一个把元数据、数据块、节点监控切成三层独立职责的分布式文件系统。三层职责分离是 HDFS 设计的核心抽象，决定了 HDFS 的所有后续行为——为什么元数据全内存、为什么写文件要 Pipeline、为什么读文件可以就近选副本、为什么 NameNode 是单点。 本篇只抓一个问题：NameNode、DataNode、客户端这三层职责是怎么切开的，以及这种切法为什么会让 HDFS 长成现在的样子。 三层职责切分 HDFS 的架构可以用一张三层图概括： 1234567891011121314151617181920212223┌─────────────────────────────────────────────────────────────────┐│                  NameNod...</div></div></div></a><a class="pagination-related" href="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-00-%E5%AF%BC%E8%AF%BB-%E8%8A%82%E7%82%B9%E6%80%BB%E4%BC%9A%E5%A4%B1%E8%B4%A5/" title="深入 Hadoop 00 - 导读：节点总会失败"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/26/%E6%B7%B1%E5%85%A5-Hadoop-00-%E5%AF%BC%E8%AF%BB-%E8%8A%82%E7%82%B9%E6%80%BB%E4%BC%9A%E5%A4%B1%E8%B4%A5/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">深入 Hadoop 00 - 导读：节点总会失败</div></div><div class="info-2"><div class="info-item-1">Hadoop 常被介绍为&quot;HDFS + YARN + MapReduce 三驾马车&quot;。这个分类把重点放错了位置。把存储、调度、计算切成三件独立的事情，读者很难回答下面这个问题：为什么这三个子系统会一起出现在同一个项目里，而不是像 Spark、Flink、Kafka 那样作为独立组件存在？ 更准确的说法是：Hadoop 是一组关于&quot;如何构建运行在大量廉价节点上的分布式系统&quot;的前提假设在三个不同层面的具体化。这组前提把整个项目串成一条主线——节点总会失败、数据总是巨大、廉价比专用更重要。HDFS、YARN、MapReduce 各自处理这组前提下的一个子问题：HDFS 把大文件切成块并多副本放置，YARN 把集群资源切成容器并按策略分配，MapReduce 把大计算切成任务并按失败重试执行。 本系列只抓一个问题：Hadoop 这套以&quot;节点总会失败&quot;为前提假设的工程化方案，在 HDFS、YARN、MapReduce 三个层面是如何具体实现的，每个实现里有哪些可以迁移到其他分布式系统的设计模式。 GFS 论文留下的设计遗产 要理解...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-03-GFS%E5%86%99%E5%85%A5%E8%B7%AF%E5%BE%84%E4%B8%8E%E5%89%AF%E6%9C%AC%E8%BE%B9%E7%95%8C/" title="分布式系统 03：GFS 写入路径与副本边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 03：GFS 写入路径与副本边界</div></div><div class="info-2"><div class="info-item-1">多个工作者可以重做同一份计算，保存计算结果的文件系统却必须回答另一组问题：数据放在哪些机器上，谁决定并发写入的先后，一次写入只有部分副本完成时能否读取，以及客户端收到成功究竟意味着什么。 上一篇：MapReduce 任务重试与输出提交区分了执行与发布。GFS 把这种区分推进到存储层：网络已经传完数据、某个副本已经改动文件、整个请求已经得到成功响应，是三个不同的时刻。混淆它们，会把失败后的残留内容当成已提交结果。 讨论对象是 Ghemawat、Gobioff 和 Leung 在 SOSP 2003 发表的 GFS。MIT 6.5840 Spring 2026 把它放在 MapReduce、RPC 之后，用它连接分片、复制与故障恢复。本篇的 Go 程序只执行有限内存时间线，不提供 GFS API，也没有真实的磁盘复制、租约时钟或网络传输。 从工作负载确定系统模型 2003 年 GFS 面向大型数据处理。文件较大，追加和顺序读取常见，系统需要聚合带宽，并把机器故障视为日常条件。这与任意程序都能直接使用的通用文件系统有距离。应用可以配合存储接口，接受校验记录、过滤重复等额外责任。原论文 ...</div></div></div></a><a class="pagination-related" href="/2025/07/13/aws-%E7%9A%84%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F%E7%9B%B8%E5%85%B3%E6%8C%91%E6%88%98/" title="aws 的分布式系统相关挑战"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2025/07/13/aws-%E7%9A%84%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F%E7%9B%B8%E5%85%B3%E6%8C%91%E6%88%98/reply-messaging-across-network.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-07-13</div><div class="info-item-2">aws 的分布式系统相关挑战</div></div><div class="info-2"><div class="info-item-1">原文：《分布式系统相关挑战》 早期的亚马逊系统的相关挑战 当服务器出现到第二台的时候，分布式系统的挑战就出现了：  latencey scalablity 理解网络 API 数据编组和解组 Paxos 算法的复杂性  随着系统的不断快速扩展和分布程度的不断提高，理论上的边缘情况成为了常态。所以小系统不出问题主要是因为分布程度不够高。 开发分布式实用程序计算服务（例如可靠的长途电话网络或 Amazon Web Services (AWS) 服务）比较困难。与其他形式的计算相比，分布式计算也更古怪，而且不够直观，因为它存在两个相互关联的问题。在分布式系统中，造成最大问题的是故障独立性和不确定性。在分布式系统中，除了大多数工程师习以为常的计算故障外，故障还会以许多其他方式出现。更糟糕的是，不可能时刻知晓某事项是否发生了故障。 分布式系统的类型 离线分布式系统  批处理系统 大数据分析集群 电影场景渲染农场 蛋白质折叠集群  这种离线系统没有对 request 和 response 之间的强实时要求。 虽然离线分布式系统实现起来并不容易，但它却几乎囊括了分布式计算的所有优点（可扩展性和容...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Offset-%E7%AE%A1%E7%90%86-%E6%8F%90%E4%BA%A4-%E9%87%8D%E7%BD%AE%E4%B8%8E%E6%B6%88%E8%B4%B9%E8%AF%AD%E4%B9%89/" title="Offset 管理：提交、重置与消费语义"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Offset-%E7%AE%A1%E7%90%86-%E6%8F%90%E4%BA%A4-%E9%87%8D%E7%BD%AE%E4%B8%8E%E6%B6%88%E8%B4%B9%E8%AF%AD%E4%B9%89/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Offset 管理：提交、重置与消费语义</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 partition 怎么分给 consumer。这一篇解决分到之后的核心问题：consumer 读到哪里了，怎么记住。 这个&quot;记住&quot;机制看起来简单——不过是记录一个数字（offset）。但&quot;什么时候记&quot;和&quot;怎么记&quot;的选择，直接决定了消息会不会丢、会不会重复处理。auto-commit 的默认行为经常被误解为&quot;自动保证 exactly-once&quot;，实际上它给出的是 at-least-once 甚至更弱的语义。 本文只抓一个问题：offset 的提交策略如何影响消费语义。 三个 offset 理解 offset 管理需要区分三个位置： 123456789Partition Log:┌────┬────┬────┬────┬────┬────┬────┬────┬─────┐│ 0  │ 1  │ 2  │ 3  │ 4  │ 5  │ 6  │ 7  │ ... │└────┴────┴────┴────┴────┴────┴────┴────┴─────┘                 ...</div></div></div></a><a class="pagination-related" href="/2020/12/16/%E4%BA%91%E5%8E%9F%E7%94%9F%E5%BA%94%E7%94%A8/" title="云原生应用"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2020-12-16</div><div class="info-item-2">云原生应用</div></div><div class="info-2"><div class="info-item-1">弹性问题  弹性服务最好和监控服务、限流服务配合。 弹性服务的监控最好低于限流服务的阈值，否则不会被触发。 要注意扩容阈值和缩容阈值。如果有必要，设置阶梯阈值，离正常值越远的阶梯越不敏感，离正常值越近的阶梯越敏感。阶梯越远，弹性的量应该越大。 注意弹性有静默期，注意发布和弹性静默期之间是相互矛盾的，要相互关闭。 如果有压测标记，注意让弹性扩容监控包括/排除压测流量。 任务调度或者特殊的有状态的中间件依赖的分布式节点应该尽量避免弹入和弹出。  慢预热服务-扩容机器服务可用性差问题 极少部分依赖缓存预热的业务在接入弹性的过程中，在业务代码配置不合理的情况下，可能出现服务节点启动时服务不可用或性能较差的情况。 出现这种问题可以产生如下情况:  服务节点启动后尚未完全预热，大量流量打入导致服务不可用（TP耗时飙升）。 服务依赖数据源尚未初始化完成，服务节点就已注册至服务治理的命名服务器，开始承担流量，但此时服务处于不可用状态（请求异常）。 机器刚刚扩容出来时cpu.busy指标较高，承接流量后影响服务可用性。  此类问题的根本原因是：服务自身预热工作未完成时，处于服务不可用状态，此时不应...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%B1%E5%90%8C%E9%AA%A8%E6%9E%B6%EF%BC%9A%E5%85%83%E6%95%B0%E6%8D%AE%E5%8F%AA%E8%B4%9F%E8%B4%A3%E6%89%BE%E5%88%B0%E6%95%B0%E6%8D%AE"><span class="toc-number">1.</span> <span class="toc-text">共同骨架：元数据只负责找到数据</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#gfs-%E4%B8%8E-hdfs%EF%BC%9A%E6%96%87%E4%BB%B6%E8%A2%AB%E6%8B%86%E6%88%90%E5%8F%AF%E5%A4%8D%E5%88%B6%E7%9A%84%E5%9D%97"><span class="toc-number">2.</span> <span class="toc-text">GFS 与 HDFS：文件被拆成可复制的块</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#bigtable-%E4%B8%8E-hbase%EF%BC%9Arow-range-%E6%98%AF%E6%9C%8D%E5%8A%A1%E5%92%8C%E6%81%A2%E5%A4%8D%E5%8D%95%E4%BD%8D"><span class="toc-number">3.</span> <span class="toc-text">Bigtable 与 HBase：row range 是服务和恢复单位</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E4%B8%AA%E7%B3%BB%E7%BB%9F%E4%B8%8D%E8%83%BD%E6%8C%89%E5%90%8D%E7%A7%B0%E4%B8%80%E4%B8%80%E5%AF%B9%E5%BA%94"><span class="toc-number">4.</span> <span class="toc-text">四个系统不能按名称一一对应</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E6%AC%A1%E8%8A%82%E7%82%B9%E6%95%85%E9%9A%9C%E8%A6%81%E7%A9%BF%E8%BF%87%E4%B8%A4%E5%B1%82%E7%8A%B6%E6%80%81"><span class="toc-number">5.</span> <span class="toc-text">一次节点故障要穿过两层状态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%BF%90%E8%A1%8C%E6%9C%89%E9%99%90%E6%A8%A1%E5%9E%8B"><span class="toc-number">6.</span> <span class="toc-text">运行有限模型</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E4%B8%AA%E6%8E%A8%E6%BC%94%E7%BB%83%E4%B9%A0"><span class="toc-number">7.</span> <span class="toc-text">两个推演练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">8.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
