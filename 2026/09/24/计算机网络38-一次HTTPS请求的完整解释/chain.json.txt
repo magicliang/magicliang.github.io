@@ -1,10 +1,98 @@
 {
-  "stages": ["DNS", "ROUTE", "TCP", "TLS", "PROXY", "BACKEND", "HTTP_RESPONSE"],
-  "baseline": {"host": "api.lab.test", "address": "192.0.2.20", "status": 200},
-  "faults": [
-    {"name": "dns_error", "last_success": "DNS_QUERY", "failure": "DNS_NXDOMAIN", "excluded": "TCP_OR_LATER", "recovery": "EXPECTED_ADDRESS_RETURNED"},
-    {"name": "syn_loss", "last_success": "ROUTE", "failure": "TCP_NO_SYN_ACK", "excluded": "TLS_OR_HTTP", "recovery": "HANDSHAKE_CONFIRMED_AT_BOTH_ENDS"},
-    {"name": "pmtu_black_hole", "last_success": "TCP_SMALL_SEGMENT", "failure": "LARGE_SEGMENT_DROPPED_WITHOUT_ICMP", "excluded": "TOTAL_PATH_OUTAGE", "recovery": "SAME_LARGE_TRANSFER_COMPLETES"},
-    {"name": "slow_backend", "last_success": "PROXY_FORWARD", "failure": "UPSTREAM_FIRST_BYTE_DELAY", "excluded": "DNS_TCP_TLS_DOMINATE", "recovery": "UPSTREAM_DELAY_REMOVED_AND_BASELINE_REPEATED"}
+  "baseline": {
+    "host": "api.lab.test",
+    "address": "192.0.2.20",
+    "status": 200
+  },
+  "pmtu_model": {
+    "path_mtu_bytes": 1300,
+    "ipv4_packet_sizes_bytes": [1200, 1400],
+    "dont_fragment": true,
+    "icmp_fragmentation_needed_delivered": false
+  },
+  "cases": [
+    {
+      "name": "dns_error",
+      "assumed_input": "The synthetic authoritative answer for api.lab.test is NXDOMAIN; the resolver may retain that negative answer for its TTL.",
+      "observable_evidence": [
+        "The correlated DNS response carries the NXDOMAIN response code.",
+        "No destination address is returned to the caller and no SYN for 192.0.2.20 appears in the same request window."
+      ],
+      "still_possible": [
+        "The authoritative record is absent or misconfigured.",
+        "A resolver is serving a still-valid cached negative answer.",
+        "Without authenticated DNS evidence, a forged or misdirected response remains possible."
+      ],
+      "excluded_if": [
+        "The same attempt obtains the expected A or AAAA answer from the selected resolver.",
+        "A correlated SYN to the resolved destination proves that this attempt progressed beyond name resolution."
+      ],
+      "recovery_criteria": [
+        "The authoritative data returns the expected test address.",
+        "The negative cache has expired or been deliberately cleared.",
+        "The repeated request progresses to TCP using that address."
+      ]
+    },
+    {
+      "name": "syn_loss",
+      "assumed_input": "DNS returns 192.0.2.20 and a controlled rule drops the client's outbound SYN before it reaches the proxy.",
+      "observable_evidence": [
+        "The client-side capture shows SYN retransmissions and no SYN-ACK.",
+        "The proxy-side capture shows no corresponding SYN and no TLS ClientHello follows."
+      ],
+      "still_possible": [
+        "A client-side filter, neighbor-resolution failure or earlier route failure can create a similar single-ended symptom.",
+        "With only a client capture, loss of the SYN and loss of the SYN-ACK cannot be distinguished."
+      ],
+      "excluded_if": [
+        "The proxy-side capture receives the SYN and the client-side capture receives the matching SYN-ACK.",
+        "A reset response would indicate rejection rather than silent SYN loss."
+      ],
+      "recovery_criteria": [
+        "Only the controlled drop rule is removed.",
+        "Both capture points show SYN, SYN-ACK and ACK for the repeated request.",
+        "The request then progresses to TLS."
+      ]
+    },
+    {
+      "name": "pmtu_black_hole",
+      "assumed_input": "The finite model uses complete IPv4 packet sizes, a 1300-byte path MTU, DF=true, and suppressed ICMP Fragmentation Needed feedback.",
+      "observable_evidence": [
+        "The model forwards the 1200-byte packet because 1200 <= 1300.",
+        "The model drops the 1400-byte packet without feedback because 1400 > 1300, DF is set, and ICMP feedback is suppressed."
+      ],
+      "still_possible": [
+        "A size-dependent application bug, ordinary packet loss, congestion, or a proxy timeout can also make larger transfers fail.",
+        "The two-size model does not reproduce TCP retransmission, MSS negotiation or kernel PMTUD state."
+      ],
+      "excluded_if": [
+        "The 1400-byte packet is observed beyond the modeled bottleneck on the same path.",
+        "Delivered ICMP feedback causes the sender to reduce packet size and make progress, so the exact black-hole assumptions no longer hold."
+      ],
+      "recovery_criteria": [
+        "Allow the required ICMP feedback or reduce complete IPv4 packet size to at most 1300 bytes.",
+        "Repeat the same transfer and observe progress beyond the former size boundary."
+      ]
+    },
+    {
+      "name": "slow_backend",
+      "assumed_input": "A synthetic delay is assigned after the proxy has forwarded a fixed request to one backend; no process or network delay is actually injected.",
+      "observable_evidence": [
+        "DNS, TCP and TLS completion precede the delay window.",
+        "The proxy records request forwarding, while upstream first-byte time exceeds the declared baseline threshold."
+      ],
+      "still_possible": [
+        "Connection-pool waiting, retry delay, proxy-to-backend transport, backend queueing and application processing remain combined in the upstream interval.",
+        "Without backend timestamps, a database or application function cannot be singled out."
+      ],
+      "excluded_if": [
+        "Most of the delay occurs before proxy forwarding or before TLS completion.",
+        "A correlated backend response arrives promptly and the delay is introduced later on the return path."
+      ],
+      "recovery_criteria": [
+        "Remove only the assigned upstream delay.",
+        "Repeat the fixed request and require its upstream first-byte time to return within the stated baseline threshold."
+      ]
+    }
   ]
 }

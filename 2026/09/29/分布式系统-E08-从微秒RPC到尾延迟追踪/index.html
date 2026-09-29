@@ -1,0 +1,862 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>分布式系统（E08）：从微秒 RPC 到尾延迟追踪 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="一次请求的平均延迟很低，p99却不断升高。trace瀑布图里某个服务占了四十毫秒，于是它被判为根因。这个诊断可能同时错在三处：请求要等待的完成条件没有写清，压测器在慢响应期间停止发新请求，跨主机时间戳又被当成了因果顺序。 eRPC说明了专用数据中心RPC如何把软件开销压低；尾延迟研究解释了罕见慢节点怎样进入用户请求；分布式追踪负责保留单次执行的关系证据。这三者解决的问题相邻，却不能彼此替代。 分布">
+<meta property="og:type" content="article">
+<meta property="og:title" content="分布式系统（E08）：从微秒 RPC 到尾延迟追踪">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/29/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E08-%E4%BB%8E%E5%BE%AE%E7%A7%92RPC%E5%88%B0%E5%B0%BE%E5%BB%B6%E8%BF%9F%E8%BF%BD%E8%B8%AA/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="一次请求的平均延迟很低，p99却不断升高。trace瀑布图里某个服务占了四十毫秒，于是它被判为根因。这个诊断可能同时错在三处：请求要等待的完成条件没有写清，压测器在慢响应期间停止发新请求，跨主机时间戳又被当成了因果顺序。 eRPC说明了专用数据中心RPC如何把软件开销压低；尾延迟研究解释了罕见慢节点怎样进入用户请求；分布式追踪负责保留单次执行的关系证据。这三者解决的问题相邻，却不能彼此替代。 分布">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg">
+<meta property="article:published_time" content="2026-09-29T10:30:00.000Z">
+<meta property="article:modified_time" content="2026-09-29T07:18:10.254Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="OpenTelemetry">
+<meta property="article:tag" content="eRPC">
+<meta property="article:tag" content="分布式系统">
+<meta property="article:tag" content="尾延迟">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-distributed-systems.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "分布式系统（E08）：从微秒 RPC 到尾延迟追踪",
+  "url": "https://magicliang.github.io/2026/09/29/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E08-%E4%BB%8E%E5%BE%AE%E7%A7%92RPC%E5%88%B0%E5%B0%BE%E5%BB%B6%E8%BF%9F%E8%BF%BD%E8%B8%AA/",
+  "image": "https://magicliang.github.io/img/cover-distributed-systems.svg",
+  "datePublished": "2026-09-29T10:30:00.000Z",
+  "dateModified": "2026-09-29T07:18:10.254Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/29/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E08-%E4%BB%8E%E5%BE%AE%E7%A7%92RPC%E5%88%B0%E5%B0%BE%E5%BB%B6%E8%BF%9F%E8%BF%BD%E8%B8%AA/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '分布式系统（E08）：从微秒 RPC 到尾延迟追踪',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1002</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1165</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">53</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-distributed-systems.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">分布式系统（E08）：从微秒 RPC 到尾延迟追踪</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">分布式系统（E08）：从微秒 RPC 到尾延迟追踪</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-29T10:30:00.000Z" title="Created 2026-09-29 18:30:00">2026-09-29</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-09-29T07:18:10.254Z" title="Updated 2026-09-29 15:18:10">2026-09-29</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>14mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-09-29 15:18:10&quot;}" hidden></div><p>一次请求的平均延迟很低，p99却不断升高。trace瀑布图里某个服务占了四十毫秒，于是它被判为根因。这个诊断可能同时错在三处：请求要等待的完成条件没有写清，压测器在慢响应期间停止发新请求，跨主机时间戳又被当成了因果顺序。</p>
+<p>eRPC说明了专用数据中心RPC如何把软件开销压低；尾延迟研究解释了罕见慢节点怎样进入用户请求；分布式追踪负责保留单次执行的关系证据。这三者解决的问题相邻，却不能彼此替代。</p>
+<a href="/2026/09/28/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E07-%E6%8E%A7%E5%88%B6%E9%9D%A2%E5%85%B1%E8%AF%86%E4%B8%8E%E6%95%B0%E6%8D%AE%E9%9D%A2%E5%A4%8D%E5%88%B6/" title="分布式系统（E07）：控制面共识与数据面复制">分布式系统（E07）：控制面共识与数据面复制</a>
+<h2 id="延迟样本由三段协议共同产生">延迟样本由三段协议共同产生</h2>
+<p>端到端延迟不是某个函数自带的属性。请求路径规定要等哪些分支，负载发生器决定请求何时进入，观测管线再决定哪些阶段留下记录。</p>
+<pre><code class="hljs mermaid">flowchart LR
+  A[到达模型&lt;br/&gt;何时产生请求] --&gt; P[执行路径&lt;br/&gt;串行、fan-out、quorum]
+  P --&gt; Q[队列与服务&lt;br/&gt;等待、计算、重试]
+  Q --&gt; O[观测管线&lt;br/&gt;span、metric、profile]
+  O --&gt; J[结论&lt;br/&gt;分位数与归因]
+  A -.遗漏计划到达.-&gt; B[coordinated omission]
+  O -.缺span或时钟偏移.-&gt; C[错误归因]</code></pre>
+<table>
+<thead>
+<tr>
+<th>诊断模式</th>
+<th>必须保留的证据</th>
+<th>常见误判</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>路径代数</td>
+<td>串行求和、并行完成条件</td>
+<td>把叶子平均值当端到端值</td>
+</tr>
+<tr>
+<td>到达与服务分离</td>
+<td>计划到达、实际开始、完成时刻</td>
+<td>只记录成功开始的请求</td>
+</tr>
+<tr>
+<td>因果先于墙钟</td>
+<td>trace-id、parent、link、主机时钟条件</td>
+<td>按跨机start time排序</td>
+</tr>
+<tr>
+<td>缺口不作否定证据</td>
+<td>采样、传播、导出与存储状态</td>
+<td>“没有span，所以没有执行”</td>
+</tr>
+</tbody>
+</table>
+<p>这组模式的共同公式是：<code>结论 = 路径语义 + 负载条件 + 可见证据</code>。少一项时，结论必须降级为观察或待检验假说。</p>
+<h2 id="erpc的低延迟成立在数据中心边界内">eRPC的低延迟成立在数据中心边界内</h2>
+<p>NSDI 2019论文把eRPC定位为通用的数据中心RPC库，摘要明确说它处理丢包、拥塞和后台工作。公开实现支持Ethernet/UDP、InfiniBand和RoCE；高性能路径依赖用户态事件推进、快速NIC、hugepage、NUMA配置和性能构建。</p>
+<pre><code class="hljs mermaid">flowchart TB
+  APP[应用请求处理器] --&gt; EL[用户态事件循环]
+  EL --&gt; SES[session与请求状态]
+  SES --&gt; TR[传输、重传与拥塞处理]
+  TR --&gt; NIC[快速NIC&lt;br/&gt;Ethernet / InfiniBand / RoCE]
+  OS[hugepage、NUMA、性能构建] --&gt; EL
+  OS --&gt; NIC</code></pre>
+<p>论文摘要报告小RPC单核最高约一千万次每秒、大RPC单连接约75Gbps，并给出三副本Raft在传统UDP Ethernet上的微秒级结果。固定提交README把小RPC限定为32-byte、大RPC限定为8MB且两端各一核；其中Raft结果写5.3μs，论文摘要写5.5μs。两处材料来自同一研究团队，数字还存在口径或版本差异，因此它们只能说明论文实验条件下的软件路径很短，不能当作本机或云环境的性能承诺。</p>
+<p>“general”也有边界。这里的故障模型是数据中心内的丢包、拥塞和端点状态变化，不是Byzantine节点、永久网络分区或跨地域WAN。快速路径还要求应用持续推进事件循环。处理线程长时间不轮询、NIC或内存配置不匹配、接收端已经崩溃时，低软件开销不会自动提供活性。</p>
+<p>RPC完成只说明库在其接口契约内结束了一次调用。它不能证明数据库事务已经提交、外部支付只执行一次，客户端超时也不能证明服务端没有执行。若调用方在超时后重试，稳定请求ID、结果回放、目标资源幂等或fencing仍由应用层负责。第01篇的请求身份和第25篇的提交边界在微秒RPC上仍然成立。</p>
+<h2 id="串行路径累加-fan-out取决于完成条件">串行路径累加，fan-out取决于完成条件</h2>
+<p>串行路径的端到端时间近似为各段等待和服务时间之和：</p>
+<p><code>L_serial = Σ(queue_i + service_i + transport_i)</code></p>
+<p>四跳路径中，即使前三跳始终稳定，只要第四跳有少量45ms请求，端到端分布就会带上这一尾部。局部p99和端到端p99不能机械相加，因为各段慢事件可能相关，也可能落在不同请求上；可用的是逐请求关键路径，而不是分位数的代数和。</p>
+<p>all-of fan-out要等全部叶子时，请求延迟接近最大叶子延迟：</p>
+<p><code>L_fanout = max(L_1, L_2, ..., L_n)</code></p>
+<p>若叶子独立，单叶以概率<code>p</code>超过阈值，则至少一个慢叶子的概率为<code>1 - (1-p)^n</code>。<code>p=1%</code>、<code>n=100</code>时约为63.4%。共享交换机、同一机架队列、GC或热点分片会制造相关性，独立公式此时只是参照。quorum、first-success和允许部分结果的API也有不同的完成函数。</p>
+<pre><code class="hljs mermaid">flowchart LR
+  R[一次请求] --&gt; A[leaf 1]
+  R --&gt; B[leaf 2]
+  R --&gt; C[leaf ...]
+  R --&gt; D[leaf n]
+  A --&gt; M&#123;完成条件&#125;
+  B --&gt; M
+  C --&gt; M
+  D --&gt; M
+  M --&gt;|all-of| MAX[取最大完成时间]
+  M --&gt;|quorum| K[取第k个完成时间]
+  M --&gt;|first-success| MIN[满足谓词的最早完成]</code></pre>
+<p>hedged request会在首个副本迟迟未完成时发第二份请求，取先完成的合法结果。它用额外工作换尾部改善。若系统已接近饱和，额外副本可能加重队列，使更多请求触发hedge，形成正反馈。阈值、取消语义、幂等边界和额外负载必须一并报告。</p>
+<h2 id="排队会被负载发生器隐藏">排队会被负载发生器隐藏</h2>
+<p>服务时间与响应时间不是同一指标。响应时间包含请求抵达后等待前序工作的队列时间。利用率接近一时，服务时间分布不变，队列尾部也可能陡增。</p>
+<p>开放模型按外部日程产生请求，不等待前一请求完成。闭合模型保持固定数量的在途客户，一个完成后才发下一个。闭合模型适合真实的“思考后再请求”用户，也适合固定并发压测；但它不能代表固定到达率。响应变慢时，闭合发生器会自动减小到达率，最需要观察的慢时段反而产生更少样本。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+  participant O as open-loop clock
+  participant C as closed-loop client
+  participant S as single server
+  O-&gt;&gt;S: t=0 planned request
+  O-&gt;&gt;S: t=6 planned request
+  O-&gt;&gt;S: t=12 planned request
+  C-&gt;&gt;S: request 1
+  S--&gt;&gt;C: slow response
+  Note over C,S: response前没有request 2
+  C-&gt;&gt;S: request 2</code></pre>
+<p>coordinated omission描述的是测量器与被测系统发生协调：慢响应期间本应出现的计划请求没有进入样本。HdrHistogram的预期间隔修正会为一个长观测补入逐级下降的反事实值，用来做遗漏敏感性分析。补样不是实际请求，也不会恢复真实队列轨迹。</p>
+<p>超时同样不能从延迟样本中删除。只统计成功请求会右删失最慢的一批观测，让p99随着故障增加反而变好。报告至少要同时给出目标到达率、实际吞吐、在途数、成功数、错误数、超时率、预热和测量窗口。</p>
+<p>分位数也不能跨实例求平均。实例A有99个1ms和1个1000ms样本，nearest-rank p99为1ms；实例B的100个样本都是100ms，p99为100ms。两个局部p99平均得到50.5ms，而合并200个原始样本后的p99是100ms。兼容直方图可以先合并桶再估算；客户端summary已经算出的quantile没有这种可加性。</p>
+<h2 id="trace保存关系-时间戳仍受时钟约束">trace保存关系，时间戳仍受时钟约束</h2>
+<p>OpenTelemetry把trace定义为span构成的因果结构。span至多有一个parent，Link可以表达批处理或消息场景中的额外关系。跨进程连续性依赖propagator把SpanContext注入carrier，并由接收端正确提取。W3C <code>traceparent</code>和<code>tracestate</code>规定互操作格式，但trace-id不是身份、授权或完整性证明。</p>
+<pre><code class="hljs mermaid">flowchart TB
+  R[root span] --&gt; G[gateway]
+  G --&gt; W[worker]
+  W --&gt; Q[queue_wait]
+  W --&gt; H[handler]
+  H --&gt; DB[database]
+  C1[client clock offset 0] -.时间戳.-&gt; R
+  C2[worker clock offset -25ms] -.时间戳.-&gt; W
+  C3[database clock offset +40ms] -.时间戳.-&gt; DB</code></pre>
+<p>span时间戳是测量字段。OpenTelemetry没有承诺各节点时钟同步或误差上界，因此跨主机start time排序不是happens-before证明。一个database子span可以因为时钟偏移显示在root结束之后；parent关系仍表明它属于handler调用，持续时间是否可信则要看各主机计时源和SDK实现。</p>
+<p>队列必须被插桩才能被归因。worker span持续62ms，其中queue_wait为40ms、handler为22ms；若queue span缺失，瀑布图只会留下40ms未归因空白。把这段空白归给网络、handler或数据库都超出了证据。</p>
+<p>传播断裂会把一次执行拆成两个trace-id。采样丢弃、未插桩、span未结束、export失败和存储丢失也会造成相似缺口。缺span因此不能证明某段代码没有执行。</p>
+<h2 id="head-sampling与tail-sampling看到的未来不同">head sampling与tail sampling看到的未来不同</h2>
+<p>OpenTelemetry SDK在创建span时调用sampler。此时可用的输入包括parent context、TraceId、名称、SpanKind、初始attributes和links；稍后产生的错误、最终duration和后加属性还不存在。head sampling可以依据入口信息稳定降载，却天然无法直接选择“后来变慢”的请求。</p>
+<p>tail sampling把决策推迟到collector一侧，因而能使用已经产生的duration、status或属性。代价是等待窗口、按trace路由、内存占用和迟到span处理。tail决策也不能保证看到了完整trace：传播断裂、export失败和超过等待窗口的span仍会缺失。</p>
+<p><code>recording</code>与<code>sampled</code>也不是同一状态。SDK可以记录但不导出；传播头里的sampled位更不表示后端已经持久化并可查询。概率采样只有在纳入概率已知并满足相应条件时才能加权估计总体。OpenTelemetry v1.61的一致概率采样章节仍标为Development，不能冒充所有语言SDK的稳定共同保证。</p>
+<p>trace适合回答“这一次请求经过哪里、可见等待落在哪段”。总体p99、错误率和流量需要metrics，CPU热点和代码栈分布需要profiling。三种信号可以关联，但单条trace不能证明总体分布，采样trace也不能单独估算罕见事件频率。</p>
+<h2 id="实验：同一慢期的三种观察">实验：同一慢期的三种观察</h2>
+<p>本篇使用纯Python确定性模型，不运行eRPC、OpenTelemetry或Jaeger。运行入口如下：</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs sh"><span class="hljs-built_in">mkdir</span> -p examples/distributed-systems/.build/e08/tmp<br><span class="hljs-built_in">export</span> TMPDIR=<span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>/examples/distributed-systems/.build/e08/tmp&quot;</span><br><span class="hljs-built_in">export</span> TMP=<span class="hljs-string">&quot;<span class="hljs-variable">$TMPDIR</span>&quot;</span> TEMP=<span class="hljs-string">&quot;<span class="hljs-variable">$TMPDIR</span>&quot;</span> PYTHONDONTWRITEBYTECODE=1<br>python3 -B examples/distributed-systems/latency-tracing-e08/check.py \<br>  --output examples/distributed-systems/.build/e08/observations.json<br></code></pre></td></tr></table></figure>
+<p>模型中的四跳串行请求通常为8合成毫秒，每40个请求有一次第三跳变成45毫秒，端到端p99随之变成51。fan-out叶子的固定慢比例为0.1%；宽度1的请求p99为2，宽度100的all-of请求p99为50。这里的算术日程不是独立随机样本，论文概率公式只作结构参照。</p>
+<p>到达模型使用每6毫秒一个计划请求，服务通常耗时5毫秒，每200个请求有一次耗时100毫秒。固定到达的open-loop p99为98；单并发closed-loop原始p99为5，其响应门控吞吐约为182.65次每秒，已经不再服从open-loop的166.67次每秒计划到达率。按6毫秒预期间隔补样后的p99为88，但输出把这些记录标为<code>synthetic_not_actual_requests</code>。</p>
+<p>trace场景为三台主机设置0、-25和+40毫秒时钟偏移。按记录start time排序得到<code>worker → queue_wait → root → gateway → handler → database</code>，parent链则从root走向database。删除queue span后，worker内部留下40毫秒未归因时间；切断context传播后，同一次执行分成两个trace-id。</p>
+<pre><code class="hljs mermaid">flowchart TD
+  S[p99升高] --&gt; L&#123;负载条件相同吗&#125;
+  L --&gt;|否| LM[先对齐offered load、吞吐、超时]
+  L --&gt;|是| P&#123;完成条件与路径相同吗&#125;
+  P --&gt;|否| PM[区分all-of、quorum、重试与hedge]
+  P --&gt;|是| T&#123;trace关系完整吗&#125;
+  T --&gt;|否| TM[查传播、采样、export和时钟]
+  T --&gt;|是| Q&#123;队列与服务分开吗&#125;
+  Q --&gt;|否| QM[补queue/连接池/线程池证据]
+  Q --&gt;|是| H[形成可证伪瓶颈假说]</code></pre>
+<p>完整输出见<a href="/2026/09/29/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E08-%E4%BB%8E%E5%BE%AE%E7%A7%92RPC%E5%88%B0%E5%B0%BE%E5%BB%B6%E8%BF%9F%E8%BF%BD%E8%B8%AA/observations.json.txt" title="观察结果">观察结果</a>，环境与运行命令见<a href="/2026/09/29/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E08-%E4%BB%8E%E5%BE%AE%E7%A7%92RPC%E5%88%B0%E5%B0%BE%E5%BB%B6%E8%BF%9F%E8%BF%BD%E8%B8%AA/evidence.txt" title="实验证据">实验证据</a>，验证边界见<a href="/2026/09/29/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E08-%E4%BB%8E%E5%BE%AE%E7%A7%92RPC%E5%88%B0%E5%B0%BE%E5%BB%B6%E8%BF%9F%E8%BF%BD%E8%B8%AA/verification.txt" title="验证说明">验证说明</a>。</p>
+<h2 id="安全性-活性与失败路径">安全性、活性与失败路径</h2>
+<p>性能诊断也有安全性要求：不能把不同负载的p99直接比较，不能平均局部分位数，不能按跨主机墙钟伪造因果顺序，不能把缺span写成未执行。这些规则防止错误结论进入容量、回滚和故障决策。</p>
+<p>活性依赖的条件更多。RPC两端要继续运行和轮询，网络最终能传递足够报文，队列不过载，重试预算没有耗尽；追踪还要求context传播、SDK结束span、exporter取得资源、collector和存储继续接收。业务请求成功与观测数据最终出现是两条独立路径。</p>
+<p>丢包会触发传输层恢复，端点崩溃会留下结果未知，永久分区可以让调用一直无法完成。超时重试可能重复业务副作用，hedge也会让多个副本同时执行。服务恢复后，新的快速样本不能抹掉故障窗口中的超时；观测后端恢复也不会补回所有丢失span。报告必须把这些删失和缺口保留下来。</p>
+<h2 id="工程成本与适用边界">工程成本与适用边界</h2>
+<p>低延迟RPC把成本移到CPU核、内存布局、NIC队列、轮询和部署同质性。追踪则消耗上下文传播、span缓冲、导出带宽、collector内存和存储索引。提高采样率可能改善稀有慢请求的可见性，也会改变被测系统和观测系统自身的负载。</p>
+<p>诊断顺序应从测量契约开始：固定请求完成条件和到达模型，保留超时及错误，再用trace缩小单次路径，最后用queue metric和profile验证瓶颈。eRPC可以缩短RPC软件路径，却不能删除排队、应用提交、重试副作用和观测缺口。</p>
+<h2 id="模式速查表">模式速查表</h2>
+<table>
+<thead>
+<tr>
+<th>看到的现象</th>
+<th>先检查</th>
+<th>可证伪动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>平均值稳定、p99升高</td>
+<td>样本数、超时、负载阶段</td>
+<td>合并原始样本并按窗口重算</td>
+</tr>
+<tr>
+<td>fan-out越宽越慢</td>
+<td>完成条件与叶子相关性</td>
+<td>改成quorum或分组输出对照</td>
+</tr>
+<tr>
+<td>压测p99异常漂亮</td>
+<td>open/closed、计划发送时刻</td>
+<td>用固定到达回放同一服务轨迹</td>
+</tr>
+<tr>
+<td>trace显示某服务最慢</td>
+<td>queue span、时钟偏移、缺口</td>
+<td>补等待段并按parent重建DAG</td>
+</tr>
+<tr>
+<td>trace中没有某次调用</td>
+<td>传播、采样、export、存储</td>
+<td>用业务日志或请求ID交叉核验</td>
+</tr>
+<tr>
+<td>RPC很快但业务仍超时</td>
+<td>连接池、队列、提交与下游</td>
+<td>分开记录运输、排队和外部效果</td>
+</tr>
+</tbody>
+</table>
+<h2 id="练习">练习</h2>
+<ol>
+<li>某请求all-of等待50个叶子，每个叶子独立地以0.2%概率超过40ms。计算至少一个慢叶子的概率。若接口改为等待任意45个成功结果，原公式为什么不再够用？</li>
+<li>修改实验，把100ms慢服务改成超时并从成功直方图删除。记录p99和超时率，再解释为什么只看成功p99会得到方向错误的结论。</li>
+</ol>
+<h2 id="资料">资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://www.usenix.org/conference/nsdi19/presentation/kalia">eRPC: Datacenter RPCs can be General and Fast</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/erpc-io/eRPC/blob/de83dab3eab4a0fb19bfc4881c11d4a6b89ff17d/README.md">eRPC fixed-commit README</a></li>
+<li><a target="_blank" rel="noopener" href="https://doi.org/10.1145/2408776.2408794">The Tail at Scale</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.usenix.org/conference/nsdi-06/open-versus-closed-cautionary-tale">Open Versus Closed: A Cautionary Tale</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/HdrHistogram/HdrHistogram/blob/HdrHistogram-2.2.2/README.md">HdrHistogram 2.2.2 README</a></li>
+<li><a target="_blank" rel="noopener" href="https://prometheus.io/docs/practices/histograms/">Prometheus: Histograms and summaries</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/open-telemetry/opentelemetry-specification/blob/v1.61.0/specification/trace/api.md">OpenTelemetry Trace API v1.61.0</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/open-telemetry/opentelemetry-specification/blob/v1.61.0/specification/context/api-propagators.md">OpenTelemetry Context Propagators v1.61.0</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/open-telemetry/opentelemetry-specification/blob/v1.61.0/specification/trace/sdk.md">OpenTelemetry Trace SDK v1.61.0</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.136.0/processor/tailsamplingprocessor/README.md">OpenTelemetry Collector tail sampling processor v0.136.0</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.w3.org/TR/2021/REC-trace-context-1-20211123/">W3C Trace Context Level 1</a></li>
+<li><a target="_blank" rel="noopener" href="https://sre.google/sre-book/monitoring-distributed-systems/">Google SRE Book: Monitoring Distributed Systems</a></li>
+<li><a target="_blank" rel="noopener" href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/">Dapper: a Large-Scale Distributed Systems Tracing Infrastructure</a></li>
+</ul>
+<p>本篇是“分布式系统：从基础到共识与工程”系列最后一篇选修。第E07篇把控制面共识与业务数据面分开，本篇再把执行路径、负载生成和观测证据分开。系列的协议、系统和实验到此形成闭环；真实生产结论仍需在目标硬件、负载和故障条件下重新验证。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/29/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E08-%E4%BB%8E%E5%BE%AE%E7%A7%92RPC%E5%88%B0%E5%B0%BE%E5%BB%B6%E8%BF%9F%E8%BF%BD%E8%B8%AA/">https://magicliang.github.io/2026/09/29/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-E08-%E4%BB%8E%E5%BE%AE%E7%A7%92RPC%E5%88%B0%E5%B0%BE%E5%BB%B6%E8%BF%9F%E8%BF%BD%E8%B8%AA/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/">分布式系统</a><a class="post-meta__tags" href="/tags/eRPC/">eRPC</a><a class="post-meta__tags" href="/tags/%E5%B0%BE%E5%BB%B6%E8%BF%9F/">尾延迟</a><a class="post-meta__tags" href="/tags/OpenTelemetry/">OpenTelemetry</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-distributed-systems.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/" title="深翻页的本质：从 RDBMS 到 ES 和 Hive"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/13/%E6%B7%B1%E7%BF%BB%E9%A1%B5%E7%9A%84%E6%9C%AC%E8%B4%A8-%E4%BB%8E-RDBMS-%E5%88%B0-ES-%E5%92%8C-Hive/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">深翻页的本质：从 RDBMS 到 ES 和 Hive</div></div><div class="info-2"><div class="info-item-1">分页通常是一个很安静的接口参数：page_no、page_size，或者 limit、offset。数据量小时，它几乎没有存在感；等列表长到几十万、几百万行之后，同一条 SQL 只是把 OFFSET 往后挪了一点，延迟却会突然变得难看。 问题不在“翻页”这个动作本身，而在系统被要求从一个有序结果集里跳过很长的前缀。RDBMS、Elasticsearch、Hive 的表现各不相同，底层代价却很接近：先把前面的候选算出来，再把它们丢掉。 这也是深翻页最容易被误解的地方。它不只是 SQL 写法问题，还牵涉访问路径、排序稳定性、产品交互，以及底层系统是否需要跨节点合并结果。一个可用的分页方案，往往先从产品语义开始，而不是从 LIMIT 990000, 1000 开始。  深翻页的成本来自“计算前缀再丢弃前缀”。优化要么把前缀变窄，要么把“第 N 页”改成“从某个锚点继续”，要么提前把结果集物化成可跳转目录。   一个大表实验 有一个很典型的大表实验：表里大约 1000 万行，按 status 过滤后命中约 100 万行。测试环境是本地硬盘，慢查询阈值按 100ms 估算。几条查询的结果很...</div></div></div></a><a class="pagination-related" href="/2026/06/20/Kafka-%E4%B8%8E-RocketMQ-%E4%B8%A4%E7%A7%8D%E6%B6%88%E6%81%AF%E7%B3%BB%E7%BB%9F%E7%9A%84%E8%AE%BE%E8%AE%A1%E9%80%89%E6%8B%A9/" title="Kafka 与 RocketMQ：两种消息系统的设计选择"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/Kafka-%E4%B8%8E-RocketMQ-%E4%B8%A4%E7%A7%8D%E6%B6%88%E6%81%AF%E7%B3%BB%E7%BB%9F%E7%9A%84%E8%AE%BE%E8%AE%A1%E9%80%89%E6%8B%A9/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Kafka 与 RocketMQ：两种消息系统的设计选择</div></div><div class="info-2"><div class="info-item-1">上一篇解决了生产运维中的集群扩缩与故障排查。这一篇进入对比视角。 两套系统面对同一类问题——高吞吐消息传递——各自作出了一组互斥的选择，这些选择决定了各自擅长什么、在什么场景下会出现明显短板。 架构差异速览 12345678910111213141516Kafka                              RocketMQ─────────────────────────          ──────────────────────────────存储: partition 文件               存储: CommitLog (单文件) +      每个 partition 独立段              ConsumeQueue (消费索引)控制: ZooKeeper (旧)               控制: NameServer (轻量)      KRaft (自 Kafka 2.8 起)消费: consumer group + partition   消费: consumer group + queue      静态/动态分配     ...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-21-etcd%E7%9A%84%E8%AF%BB%E4%BA%8B%E5%8A%A1Watch%E4%B8%8ELease/" title="分布式系统 21：etcd 的读、事务、Watch 与 Lease"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 21：etcd 的读、事务、Watch 与 Lease</div></div><div class="info-2"><div class="info-item-1">Watch 恢复时，保存“刚收到的 revision”还不够。一笔事务在修订 2 同时改了两个键，消费者只应用第一个事件就把续传位置记成 3，重连后会永久漏掉第二个键。服务端已经完整发送，错误发生在消费端的检查点。 分布式系统 20：etcd 的 Raft 与存储路径 前篇区分了 Raft 位置与 KV revision。本篇使用同一官方 etcd 3.7.1，讨论默认读、条件事务、Watch 恢复与 Lease。核心问题是：一次 API 响应究竟证明了什么，客户端需要补上哪些状态管理，才能把产品保证变成正确的业务行为。  默认读与 serializable 读 默认 KV 操作保证严格可串行化，并遵守实时时序。写已经成功完成，随后发起的读不能返回该写之前的状态，除非又发生了合法的后续修改。对于单次读，可以在调用与响应之间选择一个线性化点。与读并发的写可以排在这个点前或后，不能要求返回值包含直到响应最后一刻才完成的所有写入。API guarantees etcd 的默认 Range 先执行 LinearizableReadNotify，再读取 KV；serializable=tr...</div></div></div></a><a class="pagination-related" href="/2026/06/26/%E5%88%86%E7%89%87%E4%B8%8E%E8%B7%AF%E7%94%B1-%E6%95%B0%E6%8D%AE%E5%88%86%E5%B8%83%E7%9A%84%E6%A0%B8%E5%BF%83%E6%9C%BA%E5%88%B6/" title="深入 Elasticsearch（10）：数据分布的核心机制"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/%E5%88%86%E7%89%87%E4%B8%8E%E8%B7%AF%E7%94%B1-%E6%95%B0%E6%8D%AE%E5%88%86%E5%B8%83%E7%9A%84%E6%A0%B8%E5%BF%83%E6%9C%BA%E5%88%B6/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（10）：数据分布的核心机制</div></div><div class="info-2"><div class="info-item-1">上一篇解决了聚合分析框架——Bucket、Metric、Pipeline 三层聚合在搜索结果上提供实时分析。这一篇进入数据怎样分布到多个 shard 上。 ES 把一个 index 的数据分成多个 shard，分布到不同的节点上。分片的核心是路由公式——决定一条文档应该落在哪个 shard 上。这个公式看起来简单，但它的分母不可变这一约束影响了 ES 的整个容量规划思路。 本文只抓一个问题：分片路由公式怎样工作，以及分片数不可变的约束从何而来。  路由公式 1shard_num = hash(_routing) % number_of_primary_shards 默认情况下 _routing 等于文档的 _id。这个公式把文档 ID 的哈希值对 primary shard 数取模，得到目标 shard 编号。 5 条文档经过这个公式分配到 3 个 shard 的过程：  哈希函数对同一个 _id 总是产生相同的结果，所以读取时不需要查询元数据——直接算一次就知道文档在哪个 shard 上。 这个公式意味着：  给定相同的 _routing 和相同的 number_of_prim...</div></div></div></a><a class="pagination-related" href="/2026/02/07/%E4%B8%80%E8%87%B4%E6%80%A7%E5%93%88%E5%B8%8C%E4%B8%8E%E6%95%B0%E6%8D%AE%E5%88%86%E7%89%87/" title="一致性哈希与数据分片"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-02-07</div><div class="info-item-2">一致性哈希与数据分片</div></div><div class="info-2"><div class="info-item-1">数据分片的动机 随着互联网应用的快速发展，数据量和访问量呈现爆炸式增长。单机存储系统面临着两个根本性的瓶颈：存储容量和访问性能。 存储容量方面，单台服务器的磁盘空间是有限的。当数据量超过单机容量时，必须寻找横向扩展的解决方案。垂直扩展通过升级硬件配置可以在一定程度上缓解问题，但成本高昂且存在物理上限。更重要的是，单机无法无限扩展，当数据量达到TB甚至PB级别时，垂直扩展已经无法满足需求。 访问性能方面，单机的处理能力同样有限。随着用户数量和请求量的增加，CPU计算能力、内存带宽、磁盘I/O和网络带宽都会成为性能瓶颈。即使单机能够处理当前的负载，也无法保证未来业务的持续增长。 数据分片提供了一种水平扩展的解决方案。通过将数据分散到多台服务器上，每台服务器只存储部分数据并处理部分请求，从而实现存储容量和访问性能的线性扩展。这种架构具有更好的可扩展性，可以根据业务增长灵活地增加服务器节点。 朴素哈希分片 朴素哈希分片是最直观的数据分片方案。其核心思想是：对于给定的数据键key，通过哈希函数计算其哈希值，然后对节点数量N取模，确定该数据应该存储在哪个节点。 1node_index = h...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-24-%E5%88%86%E7%89%87%E4%B8%8E%E5%9C%A8%E7%BA%BF%E8%BF%81%E7%A7%BB%E7%9A%84%E5%BD%92%E5%B1%9E%E8%BE%B9%E7%95%8C/" title="分布式系统（24）：分片与在线迁移的归属边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统（24）：分片与在线迁移的归属边界</div></div><div class="info-2"><div class="info-item-1">分片把不同键交给不同服务组。扩容时，计算一个新映射并不困难；困难在于旧组还有请求、新组正在接收数据、控制器可能随时停止，而客户端缓存的地址不会同时更新。迁移协议必须说明每个阶段谁能接受业务请求，以及失败后凭什么继续。 分布式系统（23）：Dynamo风格复制、Quorum与冲突版本 前篇讨论 Dynamo 风格副本选择与冲突版本。本篇切换到每个分片最多一个有效服务归属的模型：每个组可以在内部使用复制状态机，跨组迁移则把源撤权、状态传输和目标授权串成有序步骤。允许迁移窗口暂时没有可用服务者，但不允许两个组各自成功修改同一分片。 映射函数不能代替迁移协议 范围分片按排序后的键空间划分区间。相邻键通常在少量分片中，范围扫描容易定位；若新写集中在尾部区间，负载也可能集中在那里。Bigtable 的 tablet 就以行键范围为分布单元，这个组织方式服务于排序与范围访问，而不是所有场景下的负载均衡保证。Bigtable，OSDI 2006，§2 哈希分片先把键映射到散列空间，再分配给节点或逻辑分片。它可以打散具有相近前缀的键，但范围查询可能需要访问多个分片。若直接使用 hash(key) ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%BB%B6%E8%BF%9F%E6%A0%B7%E6%9C%AC%E7%94%B1%E4%B8%89%E6%AE%B5%E5%8D%8F%E8%AE%AE%E5%85%B1%E5%90%8C%E4%BA%A7%E7%94%9F"><span class="toc-number">1.</span> <span class="toc-text">延迟样本由三段协议共同产生</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#erpc%E7%9A%84%E4%BD%8E%E5%BB%B6%E8%BF%9F%E6%88%90%E7%AB%8B%E5%9C%A8%E6%95%B0%E6%8D%AE%E4%B8%AD%E5%BF%83%E8%BE%B9%E7%95%8C%E5%86%85"><span class="toc-number">2.</span> <span class="toc-text">eRPC的低延迟成立在数据中心边界内</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%B2%E8%A1%8C%E8%B7%AF%E5%BE%84%E7%B4%AF%E5%8A%A0-fan-out%E5%8F%96%E5%86%B3%E4%BA%8E%E5%AE%8C%E6%88%90%E6%9D%A1%E4%BB%B6"><span class="toc-number">3.</span> <span class="toc-text">串行路径累加，fan-out取决于完成条件</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%8E%92%E9%98%9F%E4%BC%9A%E8%A2%AB%E8%B4%9F%E8%BD%BD%E5%8F%91%E7%94%9F%E5%99%A8%E9%9A%90%E8%97%8F"><span class="toc-number">4.</span> <span class="toc-text">排队会被负载发生器隐藏</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#trace%E4%BF%9D%E5%AD%98%E5%85%B3%E7%B3%BB-%E6%97%B6%E9%97%B4%E6%88%B3%E4%BB%8D%E5%8F%97%E6%97%B6%E9%92%9F%E7%BA%A6%E6%9D%9F"><span class="toc-number">5.</span> <span class="toc-text">trace保存关系，时间戳仍受时钟约束</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#head-sampling%E4%B8%8Etail-sampling%E7%9C%8B%E5%88%B0%E7%9A%84%E6%9C%AA%E6%9D%A5%E4%B8%8D%E5%90%8C"><span class="toc-number">6.</span> <span class="toc-text">head sampling与tail sampling看到的未来不同</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9E%E9%AA%8C%EF%BC%9A%E5%90%8C%E4%B8%80%E6%85%A2%E6%9C%9F%E7%9A%84%E4%B8%89%E7%A7%8D%E8%A7%82%E5%AF%9F"><span class="toc-number">7.</span> <span class="toc-text">实验：同一慢期的三种观察</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%89%E5%85%A8%E6%80%A7-%E6%B4%BB%E6%80%A7%E4%B8%8E%E5%A4%B1%E8%B4%A5%E8%B7%AF%E5%BE%84"><span class="toc-number">8.</span> <span class="toc-text">安全性、活性与失败路径</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E6%88%90%E6%9C%AC%E4%B8%8E%E9%80%82%E7%94%A8%E8%BE%B9%E7%95%8C"><span class="toc-number">9.</span> <span class="toc-text">工程成本与适用边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E9%80%9F%E6%9F%A5%E8%A1%A8"><span class="toc-number">10.</span> <span class="toc-text">模式速查表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0"><span class="toc-number">11.</span> <span class="toc-text">练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%B5%84%E6%96%99"><span class="toc-number">12.</span> <span class="toc-text">资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
