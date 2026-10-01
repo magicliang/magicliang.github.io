@@ -1,0 +1,135 @@
+"""Independent sequential interpreter and bounded in-order issue/commit model."""
+
+from __future__ import annotations
+
+
+def programs() -> dict:
+    result = {"sum": ([('addi', 1, 0, 0), ('addi', 2, 0, 3), ('lw', 3, 1, 0), ('add', 4, 4, 3), ('addi', 1, 1, 4), ('addi', 2, 2, -1), ('bne', 2, 0, -4)], {0: 1, 4: 2, 8: 3})}
+    for stride in (4, 16):
+        code = [('addi', 1, 0, 0), ('addi', 2, 0, 3), ('lw', 3, 1, 0), ('add', 4, 4, 3), ('addi', 1, 1, stride), ('addi', 2, 2, -1), ('bne', 2, 0, -4)]
+        result[f"stride_{stride}"] = (code, {index * stride: index + 1 for index in range(3)})
+    result["load_use_store"] = ([('addi', 1, 0, 16), ('lw', 2, 1, 0), ('add', 3, 2, 2), ('sw', 3, 1, 16)], {0: 0, 16: 7})
+    return result
+
+
+def reference(code: list, initial_memory: dict) -> dict:
+    registers, memory, trace = [0] * 32, initial_memory.copy(), []
+    pc = 0
+    while pc < len(code):
+        if len(trace) > 100:
+            raise AssertionError("reference instruction bound exceeded")
+        op, *args = code[pc]
+        event = {"pc": pc, "op": op}
+        next_pc = pc + 1
+        if op == 'addi':
+            rd, rs, imm = args
+            registers[rd] = registers[rs] + imm
+            event.update(rd=rd, value=registers[rd])
+        elif op == 'add':
+            rd, left, right = args
+            registers[rd] = registers[left] + registers[right]
+            event.update(rd=rd, value=registers[rd])
+        elif op == 'lw':
+            rd, base, offset = args
+            address = registers[base] + offset
+            registers[rd] = memory[address]
+            event.update(rd=rd, value=registers[rd], address=address)
+        elif op == 'sw':
+            source, base, offset = args
+            address = registers[base] + offset
+            memory[address] = registers[source]
+            event.update(address=address, value=memory[address])
+        elif op == 'bne':
+            left, right, offset = args
+            next_pc = pc + offset if registers[left] != registers[right] else next_pc
+            event["next_pc"] = next_pc
+        else:
+            raise ValueError(op)
+        trace.append(event)
+        pc = next_pc
+    return {"commits": trace, "registers": registers, "memory": memory}
+
+
+def pipeline(code: list, initial_memory: dict, *, forwarding: bool = True, interlock: bool = True, corrupt_writeback: bool = False) -> dict:
+    registers, memory, pending, commits = [0] * 32, initial_memory.copy(), [], []
+    cycle = pc = stalls = 0
+    cache_lines = [None, None]
+    cache_trace = []
+    misses = 0
+    while pc < len(code) or pending:
+        cycle += 1
+        if cycle > 250:
+            raise AssertionError("pipeline instruction bound exceeded")
+        if pending and pending[0]["commit_cycle"] <= cycle:
+            event = pending.pop(0)["event"]
+            event = event.copy()
+            if corrupt_writeback and event.get("rd") == 3:
+                event["value"] ^= 1
+            if "rd" in event:
+                registers[event["rd"]] = event["value"]
+            elif event["op"] == "sw":
+                memory[event["address"]] = event["value"]
+            commits.append(event)
+        if pc >= len(code):
+            continue
+        op, *args = code[pc]
+        sources = {"addi": (args[1],), "add": (args[1], args[2]), "lw": (args[1],), "sw": (args[0], args[1]), "bne": (args[0], args[1])}[op]
+        unresolved = [item for item in pending if item["event"].get("rd") in sources]
+        if interlock and any(not forwarding or item["ready_cycle"] > cycle for item in unresolved):
+            stalls += 1
+            continue
+
+        def read(index: int) -> int:
+            if index == 0:
+                return 0
+            for item in reversed(pending):
+                if forwarding and item["event"].get("rd") == index and item["ready_cycle"] <= cycle:
+                    return item["event"]["value"]
+            return registers[index]
+
+        event = {"pc": pc, "op": op}
+        next_pc = pc + 1
+        if op == "addi":
+            rd, rs, imm = args
+            event.update(rd=rd, value=read(rs) + imm)
+        elif op == "add":
+            rd, left, right = args
+            event.update(rd=rd, value=read(left) + read(right))
+        elif op == "lw":
+            rd, base, offset = args
+            address = read(base) + offset
+            event.update(rd=rd, value=memory[address], address=address)
+        elif op == "sw":
+            source, base, offset = args
+            event.update(address=read(base) + offset, value=read(source))
+        elif op == "bne":
+            left, right, offset = args
+            next_pc = pc + offset if read(left) != read(right) else next_pc
+            event["next_pc"] = next_pc
+        if "address" in event:
+            block = event["address"] // 16
+            index = block % 2
+            hit = cache_lines[index] == block
+            misses += not hit
+            cache_lines[index] = block
+            cache_trace.append({"cycle": cycle, "address": event["address"], "hit": hit})
+        pending.append({"event": event, "ready_cycle": cycle + (2 if op == "lw" else 1), "commit_cycle": cycle + 4})
+        pc = next_pc
+    return {"commits": commits, "registers": registers, "memory": memory, "cycles_without_cache_penalty": cycle, "stalls": stalls, "cache": {"lines": 2, "line_bytes": 16, "misses": misses, "trace": cache_trace, "metadata_only": True}, "cycles_with_cache_penalty": cycle + 4 * misses}
+
+
+def run_cases() -> dict:
+    results = {}
+    for name, (code, initial_memory) in programs().items():
+        expected = reference(code, initial_memory)
+        actual = pipeline(code, initial_memory)
+        if (expected["commits"], expected["registers"], expected["memory"]) != (actual["commits"], actual["registers"], actual["memory"]):
+            raise AssertionError(f"{name}: reference/pipeline divergence")
+        results[name] = {"reference_commits": expected["commits"], "pipeline_commits": actual["commits"], "commits_equal": True, "final_registers": {f"x{index}": value for index, value in enumerate(actual["registers"]) if value}, "final_memory": actual["memory"], "cycles_without_cache_penalty": actual["cycles_without_cache_penalty"], "stalls": actual["stalls"], "cycles_with_cache_penalty": actual["cycles_with_cache_penalty"], "cache": actual["cache"]}
+    code, memory = programs()["load_use_store"]
+    expected = reference(code, memory)["commits"]
+    bad_hazards = pipeline(code, memory, forwarding=False, interlock=False)["commits"]
+    bad_writeback = pipeline(code, memory, corrupt_writeback=True)["commits"]
+    if expected == bad_hazards or expected == bad_writeback:
+        raise AssertionError("fault injections escaped commit comparison")
+    return {"evidence_level": "教学时序模型", "cases": results, "negative": {"hazard_commits": bad_hazards, "writeback_commits": bad_writeback, "hazards_detected": expected != bad_hazards, "writeback_detected": expected != bad_writeback}, "boundary": "bounded in-order issue/commit, symbolic cache metadata/latency only; not cycle-accurate RTL or data-cache write-back"}

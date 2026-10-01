@@ -1,0 +1,680 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 OpenTelemetry 05 - 线程池异步传播与跨请求隔离 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="订单请求在入口线程创建父 Span，库存查询提交到 Executor。同一线程池连续处理两个请求时，工作线程读到的“当前 Span”究竟是谁？默认 ThreadLocal 不跨线程，遗漏传播会断链；错误地留住 Context 则可能把后一个请求挂到前一个请求下面。需要分别验证两种风险。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 OpenTelemetry 05 - 线程池异步传播与跨请求隔离">
+<meta property="og:url" content="https://magicliang.github.io/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-05-%E7%BA%BF%E7%A8%8B%E6%B1%A0%E5%BC%82%E6%AD%A5%E4%BC%A0%E6%92%AD/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="订单请求在入口线程创建父 Span，库存查询提交到 Executor。同一线程池连续处理两个请求时，工作线程读到的“当前 Span”究竟是谁？默认 ThreadLocal 不跨线程，遗漏传播会断链；错误地留住 Context 则可能把后一个请求挂到前一个请求下面。需要分别验证两种风险。">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-05-%E7%BA%BF%E7%A8%8B%E6%B1%A0%E5%BC%82%E6%AD%A5%E4%BC%A0%E6%92%AD/cover.svg">
+<meta property="article:published_time" content="2026-09-29T16:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-01T00:19:36.877Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="OpenTelemetry">
+<meta property="article:tag" content="异步Context传播">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-05-%E7%BA%BF%E7%A8%8B%E6%B1%A0%E5%BC%82%E6%AD%A5%E4%BC%A0%E6%92%AD/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 OpenTelemetry 05 - 线程池异步传播与跨请求隔离",
+  "url": "https://magicliang.github.io/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-05-%E7%BA%BF%E7%A8%8B%E6%B1%A0%E5%BC%82%E6%AD%A5%E4%BC%A0%E6%92%AD/",
+  "image": "https://magicliang.github.io/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-05-%E7%BA%BF%E7%A8%8B%E6%B1%A0%E5%BC%82%E6%AD%A5%E4%BC%A0%E6%92%AD/cover.svg",
+  "datePublished": "2026-09-29T16:00:00.000Z",
+  "dateModified": "2026-10-01T00:19:36.877Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-05-%E7%BA%BF%E7%A8%8B%E6%B1%A0%E5%BC%82%E6%AD%A5%E4%BC%A0%E6%92%AD/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 OpenTelemetry 05 - 线程池异步传播与跨请求隔离',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1075</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1229</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">71</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-05-%E7%BA%BF%E7%A8%8B%E6%B1%A0%E5%BC%82%E6%AD%A5%E4%BC%A0%E6%92%AD/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 OpenTelemetry 05 - 线程池异步传播与跨请求隔离</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 OpenTelemetry 05 - 线程池异步传播与跨请求隔离</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-09-29T16:00:00.000Z" title="Created 2026-09-30 00:00:00">2026-09-30</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-01T00:19:36.877Z" title="Updated 2026-10-01 08:19:36">2026-10-01</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">1.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>3mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-01 08:19:36&quot;}" hidden></div><p>订单请求在入口线程创建父 Span，库存查询提交到 Executor。同一线程池连续处理两个请求时，工作线程读到的“当前 Span”究竟是谁？默认 ThreadLocal 不跨线程，遗漏传播会断链；错误地留住 Context 则可能把后一个请求挂到前一个请求下面。需要分别验证两种风险。</p>
+<span id="more"></span>
+<h1>捕获和执行发生在不同时间</h1>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">入口线程：parent A 当前 -&gt; Context.current().wrap(task A) -&gt; 提交<br>工作线程：             -&gt; attach(A) -&gt; child A -&gt; close -&gt; 恢复<br>入口线程：parent B 当前 -&gt; Context.current().wrap(task B) -&gt; 提交<br>同一工作线程：         -&gt; attach(B) -&gt; child B -&gt; close -&gt; 恢复<br></code></pre></td></tr></table></figure>
+<p>关键是<strong>提交之前</strong>捕获当前 Context，而不是在工作线程执行时才调用 <code>Context.current()</code>。未包装的任务在工作线程里创建新 Span 时，没有入口请求的父 Context；即使 JVM 线程 ID 与之前任务相同，也不能因此继承正确父亲。<code>Context</code> 可安全传递的对象与当前线程的激活状态是两回事。</p>
+<h1>源码中的包装范围</h1>
+<p>公开 <a target="_blank" rel="noopener" href="https://github.com/open-telemetry/opentelemetry-java/blob/c25c0a0ee0da01ab2f74ba83052d1c249ed57020/context/src/main/java/io/opentelemetry/context/Context.java#L221"><code>Context.wrap(Callable)</code></a> 返回一个新 Callable。包装器运行时用 <code>makeCurrent()</code> 在执行线程附加捕获的 Context，再通过 try-with-resources 关闭 Scope；即使任务抛异常也执行关闭。<a target="_blank" rel="noopener" href="https://github.com/open-telemetry/opentelemetry-java/blob/c25c0a0ee0da01ab2f74ba83052d1c249ed57020/context/src/main/java/io/opentelemetry/context/Context.java#L209"><code>wrap(Runnable)</code></a> 同理。默认 <a target="_blank" rel="noopener" href="https://github.com/open-telemetry/opentelemetry-java/blob/c25c0a0ee0da01ab2f74ba83052d1c249ed57020/context/src/main/java/io/opentelemetry/context/ThreadLocalContextStorage.java#L20"><code>ThreadLocalContextStorage.attach</code></a> 在当前线程保留进入前的上下文，<code>Scope.close()</code> 将它恢复。因此包装解决的是一个任务的动态作用域，而不是永久修改线程池的 ThreadLocal。</p>
+<p>调用者是入口线程的业务代码，输入是它当前的 Context 与 Callable；输出是包装后的任务，随后由同一工作线程池执行。创建子 Span 的 <a target="_blank" rel="noopener" href="https://github.com/open-telemetry/opentelemetry-java/blob/c25c0a0ee0da01ab2f74ba83052d1c249ed57020/sdk/trace/src/main/java/io/opentelemetry/sdk/trace/SdkSpanBuilder.java#L168"><code>SdkSpanBuilder.startSpan</code></a> 默认从执行时的当前 Context 取父信息：未包装时生成新的 Trace ID，包装时与入口 Span 同 Trace ID、parent Span ID 指向入口 Span。上游 <a target="_blank" rel="noopener" href="https://github.com/open-telemetry/opentelemetry-java/blob/c25c0a0ee0da01ab2f74ba83052d1c249ed57020/context/src/test/java/io/opentelemetry/context/ContextTest.java#L215"><code>ContextTest.wrapCallable</code></a> 与 <code>wrapRunnable</code> 检查包装执行；默认 storage 的非当前 Scope 关闭限制见 <a target="_blank" rel="noopener" href="https://github.com/open-telemetry/opentelemetry-java/blob/c25c0a0ee0da01ab2f74ba83052d1c249ed57020/context/src/main/java/io/opentelemetry/context/ThreadLocalContextStorage.java#L47">实现第 47 行</a>。这不是 Reactor、CompletableFuture 或 Agent 自动传播的证据。</p>
+<h1>同一个 worker 的 A、B 对照</h1>
+<p>运行 <code>./mvnw -q -pl sdk-labs -Dtest=Lab05Test test</code>。<code>Lab05Test</code> 使用专用单线程池和有期限的 <code>Future.get(5, TimeUnit.SECONDS)</code>，不靠 sleep 猜任务是否完成。请求 A、B 各建一个入口 Span，分别提交未包装任务与在入口线程包装过的任务。测试检查工作线程 ID 相同；未包装任务的 parent ID 无效、Trace ID 不等于入口；包装任务的 parent ID 等于对应请求父 Span 的 ID。A 的包装任务还刻意抛异常，之后检查工作线程的当前 Context 无有效 Span；处理 B 时再次检查，不可串到 A。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">LAB05 requests=A,B sameWorker=true wrappedParent=correct unwrapped=root afterFailure=clean<br></code></pre></td></tr></table></figure>
+<p>这个输出只是断言集合的摘要，六条 Span 的名字、Trace ID 与父 ID 的具体断言写在 <code>Lab05Test</code>。测试在关闭 provider 前读取内存列表；没有外部 RPC、OTLP exporter 或真实库存服务。若遗漏包装，断链发生在“工作线程读取当前上下文”这一边界，而不是 exporter 的网络层。</p>
+<h1>捕获的边界</h1>
+<p>包装任务时捕获的是<strong>当时</strong>的 Context。若在请求结束后错误地缓存同一个包装对象并拿给下一请求复用，它仍会恢复旧的上下文；<code>wrap</code> 不会识别“当前业务请求是谁”。未包装断链与错误包装串链，诊断方式不同：检查提交点的捕获时机、执行线程的父 ID、作用域关闭后是否恢复初始 Context。第 04 篇的隔离泄漏反例说明，忘关 Scope 会在同一个工作线程污染下一任务；本篇正常路径使用包装器的 try-with-resources 避免这种情况。</p>
+<p><strong>练习一。</strong> 将 <code>Context.current().wrap(...)</code> 移到工作线程内部，再执行 <code>Lab05Test</code>，解释包装为何无法恢复提交线程的父 Span。</p>
+<p><strong>练习二。</strong> 将 A 的包装任务保存在变量中，在 B 的 Scope 中再次提交它；观察父 ID 指向 A 还是 B，并在运行结束后确认 worker 上下文清理。该反例验证“捕获一次、用在另一请求”的串链风险。</p>
+<h1>系列导航与资料</h1>
+<p><a href="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-00-%E5%AF%BC%E8%AF%BB%E4%B8%8E%E7%AC%AC%E4%B8%80%E6%9D%A1Trace/">00 导读</a> · <a href="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-01-API%E3%80%81SDK%E4%B8%8E%E5%88%9D%E5%A7%8B%E5%8C%96/">01 初始化</a> · <a href="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-02-Resource%E4%B8%8EInstrumentationScope/">02 字段归属</a> · <a href="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-03-Span%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/">03 生命周期</a> · <a href="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-04-Context%E4%B8%8EScope/">04 Scope</a> · 当前篇：05 线程池异步传播。下一篇：06 W3C Trace Context（待写）。</p>
+<p>参考资料：<a target="_blank" rel="noopener" href="https://opentelemetry.io/docs/languages/java/api/">OpenTelemetry Java API</a>、固定 SHA 的 Context 与 SDK 实现及测试（Apache-2.0）；教学实验 <code>Lab05Test</code> 的本机运行记录见 <code>examples/opentelemetry-java/evidence/05/</code>。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-05-%E7%BA%BF%E7%A8%8B%E6%B1%A0%E5%BC%82%E6%AD%A5%E4%BC%A0%E6%92%AD/">https://magicliang.github.io/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-05-%E7%BA%BF%E7%A8%8B%E6%B1%A0%E5%BC%82%E6%AD%A5%E4%BC%A0%E6%92%AD/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/OpenTelemetry/">OpenTelemetry</a><a class="post-meta__tags" href="/tags/%E5%BC%82%E6%AD%A5Context%E4%BC%A0%E6%92%AD/">异步Context传播</a></div><div class="post-share"><div class="social-share" data-image="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-05-%E7%BA%BF%E7%A8%8B%E6%B1%A0%E5%BC%82%E6%AD%A5%E4%BC%A0%E6%92%AD/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-25-%E8%87%AA%E5%AE%9A%E4%B9%89Agent%E6%89%A9%E5%B1%95/" title="深入 OpenTelemetry 25：为自己的库编写 Java Agent 扩展"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-25-%E8%87%AA%E5%AE%9A%E4%B9%89Agent%E6%89%A9%E5%B1%95/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-30</div><div class="info-item-2">深入 OpenTelemetry 25：为自己的库编写 Java Agent 扩展</div></div><div class="info-2"><div class="info-item-1">库没有现成的自动插桩时，业务代码可以显式创建 Span；如果不便改业务代码，也可以让 Agent 扩展匹配库的方法。困难不在调用 spanBuilder，而在确定扩展何时被找到、增强了哪个版本、辅助类由哪个加载器提供，以及异常或禁用时是否留下重复或未结束的 Span。 本文固定 JDK 21.0.12、Java Agent 1.31.0。发行 Agent 的 SHA-256 是 e866de5fa4e4c2c7d076072798fb9ca65b679d9c6be7792b37d4c94e2bc686f7。扩展的编译 API 是 io.opentelemetry.javaagent:opentelemetry-javaagent-extension-api:1.31.0-alpha（SHA-256 afc55fe952fa10fbad2836993bacc2a01cf02e1d50d53a6db9595fb97b2a37aa），Byte Buddy 编译依赖版本与 SHA-256 见 writing-plans/opentelemetry-java/VERSIONS.md；扩展 ...</div></div></div></a><a class="pagination-related" href="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-12-Instrument%E9%80%89%E6%8B%A9/" title="深入 OpenTelemetry 12：Instrument 选择与异步观测"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-12-Instrument%E9%80%89%E6%8B%A9/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-30</div><div class="info-item-2">深入 OpenTelemetry 12：Instrument 选择与异步观测</div></div><div class="info-2"><div class="info-item-1">同一笔请求需要几种指标？ 订单服务处理两笔请求，第一笔结束时仍有另一笔在执行；两笔延迟分别是 10、30 毫秒，而待处理队列当前有 2 项。若把四个事实都写成 Gauge，下一次采集就无法从当前值恢复请求总数或延迟分布。Instrument 的选择先取决于事件的数学语义：单调累计、可增减的存量、多次观测的分布，以及在采集时读取的瞬时状态。    事实 调用 固定事件 首次采集     已接收请求 LongCounter.add 1,1 sum=2   在途数 LongUpDownCounter.add +1,+1,-1 sum=1   延迟 LongHistogram.record 10,30 count=2、sum=40   队列长度 ObservableLongGauge 回调 读取原子变量 value=2    四条流都显式传入 route=/orders；同名但不同属性的记录属于不同数据点。这里的队列 2 不是累计发生过两次入队；第二次采集将它更新为 5，请求总数仍为 2。 源码路径：写入与采集不在同一时间 以下为对 Java SDK c25c0a0ee0da01ab2f...</div></div></div></a><a class="pagination-related" href="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-21-Agent%E5%90%AF%E5%8A%A8/" title="深入 OpenTelemetry 21：premain 如何把 Agent 接进 JVM"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-21-Agent%E5%90%AF%E5%8A%A8/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-30</div><div class="info-item-2">深入 OpenTelemetry 21：premain 如何把 Agent 接进 JVM</div></div><div class="info-2"><div class="info-item-1">同一份应用，为何有无 -javaagent 的 Span 不同？ 一个只调用 GlobalOpenTelemetry.get() 的程序，不装 Agent 时可以正常运行，却只得到 no-op Span。增加 Agent 后，不改业务代码，Span 变为 recording。问题不在“额外创建一个全局 SDK”：究竟是谁在应用 main 前安装它，又怎样隔离 Agent 自己的类？本文先看启动链，再用同一程序、两个独立 JVM核对应用侧可观察结果。    时点 所在边界 工作     premain JVM Instrumentation 找到发行 JAR，追加 bootstrap 搜索路径   初始化 bootstrap → AgentClassLoader 从内部 inst 加载 tooling 并启动   配置 Agent tooling 自动配置 SDK 为全局值、安装字节码 transformer   main 应用类加载器 通过 API 读取已装好的全局实现    固定源码中的启动、默认值和失败分支 本篇冻结 SDK tag v1.31.0 的完整 SHA c25c0...</div></div></div></a><a class="pagination-related" href="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-15-Reader%E4%B8%8ETemporality/" title="深入 OpenTelemetry 15：Reader 的独立时间窗与 Temporality"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-15-Reader%E4%B8%8ETemporality/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-30</div><div class="info-item-2">深入 OpenTelemetry 15：Reader 的独立时间窗与 Temporality</div></div><div class="info-2"><div class="info-item-1">第二次采集应得到 3 还是 5？ 对请求 Counter 先加 2，采集；再加 3，采集。第二次采集的 3 与 5 都可能正确：前者是第二个增量窗口，后者是自 provider 启动以来的累计值。数值本身无法解释边界，必须同时检查 AggregationTemporality 和点的起止时间。一次采集并不意味着所有 reader 的内部聚合都被清零。    reader 第一次（启动→1s） 第二次（1s→2s 或启动→2s）     Delta 2，起点为 provider 创建时刻 3，起点为本 reader 上次采集时刻   Cumulative 2，起点为 provider 创建时刻 5，起点仍为 provider 创建时刻    SDK 如何维护这些边界 以下为固定 Java SDK SHA c25c0a0ee0da01ab2f74ba83052d1c249ed57020 的源码阅读。MetricReader 由 provider 注册后获得 CollectionRegistration，读者自己决定何时采集；SDK 提供的 InMemoryMetricReader.c...</div></div></div></a><a class="pagination-related" href="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-24-Servlet%E4%B8%8EJDBC%E9%93%BE%E8%B7%AF/" title="深入 OpenTelemetry 24：Servlet 入口怎样接到 JDBC 调用"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-24-Servlet%E4%B8%8EJDBC%E9%93%BE%E8%B7%AF/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-30</div><div class="info-item-2">深入 OpenTelemetry 24：Servlet 入口怎样接到 JDBC 调用</div></div><div class="info-2"><div class="info-item-1">一次请求在入口 Servlet 里查询数据库，再请求另一个 HTTP 端点。挂上 Agent 后看到几个 Span，如何判断它们真的是同一条链，而不是恰好同一批送出的独立事件？只检查 Span 数量不够：还要核 traceId、parentSpanId、SpanKind 和 SQL 属性，并且区分成功请求与错误请求。 本文实验采用完整 JDK 21.0.12、Java Agent 1.31.0、嵌入式 Tomcat 10.1.24 和 H2 2.2.224。Agent 的发行 JAR SHA-256 为 e866de5fa4e4c2c7d076072798fb9ca65b679d9c6be7792b37d4c94e2bc686f7；Tomcat、H2 发行物的 SHA-256 和取得方法见工程的 writing-plans/opentelemetry-java/VERSIONS.md。应用没有初始化另一套全局 SDK。子进程由 Agent 负责采集，JUnit 进程只负责启动请求并解码测试 HTTP 端点收到的 OTLP Trace。 入口到数据库的状态模型 1234外部请求 G...</div></div></div></a><a class="pagination-related" href="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-22-%E5%AD%97%E8%8A%82%E7%A0%81%E5%8C%B9%E9%85%8D%E4%B8%8EAdvice/" title="深入 OpenTelemetry 22：哪些 HTTP 方法会进入 Advice"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/09/30/%E6%B7%B1%E5%85%A5-OpenTelemetry-22-%E5%AD%97%E8%8A%82%E7%A0%81%E5%8C%B9%E9%85%8D%E4%B8%8EAdvice/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-30</div><div class="info-item-2">深入 OpenTelemetry 22：哪些 HTTP 方法会进入 Advice</div></div><div class="info-2"><div class="info-item-1">同样是 URLConnection，为什么只观察到 HTTP Span？ URL.openConnection() 可以返回 HTTP 连接，也可以返回 file 连接；方法名或接口像，并不意味着都被增强。为排除“Agent 只要启动就给每次 I/O 建 Span”的误解，本篇用 JDK 21 自带的两个实现作对照：先看模块怎样筛类型和方法，再观察只有 HTTP 请求形成一个 CLIENT Span。    步骤 决策位置 当前测试实例     模块装载 InstrumentationModule 名称 http-url-connection   类型匹配 TypeInstrumentation.typeMatcher() HTTP 子类通过；file 子类不通过   方法匹配 transform → Byte Buddy Advice connect / getInputStream 等；不等于所有方法   运行入口 Advice → Instrumenter 读取连接状态、Span 生命周期；在本地端点核对输出    固定源码：模块、类型、方法与运行时门槛 SDK SHA c...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">1.</span> <span class="toc-text">捕获和执行发生在不同时间</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">2.</span> <span class="toc-text">源码中的包装范围</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">3.</span> <span class="toc-text">同一个 worker 的 A、B 对照</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">4.</span> <span class="toc-text">捕获的边界</span></a></li><li class="toc-item toc-level-1"><a class="toc-link"><span class="toc-number">5.</span> <span class="toc-text">系列导航与资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

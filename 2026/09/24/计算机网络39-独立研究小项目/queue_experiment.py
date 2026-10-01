@@ -48,7 +48,7 @@ def events_for(times: list[int], service_time: int) -> list[dict[str, int]]:
     for packet_id, arrival in sorted(enumerate(times), key=lambda item: (item[1], item[0])):
         start = max(arrival, finish)
         end = start + service_time
-        queue_ahead = sum(1 for previous in events if previous["service_end_us"] > arrival)
+        unfinished_ahead = sum(1 for previous in events if previous["service_end_us"] > arrival)
         events.append(
             {
                 "packet_id": packet_id,
@@ -56,11 +56,21 @@ def events_for(times: list[int], service_time: int) -> list[dict[str, int]]:
                 "service_start_us": start,
                 "service_end_us": end,
                 "wait_us": start - arrival,
-                "queue_ahead_at_arrival": queue_ahead,
+                "unfinished_packets_ahead_at_arrival": unfinished_ahead,
             }
         )
         finish = end
     return events
+
+
+def check_arrival_counterexample() -> None:
+    events = events_for([0, 500], 1000)
+    second = events[1]
+    preceding_waiting = sum(
+        previous["service_start_us"] > second["arrival_us"] for previous in events[:1]
+    )
+    assert (second["unfinished_packets_ahead_at_arrival"], preceding_waiting, second["wait_us"]) == (1, 0, 500)
+    assert events_for([0, 1000], 1000)[1]["unfinished_packets_ahead_at_arrival"] == 0
 
 
 def summarize(events: list[dict[str, int]]) -> dict[str, float | int]:
@@ -124,6 +134,7 @@ def evaluate_hypothesis(by_mode: dict[str, dict[str, Any]]) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args()
+    check_arrival_counterexample()
     config = json.loads((ROOT / "experiment.json.txt").read_text(encoding="utf-8"))
     validate_config(config)
     runs = []

@@ -11,7 +11,12 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+from integration import run_cases
+from models import dma_cases, persistence_cases, schedule, speculation_cases, virtualization_cases
+from roofline import model as roofline_model
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "outputs"
@@ -73,24 +78,41 @@ def batch_26_28() -> dict[str, object]:
         "evidence_level": "教学时序模型",
         "issue_width": 2,
         "threads": {"A": ["alu", "wait", "alu", "alu"], "B": ["alu", "alu", "wait", "alu"]},
-        "cycles": {"single_A": 4, "fine_grained_one_thread_per_cycle": 8, "smt_shared_issue": 5},
+        "cycles": {name: schedule(name)["cycles"] for name in ("single_A", "fine_grained_one_thread_per_cycle", "smt_shared_issue")},
+        "traces": {name: schedule(name)["trace"] for name in ("single_A", "fine_grained_one_thread_per_cycle", "smt_shared_issue")},
         "not_a_host_smt_measurement": True,
     }
-    result = {"rows": 45, "all_checksums_ok": all(r["ok"] for r in rows), "summaries": groups, "cli_validation": validation, "boundary": "current host, fixed problem size, wall-clock samples; no affinity, NUMA residency, SMT topology or PMU evidence"}
+    if not all(r["ok"] for r in rows) or any(validation[key]["exit"] == 0 for key in validation if key != "--help") or validation["--help"]["exit"] != 0:
+        raise AssertionError("scaling checksum or CLI acceptance failed")
+    if smt["cycles"] != {"single_A": 4, "fine_grained_one_thread_per_cycle": 8, "smt_shared_issue": 4}:
+        raise AssertionError("SMT schedule unexpectedly changed")
+    scaling_plot = OUT / "26-thread-scaling.svg"
+    max_time = max(summary["max"] for summary in groups.values()) * 1.1
+    dots = []
+    for mode_index, mode in enumerate(("independent", "compact", "spaced256")):
+        for thread_index, threads in enumerate((1, 2, 4)):
+            summary = groups[f"{mode}/{threads}"]
+            x = 100 + thread_index * 130 + mode_index * 24
+            y = 350 - 300 * summary["median"] / max_time
+            top = 350 - 300 * summary["max"] / max_time
+            bottom = 350 - 300 * summary["min"] / max_time
+            dots.append(f'<path d="M{x} {top:.1f} V{bottom:.1f}" stroke="#777"/><circle cx="{x}" cy="{y:.1f}" r="5" fill="{("#b33", "#187a68", "#246b9c")[mode_index]}"/>')
+    scaling_plot.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="590" height="410" viewBox="0 0 590 410" role="img" aria-label="Fixed total work 300000; median dots and minimum to maximum sample ranges, seconds">\n<rect width="590" height="410" fill="white"/><path d="M60 40 V350 H540" stroke="black" fill="none"/>' + "".join(dots) + f'<text x="2" y="45">{max_time * 1000:.2f} ms</text><text x="2" y="350">0 ms</text>' + '<text x="95" y="385">1 thread</text><text x="235" y="385">2 threads</text><text x="360" y="385">4 threads</text><text x="90" y="25" fill="#b33">independent</text><text x="245" y="25" fill="#187a68">compact</text><text x="360" y="25" fill="#246b9c">spaced256</text></svg>\n', encoding="utf-8")
+    result = {"rows": len(rows), "all_checksums_ok": True, "summaries": groups, "cli_validation": validation, "platform": platform.platform(), "samples_csv": "26-thread-scaling.csv", "plot": scaling_plot.name, "boundary": "current host, fixed problem size, wall-clock samples; no affinity, NUMA residency, SMT topology or PMU evidence"}
     write_json("26-scaling.json", result); write_json("27-numa.json", numa); write_json("28-smt.json", smt)
+    publish("2026-09-29-计算机体系结构-26-并行程序的扩展上限", {"26-scaling.json": OUT / "26-scaling.json", "26-thread-scaling.csv": OUT / "26-thread-scaling.csv", "26-thread-scaling.svg": scaling_plot, "scaling_bench.c": SRC / "scaling_bench.c"})
+    publish("2026-09-29-计算机体系结构-28-SMT与共享资源", {"28-smt.json": OUT / "28-smt.json", "models.py.txt": ROOT / "models.py"})
     return result
 
 
 def batch_29_33() -> dict[str, object]:
-    dma = {"evidence_level": "功能执行", "states": ["cpu_owned", "mapped_for_device", "device_owned", "completion_visible", "synced_for_cpu", "cpu_consumed"], "real_device_transfer": False}
+    dma = dma_cases()
     gpu_cases = []
     for name, addresses in (("contiguous", [i * 4 for i in range(32)]), ("stride_2", [i * 8 for i in range(32)]), ("misaligned", [4 + i * 4 for i in range(32)])):
         segments = sorted({a // 32 for a in addresses})
         gpu_cases.append({"name": name, "segments_32B": segments, "transaction_count_handcalc": len(segments)})
     gpu = {"evidence_level": "手算", "warp_lanes": 32, "even_mask_count": 16, "odd_mask_count": 16, "cases": gpu_cases, "not_gpu_cycles_or_measurement": True}
-    roofline = {"evidence_level": "手算", "peak_gflops": 128, "bandwidth_gb_s": 32, "points": []}
-    for name, intensity in (("naive_model", 0.25), ("tiled_model", 8.0)):
-        roofline["points"].append({"name": name, "operational_intensity_flop_per_byte": intensity, "model_bound_gflops": min(128, 32 * intensity), "measured": False})
+    roofline = roofline_model(OUT / "32-roofline.svg")
     energy = {"evidence_level": "手算", "points": [{"name": "fast", "watts": 40, "seconds": 2, "joules": 80}, {"name": "slow", "watts": 25, "seconds": 4, "joules": 100}], "measured_energy": False, "frequency_temperature_counters": False}
     write_json("29-dma.json", dma); write_json("31-gpu.json", gpu); write_json("32-roofline.json", roofline); write_json("33-energy.json", energy)
     build = ROOT / "build"; build.mkdir(exist_ok=True)
@@ -147,7 +169,7 @@ def batch_29_33() -> dict[str, object]:
         "boundary": "native wall-clock sample on current host; no PMU, affinity, fixed frequency or cross-machine claim",
     }
     write_json("30-simd.json", simd)
-    publish("2026-09-29-计算机体系结构-29-CPU怎样与设备交换数据", {"29-dma.json": OUT / "29-dma.json"})
+    publish("2026-09-29-计算机体系结构-29-CPU怎样与设备交换数据", {"29-dma.json": OUT / "29-dma.json", "models.py.txt": ROOT / "models.py"})
     publish("2026-09-29-计算机体系结构-30-SIMD与向量化边界", {
         "30-simd.json": OUT / "30-simd.json",
         "30-binary-inspection.txt": OUT / "30-binary-inspection.txt",
@@ -156,68 +178,33 @@ def batch_29_33() -> dict[str, object]:
         "simd_bench.c": SRC / "simd_bench.c",
     })
     publish("2026-09-29-计算机体系结构-31-GPU执行与合并访存", {"31-gpu.json": OUT / "31-gpu.json"})
-    publish("2026-09-29-计算机体系结构-32-Roofline与矩阵数据复用", {"32-roofline.json": OUT / "32-roofline.json"})
+    publish("2026-09-29-计算机体系结构-32-Roofline与矩阵数据复用", {"32-roofline.json": OUT / "32-roofline.json", "32-roofline.svg": OUT / "32-roofline.svg", "roofline.py.txt": ROOT / "roofline.py"})
     publish("2026-09-29-计算机体系结构-33-性能功耗与能量预算", {"33-energy.json": OUT / "33-energy.json"})
-    return {"dma": True, "simd_samples": 10, "simd_invalid_rejected": all(code != 0 for code in invalid.values()), "gpu": True, "roofline": True, "energy": True}
+    if not simd["all_checksums_equal"] or not all(code != 0 for code in invalid.values()):
+        raise AssertionError("SIMD correctness or invalid CLI check failed")
+    return {"dma": dma["read_value"] == 42, "simd_samples": sum(map(len, samples.values())), "simd_invalid_rejected": True, "gpu": True, "roofline": True, "energy": True}
+
+
+def batch_34() -> dict[str, object]:
+    integrated = run_cases()
+    write_json("34-integration.json", integrated)
+    publish("2026-09-29-计算机体系结构-34-有界处理器集成", {"34-integration.json": OUT / "34-integration.json", "run_batch.py.txt": Path(__file__), "integration.py.txt": ROOT / "integration.py"})
+    return {"integration_commits_equal": all(case["commits_equal"] for case in integrated["cases"].values()), "negative_detected": all((integrated["negative"]["hazards_detected"], integrated["negative"]["writeback_detected"]))}
 
 
 def batch_34_35() -> dict[str, object]:
-    instructions = [
-        ("addi", 1, 0, 16),
-        ("lw", 2, 1, 0),
-        ("add", 3, 2, 2),
-        ("sw", 3, 1, 16),
-        ("halt",),
-    ]
-    rendered = ["addi x1,x0,16", "lw x2,0(x1)", "add x3,x2,x2", "sw x3,16(x1)", "halt"]
-    regs = [0] * 32
-    memory = {16: 7}
-    commits = []
-    accesses = []
-    for index, ins in enumerate(instructions):
-        op = ins[0]
-        event = {"index": index, "instruction": rendered[index]}
-        if op == "addi":
-            _, rd, rs, imm = ins; regs[rd] = regs[rs] + imm; event.update({"rd": rd, "value": regs[rd]})
-        elif op == "lw":
-            _, rd, rs, imm = ins; address = regs[rs] + imm; regs[rd] = memory.get(address, 0); event.update({"rd": rd, "value": regs[rd], "address": address}); accesses.append((address, False))
-        elif op == "add":
-            _, rd, a, b = ins; regs[rd] = regs[a] + regs[b]; event.update({"rd": rd, "value": regs[rd]})
-        elif op == "sw":
-            _, rs, base, imm = ins; address = regs[base] + imm; memory[address] = regs[rs]; event.update({"address": address, "value": regs[rs]}); accesses.append((address, True))
-        commits.append(event)
-    lines = [None, None]
-    hits = misses = dirty_evictions = 0
-    cache_trace = []
-    for address, write in accesses:
-        block = address // 16; index = block % 2; hit = lines[index] == block
-        hits += int(hit); misses += int(not hit); lines[index] = block
-        cache_trace.append({"address": address, "write": write, "block": block, "index": index, "hit": hit})
-    cache = {"lines": 2, "line_bytes": 16, "hits": hits, "misses": misses, "dirty_evictions": dirty_evictions, "trace": cache_trace, "metadata_only": True}
-    baseline_cycles = len(instructions) + 4 + 1
-    integrated = {
-        "evidence_level": "教学时序模型",
-        "initial_memory": {"16": 7},
-        "reference_commits": commits,
-        "pipeline_commits": [dict(event) for event in commits],
-        "commits_equal": commits == [dict(event) for event in commits],
-        "final_registers": {"x2": regs[2], "x3": regs[3]},
-        "final_memory": {"32": memory[32]},
-        "baseline_cycles": baseline_cycles,
-        "miss_penalty_cycles": 4,
-        "integrated_cycles": baseline_cycles + misses * 4,
-        "cache": cache,
-        "negative": {"forwarding_and_interlock_disabled_x3": 0, "expected_x3": regs[3], "detected": regs[3] != 0},
-        "boundary": "cache metadata and latency only; architectural memory supplies values; not a complete write-back data hierarchy",
-    }
+    integrated_result = batch_34()
     archive = ROOT.parent.parent / "writing-plans" / "computer-architecture" / "performance.md"
     archive_text = archive.read_text(encoding="utf-8")
     required = ["192 个正式样本正确", "35.6196", "8.5251", "1.2175", "未采硬件计数器"]
-    historical = {"evidence_level": "真机测量", "source": "writing-plans/computer-architecture/performance.md", "source_sha256": sha256(archive), "archive_record_checked_now": all(text in archive_text for text in required), "host": "arm64 macOS 27.0, Apple Clang 21.0.0", "raw_samples": 192, "pmu": False, "fixed_frequency": False, "core_affinity": False, "bare_metal_confirmed": False, "archived_raw_files_present_in_this_clone": False, "observations": {"o3_2048_stride2048_ratio_median": 35.6196, "o3_2048_stride2049_ratio_median": 8.5251, "scalar_64_ratio_median": 1.2175}}
-    write_json("34-integration.json", integrated); write_json("35-performance-archive.json", historical)
-    publish("2026-09-29-计算机体系结构-34-有界处理器集成", {"34-integration.json": OUT / "34-integration.json", "run_batch.py.txt": Path(__file__)})
+    raw_dir = ROOT / "performance" / "outputs"
+    raw = [raw_dir / name for name in ("o3-raw.csv", "scalar-raw.csv")]
+    historical = {"evidence_level": "历史宿主真机测量记录，当前不可复算", "source": "writing-plans/computer-architecture/performance.md", "source_sha256": sha256(archive), "archive_record_checked_now": all(text in archive_text for text in required), "host": "arm64 macOS 27.0, Apple Clang 21.0.0 (historical only)", "raw_samples_claimed": 192, "pmu": False, "fixed_frequency": False, "core_affinity": False, "bare_metal_confirmed": False, "archived_raw_files_present_in_this_clone": all(path.exists() for path in raw), "raw_samples_verified_now": False, "observations_from_historical_text_not_recomputed": {"o3_2048_stride2048_ratio_median": 35.6196, "o3_2048_stride2049_ratio_median": 8.5251, "scalar_64_ratio_median": 1.2175}}
+    write_json("35-performance-archive.json", historical)
     publish("2026-09-29-计算机体系结构-35-独立性能研究", {"35-performance-archive.json": OUT / "35-performance-archive.json", "performance-record.txt": archive})
-    return {"integration_commits_equal": True, "negative_detected": True, "performance_record_boundary_preserved": True}
+    if not historical["raw_samples_verified_now"]:
+        raise AssertionError("35 raw CSV, source, environment and hashes unavailable: historical prose is not an acceptance check")
+    return {**integrated_result, "performance_raw_verified": True}
 
 
 def hamming_encode(data: int) -> list[int]:
@@ -269,21 +256,56 @@ def formal_check() -> dict[str, object]:
 
 
 def batch_e() -> dict[str, object]:
-    rtl = {"evidence_level": "功能执行", "source": ["rtl/rv32i_core.sv", "rtl/testbench.sv"], "synthesis": False, "sta": False, "fpga": False, "riscv_formal": False}
-    if shutil.which("iverilog") and shutil.which("vvp"):
-        build = ROOT / "build" / "rtl.out"; build.parent.mkdir(exist_ok=True)
-        run(["iverilog", "-g2012", "-o", str(build), str(ROOT / "rtl/rv32i_core.sv"), str(ROOT / "rtl/testbench.sv")])
-        p = run(["vvp", str(build)]); rtl["simulation"] = p.stdout.strip(); rtl["executed_now"] = True
+    core = ROOT / "rtl" / "rv32i_core.sv"
+    bench = ROOT / "rtl" / "testbench.sv"
+    rtl = {"evidence_level": "当前两条 addi 状态机的功能执行；历史四程序差分仅为其他源码的记录", "source_sha256": {str(path.relative_to(ROOT)): sha256(path) for path in (core, bench)}, "synthesis": False, "sta": False, "fpga": False, "riscv_formal": False}
+    iverilog = os.environ.get("IVERILOG", "iverilog")
+    vvp = os.environ.get("VVP", "vvp")
+    if shutil.which(iverilog) and shutil.which(vvp):
+        expected_trace = []
+        register = 0
+        for pc, source, immediate in ((0, False, 7), (4, True, 5)):
+            register = (register if source else 0) + immediate
+            expected_trace.append(f"COMMIT pc={pc} x1={register}")
+        with tempfile.TemporaryDirectory(prefix="ca-rtl-") as directory:
+            temp = Path(directory)
+            args = [iverilog, *(["-B", os.environ["IVERILOG_BASE"]] if "IVERILOG_BASE" in os.environ else []), "-g2012", "-o", str(temp / "rtl.out")]
+            compile_result = subprocess.run([*args, str(core), str(bench)], cwd=temp, text=True, capture_output=True, check=True)
+            result = subprocess.run([vvp, str(temp / "rtl.out")], cwd=temp, text=True, capture_output=True, check=True)
+            trace = [line for line in result.stdout.splitlines() if line.startswith("COMMIT ")]
+            if trace != expected_trace or "rtl functional trace: PASS x1=12" not in result.stdout:
+                raise AssertionError(f"current RTL/reference trace differs: {trace} != {expected_trace}")
+            mutated = temp / "buggy.sv"
+            source = core.read_text(encoding="utf-8")
+            if source.count("x1 + 5") != 1:
+                raise AssertionError("RTL fault injection target changed")
+            mutated.write_text(source.replace("x1 + 5", "x1 + 6"), encoding="utf-8")
+            subprocess.run([*args, str(mutated), str(bench)], cwd=temp, text=True, capture_output=True, check=True)
+            wrong = subprocess.run([vvp, str(temp / "rtl.out")], cwd=temp, text=True, capture_output=True)
+            wrong_trace = [line for line in wrong.stdout.splitlines() if line.startswith("COMMIT ")]
+            if wrong.returncode == 0 or wrong_trace == expected_trace:
+                raise AssertionError("RTL wrong-addend injection escaped comparison")
+        version = subprocess.run([iverilog, "-V"], text=True, capture_output=True, check=True).stdout.splitlines()[0]
+        rtl.update(simulation=result.stdout.strip(), reference_trace=expected_trace, rtl_commit_trace=trace, negative_exit=wrong.returncode, negative_trace=wrong_trace, compiler_version=version, compiler_stderr=compile_result.stderr, executed_now=True)
     else:
-        rtl["simulation"] = "NOT_RUN: iverilog/vvp unavailable on current host; historical Icarus 13 PASS remains in rtl-tool.md"
+        rtl["simulation"] = "NOT_RUN: current two-add source not compared; historical Icarus 13 four-program suite used other cumulative RTL and cannot validate this file"
         rtl["executed_now"] = False
     timing = {"evidence_level": "手算", "formulae": {"setup": "Tclk >= tCQmax+tLogicMax+tSetup", "hold": "tCQmin+tLogicMin >= tHold"}, "cases": []}
     for name, vals in (("setup_fail", (1.0, .18, .74, .16, .05)), ("setup_fixed", (1.2, .18, .74, .16, .05)), ("hold_fail", (1.0, .05, .02, .16, .10)), ("hold_fixed", (1.0, .05, .08, .16, .10))):
-        clk,cq,logic,setup,hold=vals; timing["cases"].append({"name":name,"setup_slack_ns":round(clk-(cq+logic+setup), 3),"hold_slack_ns":round(cq+logic-hold, 3)})
-    timing.update({"liberty": False, "netlist": False, "real_sta": False})
-    virt = {"evidence_level": "功能执行", "maps": {"vs": {"0x1000": "0x8000"}, "g": {"0x8000": "0x18000"}}, "cases": [{"name":"mapped","result":"0x18000","vm_exit":False},{"name":"vs_fault","result":"VS-stage fault delegated in model","vm_exit":False},{"name":"g_fault","result":"G-stage guest-page fault","vm_exit":True}], "hardware_compliance": False}
-    side = {"evidence_level": "功能执行", "transient_shadow": {"register": 7, "memory": 1}, "committed_after_squash": {"register": 0, "memory": 0}, "cache_trace_after_squash": [7], "buggy_commit_detected": True, "real_vulnerability_reproduction": False}
-    cxl = {"evidence_level": "手算", "topology": ["host0", "root0", "switch0", "mem0|mem1"], "link_payload_gb_s": {"upstream":32,"mem0":24,"mem1":24}, "application_demand_gb_s": {"app0":20,"app1":20}, "shared_bottleneck_gb_s":32,"application_effective_bandwidth_measured":False,"cxl_device_measured":False}
+        clk,cq,logic,setup,hold=vals
+        setup_slack = round(clk - (cq + logic + setup), 3)
+        hold_slack = round(cq + logic - hold, 3)
+        timing["cases"].append({"name":name,"inputs_ns":{"clock":clk,"clock_to_q":cq,"logic":logic,"setup":setup,"hold":hold},"setup_slack_ns":setup_slack,"hold_slack_ns":hold_slack,"setup_pass":setup_slack>=0,"hold_pass":hold_slack>=0})
+    by_name = {case["name"]: case for case in timing["cases"]}
+    if by_name["setup_fail"]["setup_pass"] or not by_name["setup_fixed"]["setup_pass"] or by_name["hold_fail"]["hold_pass"] or not by_name["hold_fixed"]["hold_pass"]:
+        raise AssertionError("timing constraint failure/repair case escaped checker")
+    timing.update({"tool": "Python 3 formula evaluator with explicit constraints, not static timing analysis", "liberty": False, "netlist": False, "real_sta": False})
+    virt = virtualization_cases()
+    side = speculation_cases()
+    cxl = {"evidence_level": "题设手算", "specification_context": "CXL 2.0 public switching overview; no full specification compliance claim", "topology": ["host0", "root0", "switch0", "mem0|mem1"], "link_payload_gb_s": {"upstream":32,"mem0":24,"mem1":24}, "application_demand_gb_s": {"app0":20,"app1":20}, "shared_bottleneck_gb_s":32,"link_one_way_latency_ns_assumed":{"upstream":35,"root":12,"switch":18,"mem0":80,"mem1":90},"memory_capacity_gb_assumed":{"mem0":256,"mem1":512},"coherence_guarantee":"not established by link bandwidth; depends on device/protocol mode", "failure_domains":{"upstream":"both paths unavailable","mem0":"mem0 path only"},"application_effective_bandwidth_measured":False,"cxl_device_measured":False}
+    cxl["path_one_way_latency_ns_model"] = {name: cxl["link_one_way_latency_ns_assumed"]["upstream"] + cxl["link_one_way_latency_ns_assumed"]["root"] + cxl["link_one_way_latency_ns_assumed"]["switch"] + cxl["link_one_way_latency_ns_assumed"][name] for name in ("mem0", "mem1")}
+    if sum(cxl["application_demand_gb_s"].values()) <= cxl["shared_bottleneck_gb_s"]:
+        raise AssertionError("CXL oversubscription counterexample lost")
     clean=single=double=0
     for data in range(16):
         base=hamming_encode(data)
@@ -292,14 +314,9 @@ def batch_e() -> dict[str, object]:
             b=base.copy(); b[i]^=1; single += hamming_classify(b)=="single_correctable"
         for i,j in itertools.combinations(range(1,9),2):
             b=base.copy(); b[i]^=1; b[j]^=1; double += hamming_classify(b)=="double_detected"
-    persistence = [
-      {"step":"store_data","visible":True,"pending":False,"drained":False,"powerfail_guaranteed":False},
-      {"step":"flush_data","visible":True,"pending":True,"drained":False,"powerfail_guaranteed":False},
-      {"step":"drain_data","visible":True,"pending":False,"drained":True,"powerfail_guaranteed":True},
-      {"step":"flush_commit","visible":True,"pending":True,"drained":False,"powerfail_guaranteed":False},
-      {"step":"drain_commit","visible":True,"pending":False,"drained":True,"powerfail_guaranteed":True},
-    ]
-    reliability = {"evidence_level": "功能执行", "secded_8_4": {"clean":clean,"single_corrected":single,"double_detected":double}, "persistence": persistence, "real_nvdimm_measurement":False}
+    if (clean, single, double) != (16, 128, 448):
+        raise AssertionError("SECDED exhaustive injection failed")
+    reliability = {"evidence_level": "功能执行", "secded_8_4": {"clean":clean,"single_corrected":single,"double_detected":double}, "persistence": persistence_cases(), "real_nvdimm_measurement":False}
     build = ROOT / "build"; build.mkdir(exist_ok=True)
     cross_source = SRC / "cross_isa.c"
     x86_object = build / "cross_isa_x86_64.o"
@@ -307,13 +324,19 @@ def batch_e() -> dict[str, object]:
     x86_disasm = run(["objdump", "-d", str(x86_object)])
     x86_disasm_path = OUT / "E07-x86_64-objdump.txt"
     x86_disasm_path.write_text("\n".join(line.rstrip() for line in x86_disasm.stdout.splitlines()) + "\n", encoding="utf-8")
+    executable = build / "cross_isa_native"
+    native_command = ["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", str(cross_source), str(SRC / "cross_isa_main.c"), "-o", str(executable)]
+    run(native_command)
+    native = run([str(executable)])
+    if native.stdout.strip() != "sum=34":
+        raise AssertionError("cross ISA native result mismatch")
     riscv_object = build / "cross_isa_riscv64.o"
     clang = shutil.which("clang")
     if clang:
         riscv_compile = run([clang, "--target=riscv64-unknown-elf", "-O2", "-c", str(cross_source), "-o", str(riscv_object)], check=False)
         riscv_exit, riscv_stderr = riscv_compile.returncode, riscv_compile.stderr.strip()
     else:
-        riscv_exit, riscv_stderr = 127, "NOT_RUN: clang unavailable on current host"
+        riscv_exit, riscv_stderr = 127, "NOT_RUN: clang command unavailable on current host (backend not assessed)"
     cross = {
         "evidence_level": "功能执行",
         "algorithm": "sum(values[i] * scale + i), values={2,-1,4,0,3}, scale=3",
@@ -321,31 +344,33 @@ def batch_e() -> dict[str, object]:
         "historical_native_arm64": "sum=34",
         "historical_source": "writing-plans/computer-architecture/cross-isa-formal.md",
         "current_host": platform.machine(),
-        "x86_64": {"compile_exit": x86_compile.returncode, "object_sha256": sha256(x86_object), "objdump_sha256": sha256(x86_disasm_path), "execution": "NOT_RUN"},
-        "riscv64": {"compile_exit": riscv_exit, "stderr": riscv_stderr, "backend_available": riscv_exit == 0},
+        "x86_64": {"compile_exit": x86_compile.returncode, "object_sha256": sha256(x86_object), "objdump_sha256": sha256(x86_disasm_path), "native_command": native_command, "native_binary_sha256": sha256(executable), "execution": native.stdout.strip()},
+        "riscv64": {"compile_exit": riscv_exit, "stderr": riscv_stderr, "tool_present": clang is not None, "object_present": riscv_exit == 0, "disassembly": "NOT_RUN", "execution": "NOT_RUN"},
         "pmu": False,
     }
     formal = formal_check()
     for name,value in (("E01-rtl.json",rtl),("E02-physical.json",timing),("E03-virtualization.json",virt),("E04-side-channel.json",side),("E05-cxl.json",cxl),("E06-reliability.json",reliability),("E07-cross-isa.json",cross),("E08-formal.json",formal)): write_json(name,value)
     publish("2026-09-29-计算机体系结构-E01-从教学模型到RTL", {"E01-rtl.json": OUT / "E01-rtl.json", "rv32i_core.sv.txt": ROOT / "rtl" / "rv32i_core.sv", "testbench.sv.txt": ROOT / "rtl" / "testbench.sv"})
     publish("2026-09-29-计算机体系结构-E02-数字电路的物理约束", {"E02-physical.json": OUT / "E02-physical.json"})
-    publish("2026-09-29-计算机体系结构-E03-硬件虚拟化与嵌套翻译", {"E03-virtualization.json": OUT / "E03-virtualization.json"})
-    publish("2026-09-29-计算机体系结构-E04-推测执行与侧信道边界", {"E04-side-channel.json": OUT / "E04-side-channel.json"})
+    publish("2026-09-29-计算机体系结构-E03-硬件虚拟化与嵌套翻译", {"E03-virtualization.json": OUT / "E03-virtualization.json", "models.py.txt": ROOT / "models.py"})
+    publish("2026-09-29-计算机体系结构-E04-推测执行与侧信道边界", {"E04-side-channel.json": OUT / "E04-side-channel.json", "models.py.txt": ROOT / "models.py"})
     publish("2026-09-29-计算机体系结构-E05-Chiplet与CXL互联边界", {"E05-cxl.json": OUT / "E05-cxl.json"})
-    publish("2026-09-29-计算机体系结构-E06-可靠性与持久性", {"E06-reliability.json": OUT / "E06-reliability.json"})
-    publish("2026-09-29-计算机体系结构-E07-跨ISA同题对照", {"E07-cross-isa.json": OUT / "E07-cross-isa.json", "E07-x86_64-objdump.txt": x86_disasm_path, "cross_isa.c": cross_source})
+    publish("2026-09-29-计算机体系结构-E06-可靠性与持久性", {"E06-reliability.json": OUT / "E06-reliability.json", "models.py.txt": ROOT / "models.py"})
+    publish("2026-09-29-计算机体系结构-E07-跨ISA同题对照", {"E07-cross-isa.json": OUT / "E07-cross-isa.json", "E07-x86_64-objdump.txt": x86_disasm_path, "cross_isa.c": cross_source, "cross_isa_main.c": SRC / "cross_isa_main.c"})
     publish("2026-09-29-计算机体系结构-E08-有限模型与形式验证边界", {"E08-formal.json": OUT / "E08-formal.json", "run_batch.py.txt": Path(__file__)})
-    return {"rtl_executed_now":rtl["executed_now"],"timing_cases":4,"virtualization_cases":3,"side_channel_bug_detected":True,"cxl_handcalc":True,"secded_counts":[clean,single,double],"formal_programs":formal["programs"]}
+    if not rtl["executed_now"]:
+        raise AssertionError("E01 current RTL not validated: iverilog/vvp required; historical four-program output is not a substitute")
+    return {"rtl_executed_now":rtl["executed_now"],"timing_cases":len(timing["cases"]),"virtualization_cases":len(virt["cases"]),"side_channel_bug_detected":side["buggy_commit_detected"],"cxl_handcalc":True,"secded_counts":[clean,single,double],"persistence_counterexample_detected":reliability["persistence"]["counterexample_detected"],"native_cross_isa":native.stdout.strip(),"formal_programs":formal["programs"]}
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in {"26-28", "29-33", "34-35", "E01-E08", "all"}:
-        print("usage: run_batch.py 26-28|29-33|34-35|E01-E08|all", file=sys.stderr); return 2
+    if len(sys.argv) != 2 or sys.argv[1] not in {"26-28", "29-33", "34", "34-35", "E01-E08", "all"}:
+        print("usage: run_batch.py 26-28|29-33|34|34-35|E01-E08|all", file=sys.stderr); return 2
     OUT.mkdir(exist_ok=True)
     selected = [sys.argv[1]] if sys.argv[1] != "all" else ["26-28","29-33","34-35","E01-E08"]
-    funcs = {"26-28":batch_26_28,"29-33":batch_29_33,"34-35":batch_34_35,"E01-E08":batch_e}
+    funcs = {"26-28":batch_26_28,"29-33":batch_29_33,"34":batch_34,"34-35":batch_34_35,"E01-E08":batch_e}
     results = {name: funcs[name]() for name in selected}
-    manifest = {"command": "python3 examples/computer-architecture/run_batch.py " + sys.argv[1], "python":sys.version.split()[0], "platform":platform.platform(), "machine":platform.machine(), "results":results, "source_sha256":{str(p.relative_to(ROOT)):sha256(p) for p in sorted(SRC.glob("*")) if p.is_file()}}
+    manifest = {"command": "python3 examples/computer-architecture/run_batch.py " + sys.argv[1], "python":sys.version.split()[0], "platform":platform.platform(), "machine":platform.machine(), "results":results, "source_sha256":{str(p.relative_to(ROOT)):sha256(p) for p in [*sorted(SRC.glob("*")), *sorted(ROOT.glob("*.py")), *sorted((ROOT / "rtl").glob("*.sv"))] if p.is_file()}, "output_sha256": {p.name: sha256(p) for p in sorted(OUT.iterdir()) if p.is_file() and p.name != "manifest.json"}}
     write_json("manifest.json",manifest)
     print(json.dumps(results,ensure_ascii=False)); return 0
 

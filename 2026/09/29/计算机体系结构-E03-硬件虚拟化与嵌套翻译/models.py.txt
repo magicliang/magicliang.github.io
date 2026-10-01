@@ -1,0 +1,163 @@
+"""Executable, deliberately bounded teaching models for the review cases."""
+
+from __future__ import annotations
+
+
+def schedule(mode: str) -> dict:
+    streams = {"A": ["alu", "wait", "alu", "alu"], "B": ["alu", "alu", "wait", "alu"]}
+    positions = {name: 0 for name in streams}
+    trace = []
+    for cycle in range(1, 20):
+        eligible = ("A",) if mode == "single_A" else (("A", "B") if mode == "smt_shared_issue" else ("A", "B")[((cycle - 1) % 2):((cycle - 1) % 2) + 1])
+        issued = []
+        for name in eligible:
+            if positions[name] < len(streams[name]):
+                issued.append({"thread": name, "instruction": streams[name][positions[name]]})
+                positions[name] += 1
+        trace.append({"cycle": cycle, "issued": issued, "unused_slots": 2 - len(issued)})
+        if all(positions[name] == len(streams[name]) for name in (("A",) if mode == "single_A" else streams)):
+            return {"cycles": len(trace), "trace": trace}
+    raise AssertionError("scheduler failed to terminate")
+
+
+class OwnershipError(ValueError):
+    pass
+
+
+class DmaBuffer:
+    def __init__(self) -> None:
+        self.state = "cpu_owned"
+        self.value = 0
+        self.history = [self.state]
+        self.cpu_physical_address = 0x1000
+        self.dma_address = None
+
+    def transition(self, action: str) -> int | None:
+        rules = {
+            ("cpu_owned", "map"): "mapped_for_device",
+            ("mapped_for_device", "submit"): "device_owned",
+            ("device_owned", "complete"): "completion_visible",
+            ("completion_visible", "sync_for_cpu"): "synced_for_cpu",
+            ("synced_for_cpu", "read"): "cpu_consumed",
+        }
+        target = rules.get((self.state, action))
+        if target is None:
+            raise OwnershipError(f"{action} rejected in {self.state}")
+        if action == "map":
+            self.dma_address = 0x9000
+        if action == "submit" and self.dma_address is None:
+            raise OwnershipError("DMA address not mapped")
+        if action == "complete":
+            self.value = 42
+        self.state = target
+        self.history.append(target)
+        return self.value if action == "read" else None
+
+
+def dma_cases() -> dict:
+    buffer = DmaBuffer()
+    rejected = []
+    for action in ("read", "complete"):
+        try:
+            buffer.transition(action)
+        except OwnershipError as error:
+            rejected.append(str(error))
+    for action in ("map", "submit", "complete"):
+        buffer.transition(action)
+    try:
+        buffer.transition("read")
+    except OwnershipError as error:
+        rejected.append("skip_sync: " + str(error))
+    buffer.transition("sync_for_cpu")
+    result = buffer.transition("read")
+    assert len(rejected) == 3 and result == 42
+    return {"evidence_level": "功能执行", "platform_assumption": "non-coherent streaming DMA; sync_for_cpu is mandatory after completion", "address_translation": {"cpu_physical": hex(buffer.cpu_physical_address), "iommu_device_dma": hex(buffer.dma_address)}, "data_movement": {"device_writes_dma_address": hex(buffer.dma_address), "cpu_reads_after_sync": result}, "states": buffer.history, "rejected": rejected, "read_value": result, "real_device_transfer": False}
+
+
+class StageFault(Exception):
+    def __init__(self, stage: str, reason: str) -> None:
+        self.stage = stage
+        self.reason = reason
+
+
+def translate(gva: int, access: str, vs: dict, g: dict, delegated: bool) -> dict:
+    steps = []
+    for stage, address, mappings in (("VS", gva, vs), ("G", None, g)):
+        if stage == "G":
+            address = steps[-1]["output"]
+        page, offset = divmod(address, 4096)
+        entry = mappings.get(page)
+        if entry is None:
+            raise StageFault(stage, "unmapped")
+        physical_page, permissions = entry
+        if access not in permissions:
+            raise StageFault(stage, "permission")
+        steps.append({"stage": stage, "input": address, "output": physical_page * 4096 + offset, "permissions": permissions})
+    return {"result": steps[-1]["output"], "steps": steps, "vm_exit": False}
+
+
+def virtualization_cases() -> dict:
+    vs = {1: (8, "rwx"), 2: (9, "r")}
+    g = {8: (24, "rw")}
+    cases = []
+    for name, address, access, delegated in (("mapped", 0x1020, "r", True), ("vs_fault", 0x3000, "r", True), ("vs_permission", 0x2000, "w", False), ("g_fault", 0x2000, "r", True), ("g_permission", 0x1000, "x", True)):
+        try:
+            outcome = translate(address, access, vs, g, delegated)
+        except StageFault as fault:
+            outcome = {"fault_stage": fault.stage, "reason": fault.reason, "vm_exit": fault.stage == "G" or not delegated}
+        cases.append({"name": name, "gva": address, "access": access, "vs_delegated": delegated, **outcome})
+    assert cases[0]["result"] == 0x18020
+    assert [(case["fault_stage"], case["vm_exit"]) for case in cases[1:]] == [("VS", False), ("VS", True), ("G", True), ("G", True)]
+    return {"evidence_level": "功能执行", "maps": {"vs": vs, "g": g}, "cases": cases, "hardware_compliance": False}
+
+
+def speculate(buggy: bool = False) -> dict:
+    committed = {"register": 0, "memory": 0}
+    shadow = committed.copy()
+    cache_trace = []
+    shadow.update(register=7, memory=1)
+    cache_trace.append(shadow["register"])
+    transient = shadow.copy()
+    if buggy:
+        committed.update(shadow)
+    shadow = committed.copy()
+    return {"transient_shadow": transient, "committed_after_squash": committed, "shadow_after_squash": shadow, "cache_trace_after_squash": cache_trace}
+
+
+def speculation_cases() -> dict:
+    correct, buggy = speculate(), speculate(buggy=True)
+    detected = correct["committed_after_squash"] != buggy["committed_after_squash"]
+    assert detected and correct["cache_trace_after_squash"] == [7]
+    return {"evidence_level": "功能执行", **correct, "buggy_committed": buggy["committed_after_squash"], "buggy_commit_detected": detected, "real_vulnerability_reproduction": False}
+
+
+def persist(actions: tuple[str, ...]) -> dict:
+    state = {"data": "absent", "commit": "absent"}
+    trace = []
+    for action in actions:
+        operation, _, record = action.partition("_")
+        if record not in state or operation not in ("store", "flush", "drain"):
+            raise ValueError(action)
+        expected = {"store": "absent", "flush": "visible", "drain": "pending"}[operation]
+        if state[record] != expected:
+            raise ValueError(f"{action} rejected: {state[record]}")
+        state[record] = {"store": "visible", "flush": "pending", "drain": "drained"}[operation]
+        trace.append({"step": action, "state": state.copy(), "powerfail_survivors": [key for key, value in state.items() if value == "drained"]})
+    return {"trace": trace, "powerfail_survivors": [key for key, value in state.items() if value == "drained"]}
+
+
+def persistence_cases() -> dict:
+    good = persist(("store_data", "flush_data", "drain_data", "store_commit", "flush_commit", "drain_commit"))
+    bad = persist(("store_commit", "flush_commit", "drain_commit", "store_data", "flush_data"))
+    good_failures = [event["powerfail_survivors"] for event in good["trace"]]
+    bad_failures = [event["powerfail_survivors"] for event in bad["trace"]]
+    violation = any("commit" in survivors and "data" not in survivors for survivors in bad_failures)
+    try:
+        persist(("drain_commit",))
+    except ValueError as error:
+        rejected = str(error)
+    else:
+        raise AssertionError("drain without flush was accepted")
+    assert not any("commit" in survivors and "data" not in survivors for survivors in good_failures)
+    assert violation
+    return {"ordering": "data drained before commit drained", "correct": good, "commit_first_counterexample": bad, "invalid_transition_rejected": rejected, "counterexample_detected": violation, "real_nvdimm_measurement": False}
