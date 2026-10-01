@@ -1,0 +1,9 @@
+# E07 synthetic data provenance and permission
+
+The scene and camera arrangement in `gaussianE07_check.cpp` were created for this repository, without downloaded images, scans, models, or official 3DGS source code. Generated RGB arrays, camera matrices, split lists, and PPM images are original synthetic data. The repository contributor grants permission to use, copy, modify, and redistribute these synthetic data for any purpose, with or without attribution. They are provided without warranty.
+
+The fixed generator scene is private to the generator function: the trainer receives only the six training RGB arrays and their cameras. Seeds 701 and 702, 60 iterations, step 2, ten backtracking trials, and the three held-out camera angles are fixed before running either initialization. Both runs are reported; no seed selection uses held-out scores. Scene parameters are visible in source for reproducibility, but neither initialization nor training accesses them.
+
+The independently written educational equations follow Kerbl et al., 2023, sections 2.3 and 4–5: https://arxiv.org/html/2308.04079v1 . This is a restricted CPU Gaussian-field fitting experiment, not the official implementation: no SfM, spherical harmonics, covariance learning, densification, pruning, CUDA, or real-photo reconstruction. The official software has its own license and is not redistributed here.
+
+RGB loss and PSNR operate on linear floating-point RGB, peak 1; diagnostic PPM files apply the existing sRGB encoding. Forward samples use pixel centers, a fixed 0.25 pixel-squared reconstruction variance, and a uniform linear background 0.025. Foreground metrics select reference pixels whose maximum channel exceeds 0.075. The same approximate renderer generates and fits data, so this experiment does not independently validate the perspective approximation or model real-scene mismatch.
