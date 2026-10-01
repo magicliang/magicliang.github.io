@@ -7,6 +7,7 @@ import itertools
 import json
 import os
 import platform
+import re
 import shutil
 import statistics
 import subprocess
@@ -127,8 +128,12 @@ def batch_29_33() -> dict[str, object]:
     build = ROOT / "build"; build.mkdir(exist_ok=True)
     scalar, vector = build / "simd_scalar", build / "simd_vector"
     common = ["-std=c11", "-Wall", "-Wextra", "-Werror"]
-    scalar_cmd = ["cc", *common, "-O3", "-fno-tree-vectorize", "-DKERNEL_NAME=add_scalar", str(SRC / "simd_bench.c"), "-o", str(scalar)]
-    vector_cmd = ["cc", *common, "-O3", "-ftree-vectorize", "-fopt-info-vec-optimized", "-DKERNEL_NAME=add_vector", str(SRC / "simd_bench.c"), "-o", str(vector)]
+    compiler = run(["cc", "--version"]).stdout.splitlines()[0]
+    clang = "clang" in compiler.lower()
+    scalar_flags = ["-fno-vectorize", "-fno-slp-vectorize"] if clang else ["-fno-tree-vectorize", "-fno-tree-slp-vectorize"]
+    vector_flags = ["-Rpass=loop-vectorize"] if clang else ["-ftree-vectorize", "-fopt-info-vec-optimized"]
+    scalar_cmd = ["cc", *common, "-O3", *scalar_flags, "-DKERNEL_NAME=add_scalar", str(SRC / "simd_bench.c"), "-o", str(scalar)]
+    vector_cmd = ["cc", *common, "-O3", *vector_flags, "-DKERNEL_NAME=add_vector", str(SRC / "simd_bench.c"), "-o", str(vector)]
     run(scalar_cmd); vector_compile = run(vector_cmd)
     help_result = run([str(vector), "--help"])
     samples = {}
@@ -145,7 +150,8 @@ def batch_29_33() -> dict[str, object]:
         clean_disasm = "\n".join(line.rstrip() for line in p.stdout.splitlines()) + "\n"
         path = OUT / f"30-{name}-objdump.txt"; path.write_text(clean_disasm, encoding="utf-8"); disasm[name] = sha256(path)
         binary_sha[name] = sha256(binary)
-    readelf = run(["readelf", "-h", str(vector)])
+    inspection_cmd = ["file", str(vector)] if platform.system() == "Darwin" else ["readelf", "-h", str(vector)]
+    readelf = run(inspection_cmd)
     inspection = OUT / "30-binary-inspection.txt"
     inspection.write_text(
         "compiler: " + run(["cc", "--version"]).stdout.splitlines()[0] + "\n"
@@ -153,11 +159,12 @@ def batch_29_33() -> dict[str, object]:
         + "vector command: " + " ".join(vector_cmd) + "\n"
         + "scalar sha256: " + binary_sha["scalar"] + "\n"
         + "vector sha256: " + binary_sha["vector"] + "\n"
-        + "\nreadelf -h simd_vector:\n" + "\n".join(line.rstrip() for line in readelf.stdout.splitlines()) + "\n",
+        + "\n" + " ".join(inspection_cmd) + ":\n" + "\n".join(line.rstrip() for line in readelf.stdout.splitlines()) + "\n",
         encoding="utf-8",
     )
-    vector_width_bytes = 16 if "16 byte vectors" in vector_compile.stderr else None
-    lanes = vector_width_bytes // 4 if vector_width_bytes else None
+    width_match = re.search(r"vectorization width: (\d+)", vector_compile.stderr) if clang else re.search(r"(\d+) byte vectors", vector_compile.stderr)
+    lanes = int(width_match[1]) if clang and width_match else (int(width_match[1]) // 4 if width_match else None)
+    vector_width_bytes = lanes * 4 if lanes else None
     checksums = [sample["checksum"] for group in samples.values() for sample in group]
     simd = {
         "evidence_level": "真机测量",
@@ -203,18 +210,12 @@ def batch_34() -> dict[str, object]:
 
 def batch_34_35() -> dict[str, object]:
     integrated_result = batch_34()
-    archive = ROOT.parent.parent / "writing-plans" / "computer-architecture" / "performance.md"
-    archive_text = archive.read_text(encoding="utf-8")
-    required = ["192 个正式样本正确", "35.6196", "8.5251", "1.2175", "未采硬件计数器"]
-    raw_dir = ROOT / "performance" / "outputs"
-    performance = ROOT / "performance"
-    required_material = [performance / name for name in ("README.md", "run_all.py", "src/kernels.c", "src/kernels.h", "src/bench.c", "build/o3", "build/scalar", "outputs/o3-raw.csv", "outputs/scalar-raw.csv", "outputs/summary.json", "outputs/host.txt", "outputs/commands.txt", "outputs/sha256.txt", "outputs/o3-disassembly.txt", "outputs/negative-check.txt")]
-    missing = [str(path.relative_to(ROOT)) for path in required_material if not path.is_file()]
-    historical = {"evidence_level": "历史宿主真机测量记录，当前不可复算", "source": "writing-plans/computer-architecture/performance.md", "source_sha256": sha256(archive), "archive_record_checked_now": all(text in archive_text for text in required), "host": "arm64 macOS 27.0, Apple Clang 21.0.0 (historical only)", "raw_samples_claimed": 192, "pmu": False, "fixed_frequency": False, "core_affinity": False, "bare_metal_confirmed": False, "archived_raw_files_present_in_this_clone": all((raw_dir / name).is_file() for name in ("o3-raw.csv", "scalar-raw.csv")), "missing_material": missing, "raw_samples_verified_now": False, "observations_from_historical_text_not_recomputed": {"o3_2048_stride2048_ratio_median": 35.6196, "o3_2048_stride2049_ratio_median": 8.5251, "scalar_64_ratio_median": 1.2175}}
-    write_json("35-performance-archive.json", historical)
-    publish("2026-09-29-计算机体系结构-35-独立性能研究", {"35-performance-archive.json": OUT / "35-performance-archive.json", "performance-record.txt": archive})
-    if not historical["raw_samples_verified_now"]:
-        raise AssertionError(f"35 historical samples not revalidated; missing: {missing}; prose is not an acceptance check")
+    verification = run([sys.executable, str(ROOT / "performance" / "verify_archive.py")])
+    historical = json.loads(verification.stdout)
+    if historical.get("status") != "PASS" or not historical.get("raw_samples_verified_now"):
+        raise AssertionError("35 raw-sample validation failed")
+    write_json("35-performance-verification.json", historical)
+    publish("2026-09-29-计算机体系结构-35-独立性能研究", {"35-performance-verification.json": OUT / "35-performance-verification.json", "verify_archive.py.txt": ROOT / "performance" / "verify_archive.py"})
     return {**integrated_result, "performance_raw_verified": True}
 
 
@@ -269,10 +270,11 @@ def formal_check() -> dict[str, object]:
 def cross_isa_cases() -> dict[str, object]:
     build = ROOT / "build"; build.mkdir(exist_ok=True)
     cross_source = SRC / "cross_isa.c"
-    x86_object = build / "cross_isa_x86_64.o"
+    target = run(["cc", "-dumpmachine"]).stdout.strip()
+    x86_object = build / "cross_isa_native.o"
     x86_compile = run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-c", str(cross_source), "-o", str(x86_object)])
     x86_disasm = run(["objdump", "-d", str(x86_object)])
-    x86_disasm_path = OUT / "E07-x86_64-objdump.txt"
+    x86_disasm_path = OUT / "E07-native-objdump.txt"
     x86_disasm_path.write_text("\n".join(line.rstrip() for line in x86_disasm.stdout.splitlines()) + "\n", encoding="utf-8")
     executable = build / "cross_isa_native"
     native_command = ["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", str(cross_source), str(SRC / "cross_isa_main.c"), "-o", str(executable)]
@@ -308,13 +310,13 @@ def cross_isa_cases() -> dict[str, object]:
         "historical_native_arm64": "sum=34",
         "historical_source": "writing-plans/computer-architecture/cross-isa-formal.md",
         "current_host": platform.machine(),
-        "x86_64": {"compile_exit": x86_compile.returncode, "object_sha256": sha256(x86_object), "objdump_sha256": sha256(x86_disasm_path), "native_command": native_command, "native_binary_sha256": sha256(executable), "execution": native.stdout.strip()},
+        "native": {"target": target, "object_format": run(["file", str(x86_object)]).stdout.strip(), "compile_exit": x86_compile.returncode, "object_sha256": sha256(x86_object), "objdump_sha256": sha256(x86_disasm_path), "native_command": native_command, "native_binary_sha256": sha256(executable), "execution": native.stdout.strip()},
         "fixed_input_dynamic_work": {"level": "instrumented_C_source_trace_not_machine_instruction_count", "trace_sha256": sha256(trace_path), "input": list(values), "scale": 3, "loop_iterations": len(values), "source_level_loads": len(values), "source_level_multiplications": len(values), "loop_condition_checks_by_source": len(values) + 1, "final_sum": accumulated, "instrumented_binary_sha256": sha256(traced)},
         "riscv64": {"compile_exit": riscv_exit, "stderr": riscv_stderr, "tool_present": clang is not None, "object_present": riscv_exit == 0, "disassembly": "NOT_RUN", "execution": "NOT_RUN"},
         "pmu": False,
     }
     write_json("E07-cross-isa.json", cross)
-    publish("2026-09-29-计算机体系结构-E07-跨ISA同题对照", {"E07-cross-isa.json": OUT / "E07-cross-isa.json", "E07-x86_64-objdump.txt": x86_disasm_path, "E07-source-trace.txt": trace_path, "cross_isa.c": cross_source, "cross_isa_main.c": SRC / "cross_isa_main.c"})
+    publish("2026-09-29-计算机体系结构-E07-跨ISA同题对照", {"E07-cross-isa.json": OUT / "E07-cross-isa.json", "E07-native-objdump.txt": x86_disasm_path, "E07-source-trace.txt": trace_path, "cross_isa.c": cross_source, "cross_isa_main.c": SRC / "cross_isa_main.c"})
     return cross
 
 
@@ -392,7 +394,7 @@ def batch_e(*, require_rtl: bool = True) -> dict[str, object]:
     publish("2026-09-29-计算机体系结构-E08-有限模型与形式验证边界", {"E08-formal.json": OUT / "E08-formal.json", "run_batch.py.txt": Path(__file__)})
     if require_rtl and not rtl["executed_now"]:
         raise AssertionError("E01 current RTL not validated: iverilog/vvp required; historical four-program output is not a substitute")
-    return {"rtl_executed_now":rtl["executed_now"],"timing_cases":len(timing["cases"]),"virtualization_cases":len(virt["cases"]),"side_channel_bug_detected":side["buggy_commit_detected"],"cxl_handcalc":True,"secded_counts":[clean,single,double],"persistence_counterexample_detected":reliability["persistence"]["counterexample_detected"],"native_cross_isa":cross["x86_64"]["execution"],"formal_programs":formal["programs"]}
+    return {"rtl_executed_now":rtl["executed_now"],"timing_cases":len(timing["cases"]),"virtualization_cases":len(virt["cases"]),"side_channel_bug_detected":side["buggy_commit_detected"],"cxl_handcalc":True,"secded_counts":[clean,single,double],"persistence_counterexample_detected":reliability["persistence"]["counterexample_detected"],"native_cross_isa":cross["native"]["execution"],"formal_programs":formal["programs"]}
 
 
 def main() -> int:

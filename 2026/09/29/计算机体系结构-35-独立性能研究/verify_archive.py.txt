@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import io
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import asdict
+from pathlib import Path
+
+from run_all import Sample, analyze
+
+ROOT = Path(__file__).resolve().parent
+CASES = ((64, 64), (1024, 1024), (2048, 2048), (2048, 2049))
+SOURCES = ("src/bench.c", "src/kernels.c", "src/kernels.h", "run_all.py")
+BINARIES = ("build/o3", "build/scalar")
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def verify(root: Path) -> dict:
+    manifest = {}
+    for line in (root / "outputs/sha256.txt").read_text().splitlines():
+        expected, name = line.split("  ")
+        require(name not in manifest, f"duplicate hash entry: {name}")
+        manifest[name] = expected
+    require(set(manifest) == set(SOURCES + BINARIES), "hash manifest file set")
+    checked = {}
+    missing_binaries = []
+    for name, expected in manifest.items():
+        if name in BINARIES and not (root / name).exists():
+            missing_binaries.append(name)
+            continue
+        actual = digest(root / name)
+        require(actual == expected, f"SHA-256 mismatch: {name}")
+        checked[name] = actual
+
+    recomputed = []
+    input_hashes = {}
+    expected_keys = [
+        (n, stride, round_id, position,
+         "rows" if (round_id + position) % 2 == 0 else "columns")
+        for n, stride in CASES for round_id in range(12) for position in (0, 1)
+    ]
+    for mode in ("o3", "scalar"):
+        path = root / f"outputs/{mode}-raw.csv"
+        raw = path.read_text()
+        reader = csv.DictReader(io.StringIO(raw))
+        require(reader.fieldnames == list(Sample.__dataclass_fields__), f"{mode}: CSV header")
+        rows = list(reader)
+        require(len(rows) == 96, f"{mode}: expected 96 formal samples")
+        keys = []
+        for row in rows:
+            require(None not in row and None not in row.values(), f"{mode}: CSV field count")
+            sample = Sample(**{key: value if key == "variant" else int(value)
+                               for key, value in row.items()})
+            keys.append((sample.n, sample.stride, sample.round, sample.position, sample.variant))
+            require(sample.elapsed_ns > 0, f"{mode}: nonpositive elapsed_ns")
+            require(sample.n * sample.n * sample.repeats == 8388608, f"{mode}: workload")
+            require(sample.checksum == 4290772992, f"{mode}: checksum")
+        require(keys == expected_keys, f"{mode}: layout, round, position or alternating pair order")
+        recomputed.extend(asdict(summary) for summary in analyze(raw, mode))
+        input_hashes[str(path.relative_to(root))] = digest(path)
+
+    summary_path = root / "outputs/summary.json"
+    archived = json.loads(summary_path.read_text())
+    require(archived == recomputed, "summary.json differs from raw-sample recomputation")
+    input_hashes["outputs/summary.json"] = digest(summary_path)
+    input_hashes["outputs/sha256.txt"] = digest(root / "outputs/sha256.txt")
+    return {
+        "status": "PASS",
+        "evidence_level": "historical measurements, raw statistics verified locally; no new measurements",
+        "raw_samples_verified_now": True,
+        "raw_sample_count": 192,
+        "alternating_pair_count": 96,
+        "checksum_per_sample": 4290772992,
+        "summaries_recomputed": True,
+        "summary_rows_verified": len(recomputed),
+        "historical_sha256_verified": checked,
+        "historical_binaries_sha256_verified": not missing_binaries,
+        "missing_historical_binaries": missing_binaries,
+        "current_archive_input_sha256": input_hashes,
+        "archive_input_hash_boundary": "CSV and summary hashes fingerprint current files; no historical CSV hashes exist in sha256.txt",
+        "summaries": recomputed,
+    }
+
+
+def self_test(root: Path) -> dict:
+    results = []
+    with tempfile.TemporaryDirectory(prefix="performance-archive-") as directory:
+        copied = Path(directory)
+        for name in (*SOURCES, *BINARIES, "outputs/sha256.txt", "outputs/o3-raw.csv",
+                     "outputs/scalar-raw.csv", "outputs/summary.json"):
+            if (root / name).exists():
+                (copied / name).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(root / name, copied / name)
+        raw_path = copied / "outputs/o3-raw.csv"
+        raw = raw_path.read_text()
+        rows = raw.splitlines()
+        cells = rows[1].split(",")
+        mutations = [("missing_sample", raw_path, "\n".join(rows[:-1]) + "\n"),
+                     ("duplicate_pair", raw_path, raw.replace(rows[2], rows[1]))]
+        for label, field, value in (("wrong_checksum", 7, "0"), ("zero_time", 6, "0"),
+                                    ("wrong_workload", 2, "1"), ("wrong_position", 4, "1")):
+            changed = cells.copy()
+            changed[field] = value
+            mutations.append((label, raw_path, raw.replace(rows[1], ",".join(changed))))
+        summary_path = copied / "outputs/summary.json"
+        summary = json.loads(summary_path.read_text())
+        summary[0]["median_paired_columns_over_rows"] += 1
+        mutations.extend([
+            ("wrong_statistic", summary_path, json.dumps(summary)),
+            ("source_hash_mismatch", copied / "src/kernels.c", "changed source\n"),
+            ("missing_hash_entry", copied / "outputs/sha256.txt",
+             "\n".join((copied / "outputs/sha256.txt").read_text().splitlines()[1:]) + "\n"),
+        ])
+        for flags in ([], ["-O"]):
+            command = [sys.executable, *flags, "-B", str(Path(__file__).resolve()), "--root", str(copied)]
+            baseline = subprocess.run(command, capture_output=True, text=True)
+            require(baseline.returncode == 0, f"self-test baseline: {baseline.stderr}")
+            for label, path, changed in mutations:
+                original = path.read_bytes()
+                try:
+                    path.write_text(changed)
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    require(result.returncode == 1, f"negative control accepted: {label} {flags}")
+                    failure = json.loads(result.stdout)
+                    require(failure["status"] == "FAIL", f"missing failure report: {label}")
+                    results.append({"case": label, "optimized_python": bool(flags),
+                                    "exit_code": result.returncode, "error": failure["error"]})
+                finally:
+                    path.write_bytes(original)
+    return {"status": "PASS", "negative_controls_rejected": len(results), "results": results}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Read archived measurements without running the benchmark.")
+    parser.add_argument("--root", type=Path, default=ROOT, help="archive directory (default: this module)")
+    parser.add_argument("--self-test", action="store_true", help="reject mutations in temporary copies")
+    args = parser.parse_args()
+    try:
+        report = verify(args.root)
+        if args.self_test:
+            report["self_test"] = self_test(args.root)
+    except (OSError, ValueError, KeyError, TypeError, AssertionError) as error:
+        print(json.dumps({"status": "FAIL", "error": str(error)}, indent=2))
+        return 1
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
