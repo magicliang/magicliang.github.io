@@ -23,17 +23,23 @@ def reference(code: list, initial_memory: dict) -> dict:
         next_pc = pc + 1
         if op == 'addi':
             rd, rs, imm = args
-            registers[rd] = registers[rs] + imm
-            event.update(rd=rd, value=registers[rd])
+            value = registers[rs] + imm if rd else 0
+            if rd:
+                registers[rd] = value
+            event.update(rd=rd, value=value)
         elif op == 'add':
             rd, left, right = args
-            registers[rd] = registers[left] + registers[right]
-            event.update(rd=rd, value=registers[rd])
+            value = registers[left] + registers[right] if rd else 0
+            if rd:
+                registers[rd] = value
+            event.update(rd=rd, value=value)
         elif op == 'lw':
             rd, base, offset = args
             address = registers[base] + offset
-            registers[rd] = memory[address]
-            event.update(rd=rd, value=registers[rd], address=address)
+            value = memory[address]
+            if rd:
+                registers[rd] = value
+            event.update(rd=rd, value=value if rd else 0, address=address)
         elif op == 'sw':
             source, base, offset = args
             address = registers[base] + offset
@@ -65,7 +71,7 @@ def pipeline(code: list, initial_memory: dict, *, forwarding: bool = True, inter
             event = event.copy()
             if corrupt_writeback and event.get("rd") == 3:
                 event["value"] ^= 1
-            if "rd" in event:
+            if event.get("rd") not in (None, 0):
                 registers[event["rd"]] = event["value"]
             elif event["op"] == "sw":
                 memory[event["address"]] = event["value"]
@@ -74,7 +80,7 @@ def pipeline(code: list, initial_memory: dict, *, forwarding: bool = True, inter
             continue
         op, *args = code[pc]
         sources = {"addi": (args[1],), "add": (args[1], args[2]), "lw": (args[1],), "sw": (args[0], args[1]), "bne": (args[0], args[1])}[op]
-        unresolved = [item for item in pending if item["event"].get("rd") in sources]
+        unresolved = [item for item in pending if item["event"].get("rd") not in (None, 0) and item["event"]["rd"] in sources]
         if interlock and any(not forwarding or item["ready_cycle"] > cycle for item in unresolved):
             stalls += 1
             continue
@@ -91,14 +97,16 @@ def pipeline(code: list, initial_memory: dict, *, forwarding: bool = True, inter
         next_pc = pc + 1
         if op == "addi":
             rd, rs, imm = args
-            event.update(rd=rd, value=read(rs) + imm)
+            event.update(rd=rd, value=read(rs) + imm if rd else 0)
         elif op == "add":
             rd, left, right = args
-            event.update(rd=rd, value=read(left) + read(right))
+            event.update(rd=rd, value=read(left) + read(right) if rd else 0)
         elif op == "lw":
             rd, base, offset = args
             address = read(base) + offset
-            event.update(rd=rd, value=memory[address], address=address)
+            stores = [item["event"] for item in pending if item["event"]["op"] == "sw" and item["event"]["address"] == address]
+            value = stores[-1]["value"] if stores else memory[address]
+            event.update(rd=rd, value=value if rd else 0, address=address)
         elif op == "sw":
             source, base, offset = args
             event.update(address=read(base) + offset, value=read(source))
@@ -120,7 +128,10 @@ def pipeline(code: list, initial_memory: dict, *, forwarding: bool = True, inter
 
 def run_cases() -> dict:
     results = {}
-    for name, (code, initial_memory) in programs().items():
+    cases = {**programs(),
+             "store_load": ([('addi', 1, 0, 7), ('sw', 1, 0, 0), ('lw', 2, 0, 0)], {0: 0}),
+             "zero_register": ([('addi', 0, 0, 7), ('addi', 1, 0, 1), ('sw', 1, 0, 0), ('lw', 0, 0, 0), ('addi', 2, 0, 2)], {0: 0})}
+    for name, (code, initial_memory) in cases.items():
         expected = reference(code, initial_memory)
         actual = pipeline(code, initial_memory)
         if (expected["commits"], expected["registers"], expected["memory"]) != (actual["commits"], actual["registers"], actual["memory"]):
@@ -132,4 +143,4 @@ def run_cases() -> dict:
     bad_writeback = pipeline(code, memory, corrupt_writeback=True)["commits"]
     if expected == bad_hazards or expected == bad_writeback:
         raise AssertionError("fault injections escaped commit comparison")
-    return {"evidence_level": "教学时序模型", "cases": results, "negative": {"hazard_commits": bad_hazards, "writeback_commits": bad_writeback, "hazards_detected": expected != bad_hazards, "writeback_detected": expected != bad_writeback}, "boundary": "bounded in-order issue/commit, symbolic cache metadata/latency only; not cycle-accurate RTL or data-cache write-back"}
+    return {"evidence_level": "教学时序模型", "cases": results, "negative": {"hazard_commits": bad_hazards, "writeback_commits": bad_writeback, "hazards_detected": expected != bad_hazards, "writeback_detected": expected != bad_writeback}, "boundary": "bounded in-order issue/commit, pending store-to-load forwarding, x0 hardwired zero, symbolic cache metadata/latency only; not cycle-accurate RTL or data-cache write-back"}
