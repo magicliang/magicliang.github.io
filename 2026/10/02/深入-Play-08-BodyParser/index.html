@@ -1,0 +1,817 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Play 08：BodyParser 的类型、字节限制与请求体消费 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="同样是 32 字节上限，已知 Content-Length 为 35 的 JSON 请求在本批得到 413，parser 字节计数为零；没有 Content-Length 的分块请求也得到 413，却已经向计数流交付了 35 字节。长度声明可以让拒绝提前，实际字节限制仍需要流级检查。 parser 成功也不代表业务输入有效。显式 JSON parser 接收空请求体后，本版得到 null 并进入控">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Play 08：BodyParser 的类型、字节限制与请求体消费">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Play-08-BodyParser/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="同样是 32 字节上限，已知 Content-Length 为 35 的 JSON 请求在本批得到 413，parser 字节计数为零；没有 Content-Length 的分块请求也得到 413，却已经向计数流交付了 35 字节。长度声明可以让拒绝提前，实际字节限制仍需要流级检查。 parser 成功也不代表业务输入有效。显式 JSON parser 接收空请求体后，本版得到 null 并进入控">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Play-08-BodyParser/cover.svg">
+<meta property="article:published_time" content="2026-10-02T08:08:00.000Z">
+<meta property="article:modified_time" content="2026-10-02T13:29:44.112Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Play Framework">
+<meta property="article:tag" content="源码研究">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Play-08-BodyParser/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Play 08：BodyParser 的类型、字节限制与请求体消费",
+  "url": "https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Play-08-BodyParser/",
+  "image": "https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Play-08-BodyParser/cover.svg",
+  "datePublished": "2026-10-02T08:08:00.000Z",
+  "dateModified": "2026-10-02T13:29:44.112Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Play-08-BodyParser/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Play 08：BodyParser 的类型、字节限制与请求体消费',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1350</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1470</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">25</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/10/02/%E6%B7%B1%E5%85%A5-Play-08-BodyParser/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Play 08：BodyParser 的类型、字节限制与请求体消费</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Play 08：BodyParser 的类型、字节限制与请求体消费</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-02T08:08:00.000Z" title="Created 2026-10-02 16:08:00">2026-10-02</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-02T13:29:44.112Z" title="Updated 2026-10-02 21:29:44">2026-10-02</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/Play-Framework/">Play Framework</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.9k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>9mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-02 21:29:44&quot;}" hidden></div><p>同样是 32 字节上限，已知 Content-Length 为 35 的 JSON 请求在本批得到 413，parser 字节计数为零；没有 Content-Length 的分块请求也得到 413，却已经向计数流交付了 35 字节。长度声明可以让拒绝提前，实际字节限制仍需要流级检查。</p>
+<p>parser 成功也不代表业务输入有效。显式 JSON parser 接收空请求体后，本版得到 null 并进入控制器；默认 parser 的空请求则返回 empty 表示。接口需要自己决定空输入能否接受，不能把两种入口的结果合并为“JSON 已经验证”。</p>
+<span id="more"></span>
+<h2 id="bodyparser-返回消费器而非立即返回对象">BodyParser 返回消费器而非立即返回对象</h2>
+<p><a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play/src/main/java/play/mvc/BodyParser.java">Java BodyParser</a> 的核心接口是：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs java">Accumulator&lt;ByteString, F.Either&lt;Result, A&gt;&gt;<br>    apply(Http.RequestHeader request);<br></code></pre></td></tr></table></figure>
+<p>它接收请求头，返回一个可以消费 ByteString 的 Accumulator。正文可能还在到达，不能把 apply 返回解释成已经取得整个输入对象。</p>
+<p><code>Either.Right(A)</code> 表示得到解析值，后续可以构造带 body 的 Request；<code>Either.Left(Result)</code> 表示 parser 已经形成提前响应，不再进入对应业务方法。流也可能失败，这与得到 Left 的正常拒绝结果是不同终态。</p>
+<p>“异步接收”与“完整缓冲”可以同时成立。JSON 和文本 parser 会先收集允许范围内的字节，再转换成树或字符串；不会因为接口返回 Accumulator，就自动逐元素运行 JSON 业务逻辑。大文件、流协议或逐块处理需要采用相应消费方式。</p>
+<h2 id="默认选择与显式约束">默认选择与显式约束</h2>
+<p>没有显式指定 parser 的 <code>/pipeline/any</code> 使用 Default。它检查请求是否具有 body，再依据 Content-Type 选择表达。实验方法只返回当前表示的名称，不尝试把任意 body 都强转 JSON。</p>
+<table>
+<thead>
+<tr>
+<th>输入</th>
+<th>默认入口结果</th>
+<th>显式入口结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>application/json，{}</td>
+<td>json，200</td>
+<td>JSON，200</td>
+</tr>
+<tr>
+<td>text/plain，hello</td>
+<td>text，200</td>
+<td>JSON 拒绝，415</td>
+</tr>
+<tr>
+<td>application/octet-stream，abc</td>
+<td>raw，200</td>
+<td>本批未配置原始字节业务</td>
+</tr>
+<tr>
+<td>空 body，application/json</td>
+<td>empty，200</td>
+<td>JSON null，200</td>
+</tr>
+<tr>
+<td>空 body，text/plain</td>
+<td>默认入口未单独测此类型</td>
+<td>Text 空字符串，200</td>
+</tr>
+<tr>
+<td>application/json，{</td>
+<td>parser 拒绝，400</td>
+<td>JSON 拒绝，400</td>
+</tr>
+</tbody>
+</table>
+<p>默认选择不是内容协商，也不是“自动发现内容语义”。客户端声称 text/plain，Default 按文本路径处理，即使正文恰好长得像 JSON。创建订单接口如果只接受 JSON，应使用显式 Json parser 并做结构约束。</p>
+<p><code>BodyParser.Json</code> 在本版接受 application/json 与 text/json；错误类型先返回 415。它继承 TolerantJson，但先加上类型检查。“Tolerant” 指不要求这一 Content-Type 条件，不代表忽略畸形 JSON，也不取消长度限制。</p>
+<p><code>BodyParser.Text</code> 同样检查 text/plain。3.0.6 的实现未显式给 charset 时使用 US-ASCII；本批要让中文保持原值，采用 <code>charset=utf-8</code>。请求头字符集、字节到字符转换和最大长度检查分别负责不同约束。</p>
+<p>Text 的 decoder 首次解码采用 REPORT，但 catch 后会调用同一字符集的 <code>decodeString</code> 返回替换文本。真实 HTTP 中，不声明 charset 的“你好”得到替换字符；声明 UTF-8 却发送字节 <code>ff</code> 同样返回200与替换字符。因此这个 parser 没有提供“非法编码必定400”的严格拒绝契约。</p>
+<p>默认 text/plain 路径使用另一个类 TolerantText。它先尝试声明的字符集或 US-ASCII，再依次回退 UTF-8、ISO-8859-1，最后才使用替换解码。显式 Text 与默认文本路径连字符集策略都不同，不能只因都返回 String 就推广相同语义。该回退链已核对冻结源码，本批没有穷举全部非法编码组合。</p>
+<h2 id="自定义计数器保留内置限制">自定义计数器保留内置限制</h2>
+<p>工程的 CountingJsonParser 包装内置 Json，不重新实现 JSON 语法。构造时固定 32 字节上限，然后在输入 flow 上记录实际交付的每个块：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><code class="hljs java">parser = <span class="hljs-keyword">new</span> <span class="hljs-title class_">BodyParser</span>.Json(MAX_BYTES, errorHandler);<br><br>Flow&lt;ByteString, ByteString, ?&gt; counting =<br>    Flow.of(ByteString.class).map(bytes -&gt; &#123;<br>        trace.add(id, <span class="hljs-string">&quot;parser-bytes-&quot;</span> + bytes.size());<br>        <span class="hljs-keyword">return</span> bytes;<br>    &#125;).watchTermination((unused, completion) -&gt; &#123;<br>        completion.whenComplete((done, failure) -&gt;<br>            trace.add(id, failure == <span class="hljs-literal">null</span><br>                ? <span class="hljs-string">&quot;parser-stream-end&quot;</span> : <span class="hljs-string">&quot;parser-stream-failed&quot;</span>));<br>        <span class="hljs-keyword">return</span> completion;<br>    &#125;);<br><br><span class="hljs-keyword">return</span> parser.apply(request).through(counting).map(parsed -&gt; &#123;<br>    trace.add(id, <span class="hljs-string">&quot;parser-result-&quot;</span> +<br>        parsed.left.map(Result::status).orElse(<span class="hljs-number">200</span>));<br>    <span class="hljs-keyword">return</span> parsed;<br>&#125;, Runnable::run);<br></code></pre></td></tr></table></figure>
+<p>这个包装保留内置类型验证、最大长度与错误处理。字节 flow 只观测进入该 parser 的数据，没有声称记录 TCP socket 接收量。若内置 parser 依据请求头直接完成，flow 可以没有数据而结束。</p>
+<p><code>parser-result-200</code> 是实验中对 Right 的命名，不等于 parser 单独发送了 HTTP 200；最终业务仍可产生其他状态或失败。事件名称必须结合记录位置解释，不能直接当作响应状态的唯一来源。</p>
+<p>计数器不拥有文件、socket 或额外缓冲池。其流终止由包装链传播，实验队列保存有限样本。这种“包住已有实现”的方式减少了一套重复的长度与语法判断，也使观测范围可以精确到组件交接点。</p>
+<p>若自定义 parser 自行打开临时文件，就必须把成功、Left、流失败和取消都接到清理路径。当前没有文件资源，不能用这份实验替代上传临时文件释放验收。</p>
+<h2 id="长度检查有声明与实际流两层">长度检查有声明与实际流两层</h2>
+<p><code>MaxLengthBodyParser.apply</code> 首先检查 Content-Length 是否超过 maxLength。若超过，直接返回 requestEntityTooLarge 的 done Accumulator。这个分支可以避免继续给缓冲 parser 交付数据。</p>
+<p>未超限或没有该头时，代码将 <code>takeUpTo(maxLength)</code> 流与实际 parser 的 sink 组合。终态被标记为 MaxSizeNotExceeded 才返回 parser 结果；超限状态改为 413。这一层覆盖未知长度的请求体。</p>
+<p>BufferingBodyParser 在范围内通过严格输入或 <code>Sink.fold(ByteString.emptyByteString(), ByteString::concat)</code> 收集数据，再调用 parse。异常解码交给 HttpErrorHandler 产生 400。限制发生在字节收集链上，不能只在拿到大字符串后判断 length。</p>
+<p>已知超限与未知长度超限的处理代价自然不同。前者使用声明提前拒绝，后者必须看到足够多实际输入才能确认超限。一个过大的已知请求在应用 parser 中计数为零，仍可能已经进入服务器或代理缓冲；应用与传输观测不是同一层。</p>
+<p>冻结版本的上游 <a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play/src/test/scala/play/mvc/MaxLengthBodyParserSpec.scala">MaxLengthBodyParserSpec</a>分别覆盖有头超限、有头允许、无头允许与无头超限。本批阅读该测试后，在累计应用中运行自己的 parser 与真实 HTTP 对照，没有运行整个上游 suite。</p>
+<h2 id="utf-8-边界与分块请求">UTF-8 边界与分块请求</h2>
+<p>JSON 字符串的引号也属于输入字节。十个“中”各占三个 UTF-8 字节，加上两个 ASCII 引号，合计 32 字节；再加 x 得到 33 字节，十一个“中”则是 35 字节。</p>
+<figure class="highlight python"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs python">exact = (<span class="hljs-string">&#x27;&quot;&#x27;</span> + <span class="hljs-string">&quot;中&quot;</span> * <span class="hljs-number">10</span> + <span class="hljs-string">&#x27;&quot;&#x27;</span>).encode(<span class="hljs-string">&quot;utf-8&quot;</span>)<br><span class="hljs-keyword">assert</span> <span class="hljs-built_in">len</span>(exact) == <span class="hljs-number">32</span><br>chunks = [exact[:<span class="hljs-number">16</span>], exact[<span class="hljs-number">16</span>:] + <span class="hljs-string">b&quot;xxx&quot;</span>]<br></code></pre></td></tr></table></figure>
+<p>边界必须在真实编码后计算。Java String.length 计数 UTF-16 code unit，中文字符数量也不是 UTF-8 大小。对包含补充平面字符的输入，这几种数量还可能进一步不同。</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>实际输入字节</th>
+<th>HTTP</th>
+<th>计数流交付字节</th>
+<th>业务调用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JSON 固定长度，刚好上限</td>
+<td>32</td>
+<td>200</td>
+<td>32</td>
+<td>1</td>
+</tr>
+<tr>
+<td>JSON 固定长度，上限加一</td>
+<td>33</td>
+<td>413</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td>JSON 固定长度，十一中文字符</td>
+<td>35</td>
+<td>413</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td>JSON chunked，两个允许块</td>
+<td>32</td>
+<td>200</td>
+<td>32</td>
+<td>1</td>
+</tr>
+<tr>
+<td>JSON chunked，16 + 19</td>
+<td>35</td>
+<td>413</td>
+<td>35</td>
+<td>0</td>
+</tr>
+<tr>
+<td>Text，341 个中加 x，UTF-8</td>
+<td>1024</td>
+<td>200</td>
+<td>此表未包装 Text 计数器</td>
+<td>1</td>
+</tr>
+<tr>
+<td>Text，再增加一个 x</td>
+<td>1025</td>
+<td>413</td>
+<td>此表未包装 Text 计数器</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p>Text 的 1024 来自本工程 <code>play.http.parser.maxMemoryBuffer=1k</code>；JSON 的 32 来自显式构造。不能把这两个实验值写成所有 Play 应用的默认上限。</p>
+<p>Python http.client 对字节列表使用 chunked 传输，未预先提供总 Content-Length。原始结果保存分块情形与字节数；在本次样本中两个块分别交付 16、19 字节。网络和后端有权改变块的划分，生产代码不能依赖每次都保持客户端写入边界。</p>
+<p>允许输入的内存上限、并发请求数和其他副本决定应用的总资源占用。每个 parser 有 1k 上限，不等于整个服务只占 1k。代理、服务器、解码后的对象树与日志还会使用其他内存。</p>
+<h2 id="取消-流失败与-http-拒绝">取消、流失败与 HTTP 拒绝</h2>
+<p>chunked 超限时观察到 parser-stream-failed。这个事件属于流终止，不应直接翻译成“客户端断开”：超限引起的消费终止或取消也可能进入这个分支。</p>
+<p>JUnit 另外向 parser 交付 failed Source，要求原始失败传播，并记录 stream-failed。它验证 parser 组合面对失败流的行为，不是一次真实 TCP 中途断线。真实网络断开后的资源释放仍需要持有资源的组件和后端另做验收。</p>
+<p>stream 终止回调与结果映射属于不同完成观察，原始日志中二者可以交错。断言因果关系时，应固定“鉴权先于业务”等真实调用关系；不能给所有并发回调强行规定一个全序。</p>
+<p>长度超限、语法畸形和流异常也应采用不同指标。413 是容量拒绝，400 是本接口解析拒绝，失败流没有解析结果；它们触发不同的排查与客户端修正，统一计成“JSON错误”会丢失原因。</p>
+<h2 id="解析之后还有输入契约">解析之后还有输入契约</h2>
+<p>显式 Json 读取空字节时调用 <code>Json.parse(InputStream)</code>，再交给 mapper.readTree。本次得到 null，没有抛出解析异常，于是 Right 到达控制器，返回 <code>{&quot;kind&quot;:&quot;json&quot;,&quot;body&quot;:null}</code>。</p>
+<p>这不授权创建空订单。API 需要检查根节点是否对象、必填字段是否缺失或 null、数值与字符串范围、未知字段以及跨字段业务约束。字段反序列化与这些规则还具有不同边界，09 篇继续用同一工程验证。</p>
+<p>当接口宣称“畸形输入不进入业务”，也应说清畸形的范围。本批 <code>{</code> 触发语法拒绝且业务计数为零；空输入属于 parser 接受但业务契约应主动判断的情况。仅断言响应状态，容易漏掉这条路径。</p>
+<h2 id="重跑与证据范围">重跑与证据范围</h2>
+<p>解压<a href="../%E6%B7%B1%E5%85%A5-Play-00-%E6%9C%80%E5%B0%8F%E5%BA%94%E7%94%A8/play-lab-source.zip">累计源码包</a>，进入 <code>play-lab/</code>，按 README 准备固定工具链后执行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs bash">bash sbtw <span class="hljs-built_in">test</span> stage<br>python3 lab/pipeline_checks.py --dev<br>python3 lab/pipeline_checks.py<br></code></pre></td></tr></table></figure>
+<p>累计 12 个 JUnit 与两种模式各 118 个请求通过。脚本包含 00–05 的回归，也核验 deferred 拒绝、Filter 短路与本篇字节矩阵。它会停止自己启动的服务器，并保存 <code>dev-summary.json</code>、<code>http-summary.json</code>、请求观测和运行日志。</p>
+<p>本篇没有数据库、文件上传或压测。源码提供实现依据，应用测试提供当前环境的功能证据；它们都没有证明跨后端传输行为或生产容量。</p>
+<h2 id="参考资料与继续阅读">参考资料与继续阅读</h2>
+<p>参考 <a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play/src/main/java/play/mvc/BodyParser.java">Java BodyParser 实现</a>、<a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/documentation/manual/working/javaGuide/main/http/JavaBodyParsers.md">Java BodyParser 指南</a>、<a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play-streams/src/main/java/play/libs/streams/Accumulator.java">Accumulator</a> 与<a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play/src/main/java/play/libs/Json.java">源码 Json</a>。所有引用冻结到同一 Play SHA。</p>
+<p>上一篇：<a href="../%E6%B7%B1%E5%85%A5-Play-07-Filter%E4%B8%8E%E8%AF%B7%E6%B1%82%E5%A4%84%E7%90%86%E5%99%A8/">Filter 与请求处理器</a>。下一批从 JSON 字段契约开始，发布前不生成文章链接。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Play-08-BodyParser/">https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Play-08-BodyParser/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Play-Framework/">Play Framework</a><a class="post-meta__tags" href="/tags/%E6%BA%90%E7%A0%81%E7%A0%94%E7%A9%B6/">源码研究</a></div><div class="post-share"><div class="social-share" data-image="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-08-BodyParser/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-04-Request%E4%B8%8EResult/" title="深入 Play 04：Request 与 Result 的状态边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-04-Request%E4%B8%8EResult/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Play 04：Request 与 Result 的状态边界</div></div><div class="info-2"><div class="info-item-1">把请求属性加入 Request，或给 Result 加一个头，都会得到新的对象；忽略返回值，后续代码可能继续使用旧状态。把用户名字写入 session，数据出现在浏览器 Cookie 中；签名阻止篡改，却没有让名字不可读。拿到一个流式 Result，也只说明响应描述已经存在，尚不能说明客户端收完了正文。 这三组边界分别涉及对象更新、客户端状态和实体消费。它们共享一个原则：对外观察需要明确时间与载体，不能用“请求成功了”概括所有变化。  Request 保存了什么，更新影响谁 Play 的 Http.Request 包含方法、路径、头、属性以及已解析的请求体等信息；Http.RequestHeader 不要求持有已解析的 body。第 02 篇默认 parser 成功后，才把 body 放进交给业务方法的 request。 对象更新接口返回新请求： 123456TypedKey&lt;String&gt; key = TypedKey.create(&quot;lab-key&quot;);Http.Request original = fakeRequest(GET, &quot...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-03-%E7%B1%BB%E5%9E%8B%E5%8C%96%E8%B7%AF%E7%94%B1/" title="深入 Play 03：类型化路由的绑定与反向生成"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-03-%E7%B1%BB%E5%9E%8B%E5%8C%96%E8%B7%AF%E7%94%B1/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Play 03：类型化路由的绑定与反向生成</div></div><div class="info-2"><div class="info-item-1">GET /orders/42 能调用 order(long, boolean)，依赖的不是控制器里手写 Long.parseLong，而是生成路由选择了对应的参数 binder。将输入换成 /orders/no，控制器还没执行就得到 400；将路径换成 /missing，则没有这个绑定过程，直接进入 404 fallback。 类型化路由把接口声明和代码调用连接起来，但仍有运行期错误边界。缺失值、非法值、重复 query 与百分号编码需要分别验证。尤其当参数是业务标识或权限字段时，能转换成一个 Java 值不代表请求没有歧义。  路由声明里哪些值来自请求 当前工程包含两个对照路由： 12GET /orders/:id controllers.LabController.order(id: Long, verbose: Boolean ?= false)GET /reverse    controllers.LabController.reverse(id: Long) 第一条的 id 来自 path capture，verbose 来自 query，并有缺省值 false。第二条...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-05-%E4%BE%9D%E8%B5%96%E6%B3%A8%E5%85%A5%E4%B8%8E%E9%85%8D%E7%BD%AE/" title="深入 Play 05：Guice 怎样构建对象与配置边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-05-%E4%BE%9D%E8%B5%96%E6%B3%A8%E5%85%A5%E4%B8%8E%E9%85%8D%E7%BD%AE/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Play 05：Guice 怎样构建对象与配置边界</div></div><div class="info-2"><div class="info-item-1">在 injector 上连续取得两个未标单例的控制器，本批测试得到两个不同对象；向同一条路由发送 16 个并发请求，却观察到同一个控制器引用。这两个结果同时成立：Guice 决定每次注入怎样构造对象，生成 Router 决定已注入的引用如何被后续请求使用。 因此，“控制器没有 Singleton 注解，所以每个 HTTP 请求新建一个控制器”不是可靠结论。需要分别检查对象作用域、持有关系和请求调用方式，再讨论字段能否安全共享。  从接口到构造器依赖图 示例用一个库存接口把查询边界从控制器中抽出： 123public interface InventoryService &#123;    int stock(long productId);&#125; 实现从配置读取合成库存，构造时拒绝负数： 12345678910111213141516@Singletonpublic final class ConfiguredInventoryService implements InventoryService &#123;    private final int stock;    ...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-01-sbt%E4%B8%8E%E4%BB%A3%E7%A0%81%E7%94%9F%E6%88%90/" title="深入 Play 01：sbt 怎样生成路由与模板"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-01-sbt%E4%B8%8E%E4%BB%A3%E7%A0%81%E7%94%9F%E6%88%90/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Play 01：sbt 怎样生成路由与模板</div></div><div class="info-2"><div class="info-item-1">把 routes 中的订单号从 Long 改为 String，控制器方法却仍接收 long，错误通常在编译时就会暴露。把模板参数从 String 改为 Int，调用处也必须修改。Play 将这些约束放进生成代码，再交给 Scala 与 Java 编译器；这让一部分接口错误不必等到请求到达时才出现。 这一机制不能验证订单是否存在、调用者是否有权限，也不能保证每个 URL 都匹配。编译期检查负责代码之间的调用契约，运行期 binder 和业务逻辑负责输入与状态。理解 sbt 的任务和 classpath，才能判断失败属于哪一层。  构建定义也是代码，但运行位置不同 首批 累计工程 固定 sbt 1.10.7、Play 插件 3.0.6 和 Scala 2.13.15。目录中的 build.sbt 是 Scala 风格的 sbt 构建定义，不是应用运行时的业务源码。project/plugins.sbt 将 Play 插件加入构建；它不会因为应用里 import 了 play.mvc.Result 就自动出现。 以下两个表达式承担不同用途： 12ThisBuild / scalaVer...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-06-Action%E7%BB%84%E5%90%88/" title="深入 Play 06：Action 组合怎样决定鉴权与审计的执行边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-06-Action%E7%BB%84%E5%90%88/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Play 06：Action 组合怎样决定鉴权与审计的执行边界</div></div><div class="info-2"><div class="info-item-1">合法 JSON 在默认路径先经过 parser，再进入审计和鉴权；同一条路由开启 deferred parsing 后，鉴权可以在 parser 之前返回 401。本批真实 HTTP 实验中，未授权的畸形 JSON 分别得到 400 与 401，业务计数均为零。两种结果对应不同执行边界。 Action 组合适合表达某一组控制器操作的公共条件，但注解本身不能证明拒绝请求的代价、审计覆盖范围或失败处理。需要检查 delegate 链的顺序，以及请求体解析发生在这条链的什么位置。  一个可以观察的 delegate 链 累计工程新增 PipelineController。同一个方法通过两条 routes 入口调用，JSON parser 限制为 32 字节，业务方法返回 CompletionStage&lt;Result&gt;： 123456789101112131415@With(&#123;AuditAction.class, AuthorizationAction.class&#125;)@BodyParser.Of(CountingJsonParser.class)publi...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-02-%E8%AF%B7%E6%B1%82%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/" title="深入 Play 02：一次请求在哪个阶段失败"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Play-02-%E8%AF%B7%E6%B1%82%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Play 02：一次请求在哪个阶段失败</div></div><div class="info-2"><div class="info-item-1">同一个订单接口可能返回 400、413、415 或 500。只看到状态码，无法知道业务方法是否执行：400 可能来自路由参数绑定，也可能来自 JSON 解析；500 可能来自同步抛异常，也可能来自异步结果失败。排查需要把输入、阶段事件和客户端观察对应起来。 当前工程在过滤器入口、控制器入口以及结果 Stage 的成功或失败处分别打点。它没有给每个源码函数加日志，而是用最少的事件回答一个问题：请求已经越过哪些边界，在哪个分支停止？  先找到 handler，再包装过滤器 Play 3.0.6 的默认请求处理器先选择 handler，再为可过滤的 action 包装过滤器。这一点影响读源码的方式：过滤器的执行入口早于控制器，不意味着 Router 对 handler 的选择也发生在过滤器之后。 固定的 DefaultHttpRequestHandler.handlerForRequest 依次调用 routeWithFallback、Handler.applyStages、filterHandler，再处理一次预处理阶段。filterHandler 为应用上下文内的 Essentia...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#bodyparser-%E8%BF%94%E5%9B%9E%E6%B6%88%E8%B4%B9%E5%99%A8%E8%80%8C%E9%9D%9E%E7%AB%8B%E5%8D%B3%E8%BF%94%E5%9B%9E%E5%AF%B9%E8%B1%A1"><span class="toc-number">1.</span> <span class="toc-text">BodyParser 返回消费器而非立即返回对象</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%BB%98%E8%AE%A4%E9%80%89%E6%8B%A9%E4%B8%8E%E6%98%BE%E5%BC%8F%E7%BA%A6%E6%9D%9F"><span class="toc-number">2.</span> <span class="toc-text">默认选择与显式约束</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%87%AA%E5%AE%9A%E4%B9%89%E8%AE%A1%E6%95%B0%E5%99%A8%E4%BF%9D%E7%95%99%E5%86%85%E7%BD%AE%E9%99%90%E5%88%B6"><span class="toc-number">3.</span> <span class="toc-text">自定义计数器保留内置限制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%95%BF%E5%BA%A6%E6%A3%80%E6%9F%A5%E6%9C%89%E5%A3%B0%E6%98%8E%E4%B8%8E%E5%AE%9E%E9%99%85%E6%B5%81%E4%B8%A4%E5%B1%82"><span class="toc-number">4.</span> <span class="toc-text">长度检查有声明与实际流两层</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#utf-8-%E8%BE%B9%E7%95%8C%E4%B8%8E%E5%88%86%E5%9D%97%E8%AF%B7%E6%B1%82"><span class="toc-number">5.</span> <span class="toc-text">UTF-8 边界与分块请求</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%96%E6%B6%88-%E6%B5%81%E5%A4%B1%E8%B4%A5%E4%B8%8E-http-%E6%8B%92%E7%BB%9D"><span class="toc-number">6.</span> <span class="toc-text">取消、流失败与 HTTP 拒绝</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%A7%A3%E6%9E%90%E4%B9%8B%E5%90%8E%E8%BF%98%E6%9C%89%E8%BE%93%E5%85%A5%E5%A5%91%E7%BA%A6"><span class="toc-number">7.</span> <span class="toc-text">解析之后还有输入契约</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%87%8D%E8%B7%91%E4%B8%8E%E8%AF%81%E6%8D%AE%E8%8C%83%E5%9B%B4"><span class="toc-number">8.</span> <span class="toc-text">重跑与证据范围</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99%E4%B8%8E%E7%BB%A7%E7%BB%AD%E9%98%85%E8%AF%BB"><span class="toc-number">9.</span> <span class="toc-text">参考资料与继续阅读</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
