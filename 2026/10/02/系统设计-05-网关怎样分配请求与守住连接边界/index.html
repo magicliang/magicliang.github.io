@@ -1,0 +1,707 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>系统设计 05：负载均衡与网关——请求分配不等于连接有余量 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="两台后端均分请求，不能据此推断每台仍可接新连接。一次请求可以很快结束，也可以占住连接数秒；健康的实例也可能已用完连接名额。路由必须同时回答“往哪台送”和“这台现在能否接”，失败时还要说清拒绝与重试责任。 沿用先测瓶颈再扩容的分享元数据服务。本文只处理入口到无状态应用实例这一跳：POST &#x2F;shares 写入、GET &#x2F;shares&#x2F;{id} 读取、所有者列表读取；权限和撤销仍由应用与权威库共同维护">
+<meta property="og:type" content="article">
+<meta property="og:title" content="系统设计 05：负载均衡与网关——请求分配不等于连接有余量">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-05-%E7%BD%91%E5%85%B3%E6%80%8E%E6%A0%B7%E5%88%86%E9%85%8D%E8%AF%B7%E6%B1%82%E4%B8%8E%E5%AE%88%E4%BD%8F%E8%BF%9E%E6%8E%A5%E8%BE%B9%E7%95%8C/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="两台后端均分请求，不能据此推断每台仍可接新连接。一次请求可以很快结束，也可以占住连接数秒；健康的实例也可能已用完连接名额。路由必须同时回答“往哪台送”和“这台现在能否接”，失败时还要说清拒绝与重试责任。 沿用先测瓶颈再扩容的分享元数据服务。本文只处理入口到无状态应用实例这一跳：POST &#x2F;shares 写入、GET &#x2F;shares&#x2F;{id} 读取、所有者列表读取；权限和撤销仍由应用与权威库共同维护">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-113.jpg">
+<meta property="article:published_time" content="2026-10-01T20:17:00.000Z">
+<meta property="article:modified_time" content="2026-10-02T06:30:00.845Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="系统设计">
+<meta property="article:tag" content="负载均衡">
+<meta property="article:tag" content="连接管理">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-113.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "系统设计 05：负载均衡与网关——请求分配不等于连接有余量",
+  "url": "https://magicliang.github.io/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-05-%E7%BD%91%E5%85%B3%E6%80%8E%E6%A0%B7%E5%88%86%E9%85%8D%E8%AF%B7%E6%B1%82%E4%B8%8E%E5%AE%88%E4%BD%8F%E8%BF%9E%E6%8E%A5%E8%BE%B9%E7%95%8C/",
+  "image": "https://magicliang.github.io/img/wall-paper-113.jpg",
+  "datePublished": "2026-10-01T20:17:00.000Z",
+  "dateModified": "2026-10-02T06:30:00.845Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-05-%E7%BD%91%E5%85%B3%E6%80%8E%E6%A0%B7%E5%88%86%E9%85%8D%E8%AF%B7%E6%B1%82%E4%B8%8E%E5%AE%88%E4%BD%8F%E8%BF%9E%E6%8E%A5%E8%BE%B9%E7%95%8C/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '系统设计 05：负载均衡与网关——请求分配不等于连接有余量',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1144</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1354</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">22</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-113.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">系统设计 05：负载均衡与网关——请求分配不等于连接有余量</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">系统设计 05：负载均衡与网关——请求分配不等于连接有余量</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-01T20:17:00.000Z" title="Created 2026-10-02 04:17:00">2026-10-02</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-02T06:30:00.845Z" title="Updated 2026-10-02 14:30:00">2026-10-02</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">1.9k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>6mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-02 14:30:00&quot;}" hidden></div><p>两台后端均分请求，不能据此推断每台仍可接新连接。一次请求可以很快结束，也可以占住连接数秒；健康的实例也可能已用完连接名额。路由必须同时回答“往哪台送”和“这台现在能否接”，失败时还要说清拒绝与重试责任。</p>
+<p>沿用<a href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-04-%E4%BB%8E%E5%8D%95%E6%9C%BA%E5%88%B0%E5%88%86%E5%B8%83%E5%BC%8F%E5%85%88%E6%B5%8B%E7%93%B6%E9%A2%88/">先测瓶颈再扩容</a>的分享元数据服务。本文只处理入口到无状态应用实例这一跳：<code>POST /shares</code> 写入、<code>GET /shares/{id}</code> 读取、所有者列表读取；权限和撤销仍由应用与权威库共同维护，不因为网关能缓存或改写请求而转移到入口。排除跨地域、会话黏性、TLS 证书生命周期和详细服务发现协议。</p>
+<span id="more"></span>
+<h2 id="定义目标和连接负载">定义目标和连接负载</h2>
+<p><strong>独立练习假设</strong>：每天 110 万次读和 10 万次写，读写比 11:1；峰值 360 次读/秒、40 次写/秒，共 400 次/秒（读、写各为日均的约 28.28 与 34.56 倍）。读响应平均有效载荷按 20 KiB，峰值约 <code>360 × 20 KiB = 7.03 MiB/s ≈ 58.98 Mbit/s</code>，不含 TLS、重试、连接升级和网关日志。写元数据平均 1 KiB，写入峰值约 0.039 MiB/s。</p>
+<p>假设峰值请求中 80% 的连接平均占用 0.2 秒，20% 的连接平均占用 5 秒，且处于稳定到达与完成的条件下，平均同时活跃的连接约 <code>320/s × 0.2s + 80/s × 5s = 464</code>。这是 <a target="_blank" rel="noopener" href="https://doi.org/10.1287/opre.9.3.383">Little 的平均量关系</a> 的练习推算，<strong>不是</strong>测出的连接数或 p99；HTTP 复用、一连接多请求、实际到达分布都可能让它失准。普通短请求的服务端 p99 目标暂定 200 ms，长请求须另设时长目标；网关因健康/容量拒绝的请求占比暂定小于 0.1%。没有真实样本，本篇不宣称达成。</p>
+<p>两台上游各预留 250 条活跃连接时，练习预算总计 500 条，看起来大于 464；若一台下线，另一台的 250 条小于 464。只把长连接平均占用从 5 秒改成 10 秒，推算变为 <code>320 × 0.2 + 80 × 10 = 864</code> 条，即使两台都在也不够。这个敏感性比“峰值 QPS 不变，容量就不变”更能指导测量：要看活跃连接、空闲 keepalive、文件描述符、队列和每台上游的耗时分布，而不是只查 CPU。</p>
+<p>为了不把网关开销藏进应用预算，按每次写入 1000 B 元数据与索引、365 天三份计 109.5 GB；每次读写各一条 200 B 网关诊断记录，7 天一份计 <code>1200000 × 200 × 7 = 1.68 GB</code>，两项合计 111.18 GB。若练习价格为 <code>0.02 货币单位/(GB·月)</code>，这两项稳态容量成本约 2.22 货币单位/月，<strong>没有</strong>包括网关计算与流量、实际数据库日志、连接保持成本或备份。记录不应无节制地包含用户敏感数据。</p>
+<h2 id="网关路由不是无限排队">网关路由不是无限排队</h2>
+<p>最小架构是两台无状态应用、一个权威数据库和入口网关。网关校验请求基本格式、施加总体与单上游预算、选择健康且<strong>有余量</strong>的目标；应用仍做授权和事务确认。<code>GET /shares/{id}</code> 可重试前要知道是否到达过上游；<code>POST /shares</code> 超时后即使网关换节点也不得无条件重放，必须由应用的幂等键维持同一写入归属。</p>
+<pre><code class="hljs mermaid">flowchart LR
+    C[客户端] --&gt;|GET / POST，带追踪与幂等键| G[网关]
+    G --&gt;|健康且有连接名额| A[应用 A]
+    G --&gt;|健康且有连接名额| B[应用 B]
+    A --&gt;|读写| D[(权威数据库)]
+    B --&gt;|读写| D
+    A --&gt;|完成 / 连接释放 / 错误| G
+    B --&gt;|完成 / 连接释放 / 错误| G
+    G --&gt;|响应或限时拒绝| C</code></pre>
+<p>轮询分流结构简单，却看不见某条连接占用五秒的差异；按活跃连接数选择目标有助于解释这类差异，却仍不等于按 CPU、内存或数据库等待时间选。两种策略都要有健康判断和容量上界。以 NGINX upstream 文档为<strong>尚未部署的实现候选</strong>，官方提供 <code>least_conn</code>、<code>max_fails</code>/<code>fail_timeout</code> 与 <code>max_conns</code>，但 <code>max_conns</code> 在不使用共享内存时按 worker 生效；多 worker、共享内存与空闲 keepalive 组合下总连接数也可能超过设定值（<a target="_blank" rel="noopener" href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html#max_conns">NGINX upstream 文档</a>）。不能把“填了一个配置项”当成全局严格连接上限，本篇没有 NGINX 实测。</p>
+<p>模型 <code>examples/system-design/labs/05/route.py</code> 只把连接计数与健康状态分开：<code>a</code>、<code>b</code> 各最多两条活跃连接；前四次选择 <code>a,b,a,b</code>，第五次因都满而拒；将 <code>a</code> 标为不健康、释放 <code>b</code> 一个名额后，第六次仍可路由到 <code>b</code>，再一次则拒绝。如果启动 <code>--ignore-capacity</code>，<code>b</code> 活跃数变成 3，反例以 2 退出；正常命令以 0 退出。原始输出和限制见 <code>examples/system-design/evidence/05/routing.md</code>。此脚本没有打开任何网络连接；绝不能拿它证明 NGINX 的故障摘除、健康探针或真实连接上限。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash">python3 examples/system-design/labs/05/route.py<br>python3 examples/system-design/labs/05/route.py --ignore-capacity<br></code></pre></td></tr></table></figure>
+<h2 id="故障从检测到恢复要有顺序">故障从检测到恢复要有顺序</h2>
+<p>时间线上先是 <code>a</code> 不再通过健康判断，但它原有连接还没自然结束；网关应阻止<strong>新请求</strong>发往 <code>a</code>。随后 <code>b</code> 的名额逐步被占满，网关不能因另一台机器还留着既有连接就继续放行。容量耗尽时可按策略返回 HTTP 503，并在合理情况下给 <code>Retry-After</code>；这是 RFC 9110 对状态与建议等待时间的规定，不是探针算法（<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.4">503</a>、<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3">Retry-After</a>）。如果失败实例恢复，先做少量试探流量、核对错误率与活跃连接，再逐步放量；探测结果过期或故障反复，应收回流量而不是连续无界重试。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant C as 客户端
+    participant G as 网关
+    participant A as 应用 A
+    participant B as 应用 B
+    C-&gt;&gt;G: 请求 1 至 4
+    G-&gt;&gt;A: A 获得两个活跃名额
+    G-&gt;&gt;B: B 获得两个活跃名额
+    Note over G,A: A 被标记不健康；旧连接仍占名额
+    B--&gt;&gt;G: 一个请求结束，B 释放名额
+    C-&gt;&gt;G: 新请求 6
+    G-&gt;&gt;B: 转发到 B
+    C-&gt;&gt;G: 新请求 7
+    G--&gt;&gt;C: B 已满，返回 503 或有界等待
+    Note over G,B: 别用无限重试把单机故障扩大到 B</code></pre>
+<p>面试的追问不应停在“两台应用 + 网关”：先列读写峰值和连接持有时间，再说明健康、容量与拒绝是三项独立判断，最后问写请求在网关超时后如何确认结果。一个恢复方案是观测名额回落后逐步重新纳入 <code>a</code>；另一个是让 <code>b</code> 接管全部流量，只有<strong>实测</strong>单实例能承受时才成立。本文没有真实网关运行、浏览器 Mermaid 渲染或负载压测，不能把模型路径升级为生产承诺。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html">NGINX HTTP upstream module：连接限制、失败次数及路由算法</a>。本篇未部署或验证 NGINX，引用范围限于官方文档的选项语义及限制。</li>
+<li><a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.4">RFC 9110 §15.6.4 与 §10.2.3</a>：503 与 Retry-After 的 HTTP 语义。</li>
+<li><a target="_blank" rel="noopener" href="https://doi.org/10.1287/opre.9.3.383">Little, 1961, <em>A Proof for the Queuing Formula: L = λW</em></a>：平均在途量与平均到达/占用关系；不替代本篇欠缺的连接测量。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-05-%E7%BD%91%E5%85%B3%E6%80%8E%E6%A0%B7%E5%88%86%E9%85%8D%E8%AF%B7%E6%B1%82%E4%B8%8E%E5%AE%88%E4%BD%8F%E8%BF%9E%E6%8E%A5%E8%BE%B9%E7%95%8C/">https://magicliang.github.io/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-05-%E7%BD%91%E5%85%B3%E6%80%8E%E6%A0%B7%E5%88%86%E9%85%8D%E8%AF%B7%E6%B1%82%E4%B8%8E%E5%AE%88%E4%BD%8F%E8%BF%9E%E6%8E%A5%E8%BE%B9%E7%95%8C/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E8%B4%9F%E8%BD%BD%E5%9D%87%E8%A1%A1/">负载均衡</a><a class="post-meta__tags" href="/tags/%E8%BF%9E%E6%8E%A5%E7%AE%A1%E7%90%86/">连接管理</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-113.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/29/MySQL-%E7%BB%8F%E5%85%B8%E6%9E%B6%E6%9E%84%E6%A8%A1%E5%BC%8F-%E4%BB%8E%E4%B8%BB%E4%BB%8E%E5%A4%8D%E5%88%B6%E5%88%B0%E5%88%86%E5%BA%93%E5%88%86%E8%A1%A8/" title="MySQL 经典架构模式：从主从复制到分库分表"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-29</div><div class="info-item-2">MySQL 经典架构模式：从主从复制到分库分表</div></div><div class="info-2"><div class="info-item-1">MySQL 在绝大多数业务系统中扮演事实源的角色。Redis 和 ES 都是派生存储——数据可以从 MySQL 重建，反过来不行。围绕 MySQL 的架构模式，核心问题始终是三个：怎么扛住读写压力、怎么保证数据不丢、怎么随业务增长水平扩展。 下面整理十个生产环境中反复出现的 MySQL 架构模式。和 ES 架构模式 与 Redis 用例全解 形成三件套：Redis 管热路径和派生状态，ES 管可搜索的派生索引，MySQL 管事实。  模式速查    模式 解决的问题 核心机制 典型场景     主从复制 + 读写分离 读压力分摊 binlog 复制 + 代理层路由 读多写少的业务   半同步复制 + 增强半同步 主从切换时数据不丢 after-sync / after-commit 金融、订单   双主（互为主从） 机房级故障切换 双向复制 + 自增步长错开 同城双活   级联复制 大规模从库扩展 从库的从库 读流量极大的分析场景   分库分表 单库容量和写入瓶颈 水平分片 + 路由中间件 亿级数据量   影子表与 Online DDL 大表结构变更不锁表 pt-osc / gh...</div></div></div></a><a class="pagination-related" href="/2020/07/12/%E8%BD%AF%E4%BB%B6%E6%96%B9%E6%B3%95/" title="软件方法"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2020/07/12/%E8%BD%AF%E4%BB%B6%E6%96%B9%E6%B3%95/%E8%BD%AF%E4%BB%B6%E6%96%B9%E6%B3%95.jpeg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2020-07-12</div><div class="info-item-2">软件方法</div></div><div class="info-2"><div class="info-item-1">建模带来竞争优势。 前言  “唱曲的名家，唱到极快处，吐字依然干净利落”。 不能站在别人的肩膀上看得更远，只是摘抄别人的观点，无意义。要有足够的积累，和深度的思考。 涉众（stakeholder）往往会做而不会定义，把不同类型的涉众放在一起访谈时，只会剩下在场军衔最高那个人的意见。 需求变更的时候，要注意涉众利益角度分析。 项目的流程步骤：  寻找老大 揣摩愿景 业务建模 系统用例 需求规约 分析模型 设计开发   只有一个领域（核心域）的知识是系统能在市场上生存的理由。 拿来主义要摒除门户之见，不关注流派和风格，着力于细节和应用。  建模与 uml 利润 = 需求 - 设计 需求：提升销售 设计：降低开发维护成本 几种弊习：  从需求直接映射设计，会得到大量的重复代码。 从设计出发来定义需求，会得到一堆假的“需求”。  从涉众视角对系统功能分包会得到需求包。 子系统是基于内部视角根据系统部件的耦合和内聚情况进行切割。    需求 设计     卖的视角 做的视角   具体 抽象   产品当项目做 项目当产品做   设计源于需求，高于需求     建模工作流  业务建模：描述组织...</div></div></div></a><a class="pagination-related" href="/2025/07/29/%E5%89%AF%E6%9C%AC%E5%A4%8D%E5%88%B6%E7%AE%97%E6%B3%95%E4%B8%8E%E6%9E%B6%E6%9E%84/" title="副本复制算法与架构——PacificA、Elasticsearch、Kafka、Pulsar 全面对比"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-07-29</div><div class="info-item-2">副本复制算法与架构——PacificA、Elasticsearch、Kafka、Pulsar 全面对比</div></div><div class="info-2"><div class="info-item-1">本文将深入剖析 PacificA、Elasticsearch、Kafka、Pulsar 四大分布式系统的副本复制机制，揭示它们在一致性、可用性和性能之间的精妙权衡。这些系统虽然都通过副本复制来保证数据可靠性和高可用性，但在具体的实现策略上各有特色，反映了不同的设计哲学和适用场景。  引言：为什么需要副本复制 数据可靠性与高可用性 在分布式系统中，硬件故障是常态而非例外。Google 的统计数据显示，一个拥有 10,000 台服务器的数据中心，每天平均会有 2-3 台服务器发生故障。如果数据只存储在一台机器上，那么这台机器的故障就意味着数据的永久丢失。 副本复制（Replication） 是解决这个问题的核心手段：将数据复制到多台机器上，即使部分机器故障，数据仍然可用。 CAP 定理的实际影响 CAP 定理告诉我们，在网络分区（Partition）发生时，分布式系统只能在**一致性（Consistency）和可用性（Availability）**之间二选一：    选择 含义 代表系统     CP 网络分区时拒绝服务，保证一致性 ZooKeeper、etcd、HBase   AP...</div></div></div></a><a class="pagination-related" href="/2026/09/24/%E8%AE%A1%E7%AE%97%E6%9C%BA%E7%BD%91%E7%BB%9C32-%E8%AF%B7%E6%B1%82%E5%88%B0%E8%BE%BE%E5%93%AA%E4%B8%AA%E5%90%8E%E7%AB%AF/" title="计算机网络 32：请求到达哪个后端，四层&#x2F;七层负载均衡、反向代理与健康检查"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-39.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-24</div><div class="info-item-2">计算机网络 32：请求到达哪个后端，四层&#x2F;七层负载均衡、反向代理与健康检查</div></div><div class="info-2"><div class="info-item-1">后端 A 被摘除后，为什么新请求去了 B，一条已经连到 A 的长连接却还能继续得到 A 的响应？“后端健康”若没有同时说明选择单位、检查时刻和已有状态，只是一个容易误导的标签。 第 21–24 篇分别给出了名字解析、HTTP 与 TLS，第 31 篇解释五元组和有状态转发。本篇把入口之后的选择拆成四层负载均衡、七层反向代理和健康判定，并用本机连接实验观察后端关闭监听前后的差别。 四层选择的是连接目标 四层负载均衡依据 IP、端口和传输协议等信息选择后端。实现可以转发报文、改写地址，也可以终止客户端连接后再建立上游连接；“四层”描述决策主要不依赖 HTTP 路径、方法或字段，不保证实现内部一定只有一条连接。 一次 TCP 连接选中后端 A 后，后续字节通常沿已有映射或上游连接继续发送。轮询算法按连接选择时，一个包含许多请求的长连接只贡献一次选择；因此“连接数平均”不等于“请求数平均”，更不等于后端工作量平均。 关闭 A 的监听 socket 只阻止新连接进入。操作系统中已经建立的连接是独立对象，只要进程继续服务并且连接未被关闭，已有客户端仍可交换数据。若进程退出、连接被重置或负载均...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-10-%E6%B6%88%E6%81%AF%E7%A1%AE%E8%AE%A4%E4%B8%8D%E7%AD%89%E4%BA%8E%E4%B8%9A%E5%8A%A1%E5%8F%AA%E5%81%9A%E4%B8%80%E6%AC%A1/" title="系统设计 10：消息与异步处理——确认、重领和背压"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-108.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 10：消息与异步处理——确认、重领和背压</div></div><div class="info-2"><div class="info-item-1">把“分享创建后通知关注者”改成异步，创建接口会更少等待通知渠道，但不意味着“消息只会处理一次”。消费者拿到消息后、发送通知前后都可能失效：没确认的消息应如何重领，已发出的副作用能否重复，积压能涨到多少，都要写进设计。 接在ID、幂等键与唯一约束之后，本篇以分享创建的非关键通知作异步任务。权威分享和幂等映射仍在数据库提交；通知最终送达可以延迟，分享授权与撤销不可依赖消息的消费进度。本文不设计邮件服务的真实送达承诺、跨地域队列或支付类强一致事务。  写清哪些结果可以晚到 POST /shares 用幂等键确认分享只创建一次；成功响应只承诺数据库中的分享和请求映射已提交，不承诺关注者收到通知。后续事件可建模为 ShareCreated(event_id, share_id, owner_id, version)，通知处理按 (event_id, recipient) 记录处理结果和重试次数；正文、权限信息应由权威库按需读取，不能让一条旧消息重新发布已撤销内容。若以后业务要求“通知不可丢”，必须验证数据库提交与事件发布间的崩溃窗口，引入可核对的 Outbox 或等价事务边界；本篇的 Re...</div></div></div></a><a class="pagination-related" href="/2025/07/29/%E6%95%B0%E6%8D%AE%E5%BA%93%E5%86%99%E5%85%A5%E7%9A%84%E6%BD%9C%E8%A7%84%E5%88%99/" title="数据库写入的潜规则——合并树与 MPP 架构深度剖析"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-07-29</div><div class="info-item-2">数据库写入的潜规则——合并树与 MPP 架构深度剖析</div></div><div class="info-2"><div class="info-item-1">许多开发者在使用 ClickHouse、HBase、Elasticsearch 等现代数据系统时，都会遇到&quot;不建议高频写入&quot;的限制。这一限制常被归因于&quot;列式存储&quot;，但这是一个常见的误解。 高频写入受限的根本原因在于数据库的存储引擎架构。本文将深入剖析四大主流架构——LSM-Tree、ClickHouse MergeTree、MPP 和 B-Tree——分析它们各自的写入机制、性能权衡，以及它们&quot;偏爱&quot;批量写入的底层原因。  Part 1: 磁盘 I/O 基础——理解一切的前提 深入存储引擎之前，有必要先理解磁盘 I/O 的基本特性，因为所有存储引擎的设计都是围绕磁盘特性做出的权衡。 随机写 vs 顺序写    指标 HDD（机械硬盘） SSD（固态硬盘） 内存（DRAM）     随机写 IOPS ~100-200 10K-100K ~10M   顺序写吞吐 ~100-200 MB/s 500 MB/s - 3 GB/s ~10 GB/s   随机写延迟 ~10ms（寻道时间） ~100μs ~100ns   顺序写延迟...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%9A%E4%B9%89%E7%9B%AE%E6%A0%87%E5%92%8C%E8%BF%9E%E6%8E%A5%E8%B4%9F%E8%BD%BD"><span class="toc-number">1.</span> <span class="toc-text">定义目标和连接负载</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BD%91%E5%85%B3%E8%B7%AF%E7%94%B1%E4%B8%8D%E6%98%AF%E6%97%A0%E9%99%90%E6%8E%92%E9%98%9F"><span class="toc-number">2.</span> <span class="toc-text">网关路由不是无限排队</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%85%E9%9A%9C%E4%BB%8E%E6%A3%80%E6%B5%8B%E5%88%B0%E6%81%A2%E5%A4%8D%E8%A6%81%E6%9C%89%E9%A1%BA%E5%BA%8F"><span class="toc-number">3.</span> <span class="toc-text">故障从检测到恢复要有顺序</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">4.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
