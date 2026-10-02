@@ -100,7 +100,7 @@ kubectl -n "$OWN_NAMESPACE" rollout status deployment/c28-probe --timeout=120s
 
 ## 终止、在途处理与清理边界
 
-删除专用 Deployment 的 Pod 前，先记录当前 Service 请求及 Pod UID，再用有上限的端点 watch、短时客户端采样与 `kubectl get events` 追踪 EndpointSlice 变化；确认删掉的 UID 确属本篇，不改其它 namespace。`probe_app.py` 的 `HTTPServer` 是简单单线程实现，**没有实现自定义 SIGTERM 延迟或人工慢请求端点**；上面的短请求可能看见断连或成功，但不能据此声称“所有在途请求已优雅完成”。要验收真正的长在途请求，应在同一 probe-app 增加受控延时/终止钩子、重建 digest 后另做实验，当前缺此专项代码及真实节点结果，该项维持 `NOT_RUN`。`signal_probe.py` 只有信号日志而无 HTTP，不可替代真实流量。
+删除专用 Deployment 的 Pod 前，先记录当前 Service 请求及 Pod UID，再用有上限的端点 watch、短时客户端采样与 `kubectl get events` 追踪 EndpointSlice 变化；确认删掉的 UID 确属本篇，不改其它 namespace。`probe_app.py` 已注册 SIGTERM/SIGINT 处理器，停止标志阻止继续处理新接入请求；主线程先启动三秒定时器，再调用 `server.shutdown()`。定时器到期时关闭仍在处理的连接，提前结束则取消定时器。其单线程 HTTP 请求处理尚无人工慢请求端点；上面的短请求可能看见断连或成功，但不能据此声称“所有在途请求已优雅完成”。要验收长在途请求，应增加受控慢请求与请求时间线记录、重建 digest 后另做实验；已有终止处理不能替代真实节点结果，该项维持 `NOT_RUN`。`signal_probe.py` 只有信号日志而无 HTTP，不可替代真实流量。
 
 从 `kubectl -n "$OWN_NAMESPACE" get pods -l app=c28-probe -o wide` 手工选一只当前确认属于本篇 Deployment 的 Pod，并核对其 owner 与 UID 后设置 `OWN_POD_TO_TERMINATE`；以下命令只删除这只 Pod，Deployment 会补建新实例。记录请求时需要另在专用客户端并行执行上面的有界 Service 请求，避免把单纯的控制面变化当成业务结果：
 

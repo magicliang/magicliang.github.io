@@ -10,15 +10,54 @@ import sys
 import time
 
 
+def cgroup_location(self_cgroup, mountinfo):
+    memberships = [line.split(":", 2)[2] for line in self_cgroup.splitlines()
+                   if line.startswith("0::")]
+    if len(memberships) != 1:
+        raise ValueError("exactly one cgroup v2 membership is required")
+    group = pathlib.PurePosixPath(memberships[0])
+    if not group.is_absolute() or ".." in group.parts:
+        raise ValueError("cgroup membership is outside the visible namespace")
+    candidates = []
+    for line in mountinfo.splitlines():
+        fields, separator, filesystem = line.partition(" - ")
+        if not separator or filesystem.split()[0] != "cgroup2":
+            continue
+        fields = fields.split()
+        mount_root, mount_point = [
+            pathlib.PurePosixPath(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value))
+            for value in fields[3:5]]
+        if not mount_root.is_absolute() or not mount_point.is_absolute() or ".." in mount_root.parts:
+            continue
+        try:
+            relative = group.relative_to(mount_root)
+        except ValueError:
+            continue
+        directory = pathlib.Path(mount_point / relative)
+        if directory.is_dir():
+            candidates.append((len(mount_root.parts), {
+                "membership": str(group), "mount_root": str(mount_root),
+                "mount_point": str(mount_point), "directory": str(directory),
+                "mountinfo_line": line,
+            }))
+    if not candidates:
+        raise ValueError("cannot map cgroup v2 membership to a visible mount; check namespace mounts")
+    return max(candidates, key=lambda item: item[0])[1]
+
+
 def environment():
-    root = pathlib.Path("/sys/fs/cgroup")
+    self_cgroup = pathlib.Path("/proc/self/cgroup").read_text()
+    location = cgroup_location(self_cgroup, pathlib.Path("/proc/self/mountinfo").read_text())
+    root = pathlib.Path(location["directory"])
     paths = ("cpu.max", "cpuset.cpus.effective", "memory.max", "cpu.stat")
     return {
         "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "python": sys.version,
         "platform": os.uname().machine,
         "affinity": sorted(os.sched_getaffinity(0)),
-        "self_cgroup": pathlib.Path("/proc/self/cgroup").read_text(),
+        "self_cgroup": self_cgroup,
+        "cgroup_source": location,
+        "controller_scope": "current cgroup only; ancestor limits (including hidden namespace ancestors) not evaluated",
         "controllers": {name: (root / name).read_text() if (root / name).exists() else None
                         for name in paths},
     }
