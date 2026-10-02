@@ -4,7 +4,7 @@
 
 ```sh
 unshare --user --map-root-user --mount sh
-mkdir -p /tmp/containers-11-own/{lower,upper,work,merged}
+mkdir -p /tmp/containers-11-own/lower /tmp/containers-11-own/upper /tmp/containers-11-own/work /tmp/containers-11-own/merged
 printf 'old\n' > /tmp/containers-11-own/lower/config
 mount --make-rprivate /
 mount -t overlay overlay -o lowerdir=/tmp/containers-11-own/lower,upperdir=/tmp/containers-11-own/upper,workdir=/tmp/containers-11-own/work /tmp/containers-11-own/merged
