@@ -7,6 +7,11 @@ sha256sum -c CHECKSUMS.sha256
 mkdir -p /tmp/containers-00-own-state
 sh env_probe.sh
 python3 probe_app.py --state-dir /tmp/containers-00-own-state --port 18080 --ready-delay 1
+```
+
+探针在前台运行。保留该终端，在第二个终端执行请求；结束后回到服务终端按 Ctrl-C，并核对退出日志。就绪前的 503 只会在启动后一秒内出现，手动切换终端可能错过；需要观察该窗口时，将 `--ready-delay` 改为 10，在十秒内请求并在十秒后再次请求。
+
+```sh
 curl -i http://127.0.0.1:18080/identity
 curl -i http://127.0.0.1:18080/ready
 ```
