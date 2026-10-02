@@ -1,0 +1,810 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>Scala E06：Spark 的版本、闭包与重执行 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="把普通 Scala 集合的 map 改成 Spark RDD 的 map，函数看起来相似，执行责任却发生了变化。函数可能被序列化、送到执行端，在 action 触发时运行，还可能因再次计算或故障恢复而重复执行。捕获一个驱动端对象、修改一个外部变量、发送一次业务请求，都需要重新检查含义。 本篇使用真实 Spark 4.0.0 本地模式，运行两个有边界的实验：对同一条未缓存 RDD 执行两次 acti">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Scala E06：Spark 的版本、闭包与重执行">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/02/Scala-E06-Spark%E7%9A%84%E9%97%AD%E5%8C%85%E4%B8%8E%E9%87%8D%E6%89%A7%E8%A1%8C/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="把普通 Scala 集合的 map 改成 Spark RDD 的 map，函数看起来相似，执行责任却发生了变化。函数可能被序列化、送到执行端，在 action 触发时运行，还可能因再次计算或故障恢复而重复执行。捕获一个驱动端对象、修改一个外部变量、发送一次业务请求，都需要重新检查含义。 本篇使用真实 Spark 4.0.0 本地模式，运行两个有边界的实验：对同一条未缓存 RDD 执行两次 acti">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-java-jvm.svg">
+<meta property="article:published_time" content="2026-10-02T11:06:00.000Z">
+<meta property="article:modified_time" content="2026-10-02T10:45:04.738Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Scala">
+<meta property="article:tag" content="Spark">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-java-jvm.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "Scala E06：Spark 的版本、闭包与重执行",
+  "url": "https://magicliang.github.io/2026/10/02/Scala-E06-Spark%E7%9A%84%E9%97%AD%E5%8C%85%E4%B8%8E%E9%87%8D%E6%89%A7%E8%A1%8C/",
+  "image": "https://magicliang.github.io/img/cover-java-jvm.svg",
+  "datePublished": "2026-10-02T11:06:00.000Z",
+  "dateModified": "2026-10-02T10:45:04.738Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/02/Scala-E06-Spark%E7%9A%84%E9%97%AD%E5%8C%85%E4%B8%8E%E9%87%8D%E6%89%A7%E8%A1%8C/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: 'Scala E06：Spark 的版本、闭包与重执行',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1347</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1470</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">25</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-java-jvm.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">Scala E06：Spark 的版本、闭包与重执行</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">Scala E06：Spark 的版本、闭包与重执行</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-02T11:06:00.000Z" title="Created 2026-10-02 19:06:00">2026-10-02</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-02T10:45:04.738Z" title="Updated 2026-10-02 18:45:04">2026-10-02</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E8%AE%A1%E7%AE%97%E7%90%86%E8%AE%BA/">计算理论</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>10mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-02 18:45:04&quot;}" hidden></div><p>把普通 Scala 集合的 <code>map</code> 改成 Spark RDD 的 <code>map</code>，函数看起来相似，执行责任却发生了变化。函数可能被序列化、送到执行端，在 action 触发时运行，还可能因再次计算或故障恢复而重复执行。捕获一个驱动端对象、修改一个外部变量、发送一次业务请求，都需要重新检查含义。</p>
+<p>本篇使用真实 Spark 4.0.0 本地模式，运行两个有边界的实验：对同一条未缓存 RDD 执行两次 action，观察转换被重新执行；在闭包中捕获不可序列化对象，观察任务提交被拒绝。本地实验不模拟多机网络分区、执行器丢失或真实集群容错。</p>
+<p>工程位于 <code>examples/scala-lab/electives/E06</code>。冻结 Spark 4.0.0、Scala 2.13.16、JDK 21，成功记录为 <code>evidence/20261002-c/spark-local.log</code>。主线 Scala 3.3.7 不参与这个独立工程的编译。</p>
+<h2 id="版本矩阵先于业务代码">版本矩阵先于业务代码</h2>
+<p>Spark 4.0.0 官方文档要求 Java 17 或 21，并使用 Scala 2.13。Maven 发布的 <code>spark-core_2.13:4.0.0</code> POM 进一步给出 scala-library 与 scala-reflect 为 2.13.16，因此本实验把编译器也固定为这一补丁版本。</p>
+<table>
+<thead>
+<tr>
+<th>组成部分</th>
+<th>冻结值</th>
+<th>核验依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Spark Core</td>
+<td>4.0.0</td>
+<td>官方版本文档与发布坐标</td>
+</tr>
+<tr>
+<td>Scala</td>
+<td>2.13.16</td>
+<td>Spark POM 的标准库与反射依赖</td>
+</tr>
+<tr>
+<td>JDK</td>
+<td>21.0.11</td>
+<td>本机 Java 启动输出</td>
+</tr>
+<tr>
+<td>执行环境</td>
+<td>local[2]</td>
+<td>程序显式配置</td>
+</tr>
+<tr>
+<td>部署范围</td>
+<td>单机</td>
+<td>无集群提交步骤</td>
+</tr>
+</tbody>
+</table>
+<p>Scala 语言版本相近，不代表生态库可以任意互换。<code>_2.13</code> 是二进制交叉发布标识，不能把 <code>_3</code> 产物直接改名放进 classpath。Scala 2 宏、scala-reflect、编译器插件和 TASTy 读取又有各自的兼容边界，必须按真实依赖路径验证。</p>
+<p>Scala 3.8 起标准库与 Scala 2.13 互操作还出现新的版本分界，不能把早期 Scala 3 迁移示例概括为所有未来版本均双向兼容。本篇采用 Spark 自身要求的 2.13 组合，避免把框架实验同时变成未经验证的语言迁移实验。</p>
+<p>JDK 启动参数也是组合的一部分。这里通过 Scala CLI 直接启动应用，没有使用 spark-submit 帮忙配置全部模块开放参数。序列化调试路径需要访问特定 JDK 内部包，runner 显式记录本次使用的 add-opens。缺少参数时出现的 IllegalAccessException，是启动配置失败，不是目标序列化反例通过。</p>
+<h2 id="transformation-保存计算描述">transformation 保存计算描述</h2>
+<p>实验将三个整数分成两个分区，在 map 中把每个数字乘以 100。一个 LongAccumulator 记录转换执行次数，两个 collect 都校验最终总额为 600。</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs scala"><span class="hljs-keyword">val</span> executions = sc.longAccumulator(<span class="hljs-string">&quot;executions&quot;</span>)<br><span class="hljs-keyword">val</span> rdd = sc.parallelize(<span class="hljs-type">List</span>(<span class="hljs-number">1</span>, <span class="hljs-number">2</span>, <span class="hljs-number">3</span>), <span class="hljs-number">2</span>).map &#123; n =&gt;<br>  executions.add(<span class="hljs-number">1</span>)<br>  n * <span class="hljs-number">100</span><br>&#125;<br><br>assert(rdd.collect().sum == <span class="hljs-number">600</span>)<br><span class="hljs-keyword">val</span> first = executions.value<br>assert(rdd.collect().sum == <span class="hljs-number">600</span>)<br><span class="hljs-keyword">val</span> second = executions.value<br>assert(first == <span class="hljs-number">3</span> &amp;&amp; second == <span class="hljs-number">6</span>)<br></code></pre></td></tr></table></figure>
+<p>定义 rdd 时主要形成计算关系；collect 是 action，触发需要的执行。当前没有 persist 或 cache，因此第二次 collect 会再次沿计算关系处理三个元素。累计值从 3 变为 6，显示同一个 RDD 变量不代表计算结果已经被保存。</p>
+<p>这里的两次运行来自应用主动调用两次 action，未注入 task 失败。它证明“同一转换可能执行不止一次”这一风险的一个直接场景，不能据此声称已经验证 Spark 的任务重试次数、推测执行或故障恢复策略。</p>
+<p>Accumulator 在本例中是观测工具，不是业务数据库。Spark 对 action 与 transformation 中的累计更新有不同约定；官方文档明确提示转换重新执行时，累计更新可能重复。把它当作精确计费账本，会让执行重放改变业务金额。</p>
+<p>业务侧副作用也面临相同问题。如果把 <code>executions.add(1)</code> 换成“扣款一次”，两次 collect 就可能发送两次请求。是否恰好写入一次，取决于外部系统的幂等键、提交协议和失败处理，不能从 map 看起来是纯函数的语法形式推断。</p>
+<p>[PATTERN] 分布式转换里的副作用必须能够承受重执行。RDD 变量保存计算关系，不能当作唯一执行凭据。</p>
+<h2 id="闭包捕获了什么">闭包捕获了什么</h2>
+<p>反例对象有一个普通字段 value，没有实现 Serializable。实例方法里的 lambda 访问该字段，因此闭包需要捕获接收者对象，不能只看到源代码中的一个整数加法。</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs scala"><span class="hljs-keyword">final</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">DriverOnly</span>(<span class="hljs-params">val value: <span class="hljs-type">Int</span></span>) </span>&#123;<br>  <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">transform</span></span>(sc: <span class="hljs-type">SparkContext</span>): <span class="hljs-type">Array</span>[<span class="hljs-type">Int</span>] =<br>    sc.parallelize(<span class="hljs-type">List</span>(<span class="hljs-number">1</span>, <span class="hljs-number">2</span>), <span class="hljs-number">2</span>).map(_ + value).collect()<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>调用 <code>new DriverOnly(7).transform(sc)</code> 时，Spark 清理并检查闭包，序列化失败，程序捕获包含 serializable 诊断的 SparkException。正常路径与拒绝路径在同一个进程中执行，最终还会断言拒绝确实发生。</p>
+<p>这个例子说明字段访问可能间接捕获整个对象。真实驱动对象常常持有日志器、线程池、数据库连接或 SparkContext，即使 lambda 只用到一个配置值，也可能把更多状态带进捕获图。修复时应先理解捕获关系，再决定传递简单值或构造执行端资源。</p>
+<p>把类简单标记为 Serializable 也未必正确。字段对象仍可能不可序列化；即使能序列化，一个打开的本地连接也不一定能在另一进程中恢复有效。序列化描述数据，不会自动复制系统资源的运行状态。</p>
+<p>对于配置数字，可以在方法中先取出独立局部值，再让闭包捕获该值；对于外部客户端，通常需要按执行端生命周期建立连接并控制释放。这两类修复解决的问题不同，不能用“加 Serializable”统一处理。</p>
+<h2 id="本地模式仍有边界">本地模式仍有边界</h2>
+<p><code>local[2]</code> 在本机运行两个工作线程，用于验证编程接口与部分任务执行过程。本次确实经过 Spark 的闭包序列化检查，因此捕获反例可以在本地复现；但这并不意味着本地线程与真实集群进程拥有相同的隔离与故障模型。</p>
+<p>普通外部变量尤其容易造成误解。某些本地观察可能看见共享地址空间中的状态变化，而集群任务持有的是序列化后的副本。Spark 文档明确要求通过支持的分布式状态机制交互，不能依赖驱动变量被任务直接修改。</p>
+<p>广播变量也不等于共享可变内存。它适合传播只读数据，更新策略需要单独设计。把可变对象放入广播后再尝试依靠其变化协调执行器，会混淆数据分发与一致性协议。</p>
+<p>同时，本机文件路径在执行器上不一定存在，localhost 也指向执行器自己的主机。一个读取驱动桌面文件的函数，本地运行成功，集群运行仍可能失败。因此代码迁移到集群时，需要检查输入分发、路径、凭据和网络访问范围。</p>
+<p>本篇显式绑定回环地址并关闭 Spark UI，避免为实验开放不必要的外部入口；这些配置不构成生产部署模板。集群认证、加密、资源配额与审计属于部署任务，应按实际集群管理器验收。</p>
+<h2 id="缓存改变重算成本-不提供事务">缓存改变重算成本，不提供事务</h2>
+<p>给 rdd 加上 persist，并在第一次 action 中完成物化，通常可以复用已缓存分区，减少后续重算。但缓存可能被驱逐，执行器可能丢失，分区也可能重新计算。缓存是一种执行优化，不能成为“扣款恰好一次”的正确性依据。</p>
+<p>如果应用需要把计算结果写入外部存储，应考虑使用能够表达提交语义的输出机制，并对目标系统设计幂等键。例如按订单标识与业务版本建立唯一约束，可以让重复提交变成可识别的同一操作；仅按 task attempt 标识去重，可能无法覆盖应用重新提交整个作业。</p>
+<p>失败响应还有结果未知问题。一次网络请求超时可能发生在服务端提交之后，直接重试会产生重复写；不重试又可能漏写。解决这类问题需要服务端可查询的操作标识与明确状态机，RDD API 不会代替它完成。</p>
+<p>实验特意没有用缓存来“修复”计数从 3 到 6。这个变化正是要暴露的语义。若只追求让计数一直停在 3，就可能把正确性依赖错误地建立在某次缓存命中上。</p>
+<h2 id="观测与生产推论分开">观测与生产推论分开</h2>
+<p>Spark 的执行日志包含环境、driver 启动和模块诊断。程序结束前调用 <code>sc.stop()</code>，因此本机服务由实验自身释放。日志中的本地目录与端口是运行细节，不能拿来推断真实集群上的数据分布。</p>
+<p>本次通过记录显示两次结果总额都为 600，转换执行累计 3 与 6，不可序列化捕获被拒绝。没有注入 executor 崩溃，也没有验证 shuffle 数据丢失、网络重试或分布式写入的端到端一致性。</p>
+<p>若要进一步验证故障重执行，需要建立可控制的失败注入，记录 partition、stage、attempt 与外部操作键，并区分任务开始次数、成功次数和最终业务提交次数。单纯数日志行容易把重试日志、驱动打印和执行端输出混在一起。</p>
+<p>采样任务也要避免把观测本身变成业务副作用。Accumulator 适合这个小实验，因为结果可在 action 结束后读取；对高频生产统计，还需考虑更新代价、重执行语义与监控系统的聚合方式。测试仪表应当明确它计数的是尝试还是成功。</p>
+<h2 id="闭包审查从依赖对象开始">闭包审查从依赖对象开始</h2>
+<p>闭包表达式只有一行，也可能携带很大的对象图。访问实例字段会引入接收者，接收者又可能保存连接池、线程或其他不可序列化对象。因此排查序列化错误时，应先列出表达式读取的自由变量，再沿字段依赖检查，而不是看到 lambda 短小就假定运输成本很低。把字段值复制成不可变局部数据，有时能缩小捕获范围，但仍需确认该数据本身适合序列化。</p>
+<p>连接也不应通过闭包从 driver 运输给 executor。通常需要在执行端按适当范围创建客户端，并在相同范围关闭；具体是每分区创建还是使用连接池，要依据客户端线程安全性与资源配额决定。本实验没有连接外部数据库，因此不为某个客户端提供生命周期保证，只展示为什么捕获 driver 对象会在运输边界失败。</p>
+<p>对外写入还需要独立于任务次数的业务标识。分区编号和某次任务尝试编号属于执行计划，数据重新分区后可能变化；业务去重键应来自稳定业务语义。即便某次本地测试只执行一次，真实任务重试、再次提交作业或上游重复数据仍然可能产生多次写入。测试计划应分别覆盖这些触发条件，不能用一个计数值概括所有交付语义。</p>
+<h2 id="结果与练习">结果与练习</h2>
+<p>最终进程退出码为 0，输出：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">spark=4.0.0;first=3;second=6;serialization-rejected=true<br></code></pre></td></tr></table></figure>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>实测结果</th>
+<th>解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第一次 collect</td>
+<td>总额 600，计数 3</td>
+<td>三个元素执行转换</td>
+</tr>
+<tr>
+<td>第二次 collect</td>
+<td>总额 600，计数 6</td>
+<td>未缓存结果重新计算</td>
+</tr>
+<tr>
+<td>捕获 DriverOnly</td>
+<td>被拒绝</td>
+<td>对象不可序列化</td>
+</tr>
+<tr>
+<td>进程退出</td>
+<td>0</td>
+<td>正常与拒绝路径断言通过</td>
+</tr>
+</tbody>
+</table>
+<p>手算题：把第二次 collect 删除，只读取两次 <code>executions.value</code>，计数是否还会变成 6？不会；读取驱动端累计结果不是触发这条 RDD 的第二次 action。</p>
+<p>修改练习：把 DriverOnly 的 value 先复制到局部变量，让闭包只使用局部值，验证结果为 8、9。随后增加缓存并记录两次 action 的计数，再主动解除缓存运行第三次 action。将“是否重算”的观测与“外部业务是否重复提交”分成不同断言。</p>
+<table>
+<thead>
+<tr>
+<th>可迁移规则</th>
+<th>验收需要记录</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>版本由框架矩阵决定</td>
+<td>编译器、反射库、运行 JDK</td>
+</tr>
+<tr>
+<td>闭包需要序列化</td>
+<td>捕获对象图与目标诊断</td>
+</tr>
+<tr>
+<td>转换可能重执行</td>
+<td>action、attempt 与业务操作键</td>
+</tr>
+<tr>
+<td>本地结果有范围</td>
+<td>未测的集群故障与提交协议</td>
+</tr>
+</tbody>
+</table>
+<p>完整启动参数见<a href="RUN.md">实验说明</a>。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://spark.apache.org/docs/4.0.0/">Spark 4.0.0 overview</a>：Java 与 Scala 支持矩阵。</li>
+<li><a target="_blank" rel="noopener" href="https://spark.apache.org/docs/4.0.0/rdd-programming-guide.html">Spark 4.0.0 RDD programming guide</a>：闭包、累加器与 RDD 执行。</li>
+<li><a target="_blank" rel="noopener" href="https://repo.maven.apache.org/maven2/org/apache/spark/spark-core_2.13/4.0.0/spark-core_2.13-4.0.0.pom">Spark Core 4.0.0 POM</a>：Scala 2.13.16 发布依赖。</li>
+<li><a target="_blank" rel="noopener" href="https://www.scala-lang.org/news/3.9/">Scala 3.9 release notes</a>：Scala 2.13 互操作的版本边界。</li>
+</ul>
+<p>顺序导航：<a href="/2026/10/02/Scala-00-%E5%B7%A5%E5%85%B7%E9%93%BE%E4%B8%8E%E5%8F%AF%E5%A4%8D%E7%8E%B0%E5%AE%9E%E9%AA%8C/">系列入口：00</a> · <a href="/2026/10/02/Scala-E05-Native%E4%B8%8EC%E6%8E%A5%E5%8F%A3%E7%9A%84%E5%86%85%E5%AD%98%E8%B4%A3%E4%BB%BB/">上一篇：E05</a> · <a href="/2026/10/02/Scala-E07-%E7%B1%BB%E5%9E%8B%E7%8A%B6%E6%80%81DSL%E4%B8%8E%E4%B8%A4%E7%A7%8D%E8%A7%A3%E9%87%8A%E5%99%A8/">下一篇：E07</a>。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/02/Scala-E06-Spark%E7%9A%84%E9%97%AD%E5%8C%85%E4%B8%8E%E9%87%8D%E6%89%A7%E8%A1%8C/">https://magicliang.github.io/2026/10/02/Scala-E06-Spark%E7%9A%84%E9%97%AD%E5%8C%85%E4%B8%8E%E9%87%8D%E6%89%A7%E8%A1%8C/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Scala/">Scala</a><a class="post-meta__tags" href="/tags/Spark/">Spark</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-java-jvm.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2020/04/16/Spark-SQL-%E5%8E%9F%E7%90%86/" title="Spark SQL 原理"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2020/04/16/Spark-SQL-%E5%8E%9F%E7%90%86/cluster.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2020-04-16</div><div class="info-item-2">Spark SQL 原理</div></div><div class="info-2"><div class="info-item-1">Spark SQL的发展历程 为了给熟悉的 RDBMS 但又不理解 MapReduce 的技术人员提供快速上手的工具，Hive 应运而生，他是当时唯一运行在 Hadoop 上的SQL-On-Hadoop 工具。 但是 MapReduce 计算过程中大量的中间磁盘落地过程消耗了大量的 I/O，降低的运行效率，为了提高 SQL 的执行效率，大量的 SQL-On-Hadoop工具开始产生，而 Shark 是其中一个表现较为突出的项目。 Shark是伯克利实验室 Spark 生态环境的组件之一，它主要修改了内存管理，物理计划和执行三个模块，值得它能运行在 Spark 的引擎上，从而提高 SQL 查询的效率。 但是随着 Spark 的发展，Shark 对 Hive 过多的依赖制约了 Spark 的设计理念和各个组件之间的相互继承，所以 Spark 团队停止了对 Shark 的开发，提出了 SparkSQL 项目。 因为摆脱了Hive 的过度依赖，Spark SQL在数据兼容性，性能优化和组件扩展等各个方面都得到了极大的方便和发展。 提出了 SparkSQL 项目之后，SQL On Spar...</div></div></div></a><a class="pagination-related" href="/2026/10/02/Scala-39-%E8%AE%A2%E5%8D%95%E6%89%B9%E5%A4%84%E7%90%86%E4%B8%8E%E6%95%85%E9%9A%9C%E8%AF%8A%E6%96%AD/" title="Scala 39：订单批处理与故障诊断"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">Scala 39：订单批处理与故障诊断</div></div><div class="info-2"><div class="info-item-1">一份订单文件怎样得到可信的结果 订单文件中的一行 one,2,12.00,CNY 表示编号、数量、单价和币种。程序按 5% 费率得到 25.20，再输出带行号的回执。算式很短，但外部输入可能缺列、数量为负、价格不是数字，报价可能拒绝或迟迟不返回，文件也可能在读取和关闭时分别失败。批处理需要把这些结果保留下来，调用者才能决定哪些命令可以重试。 结课工程将前面的数据类型、错误组合、上下文参数、Java 互操作、Future 和资源作用域放进同一条执行路径。模型只接受人民币订单；输入最多一万行；重复编号仅在当前批次拒绝；报价用本地实现替代外部服务。这些限制让每一种故障都有可重复的触发条件，也限定了“成功”究竟证明了什么。 冻结组合为 Scala 3.3.7、Scala CLI 1.9.1、Amazon Corretto JDK 21.0.11。状态为 LAB_VERIFIED。实验已经实际编译并运行 CLI，核验正常输入、非法字段、重复命令、报价拒绝、同步与异步报价失败、超时后任务继续、空批次、行数超限、读失败、关闭失败，以及两种失败同时出现时的异常保留。金额核心另在 Scala 2....</div></div></div></a><a class="pagination-related" href="/2026/10/02/Scala-27-Quotes%E4%B8%8E%E5%AE%8F%E9%98%B6%E6%AE%B5%E8%BE%B9%E7%95%8C/" title="Scala 27：Quotes、splices 与宏阶段边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">Scala 27：Quotes、splices 与宏阶段边界</div></div><div class="info-2"><div class="info-item-1">检查固定数量，同时保留调用者的求值次数 数量配置必须是编译时常量，并处于一到一百之间。上一章用 inline 条件能处理简单约束；当错误需要定位到具体参数，或生成逻辑需要引入局部变量时，Quotes 宏提供了更直接的有类型代码构造方式。 12inline def quantity(inline n: Int): Int =  $&#123; quantityImpl(&#x27;n) &#125; 调用 quantity(10) 会在编译阶段执行实现中的检查，并把合法结果放进生成程序。调用 quantity(101) 被拒绝。传入一个普通运行时方法参数，也被明确拒绝，而不会自动先运行应用再取回它的值。 第二个需求是生成一个二元组，两项都使用同一次输入计算结果。若简单把输入代码放两次，副作用就可能执行两次。宏必须生成局部绑定，保存一次求值结果，再读取两次。这个需求把类型正确、阶段正确和运行语义正确放在同一个可观察例子里。 实验冻结 Scala 3.3.7、Scala CLI 1.9.1、JDK 21.0.11。宏定义在 snippets/27/Checked.scala，调用在 s...</div></div></div></a><a class="pagination-related" href="/2026/10/02/Scala-30-Java%E4%BA%92%E6%93%8D%E4%BD%9C/" title="Scala 30：Java互操作的类型与运行边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">Scala 30：Java互操作的类型与运行边界</div></div><div class="info-2"><div class="info-item-1">能读取Java签名还不等于程序能运行 Scala 与 Java 都可以生成 JVM 类文件，但互操作不能只用“能导入一个 Java 类”验收。编译器可能读到源文件中的签名，运行时却找不到对应 class；集合转换可能改变可见接口，却仍共享底层可变对象；Java 返回 null 时，默认 Scala 引用类型也不自动得到非空保证。 本章把这些问题分开实验。独立工程先用 javac 编译 Java 库，再编译调用该库的 Scala 对象，然后用 javac 编译真正的 Java 客户端，最后直接执行 java。普通章节入口另外验证集合视图、快照、单抽象方法接口和空值行为。 冻结环境为 Scala 3.3.7、Scala CLI 1.9.1、JDK 21.0.11。带显式空值检查的样例单独使用 -Yexplicit-nulls，没有把这个选项注入整套默认构建。这样才能比较默认模式与显式空值模式各自接受什么，而不是把两套规则混成一个描述。 双向调用需要真正的两种编译产物 Java 库提供一个静态乘三方法，Scala 对象提供乘二与调用 Java 的方法，Java 客户端再调用这两个 Sc...</div></div></div></a><a class="pagination-related" href="/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/" title="宽依赖与窄依赖：Stage 是怎样划分出来的"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/07/13/%E5%AE%BD%E4%BE%9D%E8%B5%96%E4%B8%8E%E7%AA%84%E4%BE%9D%E8%B5%96-Stage-%E6%98%AF%E6%80%8E%E6%A0%B7%E5%88%92%E5%88%86%E5%87%BA%E6%9D%A5%E7%9A%84/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">宽依赖与窄依赖：Stage 是怎样划分出来的</div></div><div class="info-2"><div class="info-item-1">上一篇拆解了 RDD 的五大属性，其中 dependencies 决定了 RDD 之间的依赖类型。这一篇进入依赖类型的核心区分——宽依赖和窄依赖——以及它如何直接决定 Stage 的划分。 宽依赖和窄依赖容易被理解成&quot;一对一&quot;和&quot;多对多&quot;的分区关系。更准确的说法是：窄依赖意味着子 RDD 的每个分区只依赖父 RDD 的固定少数分区，可以在单个 Task 内完成计算；宽依赖意味着子 RDD 的分区需要读取父 RDD 所有分区的数据，必须等待一次全量数据交换（Shuffle）。 本文只抓一个问题：DAGScheduler 按什么规则把 RDD 依赖图切分成 Stage。 下图展示了 Stage 划分的核心规则——窄依赖 pipeline 执行，宽依赖切出新 Stage：  窄依赖的三种形态 窄依赖（NarrowDependency）的定义是：父 RDD 的每个分区最多被子 RDD 的一个分区使用。在 Spark 源码中，NarrowDependency 有两个具体子类： OneToOneDependency：父子分区一一对应。map、filte...</div></div></div></a><a class="pagination-related" href="/2026/10/02/Scala-35-sbt%E6%A8%A1%E5%9D%97%E4%B8%8E%E4%BE%9D%E8%B5%96/" title="Scala 35：sbt、模块与依赖"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">Scala 35：sbt、模块与依赖</div></div><div class="info-2"><div class="info-item-1">订单程序可以运行以后，构建还需要证明什么 订单总额计算只有几行代码，把它和命令行入口放在一起很方便。但当另一个程序也要复用计算规则时，两个问题随之出现：核心规则能否独立编译，使用者拿到发布的 jar 后能否得到相同行为？源码放进同一个仓库，只能说明文件接近，不能回答这两个问题。 本章把纯计算放在 core，把输出入口放在 cli，再增加一个只读取发布坐标的 consumer。模块边界由实际编译成功和失败来观察；发布边界由另一条依赖路径来验证。测试采用简单断言，业务规则仍是两项订单合计五百分，避免构建问题被复杂业务掩盖。 实验固定 sbt 1.11.7、JDK 21.0.11-amzn，主版本 Scala 3.3.7，并以 Scala 2.13.16 做交叉构建。实验状态为 LAB_VERIFIED，最终运行编号为 20261002-ch35-r3。完整源码位于 examples/scala-lab/modules/35，命令、退出码和原始日志见配套 RUN.md。 构建定义同时描述配置值与任务依赖 下面是工程的版本配置： 1234ThisBuild / organization ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%89%88%E6%9C%AC%E7%9F%A9%E9%98%B5%E5%85%88%E4%BA%8E%E4%B8%9A%E5%8A%A1%E4%BB%A3%E7%A0%81"><span class="toc-number">1.</span> <span class="toc-text">版本矩阵先于业务代码</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#transformation-%E4%BF%9D%E5%AD%98%E8%AE%A1%E7%AE%97%E6%8F%8F%E8%BF%B0"><span class="toc-number">2.</span> <span class="toc-text">transformation 保存计算描述</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%97%AD%E5%8C%85%E6%8D%95%E8%8E%B7%E4%BA%86%E4%BB%80%E4%B9%88"><span class="toc-number">3.</span> <span class="toc-text">闭包捕获了什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%AC%E5%9C%B0%E6%A8%A1%E5%BC%8F%E4%BB%8D%E6%9C%89%E8%BE%B9%E7%95%8C"><span class="toc-number">4.</span> <span class="toc-text">本地模式仍有边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BC%93%E5%AD%98%E6%94%B9%E5%8F%98%E9%87%8D%E7%AE%97%E6%88%90%E6%9C%AC-%E4%B8%8D%E6%8F%90%E4%BE%9B%E4%BA%8B%E5%8A%A1"><span class="toc-number">5.</span> <span class="toc-text">缓存改变重算成本，不提供事务</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%A7%82%E6%B5%8B%E4%B8%8E%E7%94%9F%E4%BA%A7%E6%8E%A8%E8%AE%BA%E5%88%86%E5%BC%80"><span class="toc-number">6.</span> <span class="toc-text">观测与生产推论分开</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%97%AD%E5%8C%85%E5%AE%A1%E6%9F%A5%E4%BB%8E%E4%BE%9D%E8%B5%96%E5%AF%B9%E8%B1%A1%E5%BC%80%E5%A7%8B"><span class="toc-number">7.</span> <span class="toc-text">闭包审查从依赖对象开始</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%93%E6%9E%9C%E4%B8%8E%E7%BB%83%E4%B9%A0"><span class="toc-number">8.</span> <span class="toc-text">结果与练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">9.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

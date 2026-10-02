@@ -1,0 +1,716 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Spring 33：缓存键、并发加载与事务回滚 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="数据库回滚，缓存为什么还保留新值 一次操作写入数据库，再通过 @CachePut 更新价格缓存，最后把事务标记为 rollback-only。独立连接确认数据库里没有新记录，缓存里却能读到 uncommitted。这个结果不需要框架出错：普通内存缓存与 JDBC 事务管理器没有共同的提交协议。 缓存一致性至少涉及键空间、加载并发和提交边界。代理命中只能说明某次调用找到了缓存条目，不能证明条目仍然新">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Spring 33：缓存键、并发加载与事务回滚">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-33-%E7%BC%93%E5%AD%98%E9%94%AE%E5%B9%B6%E5%8F%91%E5%8A%A0%E8%BD%BD%E4%B8%8E%E4%BA%8B%E5%8A%A1%E5%9B%9E%E6%BB%9A/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="数据库回滚，缓存为什么还保留新值 一次操作写入数据库，再通过 @CachePut 更新价格缓存，最后把事务标记为 rollback-only。独立连接确认数据库里没有新记录，缓存里却能读到 uncommitted。这个结果不需要框架出错：普通内存缓存与 JDBC 事务管理器没有共同的提交协议。 缓存一致性至少涉及键空间、加载并发和提交边界。代理命中只能说明某次调用找到了缓存条目，不能证明条目仍然新">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-33-%E7%BC%93%E5%AD%98%E9%94%AE%E5%B9%B6%E5%8F%91%E5%8A%A0%E8%BD%BD%E4%B8%8E%E4%BA%8B%E5%8A%A1%E5%9B%9E%E6%BB%9A/cover.svg">
+<meta property="article:published_time" content="2026-10-02T11:40:00.000Z">
+<meta property="article:modified_time" content="2026-10-02T10:45:04.761Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Spring">
+<meta property="article:tag" content="缓存">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-33-%E7%BC%93%E5%AD%98%E9%94%AE%E5%B9%B6%E5%8F%91%E5%8A%A0%E8%BD%BD%E4%B8%8E%E4%BA%8B%E5%8A%A1%E5%9B%9E%E6%BB%9A/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Spring 33：缓存键、并发加载与事务回滚",
+  "url": "https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-33-%E7%BC%93%E5%AD%98%E9%94%AE%E5%B9%B6%E5%8F%91%E5%8A%A0%E8%BD%BD%E4%B8%8E%E4%BA%8B%E5%8A%A1%E5%9B%9E%E6%BB%9A/",
+  "image": "https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-33-%E7%BC%93%E5%AD%98%E9%94%AE%E5%B9%B6%E5%8F%91%E5%8A%A0%E8%BD%BD%E4%B8%8E%E4%BA%8B%E5%8A%A1%E5%9B%9E%E6%BB%9A/cover.svg",
+  "datePublished": "2026-10-02T11:40:00.000Z",
+  "dateModified": "2026-10-02T10:45:04.761Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-33-%E7%BC%93%E5%AD%98%E9%94%AE%E5%B9%B6%E5%8F%91%E5%8A%A0%E8%BD%BD%E4%B8%8E%E4%BA%8B%E5%8A%A1%E5%9B%9E%E6%BB%9A/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Spring 33：缓存键、并发加载与事务回滚',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1347</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1470</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">25</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-33-%E7%BC%93%E5%AD%98%E9%94%AE%E5%B9%B6%E5%8F%91%E5%8A%A0%E8%BD%BD%E4%B8%8E%E4%BA%8B%E5%8A%A1%E5%9B%9E%E6%BB%9A/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Spring 33：缓存键、并发加载与事务回滚</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Spring 33：缓存键、并发加载与事务回滚</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-02T11:40:00.000Z" title="Created 2026-10-02 19:40:00">2026-10-02</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-02T10:45:04.761Z" title="Updated 2026-10-02 18:45:04">2026-10-02</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.6k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>8mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-02 18:45:04&quot;}" hidden></div><h2 id="数据库回滚-缓存为什么还保留新值">数据库回滚，缓存为什么还保留新值</h2>
+<p>一次操作写入数据库，再通过 <code>@CachePut</code> 更新价格缓存，最后把事务标记为 rollback-only。独立连接确认数据库里没有新记录，缓存里却能读到 <code>uncommitted</code>。这个结果不需要框架出错：普通内存缓存与 JDBC 事务管理器没有共同的提交协议。</p>
+<p>缓存一致性至少涉及键空间、加载并发和提交边界。代理命中只能说明某次调用找到了缓存条目，不能证明条目仍然新鲜，也不能证明它来自已经提交的数据库状态。</p>
+<p>实验 <code>blog.spring.Chapter33</code> 固定 Spring Framework 6.2.11、JDK 21、<code>ConcurrentMapCacheManager</code>，数据库使用 PostgreSQL 18.0。所有缓存结论都限定在这个 provider 和单 JVM 内；没有用本地 <code>sync=true</code> 推导 Redis 集群的行为。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="cache-consistency.svg" alt="缓存查找、加载与独立数据库提交"></p>
+<h2 id="cacheinterceptor-处理调用-provider-保存数据">CacheInterceptor 处理调用，provider 保存数据</h2>
+<p><code>@EnableCaching</code> 注册缓存 Advisor，<code>CacheInterceptor</code> 把代理调用委托给 <code>CacheAspectSupport</code>。后者解析操作元数据，计算键，解析 Cache，按照操作类型查找、调用目标、写入或失效。实际存储由 <code>CacheManager</code> 返回的 Cache 完成。</p>
+<p>这层分工使相同注解可以适配多个 provider，也保留了能力差异。是否有过期时间、是否跨进程共享、加载是否原子、是否支持事务感知，都不能仅凭方法上有 <code>@Cacheable</code> 作答。<a target="_blank" rel="noopener" href="https://github.com/spring-projects/spring-framework/blob/4c134254642d88e058aa004bdaf44168e1be7bb2/spring-context/src/main/java/org/springframework/cache/interceptor/CacheAspectSupport.java">固定版本缓存拦截实现</a></p>
+<p>实验中的 <code>read(&quot;a&quot;)</code> 每次真正执行都会增加目标计数并生成新值。两次外部调用返回相同字符串，目标计数保持1，证明第二次没有再次执行加载逻辑。随后目标内部的 <code>self(&quot;a&quot;)</code> 直接调用 <code>read</code>，计数继续变化，返回值与缓存命中值不同。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CHECK PASS 33 second read hits cache<br>CHECK PASS 33 self call bypasses cache<br></code></pre></td></tr></table></figure>
+<p>计数放在目标对象中。测试经 <code>Advised.getTargetSource()</code> 取得目标，仅用来读取计数和控制门闩；业务调用仍经过代理。直接读取 CGLIB 代理实例上的字段会混淆代理与目标的状态，这种测试写法本身也必须避免。</p>
+<h2 id="默认键没有包括方法名">默认键没有包括方法名</h2>
+<p><code>usd(String key)</code> 与 <code>eur(String key)</code> 使用同一个 <code>collision</code> 缓存，参数都是 <code>sku</code>。先调用 usd 得到 <code>USD</code>，再调用 eur 仍得到 <code>USD</code>，虽然第二个目标方法的实现固定返回 <code>EUR</code>。</p>
+<p>原因是默认 <code>SimpleKeyGenerator</code> 根据参数生成键：零参数用空键，单个非空且非数组参数直接作为键，多参数等情况使用 <code>SimpleKey</code>。方法名和所属类不自动进入默认键。因此不同方法共享缓存名和同一参数值，会共享条目。<a target="_blank" rel="noopener" href="https://github.com/spring-projects/spring-framework/blob/4c134254642d88e058aa004bdaf44168e1be7bb2/spring-context/src/main/java/org/springframework/cache/interceptor/SimpleKeyGenerator.java">键生成源码</a></p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CHECK PASS 33 default key omits method identity<br></code></pre></td></tr></table></figure>
+<p>这种冲突在实际接口里不一定立即表现为异常。如果两个方法都返回 String，错误值仍满足类型要求，测试只检查非空就会通过。若一个返回商品摘要、另一个返回完整对象，则可能在更远处出现类型错误。</p>
+<p>修复应围绕数据身份设计：不同语义使用不同缓存空间，或把币种、租户和版本等真正决定值的维度纳入键。机械地加入方法名能减少方法间碰撞，却不能补上遗漏的租户。键中的可变对象也要谨慎；对象在写入之后改变 equals/hashCode 所依赖字段，会破坏查找预期。</p>
+<h2 id="成功-异常与失效有不同的时点">成功、异常与失效有不同的时点</h2>
+<p><code>broken(&quot;bad&quot;)</code> 在加载时抛异常。调用方观察到 <code>IllegalArgumentException</code>，随后直接查询 provider，要求 <code>bad</code> 条目不存在。这一对断言把“异常传播”和“没有缓存失败结果”分别验证。</p>
+<p><code>evict(&quot;a&quot;)</code> 使用普通 <code>@CacheEvict</code>。调用前保存旧值，失效后再次 read 得到新的计数值。仅仅调用 eviction 方法不够，下一次读取是否重新加载才是失效行为的可见结果。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">CHECK PASS 33 failure escapes<br>CHECK PASS 33 failing invocation not populated<br>CHECK PASS 33 eviction forces reload<br></code></pre></td></tr></table></figure>
+<p>默认在成功调用后失效与 <code>beforeInvocation=true</code> 的行为不同：目标方法失败时，后置失效可能尚未发生，前置失效则已经执行。选择取决于业务对失败后的旧值有什么要求，不能为了提高命中率就隐去更新失败与条目失效的关系。</p>
+<p><code>@CachePut</code> 与 <code>@Cacheable</code> 也不能互换。前者用于执行目标并把结果写入缓存，后者可以在命中时跳过目标。需要执行数据库写入的命令若被不恰当地标成 Cacheable，命中时可能连命令本身都不再执行。<a target="_blank" rel="noopener" href="https://docs.spring.io/spring-framework/reference/6.2/integration/cache/annotations.html">Spring 缓存注解</a></p>
+<h2 id="两次-miss-为什么会执行两次加载">两次 miss 为什么会执行两次加载</h2>
+<p>普通缓存实验启动两个客户端线程，同时读取 <code>normal</code> 缓存中的 <code>same</code>。目标每次进入都增加 normalLoads，然后等待一个初始为2的门闩。只有两个目标调用都已进入，门闩才打开。</p>
+<p>两次 Future 最终都返回 <code>loaded</code>，目标计数是2。这个受控条件证明：线程安全的 Map 并没有把“查找未命中→执行昂贵加载→写入”整体变成互斥操作。Map 自身没有损坏，与数据库查询只执行一次，是两个不同的属性。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CHECK PASS 33 concurrent misses execute twice<br></code></pre></td></tr></table></figure>
+<p>这也解释了高命中率为什么不能单独防止缓存击穿。热点键失效的一刻，大量调用可能都先读到 miss。即使最后留下的是一个正确值，底层服务也已经承受了多次加载。需要观察加载次数、耗时和队列，而不能只看最终缓存大小。</p>
+<p>实验没有以吞吐量测量替代并发关系。门闩使两次加载必然重叠，5秒超时只负责让错误条件有界失败。把并发测试写成启动两条线程后睡一会儿，可能在调度碰巧串行时也通过，无法证明 miss 窗口存在。</p>
+<h2 id="sync-true-把加载协调交给-provider">sync=true 把加载协调交给 provider</h2>
+<p>第二组方法使用 <code>@Cacheable(sync=true)</code>。第一条加载进入后阻塞，第二个客户端必须已经到达 provider 的 <code>get(key, Callable)</code> 入口，主线程才释放第一条加载。provider 是 <code>ConcurrentMapCache</code>，实验子类只在入口减少门闩，随后完整委托给原实现，没有替换它的并发语义。</p>
+<p>两个客户端得到相同结果，syncLoads 为1。底层实现通过 ConcurrentMap 的原子计算协调同键加载；第二个客户端不会重新执行本次加载函数。<a target="_blank" rel="noopener" href="https://github.com/spring-projects/spring-framework/blob/4c134254642d88e058aa004bdaf44168e1be7bb2/spring-context/src/main/java/org/springframework/cache/concurrent/ConcurrentMapCache.java">ConcurrentMapCache 固定版本源码</a></p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CHECK PASS 33 sync provider loads once<br>CHECK PASS 33 concurrent clients terminated<br></code></pre></td></tr></table></figure>
+<p>这个结论严格限定为本次 provider、同一缓存实例与同一键。换一个 provider 必须核对 <code>get(key, Callable)</code> 的保证；跨两个 JVM 的内存 Map 当然不会共享锁。sync 也有操作组合限制，例如不能随意与 <code>unless</code> 等配置组合，配置合法性应独立验证。</p>
+<p>同步加载还引入等待关系。加载函数如果永久阻塞，同键调用会一起等待。减少重复加载不是超时、熔断或幂等协议的替代品。返回可变对象时，所有命中者还可能共享同一引用，读取后修改对象的并发风险也没有被 sync 消除。</p>
+<h2 id="回滚反例需要独立数据库观察者">回滚反例需要独立数据库观察者</h2>
+<p>事务实验在专用表 <code>spring_ch33_value</code> 插入记录1，通过 <code>p.put(&quot;tx&quot;, &quot;uncommitted&quot;)</code> 更新缓存，再调用 <code>setRollbackOnly()</code>。TransactionTemplate 返回后，独立 DriverManager 连接查询表内计数，要求为0；随后直接查询缓存，要求仍是 <code>uncommitted</code>。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">CHECK PASS 33 independent observer confirms database rollback<br>CHECK PASS 33 ordinary cache survives database rollback<br>CHECK PASS 33 JDBC lease returned<br></code></pre></td></tr></table></figure>
+<p>程序没有使用同一事务连接验证回滚，也没有把一个内存变量当成数据库状态。数据库查询与缓存读取分别观察两个资源，结果表明默认配置不存在联合回滚。</p>
+<p>事务感知缓存装饰器可以把部分写入动作延迟到成功提交之后，但仍需逐项阅读它对 put、evict、clear 及即时操作的契约。延后本地缓存更新也不能自动解决其他进程读旧值、提交与远程缓存写入之间崩溃、失效消息乱序等问题。本篇没有启用该装饰器，不能用默认 provider 的实验宣称其功能失效。<a target="_blank" rel="noopener" href="https://docs.spring.io/spring-framework/docs/6.2.11/javadoc-api/org/springframework/cache/transaction/TransactionAwareCacheDecorator.html">TransactionAwareCacheDecorator API</a></p>
+<p>缓存可以作为可重建的读优化，也可以承担幂等判断或状态协调。一旦承担后两者，就需要把一致性与故障恢复写进协议，而不是把 CacheManager 接口当成已经提供了这些保证。</p>
+<h2 id="复现与预测练习">复现与预测练习</h2>
+<p>JDK 21、数据库启动方式见实验工程 <code>db/README.md</code>，运行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">./mvnw -q compile <span class="hljs-built_in">exec</span>:java -Dexec.mainClass=blog.spring.Chapter33<br></code></pre></td></tr></table></figure>
+<p>本次12条断言通过，退出码0，日志在 <code>evidence/33/local-20261002/run.txt</code>。程序关闭两个并发客户端线程，检查数据库活跃租约归零，最后由 try-with-resources 关闭容器和连接池。</p>
+<p>预测题：给 eur 方法增加不同的方法名，却仍使用默认键和同一个缓存，冲突会消失吗？不会，默认键未包含方法名。改变缓存名或明确包含币种的键才会改变条目身份。</p>
+<p>改动练习：把 usd 与 eur 统一成 <code>price(currency, sku)</code>，保留同一缓存名，增加两种币种的断言。再把 key 错误地指定为只包含 sku，要求测试重新捕获冲突。这样能确认测试检查的是业务身份，而不是偶然不同的字符串。</p>
+<p>上游 <code>AbstractCacheAnnotationTests</code> 的 sync 与异常用例只做源码对照，本次未运行 Framework 的完整测试集。本地12条断言覆盖本文列出的行为，不代表已经完成任意缓存 provider 的兼容性认证。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://docs.spring.io/spring-framework/reference/6.2/integration/cache.html">Spring 6.2 缓存抽象</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/spring-projects/spring-framework/blob/4c134254642d88e058aa004bdaf44168e1be7bb2/spring-context/src/main/java/org/springframework/cache/interceptor/SimpleKeyGenerator.java">固定版本 SimpleKeyGenerator</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/spring-projects/spring-framework/blob/4c134254642d88e058aa004bdaf44168e1be7bb2/spring-context/src/testFixtures/java/org/springframework/context/testfixture/cache/AbstractCacheAnnotationTests.java">固定版本缓存注解测试夹具</a></li>
+</ul>
+<a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-00-%E4%BB%8E%E6%89%8B%E5%8A%A8%E7%BB%84%E8%A3%85%E5%88%B0%E5%8F%AF%E9%AA%8C%E8%AF%81%E7%9A%84%E5%AE%B9%E5%99%A8%E5%AE%9E%E9%AA%8C/" title="深入 Spring（00）：从手动组装到可验证的容器实验">系列入口与完整实验工程</a>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-33-%E7%BC%93%E5%AD%98%E9%94%AE%E5%B9%B6%E5%8F%91%E5%8A%A0%E8%BD%BD%E4%B8%8E%E4%BA%8B%E5%8A%A1%E5%9B%9E%E6%BB%9A/">https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-33-%E7%BC%93%E5%AD%98%E9%94%AE%E5%B9%B6%E5%8F%91%E5%8A%A0%E8%BD%BD%E4%B8%8E%E4%BA%8B%E5%8A%A1%E5%9B%9E%E6%BB%9A/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Spring/">Spring</a><a class="post-meta__tags" href="/tags/%E7%BC%93%E5%AD%98/">缓存</a></div><div class="post-share"><div class="social-share" data-image="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-33-%E7%BC%93%E5%AD%98%E9%94%AE%E5%B9%B6%E5%8F%91%E5%8A%A0%E8%BD%BD%E4%B8%8E%E4%BA%8B%E5%8A%A1%E5%9B%9E%E6%BB%9A/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-32-Scheduled%E7%9A%84%E6%97%B6%E9%97%B4%E5%9F%BA%E5%87%86%E9%87%8D%E5%8F%A0%E4%B8%8E%E5%85%B3%E9%97%AD/" title="深入 Spring 32：Scheduled 的时间基准、重叠与关闭"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-32-Scheduled%E7%9A%84%E6%97%B6%E9%97%B4%E5%9F%BA%E5%87%86%E9%87%8D%E5%8F%A0%E4%B8%8E%E5%85%B3%E9%97%AD/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring 32：Scheduled 的时间基准、重叠与关闭</div></div><div class="info-2"><div class="info-item-1">任务运行25秒，每10秒调度意味着什么 一条任务配置每10秒执行，实际运行25秒。下一次开始于第10秒、第25秒还是第35秒？回答取决于时间基准和执行器。固定频率描述计划时刻，固定延迟描述前一次完成之后的等待时间；计划到期也不保证立即拿到工作线程。 第二个问题同样需要限定条件：线程池有两条线程，同一个调度方法会不会重叠？单个周期注册与同一方法上的两个独立注册具有不同的约束。把“方法相同”误当成“注册相同”，容易遗漏并发执行。 实验 blog.spring.Chapter32 固定 Spring Framework 6.2.11 和 JDK 21。时间公式使用固定 Instant、固定 Clock 与 Asia/Shanghai 时区；实际调度器用门闩控制重叠，用有界等待观察结束。没有依靠机器负载估计时间精度。  注解注册发生在容器阶段 @EnableScheduling 注册负责扫描的 ScheduledAnnotationBeanPostProcessor。它查找适用方法，将同步方法转换为可调用的调度任务，交给注册器及调度器。Bean 初始化只是发现和注册的一部分，实际运行时点...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-31-Async%E7%9A%84%E6%8F%90%E4%BA%A4%E6%89%A7%E8%A1%8C%E4%B8%8E%E5%A4%B1%E8%B4%A5%E8%A7%82%E5%AF%9F/" title="深入 Spring 31：Async 的提交、执行与失败观察"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-31-Async%E7%9A%84%E6%8F%90%E4%BA%A4%E6%89%A7%E8%A1%8C%E4%B8%8E%E5%A4%B1%E8%B4%A5%E8%A7%82%E5%AF%9F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring 31：Async 的提交、执行与失败观察</div></div><div class="info-2"><div class="info-item-1">返回 Future 时，任务可能还没有开始 订单接口调用一个标记 @Async 的方法，获得 CompletableFuture，随即返回成功。这个动作能够证明什么？只能证明提交路径返回了一个句柄。线程池可能正在执行别的任务，新任务仍留在队列里；稍后的业务执行也可能失败。若执行器已饱和，提交本身就可能抛异常，连这个句柄都拿不到。 把异步流程拆成提交、开始和完成三个时点，错误位置就容易定位。提交拒绝发生在调用线程，目标方法异常发生在工作线程，结果观察则由 Future 或异常处理器承担。它们不应共用一条“异步失败”的无阶段日志。 实验基线为 Spring Framework 6.2.11、JDK 21，源码固定到 4c134254642d88e058aa004bdaf44168e1be7bb2。入口 blog.spring.Chapter31 使用真实的 Spring 异步代理、容量有限的 ThreadPoolTaskExecutor 和 PostgreSQL 18.0 事务。没有依赖 Spring Boot 的线程池自动配置。  注解如何变成执行器提交 启用 @EnableAsy...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-42-AOT%E7%94%9F%E6%88%90%E4%BB%A3%E7%A0%81%E4%B8%8E%E8%BF%90%E8%A1%8C%E6%97%B6%E9%85%8D%E7%BD%AE%E7%9A%84%E8%BE%B9%E7%95%8C/" title="深入 Spring 42：AOT 生成代码与运行时配置的边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-42-AOT%E7%94%9F%E6%88%90%E4%BB%A3%E7%A0%81%E4%B8%8E%E8%BF%90%E8%A1%8C%E6%97%B6%E9%85%8D%E7%BD%AE%E7%9A%84%E8%BE%B9%E7%95%8C/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring 42：AOT 生成代码与运行时配置的边界</div></div><div class="info-2"><div class="info-item-1">启动参数出现 red，容器里的 Bean 仍然是 blue 配置类定义两个同类型 Bean：@Profile(&quot;blue&quot;) 返回 blue，@Profile(&quot;red&quot;) 返回 red。普通 JVM 分别带 blue、red 启动，容器里也分别出现对应 Bean。用 blue 生成 Spring AOT 产物后，再给 AOT JVM 传 red，实验仍取得 blue Bean。 日志中有效 profile 是 blue,red，这并不矛盾。环境属性仍可在启动时参与处理，已经生成的 Bean 注册代码却不会重新执行一次任意的配置类发现与条件选择。把“Environment 中出现了某个值”当作“容器根据该值重建了 Bean 集合”，会误判 AOT 应用的装配行为。 实验固定 Framework 6.2.11、Boot 3.5.6 与 JDK 21。final-lab/AotApp 是独立的非 Web 入口，避免把数据库连接和服务器启动引入 AOT 基础实验；它与订单入口共享 Maven 模块和冻结依赖。普通 JVM、生成代码、AOT JVM...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-30-MVC%E5%BC%82%E6%AD%A5%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E8%B5%84%E6%BA%90%E5%9B%9E%E6%94%B6/" title="深入 Spring 30：MVC 异步超时取消与资源回收"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-30-MVC%E5%BC%82%E6%AD%A5%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E8%B5%84%E6%BA%90%E5%9B%9E%E6%94%B6/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring 30：MVC 异步超时取消与资源回收</div></div><div class="info-2"><div class="info-item-1">响应已经超时，后台为何还在工作 客户端收到 503，服务器的一项外部生产任务仍停在等待中。稍后任务结束，尝试把结果写回 DeferredResult，却得到 false。请求超时只结束了可向客户端交付结果的窗口，没有自动取得并终止应用自行创建的任务。 相似的误判也发生在断连场景：客户端关闭连接后，服务器不一定立即知道；通常要到读写触及网络错误时才能发现。即使发现了断连，也需要业务代码释放持有的资源。Servlet 异步把请求线程释放出来，并没有把这些生命周期合并成一个自动完成的对象。 本篇使用 Spring Framework 6.2.11，固定源码提交 4c134254642d88e058aa004bdaf44168e1be7bb2，JDK 21 与 Tomcat 10.1.46。完整实验 MvcLab 30 运行真实容器，分别观察 HTTP 响应、重新分派、任务状态及资源计数。断连负例使用真实 Socket 发送 RST，不以取消模拟 Future 代替网络故障。  Callable 与 DeferredResult 的任务归属 Callable 返回值把任务交给 MVC 的...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-39-%E5%AF%BC%E5%85%A5%E9%80%89%E6%8B%A9%E6%B3%A8%E5%86%8C%E4%B8%8E%E6%89%A9%E5%B1%95%E8%BE%B9%E7%95%8C/" title="深入 Spring 39：导入、选择、注册与容器扩展边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-39-%E5%AF%BC%E5%85%A5%E9%80%89%E6%8B%A9%E6%B3%A8%E5%86%8C%E4%B8%8E%E6%89%A9%E5%B1%95%E8%BE%B9%E7%95%8C/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring 39：导入、选择、注册与容器扩展边界</div></div><div class="info-2"><div class="info-item-1">增加一个策略，是否需要一个框架 订单应用需要一个限额为 7 的策略。直接写 @Bean OrderPolicy registeredPolicy() 就能完成注册、构造器调用、依赖注入和销毁管理。增加一个 @EnableOrderPolicy 注解后，最终对象仍然是同一个 record 类型，使用方的业务能力没有增加。 扩展有价值的条件，是声明来源和注册规则出现重复：多个应用需要按同一种注解协议启用一组定义，或者注册数量与导入类元数据有关。只有一个应用、一个固定对象时，普通配置已经表达了全部事实。多加 Selector 和 Registrar 会增加故障发生的阶段与定位成本。 本篇构造一个刻意很小的扩展，并保留普通 Bean 对照。它只注册一个名字固定的策略，遇到独立导入者争用名称时立即失败，不提供扫描全包、动态脚本、自动发现所有策略或通用插件平台。这个限制让重复导入与名称冲突可以在十条断言中解释清楚。 实验使用 JDK 21、Framework 6.2.11，Framework 固定源码提交为 4c134254642d88e058aa004bdaf44168e1be7bb2。自...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-00-%E4%BB%8E%E6%89%8B%E5%8A%A8%E7%BB%84%E8%A3%85%E5%88%B0%E5%8F%AF%E9%AA%8C%E8%AF%81%E7%9A%84%E5%AE%B9%E5%99%A8%E5%AE%9E%E9%AA%8C/" title="深入 Spring（00）：从手动组装到可验证的容器实验"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-00-%E4%BB%8E%E6%89%8B%E5%8A%A8%E7%BB%84%E8%A3%85%E5%88%B0%E5%8F%AF%E9%AA%8C%E8%AF%81%E7%9A%84%E5%AE%B9%E5%99%A8%E5%AE%9E%E9%AA%8C/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring（00）：从手动组装到可验证的容器实验</div></div><div class="info-2"><div class="info-item-1">订单服务能够计算金额并保存订单，是否必须使用 Spring？可以先直接创建三个对象，调用结果与容器装配后的结果相同。差异出现在依赖由谁选择、对象在何时创建、失败在何处暴露，以及关闭时由谁执行清理。理解这些差异，比记住一个启动注解更适合作为源码阅读的起点。 本篇固定一个可检验的问题：把同一份订单业务交给容器装配，业务结果、缺依赖时的异常与资源终态分别怎样变化？示例使用内存仓储，仅运行单线程调用。实验不涉及 HTTP、事务、数据库或 Spring Boot。 冻结版本与复现入口 教学工程采用 Spring Framework 6.2.11、JDK 21，对应 release tag v6.2.11，完整源码 SHA 为 4c134254642d88e058aa004bdaf44168e1be7bb2。官方发布记录与版本提交用于核对坐标和源码。 Framework 6.x 最低要求 Java 17，采用 Jakarta 命名空间。本系列运行 JDK 21；操作系统默认的 Java 8 无法编译本实验。6.2 已于 2026 年 6 月结束开源支持，因此这里固定它作为机制研究版本。生产版...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%B0%E6%8D%AE%E5%BA%93%E5%9B%9E%E6%BB%9A-%E7%BC%93%E5%AD%98%E4%B8%BA%E4%BB%80%E4%B9%88%E8%BF%98%E4%BF%9D%E7%95%99%E6%96%B0%E5%80%BC"><span class="toc-number">1.</span> <span class="toc-text">数据库回滚，缓存为什么还保留新值</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#cacheinterceptor-%E5%A4%84%E7%90%86%E8%B0%83%E7%94%A8-provider-%E4%BF%9D%E5%AD%98%E6%95%B0%E6%8D%AE"><span class="toc-number">2.</span> <span class="toc-text">CacheInterceptor 处理调用，provider 保存数据</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%BB%98%E8%AE%A4%E9%94%AE%E6%B2%A1%E6%9C%89%E5%8C%85%E6%8B%AC%E6%96%B9%E6%B3%95%E5%90%8D"><span class="toc-number">3.</span> <span class="toc-text">默认键没有包括方法名</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%88%90%E5%8A%9F-%E5%BC%82%E5%B8%B8%E4%B8%8E%E5%A4%B1%E6%95%88%E6%9C%89%E4%B8%8D%E5%90%8C%E7%9A%84%E6%97%B6%E7%82%B9"><span class="toc-number">4.</span> <span class="toc-text">成功、异常与失效有不同的时点</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E6%AC%A1-miss-%E4%B8%BA%E4%BB%80%E4%B9%88%E4%BC%9A%E6%89%A7%E8%A1%8C%E4%B8%A4%E6%AC%A1%E5%8A%A0%E8%BD%BD"><span class="toc-number">5.</span> <span class="toc-text">两次 miss 为什么会执行两次加载</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#sync-true-%E6%8A%8A%E5%8A%A0%E8%BD%BD%E5%8D%8F%E8%B0%83%E4%BA%A4%E7%BB%99-provider"><span class="toc-number">6.</span> <span class="toc-text">sync&#x3D;true 把加载协调交给 provider</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9E%E6%BB%9A%E5%8F%8D%E4%BE%8B%E9%9C%80%E8%A6%81%E7%8B%AC%E7%AB%8B%E6%95%B0%E6%8D%AE%E5%BA%93%E8%A7%82%E5%AF%9F%E8%80%85"><span class="toc-number">7.</span> <span class="toc-text">回滚反例需要独立数据库观察者</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%8D%E7%8E%B0%E4%B8%8E%E9%A2%84%E6%B5%8B%E7%BB%83%E4%B9%A0"><span class="toc-number">8.</span> <span class="toc-text">复现与预测练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">9.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

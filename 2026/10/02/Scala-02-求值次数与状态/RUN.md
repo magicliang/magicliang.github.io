@@ -14,4 +14,4 @@ python3 examples/scala-lab/run.py bytecode --run-id local
 
 实测计数：source 总调用 7 次；lazy 首次失败、第二次成功、随后缓存，总尝试 2 次；两个线程读取局部 lazy 得到 99，初始化次数 1。线程均设超时并关闭线程池。
 
-局部字节码 `bytecode-02.log` 与 JSON 为 `LAB_VERIFIED`，exit=0，匹配 LazyInt、initialized、initialize 和 monitorenter。固定源码结构为 `SOURCE_VERIFIED`；递归死锁、成员字段字节码、Scala.js 和 @threadUnsafe 为 `NOT_RUN`。一次线程调度不能证明所有竞争路径覆盖。
+局部字节码 `bytecode-02.log` 与 JSON 为 `LAB_VERIFIED`，exit=0，匹配 LazyInt、initialized、initialize 和 monitorenter。固定源码结构为 `SOURCE_VERIFIED`；递归死锁、成员字段字节码、本章 lazy 实现的 Scala.js 对照和 @threadUnsafe 为 `NOT_RUN`。E04 另有共享纯核心的实际 Scala.js 运行，不能替代这里的 lazy 对照。一次线程调度不能证明所有竞争路径覆盖。
