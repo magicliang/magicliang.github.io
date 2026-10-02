@@ -1,0 +1,781 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Ruby E03：JRuby 与 JVM | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="文章卡    项目 本篇范围     先修 21、30、34–36：依赖、线程、GC 与执行路径   核心问题 同一语言契约在两种实现下是否一致，Java 互操作增加哪些边界？   实验入口 examples&#x2F;ruby&#x2F;labs&#x2F;E03&#x2F;run.rb，安装条件见同目录 INSTALL.md   验收 两进程契约相等；JVM 双线程屏障与关闭；Java 集合、十进制和异常断言   版本边界 CRub">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Ruby E03：JRuby 与 JVM">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E03-JRuby-%E4%B8%8E-JVM/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="文章卡    项目 本篇范围     先修 21、30、34–36：依赖、线程、GC 与执行路径   核心问题 同一语言契约在两种实现下是否一致，Java 互操作增加哪些边界？   实验入口 examples&#x2F;ruby&#x2F;labs&#x2F;E03&#x2F;run.rb，安装条件见同目录 INSTALL.md   验收 两进程契约相等；JVM 双线程屏障与关闭；Java 集合、十进制和异常断言   版本边界 CRub">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-programming-language.svg">
+<meta property="article:published_time" content="2026-10-02T05:03:00.000Z">
+<meta property="article:modified_time" content="2026-10-02T10:13:39.290Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Ruby">
+<meta property="article:tag" content="编程语言">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-programming-language.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Ruby E03：JRuby 与 JVM",
+  "url": "https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E03-JRuby-%E4%B8%8E-JVM/",
+  "image": "https://magicliang.github.io/img/cover-programming-language.svg",
+  "datePublished": "2026-10-02T05:03:00.000Z",
+  "dateModified": "2026-10-02T10:13:39.290Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E03-JRuby-%E4%B8%8E-JVM/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Ruby E03：JRuby 与 JVM',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1234</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1385</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">25</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-programming-language.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Ruby E03：JRuby 与 JVM</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Ruby E03：JRuby 与 JVM</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-02T05:03:00.000Z" title="Created 2026-10-02 13:03:00">2026-10-02</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-02T10:13:39.290Z" title="Updated 2026-10-02 18:13:39">2026-10-02</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%BC%96%E7%A8%8B%E8%AF%AD%E8%A8%80/">编程语言</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.1k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>10mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-02 18:13:39&quot;}" hidden></div><h2 id="文章卡">文章卡</h2>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>本篇范围</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>先修</td>
+<td>21、30、34–36：依赖、线程、GC 与执行路径</td>
+</tr>
+<tr>
+<td>核心问题</td>
+<td>同一语言契约在两种实现下是否一致，Java 互操作增加哪些边界？</td>
+</tr>
+<tr>
+<td>实验入口</td>
+<td><code>examples/ruby/labs/E03/run.rb</code>，安装条件见同目录 <a target="_blank" rel="noopener" href="http://INSTALL.md">INSTALL.md</a></td>
+</tr>
+<tr>
+<td>验收</td>
+<td>两进程契约相等；JVM 双线程屏障与关闭；Java 集合、十进制和异常断言</td>
+</tr>
+<tr>
+<td>版本边界</td>
+<td>CRuby 3.4.11、JRuby 10.0.5.0（Ruby 3.4.5）、OpenJDK 21.0.10；不声明全部应用兼容</td>
+</tr>
+</tbody>
+</table>
+<h2 id="相同脚本通过-兼容结论仍有边界">相同脚本通过，兼容结论仍有边界</h2>
+<p>任务筛选脚本在 CRuby 与 JRuby 上都返回「写作」，是否意味着整个 Taskbook 可以直接切换解释器？这个结果只覆盖本次调用。参数绑定、异常、线程同步、依赖平台和运行时扩展各自需要证据。迁移判断应从应用依赖的契约开始，再检查实现特有的能力。</p>
+<p>本章固定 CRuby 3.4.11、JRuby 10.0.5.0 和 OpenJDK 21.0.10。JRuby 的<a target="_blank" rel="noopener" href="https://www.jruby.org/2026/04/06/jruby-10-0-5-0">固定版本发布说明</a>声明目标为 Ruby 3.4 兼容；实际程序中的 RUBY_VERSION 为 3.4.5，JRUBY_VERSION 为 10.0.5.0。三个数字分别标识语言兼容基线、实现版本和 JVM，不应合并成一个「Ruby 版本」。</p>
+<p>JRuby 10 将最低 Java 版本提升到 21，不能因系统默认 java 指向 Java 8 就直接运行。实验使用已有的 Homebrew OpenJDK 21.0.10，不替换系统 JDK。选用固定版本是为了重放本章实验，不代表它是当前最新版本，也不是对任意应用依赖的兼容承诺。</p>
+<h2 id="用独立进程运行共同契约">用独立进程运行共同契约</h2>
+<p>实验的 contract.rb 只使用两种实现都支持的语言与核心库能力。输入为两条带状态的中文任务，方法要求显式关键字参数，并限制 limit 为正整数。父脚本分别调用 CRuby 和 JRuby，解析结果 JSON，再比较 result 字段；实现名称和版本单独保留，不参与业务值相等判断。</p>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs ruby"><span class="hljs-keyword">def</span> <span class="hljs-title function_">select_tasks</span>(<span class="hljs-params">tasks, <span class="hljs-symbol">status:</span>, <span class="hljs-symbol">limit:</span></span>)<br>  <span class="hljs-keyword">raise</span> <span class="hljs-title class_">ArgumentError</span>, <span class="hljs-string">&#x27;limit&#x27;</span> <span class="hljs-keyword">unless</span> limit.is_a?(<span class="hljs-title class_">Integer</span>) &amp;&amp; limit.positive?<br>  tasks.select &#123; |<span class="hljs-params">task</span>| task.fetch(<span class="hljs-symbol">:status</span>) == status &#125;<br>       .first(limit).map &#123; |<span class="hljs-params">task</span>| task.fetch(<span class="hljs-symbol">:title</span>) &#125;<br><span class="hljs-keyword">end</span><br></code></pre></td></tr></table></figure>
+<p>反例把关键字参数改为位置 Hash，断言 ArgumentError；另一个反例传入零，检查参数校验失败后 ensure 仍执行。浅复制实验则修改副本中共享的字符串，确认原数组也观察到变化。只比较正常输出会漏掉这些调用者可见差异，错误类型、清理路径和可变对象关系都属于契约。</p>
+<p>这组实验未调用 RubyVM、YJIT 或 CRuby 的 ObjectSpace 内部接口。它没有先调用专属 API，再把 JRuby 报错记为兼容通过。需要跨实现的模块应明确公共边界；实现探针适合留在诊断层，通过能力检测决定使用路径，但能力缺失不能计入语义测试成功数。</p>
+<p>本次两个进程得到相同结果：筛选标题为「写作」，两个参数错误均被捕获，ensure 事件存在，浅复制后的嵌套字符串为 title!。这证明列出的有限案例一致，没有证明全部 Ruby 标准测试、所有 gem 或整个 Taskbook 的迁移完成。</p>
+<h2 id="没有-gvl-也需要业务同步">没有 GVL 也需要业务同步</h2>
+<p>CRuby 的 GVL 不能替代读改写的业务锁，JRuby 的并行执行能力也不会自动使共享状态安全。共同契约先用两个 Queue 固定交错：两个线程均读取旧值零，报告就绪，然后等待主线程释放；两次写回都得到一。两个解释器的结果均为一。</p>
+<p>修复版本把每次计数增量放入同一个 Mutex，两线程各更新一千次，最终均为两千。这里验证的是受保护的复合操作，而非任意一次 Integer 赋值的内部实现。只锁写入、把读取留在锁外，仍可能使用已经过期的旧值。</p>
+<p>JRuby 的<a target="_blank" rel="noopener" href="https://github.com/jruby/jruby/wiki/Concurrency-in-jruby">并发文档</a>区分可见性与原子性，并明确提醒可变核心集合的并发访问风险。一个字段的新值能够被另一个线程观察，不意味着「读取、计算、写回」已经成为不可分割操作。迁移前应寻找共享 Hash、缓存初始化和集合迭代中的复合约束，而不只搜索 Thread.new。</p>
+<h2 id="从-ruby-线程观察-jvm-线程">从 Ruby 线程观察 JVM 线程</h2>
+<p>interop.rb 使用 Java CountDownLatch 建立两个阶段。两个 Ruby 工作线程各记录当前 Java 线程 ID，减少 ready 计数，然后等待 start。主线程只有在两个工作线程都已就绪且仍存活时才释放 start。每个线程随后调用 AtomicInteger.incrementAndGet 一千次。</p>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs ruby">ready, start = <span class="hljs-title class_">CountDownLatch</span>.new(<span class="hljs-number">2</span>), <span class="hljs-title class_">CountDownLatch</span>.new(<span class="hljs-number">1</span>)<br>counter = <span class="hljs-title class_">AtomicInteger</span>.new(<span class="hljs-number">0</span>)<br><span class="hljs-comment"># 每个工作线程进入相同的就绪协议后执行：</span><br><span class="hljs-keyword">raise</span> <span class="hljs-string">&#x27;start timeout&#x27;</span> <span class="hljs-keyword">unless</span> start.await(<span class="hljs-number">5</span>, <span class="hljs-title class_">TimeUnit</span><span class="hljs-symbol">:</span><span class="hljs-symbol">:SECONDS</span>)<br><span class="hljs-number">1_000</span>.times &#123; counter.incrementAndGet &#125;<br></code></pre></td></tr></table></figure>
+<p>完整文件还包含五秒等待上限、异常检查以及 ensure 中的关闭逻辑。线程异常通过 value 传回调用者，不因主线程得到了一个数字就忽略。一次性 latch 不能当作可重复使用的循环屏障，每轮新任务需要新的同步协议。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant A as Ruby 工作线程 A
+    participant B as Ruby 工作线程 B
+    participant Main as 主线程
+    participant Start as Java start latch
+    A-&gt;&gt;Main: 记录 JVM 线程 ID，ready 减一
+    B-&gt;&gt;Main: 记录 JVM 线程 ID，ready 减一
+    Note over A,B: 各自在 start.await 等待
+    Main-&gt;&gt;Start: ready 归零后 countDown
+    Start--&gt;&gt;A: 返回
+    Start--&gt;&gt;B: 返回
+    Note over A,B: 各调用原子增量一千次
+    A--&gt;&gt;Main: value 返回
+    B--&gt;&gt;Main: value 返回</code></pre>
+<p>本次 ID 为 38 与 37，事件顺序是两个 ready 后出现两个 done，结果为 2000，退出后线程均不再存活。不同 JVM 线程 ID 与受控等待说明本次确实使用了不同 JVM 线程；ID 不等于操作系统线程号，也不能据此断言特定时刻占用了两个 CPU 核。</p>
+<p>本章没有把这段短循环计时，没有给出 JRuby 相对 CRuby 的倍率。吞吐比较还需相同任务、预热、重复样本、GC 与内存记录，并区分启动时间和稳态执行。启动 JVM 的成本不能与一个已经运行很久的服务请求直接比较。</p>
+<h2 id="java-对象进入-ruby-后仍保留类型约束">Java 对象进入 Ruby 后仍保留类型约束</h2>
+<p>Java 互操作可以直接复用已有库。实验创建 ArrayList，添加「写作」和「校验」，通过 to_a 转换后核对内容。边界转换值得显式检查：方法重载、数值宽度、字符编码和 null 都可能影响调用结果，不能把代理对象外观看起来像 Ruby 对象视为语义完全相同。</p>
+<p>十进制示例从字符串构造两个 java.math.BigDecimal，执行 0.1 与 0.2 相加，toPlainString 返回 0.3。这里主动避免先把十进制输入转换为二进制浮点数，再把近似值交给 Java。跨语言调用可以保留精度，也可以把入口处的误差原样带入另一套数值类型。</p>
+<figure class="highlight ruby"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs ruby">amount = java.math.<span class="hljs-title class_">BigDecimal</span>.new(<span class="hljs-string">&#x27;0.1&#x27;</span>)<br>            .add(java.math.<span class="hljs-title class_">BigDecimal</span>.new(<span class="hljs-string">&#x27;0.2&#x27;</span>)).toPlainString<br><span class="hljs-keyword">raise</span> <span class="hljs-string">&#x27;decimal&#x27;</span> <span class="hljs-keyword">unless</span> amount == <span class="hljs-string">&#x27;0.3&#x27;</span><br></code></pre></td></tr></table></figure>
+<p>Integer.parseInt 接收非法字符串时抛出 Java NumberFormatException，Ruby 通过对应的 Java 异常类捕获。实际日志记录完整 Java 类名。业务接口通常应在边界处把外部异常翻译为稳定错误协议，同时保留原因供诊断；本章保留原始类型，是为了展示实际映射而非隐藏差异。</p>
+<p>Java 对象由 JVM 的对象与垃圾回收体系管理，跨边界引用仍可能延长生命周期。把对象放入 Ruby 全局缓存不会因为它来自 Java 就自动释放。若 Java 库持有文件、连接或线程等外部资源，应遵循该库的关闭协议，GC 不能代替业务关闭操作。本实验只使用内存对象和明确结束的线程。</p>
+<h2 id="从局部契约扩大到应用边界">从局部契约扩大到应用边界</h2>
+<p>目标版本相同也不能省略依赖矩阵。一个 gem 可能只包含 Ruby 源码，也可能带有 CRuby C 扩展或专门的 Java 平台实现。应用调用表面相同，加载的实现和底层资源却可能不同。迁移清单应记录实际平台包、版本及加载路径，然后对已安装产物运行业务场景，不从 gem 名称推断平台支持。</p>
+<p>共同契约刻意没有加载 Taskbook 的主线依赖。这让语言行为比较保持独立，也意味着不能把本章结果填成 Taskbook 的 JRuby 支持声明。若要扩大结论，应先在隔离的 JRuby 依赖环境安装应用，再验证导入、筛选、错误输出与关闭路径；某个依赖无法安装时，应把失败归属于那一层。</p>
+<p>线程实验同样需要扩大输入覆盖。当前整数增量没有事务关系，AtomicInteger 足够；若业务要求同时更新计数与任务列表，两个字段分别使用原子容器仍不能保证整体不变量。可以用一个锁覆盖共同状态，或把更新作为消息交给单一所有者。同步粒度要由业务约束决定，不能由刚好可用的原子类决定。</p>
+<p>异常映射应按具体失败定义恢复动作。数字解析失败通常属于输入错误，不应通过无限重试掩盖；资源库返回临时连接错误可能允许有界重试，但必须检查是否已经产生副作用。本章只捕获明确的 NumberFormatException，没有把所有 Java 异常或 Ruby Exception 一并吞掉，这样未知失败仍会使实验退出非零。</p>
+<h2 id="固定下载与复现入口">固定下载与复现入口</h2>
+<p>JRuby complete JAR 来自项目发布到 Maven Central 的 org.jruby 坐标，下载文件和官方 .sha256 核对一致。仓库只保存校验值与 Ruby 源码，JAR 留在临时目录。run.rb 每次启动前再次核对 SHA256，避免路径下的文件被换成另一版后继续沿用原结论。</p>
+<p>从仓库根目录执行，具体安装命令见同目录 <a target="_blank" rel="noopener" href="http://INSTALL.md">INSTALL.md</a>：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs bash">JAVA=/opt/homebrew/opt/openjdk@21/bin/java \<br>JRUBY_JAR=/private/tmp/ruby-electives-jruby-10.0.5.0.jar \<br>ruby examples/ruby/labs/E03/run.rb<br></code></pre></td></tr></table></figure>
+<p>调用该父脚本的 ruby 必须是本章 CRuby 3.4.11。脚本清除子进程的 Bundler 和额外 Ruby 加载路径，避免主线工程依赖影响这个独立实验。它没有安装 Java 平台 gem，也没有更改主线 Gemfile.lock；真实应用迁移还需为目标平台重新验证依赖及打包结果。</p>
+<h2 id="练习与验收">练习与验收</h2>
+<p>把筛选输入增加缺失 status 字段的任务，为两种实现定义相同错误契约并补断言。再增加带换行和中文标点的标题，检查 JSON 输出往返；测试应该覆盖错误与正常输入，而非简单地扩大循环次数。</p>
+<p>把 Java 原子增量改成分离的 get 与 set，并用新建的 latch 固定两个线程读取同一旧值后再写入。先预测结果，再记录实际事件，最后恢复原子操作。不得用偶然未出现丢更新来证明拆分操作安全。</p>
+<table>
+<thead>
+<tr>
+<th>观察对象</th>
+<th>本次证据</th>
+<th>仍需另测的范围</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>语言契约</td>
+<td>两实现 result 完全相同</td>
+<td>全应用及依赖兼容</td>
+</tr>
+<tr>
+<td>JVM 线程</td>
+<td>不同 ID、屏障与关闭事件</td>
+<td>CPU 加速与长期吞吐</td>
+</tr>
+<tr>
+<td>Java 互操作</td>
+<td>集合、十进制、异常类型</td>
+<td>任意重载与资源库</td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考资料与实验附件">参考资料与实验附件</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://www.jruby.org/2026/04/06/jruby-10-0-5-0">JRuby 10.0.5.0 发布说明</a></li>
+<li><a target="_blank" rel="noopener" href="https://blog.jruby.org/2025/04/jruby-10-part-1-whats-new">JRuby 10 的 Java 基线与实现说明</a></li>
+<li><a target="_blank" rel="noopener" href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CountDownLatch.html">JDK 21 CountDownLatch</a></li>
+<li><a target="_blank" rel="noopener" href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/AtomicInteger.html">JDK 21 AtomicInteger</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/jruby/jruby/tree/5db1ba72f3062af4130ddfa3764879969fb028b8">固定 JRuby 源码版本</a></li>
+</ul>
+<a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E03-JRuby-%E4%B8%8E-JVM/run.rb" title="运行入口">运行入口</a>、<a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E03-JRuby-%E4%B8%8E-JVM/contract.rb" title="共同契约">共同契约</a>、<a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E03-JRuby-%E4%B8%8E-JVM/interop.rb" title="Java互操作">Java互操作</a>、<a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E03-JRuby-%E4%B8%8E-JVM/jruby.sha256" title="固定校验值">固定校验值</a>、<a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E03-JRuby-%E4%B8%8E-JVM/INSTALL.md" title="安装说明">安装说明</a>。原始证据在 writing-plans/ruby/evidence/E03/run.log。
+<h2 id="系列导航">系列导航</h2>
+<p><a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-00-%E5%AF%BC%E8%AF%BB%E4%B8%8E%E5%8F%AF%E9%87%8D%E5%A4%8D%E8%BF%90%E8%A1%8C/">导读</a> · <a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E02-RSpec-%E5%A5%91%E7%BA%A6%E6%B5%8B%E8%AF%95%E4%B8%8E%E7%94%9F%E6%88%90%E5%BC%8F%E6%B5%8B%E8%AF%95/">上一篇：E02：RSpec、契约测试与可重放的生成式测试</a> · <a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E04-C%E6%89%A9%E5%B1%95%E4%B8%8E-FFI/">下一篇：E04：C扩展与 FFI</a> · <a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-00-%E5%AF%BC%E8%AF%BB%E4%B8%8E%E5%8F%AF%E9%87%8D%E5%A4%8D%E8%BF%90%E8%A1%8C/taskbook-workshop-source.tar.gz">完整源码包</a></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E03-JRuby-%E4%B8%8E-JVM/">https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E03-JRuby-%E4%B8%8E-JVM/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%BC%96%E7%A8%8B%E8%AF%AD%E8%A8%80/">编程语言</a><a class="post-meta__tags" href="/tags/Ruby/">Ruby</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-programming-language.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-16-%E5%8A%A8%E6%80%81%E6%96%B9%E6%B3%95-%E5%8F%8D%E5%B0%84%E4%B8%8E%E9%92%A9%E5%AD%90/" title="深入 Ruby 16：动态方法、反射与钩子：元编程怎样保持可诊断"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-programming-language.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Ruby 16：动态方法、反射与钩子：元编程怎样保持可诊断</div></div><div class="info-2"><div class="info-item-1">动态接口需要同时回答调用与查询 系列导读 · 下载本篇完整实验 代理对象能执行 open?，却声称自己不响应这个方法，依赖反射的调用者可能直接拒绝使用它。另一个代理把未知方法都返回 nil，拼写错误又会变成正常结果。动态接口除了生成行为，还需要维护可发现性与失败语义。 本篇承接方法查找与委托，在 Ruby 3.4 中比较普通方法、define_method 和 method_missing。完整实验位于 examples/ruby/labs/16/run.rb，动态版本与普通版本使用同一任务输入对照，不通过代码行数判断设计是否更好。 123456789class StaticRules  def open?(task)    task.fetch(:status) == :open  end  def done?(task)    task.fetch(:status) == :done  endend 只有两个状态时，这个实现已经清楚。元编程版用于解释机制；如果状态集合没有显著重复或动态来源，不需要为了“Ruby 风格”替换它。 define_method 从可调用体建立实例方...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-35-Prism%E3%80%81YARV-%E4%B8%8E%E5%AD%97%E8%8A%82%E7%A0%81/" title="深入 Ruby 35：Prism、YARV 与字节码"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-programming-language.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Ruby 35：Prism、YARV 与字节码</div></div><div class="info-2"><div class="info-item-1">系列导航 导读 · 上一篇：34：对象分配与 GC · 下一篇：36：YJIT 与性能实验 · 完整源码包 解析器、字节码与执行对象各自负责什么 Ruby 源码先要被理解为语法结构，再变成当前实现可以执行的形式，执行时才读取变量、调用方法并产生结果。Prism、YARV 与 Ruby 对象处于这条路径的不同位置。Ruby 3.4 把 Prism 设为默认解析器，不意味着删除了字节码虚拟机，也不意味着解析源码已经运行了程序。 这种区分直接影响调试。语法错误发生在解析阶段；方法不存在通常要到执行阶段才能确定；运行结果错误还可能来自对象状态或方法重新定义。把所有问题称为“编译器错误”，会使排查入口变得模糊。 本章选择一个很小的表达式，同时观察 Prism AST、CRuby InstructionSequence 以及求值结果。源码阅读固定到 Ruby 3.4.11 的完整提交 592f1ffdb36153e8be83603ade3c2e9ab6138a77。不同补丁版本的节点、指令文本或优化可能变化，不能拿未来 master 的实现解释当前实验。 下图区分源码处理与运行时执行。第 3...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-36-YJIT-%E4%B8%8E%E6%80%A7%E8%83%BD%E5%AE%9E%E9%AA%8C/" title="深入 Ruby 36：YJIT 与性能实验"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-programming-language.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Ruby 36：YJIT 与性能实验</div></div><div class="info-2"><div class="info-item-1">系列导航 导读 · 上一篇：35：Prism、YARV 与字节码 · 下一篇：37：Ruby 惯用法与必要优化 · 完整源码包 先定义值得测量的收益 启用 YJIT 之后，某段 Ruby 代码可能更快，也可能因为启动、预热或额外内存成本而不适合当前任务。对短命命令行程序，用户等待的是从进程启动到结果出现的总时间；对常驻服务，稳定负载下的吞吐与尾延迟更重要。两种场景不能用同一段已经预热的循环统一回答。 Taskbook 目前处理小型本地任务集合，没有因为 Ruby 支持 JIT 就自动需要开启它。本章用确定输入建立可复现性能实验，结果只用于解释测量方法。只有业务瓶颈确认落在受益路径上，才有理由调整运行参数。 YJIT 3.4 文档说明构建要求、平台限制与内存代价。安装了 Ruby 不一定意味着二进制包含可用 YJIT；命令行传入选项也不应作为启用成功的唯一证据。实验在每个子进程内检查 RubyVM::YJIT.enabled?。 相同输入与相同结果先于计时 从仓库根目录运行： 1ruby examples/ruby/labs/36/run.rb 实验使用一到两万的整数数组，每个元素...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E08-%E5%90%8E%E5%8F%B0%E4%BB%BB%E5%8A%A1-%E9%87%8D%E8%AF%95%E4%B8%8E%E5%B9%82%E7%AD%89/" title="深入 Ruby E08：后台任务与消息处理：重试怎样改变副作用"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-programming-language.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Ruby E08：后台任务与消息处理：重试怎样改变副作用</div></div><div class="info-2"><div class="info-item-1">执行成功，确认却丢失了 任务要求把累计值增加 7。处理器完成加法，确认消息随后丢失；发送方无法确定结果，于是再次执行任务。没有幂等保护时，两次尝试把累计值变成 14，即使第二次正常返回，也不能据此认定业务只执行过一次。 本篇用 Ruby 3.4.11 的 Queue、Mutex 和 Thread 建立本地替身。它真实记录执行次数、累计值和事件顺序，故障由固定条件注入，不依赖网络偶发失败。完整源码位于 examples/ruby/labs/E08/，附件为 本篇实验源码。 前置内容是异常、测试和并发。实验不连接 Redis，也不安装任务框架；队列、幂等记录和失败事件都仅存在于当前进程内。目标是先明确协议需要保证什么，再讨论框架能力是否覆盖这些要求。 返回值、确认和副作用是三个事件 一次处理可以分成收到任务、执行副作用、确认完成三段。失败发生在不同位置，对重试的要求不同：副作用前失败通常尚未改变目标；副作用后但确认前失败，则结果可能已经存在。 sequenceDiagram   participant W as Worker   participant S as EffectStor...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-38-%E8%BE%93%E5%85%A5%E4%B8%8E%E5%AE%89%E5%85%A8%E8%BE%B9%E7%95%8C/" title="深入 Ruby 38：输入与安全边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-programming-language.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Ruby 38：输入与安全边界</div></div><div class="info-2"><div class="info-item-1">系列导航 导读 · 上一篇：37：Ruby 惯用法与必要优化 · 下一篇：39：综合交付与可复现使用 · 完整源码包 外部输入只能选择已授权操作 Ruby 能根据字符串调用方法、执行代码、加载对象和创建进程。这些能力用于内部扩展很方便，但若外部输入可以直接决定目标，就可能把一个“导入任务”接口扩展成任意文件访问或任意代码执行。安全设计需要先列出允许的操作，再把输入约束到这组操作。 Taskbook 的正常输入是任务数据，包含标题、优先级、标签和状态。它不需要用户提交 Ruby 类名、任意方法名或 shell 片段。拒绝这些额外解释能力，可以缩小整个输入面的复杂度，同时让错误处理保持可预测。 本章实验只使用临时目录与合成数据，分别验证文件名越界、命令参数解释、动态调用白名单和 YAML 类标签拒绝。测试证明这些具体边界生效，没有声称代码构成可执行任意敌对程序的沙箱。 文件路径先定义可接受名称 从仓库根目录运行： 1ruby examples/ruby/labs/38/run.rb 实验只接受由小写字母、数字、下划线和连字符组成、以 json 结尾的单层文件名： 12raise Ar...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Ruby-E04-C%E6%89%A9%E5%B1%95%E4%B8%8E-FFI/" title="深入 Ruby E04：C扩展与 FFI"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-programming-language.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Ruby E04：C扩展与 FFI</div></div><div class="info-2"><div class="info-item-1">文章卡    项目 本篇范围     先修 18–19、22、30、34–35：资源、打包、线程、GC 与实现路径   核心问题 跨语言资源由谁拥有，GC、GVL 与原生同步各保护什么？   实验入口 examples/ruby/labs/E04/run.rb，需要完整 CRuby 头文件、clang 与 make   验收 TypedData 参数/GC/幂等关闭；GVL 管道对照；FFI 真实调用与配对释放；C 原子更新   版本边界 CRuby 3.4.11、Fiddle 1.1.6、Apple clang 21、arm64 macOS；其他平台未实测    原生调用把哪些责任交给调用者 Ruby 对象离开作用域后，关联的 C 缓冲区是否会释放？答案取决于扩展怎样声明引用和所有权。GC 能识别 Ruby 对象，不会自动推断一个任意地址由谁分配、何时仍在使用、应该交给哪个释放函数。FFI 减少包装代码，也不会删除这些责任。 本章在 CRuby 3.4.11 中构建一个 TypedData 扩展，并通过 Fiddle 1.1.6 调用独立 C 动态库。实验只处理合成字节与本地管...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%96%87%E7%AB%A0%E5%8D%A1"><span class="toc-number">1.</span> <span class="toc-text">文章卡</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%9B%B8%E5%90%8C%E8%84%9A%E6%9C%AC%E9%80%9A%E8%BF%87-%E5%85%BC%E5%AE%B9%E7%BB%93%E8%AE%BA%E4%BB%8D%E6%9C%89%E8%BE%B9%E7%95%8C"><span class="toc-number">2.</span> <span class="toc-text">相同脚本通过，兼容结论仍有边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E7%8B%AC%E7%AB%8B%E8%BF%9B%E7%A8%8B%E8%BF%90%E8%A1%8C%E5%85%B1%E5%90%8C%E5%A5%91%E7%BA%A6"><span class="toc-number">3.</span> <span class="toc-text">用独立进程运行共同契约</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%B2%A1%E6%9C%89-gvl-%E4%B9%9F%E9%9C%80%E8%A6%81%E4%B8%9A%E5%8A%A1%E5%90%8C%E6%AD%A5"><span class="toc-number">4.</span> <span class="toc-text">没有 GVL 也需要业务同步</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BB%8E-ruby-%E7%BA%BF%E7%A8%8B%E8%A7%82%E5%AF%9F-jvm-%E7%BA%BF%E7%A8%8B"><span class="toc-number">5.</span> <span class="toc-text">从 Ruby 线程观察 JVM 线程</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#java-%E5%AF%B9%E8%B1%A1%E8%BF%9B%E5%85%A5-ruby-%E5%90%8E%E4%BB%8D%E4%BF%9D%E7%95%99%E7%B1%BB%E5%9E%8B%E7%BA%A6%E6%9D%9F"><span class="toc-number">6.</span> <span class="toc-text">Java 对象进入 Ruby 后仍保留类型约束</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BB%8E%E5%B1%80%E9%83%A8%E5%A5%91%E7%BA%A6%E6%89%A9%E5%A4%A7%E5%88%B0%E5%BA%94%E7%94%A8%E8%BE%B9%E7%95%8C"><span class="toc-number">7.</span> <span class="toc-text">从局部契约扩大到应用边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%BA%E5%AE%9A%E4%B8%8B%E8%BD%BD%E4%B8%8E%E5%A4%8D%E7%8E%B0%E5%85%A5%E5%8F%A3"><span class="toc-number">8.</span> <span class="toc-text">固定下载与复现入口</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0%E4%B8%8E%E9%AA%8C%E6%94%B6"><span class="toc-number">9.</span> <span class="toc-text">练习与验收</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99%E4%B8%8E%E5%AE%9E%E9%AA%8C%E9%99%84%E4%BB%B6"><span class="toc-number">10.</span> <span class="toc-text">参考资料与实验附件</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">11.</span> <span class="toc-text">系列导航</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

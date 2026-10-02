@@ -1,0 +1,872 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Spring 03：refresh 如何组织容器启动 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="启动失败发生在哪一步，会改变清理结果 “Spring 启动时创建所有 Bean，失败就销毁全部对象”不足以解释实际故障。有些对象是后处理器，业务对象创建前就必须存在；有些业务对象设置为懒加载，启动成功时仍未创建；某些前置准备失败甚至没有进入统一销毁的异常捕获范围。 本篇检验的问题是：refresh() 中的阶段顺序怎样限制扩展点，异常落点又怎样影响已创建对象？实验采用 Spring Framewo">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Spring 03：refresh 如何组织容器启动">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-03-refresh%E5%A6%82%E4%BD%95%E7%BB%84%E7%BB%87%E5%AE%B9%E5%99%A8%E5%90%AF%E5%8A%A8/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="启动失败发生在哪一步，会改变清理结果 “Spring 启动时创建所有 Bean，失败就销毁全部对象”不足以解释实际故障。有些对象是后处理器，业务对象创建前就必须存在；有些业务对象设置为懒加载，启动成功时仍未创建；某些前置准备失败甚至没有进入统一销毁的异常捕获范围。 本篇检验的问题是：refresh() 中的阶段顺序怎样限制扩展点，异常落点又怎样影响已创建对象？实验采用 Spring Framewo">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-03-refresh%E5%A6%82%E4%BD%95%E7%BB%84%E7%BB%87%E5%AE%B9%E5%99%A8%E5%90%AF%E5%8A%A8/cover.svg">
+<meta property="article:published_time" content="2026-10-02T02:03:00.000Z">
+<meta property="article:modified_time" content="2026-10-02T10:13:39.292Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="ApplicationContext">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Spring">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-03-refresh%E5%A6%82%E4%BD%95%E7%BB%84%E7%BB%87%E5%AE%B9%E5%99%A8%E5%90%AF%E5%8A%A8/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Spring 03：refresh 如何组织容器启动",
+  "url": "https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-03-refresh%E5%A6%82%E4%BD%95%E7%BB%84%E7%BB%87%E5%AE%B9%E5%99%A8%E5%90%AF%E5%8A%A8/",
+  "image": "https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-03-refresh%E5%A6%82%E4%BD%95%E7%BB%84%E7%BB%87%E5%AE%B9%E5%99%A8%E5%90%AF%E5%8A%A8/cover.svg",
+  "datePublished": "2026-10-02T02:03:00.000Z",
+  "dateModified": "2026-10-02T10:13:39.292Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-03-refresh%E5%A6%82%E4%BD%95%E7%BB%84%E7%BB%87%E5%AE%B9%E5%99%A8%E5%90%AF%E5%8A%A8/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Spring 03：refresh 如何组织容器启动',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1234</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1385</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">25</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-03-refresh%E5%A6%82%E4%BD%95%E7%BB%84%E7%BB%87%E5%AE%B9%E5%99%A8%E5%90%AF%E5%8A%A8/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Spring 03：refresh 如何组织容器启动</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Spring 03：refresh 如何组织容器启动</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-02T02:03:00.000Z" title="Created 2026-10-02 10:03:00">2026-10-02</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-02T10:13:39.292Z" title="Updated 2026-10-02 18:13:39">2026-10-02</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>14mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-02 18:13:39&quot;}" hidden></div><h2 id="启动失败发生在哪一步-会改变清理结果">启动失败发生在哪一步，会改变清理结果</h2>
+<p>“Spring 启动时创建所有 Bean，失败就销毁全部对象”不足以解释实际故障。有些对象是后处理器，业务对象创建前就必须存在；有些业务对象设置为懒加载，启动成功时仍未创建；某些前置准备失败甚至没有进入统一销毁的异常捕获范围。</p>
+<p>本篇检验的问题是：<code>refresh()</code> 中的阶段顺序怎样限制扩展点，异常落点又怎样影响已创建对象？实验采用 Spring Framework 6.2.11、JDK 21 的 <code>GenericApplicationContext</code>，不借用 Boot 启动日志推断原生 Framework 行为。实现引用固定到 <code>4c134254642d88e058aa004bdaf44168e1be7bb2</code>。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="refresh-boundary.svg" alt="refresh准备阶段、内部初始化阶段及异常清理范围"></p>
+<p>图据 <code>AbstractApplicationContext.refresh</code> 绘制。内层异常分支覆盖图中第二组初始化阶段；外层 <code>finally</code> 负责恢复启动线程标记并释放锁，它不等同于销毁 Bean。</p>
+<h2 id="refresh-是阶段协议-不是对象创建循环">refresh 是阶段协议，不是对象创建循环</h2>
+<p>容器先执行 <code>prepareRefresh</code>，记录启动状态并准备环境；随后 <code>obtainFreshBeanFactory</code> 取得供本次启动使用的工厂，<code>prepareBeanFactory</code> 为工厂配置上下文相关设施。方法名称中的 “fresh” 不能机械解释成所有 Context 都新建一个工厂：具体行为由子类实现，<code>GenericApplicationContext</code> 使用预先持有的工厂，并限制多次 refresh。</p>
+<p>之后才进入本篇关注的内层初始化范围。子类可先执行 <code>postProcessBeanFactory</code>；容器调用工厂后处理器，再注册 Bean 后处理器；消息源、事件广播器、子类刷新钩子与监听器注册随后执行；<code>finishBeanFactoryInitialization</code> 完成剩余普通单例的预实例化；最后 <code>finishRefresh</code> 完成生命周期处理并发布刷新事件。<a target="_blank" rel="noopener" href="https://github.com/spring-projects/spring-framework/blob/4c134254642d88e058aa004bdaf44168e1be7bb2/spring-context/src/main/java/org/springframework/context/support/AbstractApplicationContext.java">refresh 固定实现</a></p>
+<p>这些步骤不能随意交换。配置类本身包含其他 Bean 的声明，如果先创建业务对象再解析配置，依赖候选可能还没注册。自动代理处理器如果安装过晚，已暴露的引用可能没有经过它。把全部逻辑压成一次“遍历 Bean 并 new”，无法保留元数据扩展与实例扩展各自的处理窗口。</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>主要输入与状态变化</th>
+<th>此时能做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>定义注册</td>
+<td>配置进入注册表</td>
+<td>增加类、工厂方法、依赖描述</td>
+</tr>
+<tr>
+<td>Registry 后处理</td>
+<td>注册表可能继续增长</td>
+<td>根据已有元数据补充定义</td>
+</tr>
+<tr>
+<td>Factory 后处理</td>
+<td>定义内容最终调整</td>
+<td>修改属性值等创建参数</td>
+</tr>
+<tr>
+<td>BPP 注册</td>
+<td>处理器实例进入处理链</td>
+<td>为后续实例的初始化与包装做准备</td>
+</tr>
+<tr>
+<td>单例预实例化</td>
+<td>描述转为对象，缓存保存最终引用</td>
+<td>完成依赖、初始化与后处理</td>
+</tr>
+<tr>
+<td>刷新完成</td>
+<td>生命周期启动、刷新事件发布</td>
+<td>暴露容器启动结果</td>
+</tr>
+</tbody>
+</table>
+<p>这里的“BPP 注册”并不是仅保存一个类名。<code>PostProcessorRegistrationDelegate.registerBeanPostProcessors</code> 会调用 <code>getBean</code> 创建后处理器，再把处理器对象加入工厂。因此在普通业务对象批量创建之前，容器里已经可能存在后处理器及其依赖。</p>
+<h2 id="后处理器的两个窗口">后处理器的两个窗口</h2>
+<p><code>BeanDefinitionRegistryPostProcessor</code> 可以增加定义，<code>BeanFactoryPostProcessor</code> 可以修改工厂中的定义配置，<code>BeanPostProcessor</code> 则作用于创建中的对象。前两者名称相近，但操作目标仍是元数据；最后一种才能看到某个实际 Bean 引用，并可能返回替代引用。</p>
+<p>注册表后处理器还能注册新的注册表后处理器。固定版本的委托实现因此不是只获取一次列表：它处理已知优先级组，并继续查找尚未执行的注册表处理器，直到没有新项，再调用相应工厂后处理回调。源码保留多轮查找与多个列表，是为了避免过早实例化错误优先级的处理器。<a target="_blank" rel="noopener" href="https://github.com/spring-projects/spring-framework/blob/4c134254642d88e058aa004bdaf44168e1be7bb2/spring-context/src/main/java/org/springframework/context/support/PostProcessorRegistrationDelegate.java">后处理器调度实现</a></p>
+<p>对容器自动发现的后处理器，需要区分 <code>PriorityOrdered</code>、<code>Ordered</code> 与其他对象；通过上下文编程接口直接加入的工厂后处理器走显式列表路径，不能把同一排序口诀覆盖所有注册方式。本篇实验只用受控的少量处理器证明阶段关系，完整排序规则留在扩展顺序篇。</p>
+<p>工厂后处理回调在类型上持有工厂，因而可以调用 <code>getBean</code>，但“能调用”不等于“适合在这里创建业务对象”。过早创建的对象可能赶不上尚未安装的全部 BPP，后续不会仅因处理器安装完成就自动重新创建。需要调整配置时修改定义，避免用 <code>getBean</code> 当成读取元数据的工具。否则实验虽能运行，代理、注解注入等效果可能因对象创建过早而缺失。</p>
+<h3 id="模式提炼：先安装执行规则-再处理业务对象">模式提炼：先安装执行规则，再处理业务对象</h3>
+<p>参数化表达为 <code>收集{规则定义} → 实例化并安装{规则} → 处理{业务对象}</code>。</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>先安装</th>
+<th>后处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Spring 容器</td>
+<td>Bean 后处理器</td>
+<td>普通业务 Bean</td>
+</tr>
+<tr>
+<td>HTTP 服务</td>
+<td>路由和过滤器</td>
+<td>请求</td>
+</tr>
+<tr>
+<td>编译流程</td>
+<td>转换阶段及其配置</td>
+<td>业务代码的中间表示</td>
+</tr>
+</tbody>
+</table>
+<p>遇到“同一种对象有的生效、有的不生效”，除了检查规则是否存在，还应检查对象进入流程时规则是否已经安装。创建时点本身就是行为差异的来源。</p>
+<h2 id="用事件序列检查正常启动">用事件序列检查正常启动</h2>
+<p>实验入口注册一个 Registry 后处理器、一个 Factory 后处理器和一个 BPP。业务 <code>Target</code> 记录构造、初始化、销毁事件；BPP 的前置回调记录 <code>before</code>，后置回调记录 <code>after</code> 并返回一个 JDK 接口代理。刷新监听器记录 <code>refreshed</code>。</p>
+<p>代理实验只证明 BPP 可改变容器最终暴露的引用，不把这个手写代理等同于 Spring AOP 自动代理。断言同时检查代理类型和一次真实调用的返回值，关闭后检查原始目标的销毁事件，避免只凭类名里出现 <code>Proxy</code> 就宣称生命周期正确。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">cd</span> examples/spring-framework-lab<br>./mvnw -q compile <span class="hljs-built_in">exec</span>:java -Dexec.mainClass=blog.spring.Chapter03<br></code></pre></td></tr></table></figure>
+<p>完整可运行入口在 <code>src/main/java/blog/spring/Chapter03.java</code>，共用断言在 <code>Checks.java</code>。以下是该入口代码，包含正常启动与故障控制组。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br><span class="line">72</span><br><span class="line">73</span><br><span class="line">74</span><br><span class="line">75</span><br><span class="line">76</span><br><span class="line">77</span><br><span class="line">78</span><br><span class="line">79</span><br><span class="line">80</span><br><span class="line">81</span><br><span class="line">82</span><br><span class="line">83</span><br><span class="line">84</span><br><span class="line">85</span><br><span class="line">86</span><br><span class="line">87</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">package</span> blog.spring;<br><br><span class="hljs-keyword">import</span> java.lang.reflect.Proxy;<br><span class="hljs-keyword">import</span> java.util.ArrayList;<br><span class="hljs-keyword">import</span> java.util.List;<br><span class="hljs-keyword">import</span> org.springframework.beans.factory.*;<br><span class="hljs-keyword">import</span> org.springframework.beans.factory.config.BeanPostProcessor;<br><span class="hljs-keyword">import</span> org.springframework.beans.factory.support.BeanDefinitionRegistryPostProcessor;<br><span class="hljs-keyword">import</span> org.springframework.context.event.ContextRefreshedEvent;<br><span class="hljs-keyword">import</span> org.springframework.context.support.GenericApplicationContext;<br><span class="hljs-keyword">import</span> <span class="hljs-keyword">static</span> blog.spring.Checks.*;<br><br><span class="hljs-keyword">public</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">Chapter03</span> &#123;<br>    <span class="hljs-keyword">static</span> <span class="hljs-keyword">final</span> List&lt;String&gt; events = <span class="hljs-keyword">new</span> <span class="hljs-title class_">ArrayList</span>&lt;&gt;();<br>    <span class="hljs-keyword">public</span> <span class="hljs-keyword">interface</span> <span class="hljs-title class_">Operation</span> &#123; String <span class="hljs-title function_">execute</span><span class="hljs-params">()</span>; &#125;<br>    <span class="hljs-keyword">public</span> <span class="hljs-keyword">static</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">Target</span> <span class="hljs-keyword">implements</span> <span class="hljs-title class_">Operation</span>, InitializingBean, DisposableBean &#123;<br>        <span class="hljs-keyword">public</span> <span class="hljs-title function_">Target</span><span class="hljs-params">()</span> &#123; events.add(<span class="hljs-string">&quot;construct&quot;</span>); &#125;<br>        <span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title function_">afterPropertiesSet</span><span class="hljs-params">()</span> &#123; events.add(<span class="hljs-string">&quot;init&quot;</span>); &#125;<br>        <span class="hljs-keyword">public</span> String <span class="hljs-title function_">execute</span><span class="hljs-params">()</span> &#123; <span class="hljs-keyword">return</span> <span class="hljs-string">&quot;order&quot;</span>; &#125;<br>        <span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title function_">destroy</span><span class="hljs-params">()</span> &#123; events.add(<span class="hljs-string">&quot;destroy&quot;</span>); &#125;<br>    &#125;<br>    <span class="hljs-keyword">public</span> <span class="hljs-keyword">static</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">Broken</span> &#123; <span class="hljs-keyword">public</span> <span class="hljs-title function_">Broken</span><span class="hljs-params">()</span> &#123; <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">IllegalStateException</span>(<span class="hljs-string">&quot;intentional bean creation failure&quot;</span>); &#125; &#125;<br>    <span class="hljs-keyword">public</span> <span class="hljs-keyword">static</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">PrepareFailure</span> <span class="hljs-keyword">extends</span> <span class="hljs-title class_">GenericApplicationContext</span> &#123;<br>        <span class="hljs-meta">@Override</span> <span class="hljs-keyword">protected</span> <span class="hljs-keyword">void</span> <span class="hljs-title function_">prepareRefresh</span><span class="hljs-params">()</span> &#123;<br>            <span class="hljs-built_in">super</span>.prepareRefresh();<br>            <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">IllegalStateException</span>(<span class="hljs-string">&quot;intentional prepareRefresh failure&quot;</span>);<br>        &#125;<br>    &#125;<br>    <span class="hljs-keyword">private</span> <span class="hljs-keyword">static</span> <span class="hljs-keyword">void</span> <span class="hljs-title function_">failureBoundary</span><span class="hljs-params">(String phase)</span> &#123;<br>        events.clear();<br>        <span class="hljs-keyword">try</span> (<span class="hljs-type">var</span> <span class="hljs-variable">context</span> <span class="hljs-operator">=</span> phase.equals(<span class="hljs-string">&quot;prepareRefresh&quot;</span>) ? <span class="hljs-keyword">new</span> <span class="hljs-title class_">PrepareFailure</span>() : <span class="hljs-keyword">new</span> <span class="hljs-title class_">GenericApplicationContext</span>()) &#123;<br>            context.registerBean(<span class="hljs-string">&quot;precreated&quot;</span>, Target.class);<br>            <span class="hljs-comment">// Deliberately create a disposable singleton before refresh, to observe cleanup boundaries.</span><br>            context.getBeanFactory().getBean(<span class="hljs-string">&quot;precreated&quot;</span>);<br>            <span class="hljs-keyword">if</span> (phase.equals(<span class="hljs-string">&quot;factory&quot;</span>)) context.addBeanFactoryPostProcessor(factory -&gt; &#123;<br>                <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">IllegalStateException</span>(<span class="hljs-string">&quot;intentional factory post-processor failure&quot;</span>);<br>            &#125;);<br>            <span class="hljs-keyword">if</span> (phase.equals(<span class="hljs-string">&quot;BPP&quot;</span>)) context.registerBean(<span class="hljs-string">&quot;brokenProcessor&quot;</span>, BeanPostProcessor.class, () -&gt; &#123;<br>                <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">IllegalStateException</span>(<span class="hljs-string">&quot;intentional BPP creation failure&quot;</span>);<br>            &#125;);<br>            fails(RuntimeException.class, context::refresh, <span class="hljs-string">&quot;03 &quot;</span> + phase + <span class="hljs-string">&quot; failure propagates&quot;</span>);<br>            <span class="hljs-type">boolean</span> <span class="hljs-variable">outsideCatch</span> <span class="hljs-operator">=</span> phase.equals(<span class="hljs-string">&quot;prepareRefresh&quot;</span>);<br>            check(events.contains(<span class="hljs-string">&quot;destroy&quot;</span>) != outsideCatch, <span class="hljs-string">&quot;03 &quot;</span> + phase + <span class="hljs-string">&quot; cleanup boundary events=&quot;</span> + events);<br>            check(context.isActive() == outsideCatch, <span class="hljs-string">&quot;03 &quot;</span> + phase + <span class="hljs-string">&quot; active=&quot;</span> + context.isActive());<br>            check(context.getBeanFactory().containsSingleton(<span class="hljs-string">&quot;precreated&quot;</span>) == outsideCatch, <span class="hljs-string">&quot;03 &quot;</span> + phase + <span class="hljs-string">&quot; singleton retention=&quot;</span> + context.getBeanFactory().containsSingleton(<span class="hljs-string">&quot;precreated&quot;</span>));<br>        &#125;<br>        check(events.getLast().equals(<span class="hljs-string">&quot;destroy&quot;</span>), <span class="hljs-string">&quot;03 &quot;</span> + phase + <span class="hljs-string">&quot; explicit close leaves disposable destroyed&quot;</span>);<br>    &#125;<br>    <span class="hljs-keyword">public</span> <span class="hljs-keyword">static</span> <span class="hljs-keyword">void</span> <span class="hljs-title function_">main</span><span class="hljs-params">(String[] args)</span> &#123;<br>        events.clear();<br>        <span class="hljs-keyword">try</span> (<span class="hljs-type">var</span> <span class="hljs-variable">context</span> <span class="hljs-operator">=</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">GenericApplicationContext</span>()) &#123;<br>            context.addBeanFactoryPostProcessor((BeanDefinitionRegistryPostProcessor) registry -&gt; events.add(<span class="hljs-string">&quot;registry&quot;</span>));<br>            context.addBeanFactoryPostProcessor(factory -&gt; events.add(<span class="hljs-string">&quot;factory&quot;</span>));<br>            context.registerBean(<span class="hljs-string">&quot;postProcessor&quot;</span>, BeanPostProcessor.class, () -&gt; <span class="hljs-keyword">new</span> <span class="hljs-title class_">BeanPostProcessor</span>() &#123;<br>                <span class="hljs-keyword">public</span> Object <span class="hljs-title function_">postProcessBeforeInitialization</span><span class="hljs-params">(Object bean, String name)</span> &#123;<br>                    <span class="hljs-keyword">if</span> (name.equals(<span class="hljs-string">&quot;target&quot;</span>)) events.add(<span class="hljs-string">&quot;before&quot;</span>);<br>                    <span class="hljs-keyword">return</span> bean;<br>                &#125;<br>                <span class="hljs-keyword">public</span> Object <span class="hljs-title function_">postProcessAfterInitialization</span><span class="hljs-params">(Object bean, String name)</span> &#123;<br>                    <span class="hljs-keyword">if</span> (!name.equals(<span class="hljs-string">&quot;target&quot;</span>)) <span class="hljs-keyword">return</span> bean;<br>                    events.add(<span class="hljs-string">&quot;after&quot;</span>);<br>                    <span class="hljs-keyword">return</span> Proxy.newProxyInstance(Operation.class.getClassLoader(), <span class="hljs-keyword">new</span> <span class="hljs-title class_">Class</span>&lt;?&gt;[]&#123;Operation.class&#125;,<br>                        (proxy, method, arguments) -&gt; method.invoke(bean, arguments));<br>                &#125;<br>            &#125;);<br>            context.registerBean(<span class="hljs-string">&quot;target&quot;</span>, Target.class);<br>            context.addApplicationListener(event -&gt; &#123; <span class="hljs-keyword">if</span> (event <span class="hljs-keyword">instanceof</span> ContextRefreshedEvent) events.add(<span class="hljs-string">&quot;refreshed&quot;</span>); &#125;);<br>            context.refresh();<br>            check(events.equals(List.of(<span class="hljs-string">&quot;registry&quot;</span>, <span class="hljs-string">&quot;factory&quot;</span>, <span class="hljs-string">&quot;construct&quot;</span>, <span class="hljs-string">&quot;before&quot;</span>, <span class="hljs-string">&quot;init&quot;</span>, <span class="hljs-string">&quot;after&quot;</span>, <span class="hljs-string">&quot;refreshed&quot;</span>)), <span class="hljs-string">&quot;03 refresh phase order &quot;</span> + events);<br>            <span class="hljs-type">var</span> <span class="hljs-variable">operation</span> <span class="hljs-operator">=</span> context.getBean(<span class="hljs-string">&quot;target&quot;</span>, Operation.class);<br>            check(Proxy.isProxyClass(operation.getClass()) &amp;&amp; operation.execute().equals(<span class="hljs-string">&quot;order&quot;</span>), <span class="hljs-string">&quot;03 BPP wrapper preserves callable behavior&quot;</span>);<br>        &#125;<br>        check(events.getLast().equals(<span class="hljs-string">&quot;destroy&quot;</span>), <span class="hljs-string">&quot;03 close destroys original target behind wrapper&quot;</span>);<br>        events.clear();<br>        <span class="hljs-keyword">try</span> (<span class="hljs-type">var</span> <span class="hljs-variable">context</span> <span class="hljs-operator">=</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">GenericApplicationContext</span>()) &#123;<br>            context.registerBean(<span class="hljs-string">&quot;first&quot;</span>, Target.class);<br>            context.registerBean(<span class="hljs-string">&quot;broken&quot;</span>, Broken.class, d -&gt; d.setDependsOn(<span class="hljs-string">&quot;first&quot;</span>));<br>            fails(BeanCreationException.class, context::refresh, <span class="hljs-string">&quot;03 singleton creation failure cancels refresh&quot;</span>);<br>            check(events.equals(List.of(<span class="hljs-string">&quot;construct&quot;</span>, <span class="hljs-string">&quot;init&quot;</span>, <span class="hljs-string">&quot;destroy&quot;</span>)), <span class="hljs-string">&quot;03 failed refresh destroys already created disposable singleton &quot;</span> + events);<br>            check(!context.isActive(), <span class="hljs-string">&quot;03 failed context inactive&quot;</span>);<br>        &#125;<br>        failureBoundary(<span class="hljs-string">&quot;factory&quot;</span>);<br>        failureBoundary(<span class="hljs-string">&quot;BPP&quot;</span>);<br>        failureBoundary(<span class="hljs-string">&quot;prepareRefresh&quot;</span>);<br>        System.out.println(<span class="hljs-string">&quot;CHAPTER 03 PASS&quot;</span>);<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>本地命令在 Amazon Corretto 21.0.11 / Spring 6.2.11 下退出 0，末行是 <code>CHAPTER 03 PASS</code>。原始输出在 <code>evidence/03/local-20261002/run.txt</code>；预期异常对应的 WARN 属于故障实验，不能单凭它判断命令失败。</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>清理前后的实际观察</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正常刷新</td>
+<td><code>registry, factory, construct, before, init, after, refreshed</code></td>
+<td>阶段顺序断言成立</td>
+</tr>
+<tr>
+<td>普通单例创建失败</td>
+<td><code>construct, init, destroy</code>；active=false</td>
+<td>既有单例销毁</td>
+</tr>
+<tr>
+<td>Factory 后处理失败</td>
+<td>active=false；单例缓存不保留预创建对象</td>
+<td>内层清理分支执行</td>
+</tr>
+<tr>
+<td>BPP 创建失败</td>
+<td>active=false；单例缓存不保留预创建对象</td>
+<td>内层清理分支执行</td>
+</tr>
+<tr>
+<td>父类准备完成后抛错</td>
+<td>active=true；预创建单例仍保留；显式 close 后 destroy</td>
+<td>此故障在内层清理范围之外</td>
+</tr>
+</tbody>
+</table>
+<p>事件序列是本实验的断言，不是全框架的完整生命周期清单。比如记录到 <code>factory</code> 与 <code>construct</code> 相邻，不代表框架没有在中间创建 BPP；只表示日志没有给 BPP 构造器单独打点。源码调度范围负责解释没有记录的步骤，日志负责证明本次观察到的先后关系。</p>
+<h2 id="失败清理必须同时看异常位置与已有对象">失败清理必须同时看异常位置与已有对象</h2>
+<p>固定版本 <code>refresh</code> 的内层 <code>catch (RuntimeException | Error)</code> 调用 <code>destroyBeans()</code>，接着 <code>cancelRefresh(ex)</code> 重置 active 状态，再向调用者传播原异常。普通构造器失败、工厂后处理失败以及 BPP 安装阶段失败，只要传播到这个范围，都会到达该分支。</p>
+<p>这并不表示每次都能观察到销毁事件。若失败前没有成功创建可销毁的单例，销毁集合可能没有对应业务对象。因此实验故意预先通过内部工厂创建一个可销毁的 <code>Target</code>，再分别在 Factory 后处理与 BPP 创建阶段抛异常。这个预创建操作是为了固定“失败时已存在对象”的控制条件，不是推荐的应用初始化方式。</p>
+<p>普通业务创建失败的实验则注册 <code>first</code> 与 <code>broken</code>，显式设置后者依赖前者，确保可销毁对象先完成初始化。<code>broken</code> 构造器抛异常后，断言检查先前对象的 <code>destroy</code> 事件以及 Context 的 inactive 状态。这里只验证已有且纳入容器销毁管理的对象。构造器若取得资源后抛出异常，资源尚未交付容器，就需要在构造器自身的异常路径中释放。</p>
+<p>前置准备失败是反例。<code>prepareRefresh</code>、<code>obtainFreshBeanFactory</code>、<code>prepareBeanFactory</code> 位于上述内层 <code>try</code> 之前。从这些步骤抛出的异常不会经过同一个 <code>destroyBeans/cancelRefresh</code> 分支。实验在调用父类 <code>prepareRefresh</code> 后抛异常，让 active 标记已经被设置，并用预创建对象观测此时尚未自动销毁；随后显式 <code>close</code>，验证最终释放。这个结果不应扩展成“任何 Context 的任何准备失败都一定仍是 active”，因为具体抛出时点和子类实现会改变状态。</p>
+<h3 id="模式提炼：按失败边界计算清理集合">模式提炼：按失败边界计算清理集合</h3>
+<p>参数化表达为 <code>清理对象 = 已成功登记的资源 ∩ 当前异常处理范围负责的资源</code>。</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>已成功登记</th>
+<th>尚未登记或不在本范围</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>容器启动</td>
+<td>已注册销毁回调的单例</td>
+<td>失败构造器中的临时资源</td>
+</tr>
+<tr>
+<td>批量文件处理</td>
+<td>已打开并纳入关闭逻辑的文件</td>
+<td>打开动作自身失败前的临时状态</td>
+</tr>
+<tr>
+<td>事务操作</td>
+<td>已加入事务的数据库修改</td>
+<td>外部网络副作用与普通内存字段</td>
+</tr>
+</tbody>
+</table>
+<p>“异常被捕获”不等于“所有副作用已撤回”。清理结果应由具体资源终态证明，而不是从一次 catch 或一条 close 日志推断。</p>
+<h2 id="单例预实例化也有边界">单例预实例化也有边界</h2>
+<p><code>finishBeanFactoryInitialization</code> 最终进入工厂的预实例化逻辑，普通路径处理非抽象且符合单例创建条件的定义。prototype 不因这个阶段自动变成单例；lazy Bean 如果被另一个非懒单例依赖，仍可能因依赖解析而创建。Framework 6.2.11 还支持标记后台初始化并配置相应执行器的分支，本实验没有启用它，因此单线程事件表不用于证明所有启动场景都由同一线程串行执行。</p>
+<p>预实例化后还有 <code>SmartInitializingSingleton.afterSingletonsInstantiated</code> 回调。上游 <code>GenericApplicationContextTests</code> 分别测试普通 Bean 创建失败与该回调抛异常时，已创建对象被销毁。这说明“构造器都执行成功”并不等于 refresh 已经成功；后面的初始化回调、生命周期阶段和同步事件处理仍可能失败。<a target="_blank" rel="noopener" href="https://github.com/spring-projects/spring-framework/blob/4c134254642d88e058aa004bdaf44168e1be7bb2/spring-context/src/test/java/org/springframework/context/support/GenericApplicationContextTests.java">上游故障清理测试</a></p>
+<p>上述上游测试只做源码阅读；本地运行覆盖的是入口中的故障控制组，没有执行整套 Spring 上游 Gradle 测试。资源释放结论也限于实验记录的 <code>DisposableBean</code>，没有据此宣称真实连接池、后台线程或网络请求已经释放。</p>
+<h2 id="练习与解答">练习与解答</h2>
+<p><strong>练习一。</strong> 一个 Factory 后处理器调用 <code>getBean(&quot;service&quot;)</code>，之后才安装一个包装 <code>service</code> 的 BPP。启动没有异常，能否推断 service 已被包装？</p>
+<p>解答：不能。业务对象可能已经在处理链不完整时创建并缓存，后续安装 BPP 不会自动补做该实例的全套创建流程。先检查对象的第一次创建时点与最终引用，把元数据修改留在 Factory 后处理器，把实例包装留在 BPP。</p>
+<p><strong>练习二。</strong> <code>broken</code> 构造器抛异常后，日志里没有 <code>first.destroy</code>，能否判定 refresh 清理失效？</p>
+<p>解答：不能先下结论。要检查 <code>first</code> 是否在失败前创建成功、是否登记销毁回调、异常是否落在统一清理范围。使用显式依赖建立创建前后关系，比依靠两个定义的偶然注册顺序更适合故障实验。</p>
+<h2 id="模式速查">模式速查</h2>
+<table>
+<thead>
+<tr>
+<th>观察</th>
+<th>对应模式</th>
+<th>优先证据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>某个 Bean 没经过完整后处理</td>
+<td>规则安装早于业务创建</td>
+<td>首次 getBean 时点与 BPP 安装时点</td>
+</tr>
+<tr>
+<td>失败后仍有对象未销毁</td>
+<td>按异常范围计算清理集合</td>
+<td>抛出位置、资源登记与销毁终态</td>
+</tr>
+<tr>
+<td>构造器全成功却启动失败</td>
+<td>启动是多阶段协议</td>
+<td>后续回调、生命周期与刷新事件</td>
+</tr>
+<tr>
+<td>故障组没有销毁日志</td>
+<td>先确认资源是否存在</td>
+<td>显式依赖或预创建控制条件</td>
+</tr>
+</tbody>
+</table>
+<h2 id="参考资料">参考资料</h2>
+<p>实验工程与环境准备见<a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-00-%E4%BB%8E%E6%89%8B%E5%8A%A8%E7%BB%84%E8%A3%85%E5%88%B0%E5%8F%AF%E9%AA%8C%E8%AF%81%E7%9A%84%E5%AE%B9%E5%99%A8%E5%AE%9E%E9%AA%8C/">00：容器实验入口</a>。继续阅读<a href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-04-%E9%85%8D%E7%BD%AE%E7%B1%BB%E8%A7%A3%E6%9E%90%E4%B8%8EBean%E6%96%B9%E6%B3%95%E8%B0%83%E7%94%A8/">04：配置类解析与 Bean 方法调用</a>。</p>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://github.com/spring-projects/spring-framework/blob/4c134254642d88e058aa004bdaf44168e1be7bb2/spring-context/src/main/java/org/springframework/context/support/PostProcessorRegistrationDelegate.java">PostProcessorRegistrationDelegate</a>：后处理器分组、调用和安装。</li>
+<li><a target="_blank" rel="noopener" href="https://github.com/spring-projects/spring-framework/blob/4c134254642d88e058aa004bdaf44168e1be7bb2/spring-beans/src/main/java/org/springframework/beans/factory/support/DefaultListableBeanFactory.java">DefaultListableBeanFactory</a>：预实例化、后台初始化分支和完成回调。</li>
+<li><a target="_blank" rel="noopener" href="https://github.com/spring-projects/spring-framework/blob/4c134254642d88e058aa004bdaf44168e1be7bb2/spring-context/src/main/java/org/springframework/context/support/GenericApplicationContext.java">GenericApplicationContext</a>：单次 refresh 与内部工厂语义。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-03-refresh%E5%A6%82%E4%BD%95%E7%BB%84%E7%BB%87%E5%AE%B9%E5%99%A8%E5%90%AF%E5%8A%A8/">https://magicliang.github.io/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-03-refresh%E5%A6%82%E4%BD%95%E7%BB%84%E7%BB%87%E5%AE%B9%E5%99%A8%E5%90%AF%E5%8A%A8/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Spring/">Spring</a><a class="post-meta__tags" href="/tags/ApplicationContext/">ApplicationContext</a></div><div class="post-share"><div class="social-share" data-image="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-03-refresh%E5%A6%82%E4%BD%95%E7%BB%84%E7%BB%87%E5%AE%B9%E5%99%A8%E5%90%AF%E5%8A%A8/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-07-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F%E5%9B%9E%E8%B0%83%E4%B8%8E%E6%9C%80%E7%BB%88%E4%BB%A3%E7%90%86%E5%BC%95%E7%94%A8/" title="深入 Spring 07：生命周期回调与最终代理引用"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-07-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F%E5%9B%9E%E8%B0%83%E4%B8%8E%E6%9C%80%E7%BB%88%E4%BB%A3%E7%90%86%E5%BC%95%E7%94%A8/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring 07：生命周期回调与最终代理引用</div></div><div class="info-2"><div class="info-item-1">初始化回调中的 this 属于目标对象 订单服务在初始化方法里调用自己的业务方法，容器启动后外部请求又调用同一个方法。如果业务方法由代理拦截，两次调用不一定经过同一条路径。初始化回调作用于正在创建的目标对象，最终提供给调用方的引用可以在后处理阶段被替换为代理；方法名相同不意味着入口相同。 本文固定 Spring Framework 6.2.11、JDK 21，源码提交为 4c134254642d88e058aa004bdaf44168e1be7bb2。实验使用普通 GenericApplicationContext，显式注册后处理器，避免组件扫描带入无关扩展。标准生命周期注解来自 Jakarta Annotation 2.1.1。这里使用 Java 21 编译，代码中的 var 和 List.of 不能直接用于 Java 8。 完整程序是仓库 examples/spring-framework-lab/src/main/java/blog/spring/Chapter07.java。实验同时保存回调顺序、初始化时的 this、容器公开引用和拦截次数，单靠“某条日志出现了”无法证明...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-14-JDK%E4%B8%8ECGLIB%E4%BB%A3%E7%90%86%E7%9A%84%E6%8B%A6%E6%88%AA%E8%BE%B9%E7%95%8C/" title="深入 Spring 14：JDK 与 CGLIB 代理的拦截边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-14-JDK%E4%B8%8ECGLIB%E4%BB%A3%E7%90%86%E7%9A%84%E6%8B%A6%E6%88%AA%E8%BE%B9%E7%95%8C/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring 14：JDK 与 CGLIB 代理的拦截边界</div></div><div class="info-2"><div class="info-item-1">final 方法为何在两种代理中得到不同结果 订单接口声明了 fixed()，实现类把它声明成 final。同样一个计数通知，通过 JDK 代理调用时计数增加，通过 CGLIB 代理调用时计数不增加。不能据此判断 Spring 偶尔忽略了 final，也不能把“final 不能被代理”当成不带条件的规则。 JDK 代理实现接口，接住接口调用以后委托目标对象；它不需要覆盖实现类的 final 方法。类代理依赖子类覆盖可以覆盖的方法，把调用转入拦截器。final 限制覆盖，private 方法不被子类继承，这两种限制与选用的代理入口直接相关。JLS 21 方法覆盖与 final 本文要验证的问题是：改变代理策略后，哪些调用确实经过通知，哪些只在类型上看似相同？实验固定 Spring Framework 6.2.11、JDK 21，源码提交 4c134254642d88e058aa004bdaf44168e1be7bb2。完整入口为 examples/spring-framework-lab/src/main/java/blog/spring/Chapter14.java。  把接口、...</div></div></div></a><a class="pagination-related" href="/2023/03/31/Spring-Web/" title="Spring Web"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2023/03/31/Spring-Web/1.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2023-03-31</div><div class="info-item-2">Spring Web</div></div><div class="info-2"><div class="info-item-1">Spring MVC 把 httprequest 放入线程的过程 1234567891011public class ServletRequestAttributes extends AbstractRequestAttributes &#123;	/**	 * Create a new ServletRequestAttributes instance for the given request.	 * @param request current HTTP request	 */	public ServletRequestAttributes(HttpServletRequest request) &#123;		Assert.notNull(request, &quot;Request must not be null&quot;);		this.request = request;	&#125;&#125; 在 RequestContextFilter 的子类 OrderedRequestContextFilter： 123456789101112131415161718...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-21-%E4%BA%8B%E5%8A%A1%E4%BC%A0%E6%92%AD%E4%BF%9D%E5%AD%98%E7%82%B9%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0%E7%AD%89%E5%BE%85/" title="深入 Spring 21：事务传播、保存点与连接池等待"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-21-%E4%BA%8B%E5%8A%A1%E4%BC%A0%E6%92%AD%E4%BF%9D%E5%AD%98%E7%82%B9%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0%E7%AD%89%E5%BE%85/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring 21：事务传播、保存点与连接池等待</div></div><div class="info-2"><div class="info-item-1">内层成功不等于整个业务成功 外层事务先写订单，内层写审计记录。内层正常返回后，外层抛出异常。审计记录是否保留，取决于内部范围是否拥有独立物理事务：REQUIRED 的写入随外层一起撤销；REQUIRES_NEW 可以已经提交；NESTED 即使成功释放保存点，也仍受外层最终回滚约束。 方法嵌套只描述 Java 调用结构。解释事务传播，还要同时画出逻辑范围、物理事务、数据库连接三条线。一条连接在外层挂起期间仍被借出，内部的新逻辑范围也不必然对应新连接。混淆这两个方向，会同时误判数据原子性和连接池容量。 本文固定 Spring Framework 6.2.11、源码提交 4c134254642d88e058aa004bdaf44168e1be7bb2，使用 JDK 21、PostgreSQL 18.0、pgjdbc 42.7.7、HikariCP 5.0.1。实验通过 TransactionTemplate 直接指定传播，排除自调用是否穿过代理这一变量。第 20 篇声明式入口在解析属性后调用同一个事务管理器；以下结论仍要求那个入口真实生效。 三条时间线如何对应  AbstractPl...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-18-%E8%87%AA%E8%B0%83%E7%94%A8%E7%9B%AE%E6%A0%87%E5%BC%95%E7%94%A8%E4%B8%8E%E6%96%B9%E6%B3%95%E5%85%83%E6%95%B0%E6%8D%AE/" title="深入 Spring 18：自调用、目标引用与方法元数据"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-18-%E8%87%AA%E8%B0%83%E7%94%A8%E7%9B%AE%E6%A0%87%E5%BC%95%E7%94%A8%E4%B8%8E%E6%96%B9%E6%B3%95%E5%85%83%E6%95%B0%E6%8D%AE/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring 18：自调用、目标引用与方法元数据</div></div><div class="info-2"><div class="info-item-1">注解没变，调用经过的对象变了 订单服务的 inner 方法有边界注解，outer 方法内部执行 this.inner()。外部调用 proxy.inner() 能进入通知，调用 proxy.outer() 却不会为内部 inner 再执行一次通知。两个路径执行同一个业务方法，得到同一个 order 字符串，但代理边界不同。 这里不能用“注解失效”代替原因。注解只是方法元数据；只有相应基础设施读取它、生成通知，并且调用进入这个通知所在的代理，元数据才会影响运行。本实验使用自定义 @Boundary 与计数拦截器把问题缩到一个变量：调用经过哪个对象。 固定环境为 Spring Framework 6.2.11、JDK 21，源码提交 4c134254642d88e058aa004bdaf44168e1be7bb2。代码位于 examples/spring-framework-lab/src/main/java/blog/spring/Chapter18.java。JDK 与 CGLIB 各执行相同六项调用断言，另有泛型桥接解析实验。  从代理入口追到目标上的 this 实验中的服务只...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-10-%E4%BD%9C%E7%94%A8%E5%9F%9F%E5%AF%B9%E8%B1%A1%E8%BA%AB%E4%BB%BD%E4%B8%8E%E9%94%80%E6%AF%81%E8%B4%A3%E4%BB%BB/" title="深入 Spring 10：作用域、对象身份与销毁责任"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-10-%E4%BD%9C%E7%94%A8%E5%9F%9F%E5%AF%B9%E8%B1%A1%E8%BA%AB%E4%BB%BD%E4%B8%8E%E9%94%80%E6%AF%81%E8%B4%A3%E4%BB%BB/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring 10：作用域、对象身份与销毁责任</div></div><div class="info-2"><div class="info-item-1">prototype 为什么仍被重复使用 订单服务是 singleton，订单计算票据 Ticket 是 prototype。服务构造时收到一个 Ticket，之后每次处理订单都读取同一个字段。即使 Ticket 的声明写着 prototype，第二次业务调用也没有再向容器请求对象。对象仍被服务字段持有，作用域声明不会改写普通 Java 字段访问。 问题可以缩成三个动作：何时向容器请求、请求后保留哪个引用、何时结束资源所有权。singleton 与 prototype 主要改变创建与复用规则；Provider 将请求推迟到调用时；scoped proxy 在每次被拦截的方法调用中解析当前作用域目标。几种机制叠加时，必须分别观察代理和目标的身份。 本文固定 Spring Framework 6.2.11、JDK 21，源码为 4c134254642d88e058aa004bdaf44168e1be7bb2。实验在 examples/spring-framework-lab/src/main/java/blog/spring/Chapter10.java，新增的 Spring Web ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%90%AF%E5%8A%A8%E5%A4%B1%E8%B4%A5%E5%8F%91%E7%94%9F%E5%9C%A8%E5%93%AA%E4%B8%80%E6%AD%A5-%E4%BC%9A%E6%94%B9%E5%8F%98%E6%B8%85%E7%90%86%E7%BB%93%E6%9E%9C"><span class="toc-number">1.</span> <span class="toc-text">启动失败发生在哪一步，会改变清理结果</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#refresh-%E6%98%AF%E9%98%B6%E6%AE%B5%E5%8D%8F%E8%AE%AE-%E4%B8%8D%E6%98%AF%E5%AF%B9%E8%B1%A1%E5%88%9B%E5%BB%BA%E5%BE%AA%E7%8E%AF"><span class="toc-number">2.</span> <span class="toc-text">refresh 是阶段协议，不是对象创建循环</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%90%8E%E5%A4%84%E7%90%86%E5%99%A8%E7%9A%84%E4%B8%A4%E4%B8%AA%E7%AA%97%E5%8F%A3"><span class="toc-number">3.</span> <span class="toc-text">后处理器的两个窗口</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9A%E5%85%88%E5%AE%89%E8%A3%85%E6%89%A7%E8%A1%8C%E8%A7%84%E5%88%99-%E5%86%8D%E5%A4%84%E7%90%86%E4%B8%9A%E5%8A%A1%E5%AF%B9%E8%B1%A1"><span class="toc-number">3.1.</span> <span class="toc-text">模式提炼：先安装执行规则，再处理业务对象</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E4%BA%8B%E4%BB%B6%E5%BA%8F%E5%88%97%E6%A3%80%E6%9F%A5%E6%AD%A3%E5%B8%B8%E5%90%AF%E5%8A%A8"><span class="toc-number">4.</span> <span class="toc-text">用事件序列检查正常启动</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%B1%E8%B4%A5%E6%B8%85%E7%90%86%E5%BF%85%E9%A1%BB%E5%90%8C%E6%97%B6%E7%9C%8B%E5%BC%82%E5%B8%B8%E4%BD%8D%E7%BD%AE%E4%B8%8E%E5%B7%B2%E6%9C%89%E5%AF%B9%E8%B1%A1"><span class="toc-number">5.</span> <span class="toc-text">失败清理必须同时看异常位置与已有对象</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E6%8F%90%E7%82%BC%EF%BC%9A%E6%8C%89%E5%A4%B1%E8%B4%A5%E8%BE%B9%E7%95%8C%E8%AE%A1%E7%AE%97%E6%B8%85%E7%90%86%E9%9B%86%E5%90%88"><span class="toc-number">5.1.</span> <span class="toc-text">模式提炼：按失败边界计算清理集合</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%95%E4%BE%8B%E9%A2%84%E5%AE%9E%E4%BE%8B%E5%8C%96%E4%B9%9F%E6%9C%89%E8%BE%B9%E7%95%8C"><span class="toc-number">6.</span> <span class="toc-text">单例预实例化也有边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0%E4%B8%8E%E8%A7%A3%E7%AD%94"><span class="toc-number">7.</span> <span class="toc-text">练习与解答</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F%E9%80%9F%E6%9F%A5"><span class="toc-number">8.</span> <span class="toc-text">模式速查</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">9.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
