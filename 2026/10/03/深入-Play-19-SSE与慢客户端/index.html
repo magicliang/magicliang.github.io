@@ -1,0 +1,798 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Play 19：SSE 编码、重连游标与慢客户端 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="客户端收到 id 为 101、102、103 的三个事件后关闭连接，再携带 Last-Event-ID: 103 建立新请求，得到 104、105、106。这次连续性来自服务器保存的事件集合与游标选择规则；仅给事件加一个递增 id，无法提供相同的重放能力。 同一个有限事件源经过两种本地代理模式时，首个事件的交付时间也不同。立即转发模式几乎立刻交付，按两秒条件刷出的缓冲模式约等待 2.279 秒。控">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Play 19：SSE 编码、重连游标与慢客户端">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="客户端收到 id 为 101、102、103 的三个事件后关闭连接，再携带 Last-Event-ID: 103 建立新请求，得到 104、105、106。这次连续性来自服务器保存的事件集合与游标选择规则；仅给事件加一个递增 id，无法提供相同的重放能力。 同一个有限事件源经过两种本地代理模式时，首个事件的交付时间也不同。立即转发模式几乎立刻交付，按两秒条件刷出的缓冲模式约等待 2.279 秒。控">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/cover.svg">
+<meta property="article:published_time" content="2026-10-03T09:19:00.000Z">
+<meta property="article:modified_time" content="2026-10-03T12:38:38.659Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Play">
+<meta property="article:tag" content="SSE">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Play 19：SSE 编码、重连游标与慢客户端",
+  "url": "https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/",
+  "image": "https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/cover.svg",
+  "datePublished": "2026-10-03T09:19:00.000Z",
+  "dateModified": "2026-10-03T12:38:38.659Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Play 19：SSE 编码、重连游标与慢客户端',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1481</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1568</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">27</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Play 19：SSE 编码、重连游标与慢客户端</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Play 19：SSE 编码、重连游标与慢客户端</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-03T09:19:00.000Z" title="Created 2026-10-03 17:19:00">2026-10-03</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-03T12:38:38.659Z" title="Updated 2026-10-03 20:38:38">2026-10-03</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/Play-Framework/">Play Framework</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.9k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>9mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-03 20:38:38&quot;}" hidden></div><p>客户端收到 id 为 101、102、103 的三个事件后关闭连接，再携带 Last-Event-ID: 103 建立新请求，得到 104、105、106。这次连续性来自服务器保存的事件集合与游标选择规则；仅给事件加一个递增 id，无法提供相同的重放能力。</p>
+<p>同一个有限事件源经过两种本地代理模式时，首个事件的交付时间也不同。立即转发模式几乎立刻交付，按两秒条件刷出的缓冲模式约等待 2.279 秒。控制器已经生成事件，不代表下游每一层都已把事件交给客户端。</p>
+<span id="more"></span>
+<h2 id="一条事件可以跨越多个读取操作">一条事件可以跨越多个读取操作</h2>
+<p>Server-Sent Events 使用文本格式表达服务端事件。应用需要同时处理 HTTP 传输边界和 SSE 事件边界。网络上的一个 read 可能只得到半行，也可能包含多个事件；使用“一次 read 对应一个事件”的解析方法会把 TCP 分段误当业务分段。</p>
+<p>本篇的每个 sample 事件包含两行 data、一行 id 和一行 event，空行结束事件。首次消息格式如下：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">event: sample<br>id: 101<br>data: line-one-101<br>data: line-two-101<br><br></code></pre></td></tr></table></figure>
+<p>两个 data 行属于同一事件。若业务原始字符串包含换行，直接拼接 <code>data: </code> 与原始字符串，会让第二行脱离 data 字段。应使用能逐行编码的 EventSource.Event，而不是自行假设内容永远为单行。</p>
+<p>实验客户端以 readline 累积字段，到空行才提交事件。它保留 data 数组，因此能明确断言每个事件含两个 data 字段。实际业务处理器还需要决定如何把这些行还原为文本，不能把字段扫描结果与最终业务对象混为一谈。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="cover.svg" alt="SSE 编码、保留记录与客户端游标"></p>
+<h2 id="eventsource-flow-编码的范围">EventSource.flow 编码的范围</h2>
+<p>Java 入口位于 Play 3.0.6 固定提交 <code>2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6</code> 的 <a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play-java/src/main/java/play/libs/EventSource.java">core/play-java/src/main/java/play/libs/EventSource.java</a>。<code>flow()</code> 把 Event 的 formatted 结果转换为 ByteString，Event.formatted 再委托 Scala 编码实现。</p>
+<p><a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play/src/main/scala/play/api/libs/EventSource.scala">core/play/src/main/scala/play/api/libs/EventSource.scala</a> 负责字段和逐行 data 格式。Java Flow 的存在没有增加持久化、确认、重试或重放；这些都不在字符串编码函数的职责范围内。</p>
+<p>Pekko Streams 固定为 1.0.3，提交 <code>4f77c8108aaf548a65531d2c8807da13dbba8146</code>。累计工程中的 SseLabController 使用有限 Source、throttle 与 takeWithin，在物化时注册终止回调。对应 Java DSL 实现可查 <a target="_blank" rel="noopener" href="https://github.com/apache/pekko/blob/4f77c8108aaf548a65531d2c8807da13dbba8146/stream/src/main/scala/org/apache/pekko/stream/javadsl/Source.scala">Source.scala</a>。</p>
+<p>下面的完整类可放入累计工程 app 目录编译，返回一个两行 data 的有限事件流。它展示编码和评论心跳的顺序，不承担重连游标逻辑；包含固定保留集合的完整端点见 <code>app/controllers/SseLabController.java</code>。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">import</span> java.time.Duration;<br><span class="hljs-keyword">import</span> org.apache.pekko.stream.javadsl.Source;<br><span class="hljs-keyword">import</span> org.apache.pekko.util.ByteString;<br><span class="hljs-keyword">import</span> play.libs.EventSource;<br><span class="hljs-keyword">import</span> play.mvc.Result;<br><span class="hljs-keyword">import</span> play.mvc.Results;<br><br><span class="hljs-keyword">public</span> <span class="hljs-keyword">final</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">FiniteSse</span> &#123;<br>    <span class="hljs-keyword">public</span> <span class="hljs-keyword">static</span> Result <span class="hljs-title function_">events</span><span class="hljs-params">()</span> &#123;<br>        Source&lt;ByteString, ?&gt; body = Source.range(<span class="hljs-number">101</span>, <span class="hljs-number">120</span>)<br>            .throttle(<span class="hljs-number">1</span>, Duration.ofMillis(<span class="hljs-number">450</span>))<br>            .map(id -&gt; EventSource.Event<br>                .event(<span class="hljs-string">&quot;line-one-&quot;</span> + id + <span class="hljs-string">&quot;\nline-two-&quot;</span> + id)<br>                .withId(Integer.toString(id))<br>                .withName(<span class="hljs-string">&quot;sample&quot;</span>))<br>            .via(EventSource.flow())<br>            .intersperse(ByteString.fromString(<span class="hljs-string">&quot;: heartbeat\n\n&quot;</span>))<br>            .takeWithin(Duration.ofSeconds(<span class="hljs-number">10</span>));<br>        <span class="hljs-keyword">return</span> Results.ok().chunked(body)<br>            .as(<span class="hljs-string">&quot;text/event-stream&quot;</span>)<br>            .withHeader(<span class="hljs-string">&quot;Cache-Control&quot;</span>, <span class="hljs-string">&quot;no-cache&quot;</span>);<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>这里的心跳是两个有限事件之间插入的 SSE comment，不带 id，也不推进客户端业务游标。它能够验证客户端跳过评论行，但没有演示“长时间完全没有业务事件时仍定时发送”的独立保活服务。生产接口若存在长时间空闲，心跳生成与超时策略需要另外设计和测试。</p>
+<p>throttle 限制的是源侧生成节奏。代理仍可以先消费并保存多条事件，再一次交付。客户端看到突发的事件批次时，应同时检查中间层缓冲，不能直接断言 throttle 没有生效。</p>
+<h2 id="明确有限重放的游标规则">明确有限重放的游标规则</h2>
+<p>实验只保留固定的 20 个事件，id 为 101 到 120。它们是可重复读取的内存对象，不是连接每生成一次就丢弃的临时编号。首次请求不带游标时按 100 处理，取所有 id 大于游标的事件。</p>
+<table>
+<thead>
+<tr>
+<th>Last-Event-ID</th>
+<th>响应</th>
+<th>解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>缺省或 100</td>
+<td>从 101 开始</td>
+<td>固定日志的起点</td>
+</tr>
+<tr>
+<td>103</td>
+<td>从 104 开始</td>
+<td>已收到 103，重放剩余记录</td>
+</tr>
+<tr>
+<td>99</td>
+<td>410</td>
+<td>游标早于允许起点，无法承诺所缺记录仍在</td>
+</tr>
+<tr>
+<td>120</td>
+<td>204</td>
+<td>这份有限日志已全部读完</td>
+</tr>
+<tr>
+<td>121 或无法解析的文本</td>
+<td>400</td>
+<td>超出当前日志或格式错误</td>
+</tr>
+</tbody>
+</table>
+<p>过期游标不能悄悄重置为最新位置，否则客户端会把跳过的数据误认为已经连续收到。实际系统可以选择返回明确过期错误、要求客户端获取全量快照，或提供单独的补偿读取入口；每一种都需要相应客户端处理。</p>
+<p>游标也不是授权信息。多用户事件流应先确定调用者可见的事件范围，再解释该范围内的游标。同一个整数出现在两个租户中，不代表它们可以共享重放位置。本实验使用公开的合成数据，未实现租户隔离与持久化日志。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">保留集合: 101 102 103 104 105 106 ... 120<br>连接 A:   └────── 接收 ───┘  TCP close<br>保存游标:                103<br>连接 B: Last-Event-ID=103 ──&gt; 104 105 106 ...<br>过期输入:99 ──&gt; 410，不悄悄跳到最新事件<br></code></pre></td></tr></table></figure>
+<p>将游标持久化放在业务处理之前，会出现“游标已推进、业务未处理”的丢失窗口。放在业务处理之后，则可能在断电重连时重复处理最后一条。需要恰好一次业务效果时，消费者必须把去重或业务幂等纳入设计，SSE 传输本身无法替代这一步。</p>
+<h2 id="三事件断线重连的真实观测">三事件断线重连的真实观测</h2>
+<p>Python 标准库客户端建立 HTTP 连接，逐行接收三个完整事件，然后实际关闭连接对象和响应。服务端终态通过另一个有限轮询请求读取。随后客户端新建连接，显式发送 Last-Event-ID: 103，而不是复用原连接或直接调用 controller 方法。</p>
+<table>
+<thead>
+<tr>
+<th>观察项</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>首次三条 id</td>
+<td>101、102、103</td>
+</tr>
+<tr>
+<td>每条 data 行数</td>
+<td>2</td>
+</tr>
+<tr>
+<td>首次读取期间评论行</td>
+<td>至少 2</td>
+</tr>
+<tr>
+<td>新连接三条 id</td>
+<td>104、105、106</td>
+</tr>
+<tr>
+<td>两个连接的终止记录</td>
+<td>terminated=true，closeCount=1</td>
+</tr>
+<tr>
+<td>过期、读完、未来、非法游标</td>
+<td>410、204、400、400</td>
+</tr>
+</tbody>
+</table>
+<p>这份结果只覆盖固定集合仍在内存中的重连。没有运行跨进程重启、事件淘汰竞争、分区切换与消费者崩溃恢复，不能写成一般性的“断连不丢消息”。已经发送的 id 提供定位能力，能够重放的记录和明确的过期协议才提供恢复能力。</p>
+<h2 id="两秒缓冲怎样改变首事件时间">两秒缓冲怎样改变首事件时间</h2>
+<p>本地代理有两种模式。direct 每读到一块就转发并 flush；buffered 将块加入 bytearray，在达到容量阈值或距上次 flush 超过两秒时刷出。每次上游读取最多 1024 字节，阈值预留这一块的空间，缓冲断言不超过 65536 字节。</p>
+<p>这个两秒检查在读到上游新数据时触发，不是独立定时器。因此在当前每 450 毫秒产生事件的输入下，实际等待会大于两秒；如果上游完全静默，代码不会凭空唤醒一次读操作。本地示例的有限输入和 socket 超时保证它不会无限挂起。</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th style="text-align:right">首事件等待，秒</th>
+<th style="text-align:right">完整接收事件数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>direct</td>
+<td style="text-align:right">0.00001825</td>
+<td style="text-align:right">20</td>
+</tr>
+<tr>
+<td>buffered</td>
+<td style="text-align:right">2.27906479</td>
+<td style="text-align:right">20</td>
+</tr>
+</tbody>
+</table>
+<p>计时从客户端取得代理响应对象后、开始解析 SSE 行时起算。首事件可能已经进入 socket 缓冲，所以 direct 的微秒级数值不能解释成完整的端到端 HTTP 延迟。测试断言比较两种模式至少一秒的差距，不要求复现表内小数。</p>
+<p>两个模式都收到了全部 20 个事件，却有不同的交付延迟。只核对最终事件数量会漏掉实时性退化；只测首事件则可能漏掉尾部丢失。代理实验需要同时记录首事件时间、事件总数与连接终态。</p>
+<p>这段 Python 代理没有使用 nginx，也没有访问生产网关。它展示的是显式缓冲算法对有限输入的影响，不能据此推导某个代理产品的默认配置。部署链路中的压缩、缓存、缓冲和空闲超时仍需各自验证。</p>
+<h2 id="响应已经开始以后的失败">响应已经开始以后的失败</h2>
+<p><code>mode=fail</code> 在前三个事件之后令上游失败。本次客户端已经得到 HTTP 200 和 chunked 响应头，也完成了三个事件的解析，继续读取时收到 ConnectionResetError；服务端账本的 failure 为 IllegalStateException。</p>
+<p>另一轮同类流失败可以呈现不完整 chunked 消息。TCP reset 与读到 EOF 后识别消息截断，取决于服务器关闭方式和客户端读取时序。验收关注响应未完整结束、上游异常被记录及流释放，不将某一个 Python 异常类型当成协议保证。</p>
+<p>自动重连如果反复携带同一个最后游标，会反复遇到同一条坏事件。服务端需要决定是保留失败、产生可识别的错误事件、跳过特定记录还是终止订阅；随意跳过会改变业务语义。当前实验直接中止，不伪造一条“成功”的业务事件掩盖异常。</p>
+<h2 id="重跑与练习">重跑与练习</h2>
+<p>共享累计工程已另行验收：39项JUnit与stage通过，8个流/文件class与生产jar字节一致；DEV/PROD各198次既有HTTP和五组真实socket通过。共享记录在<code>evidence/batch18-21/shared-socket/observations.json</code>；隔离样本保留原测量值，不将两轮耗时、RSS、块数混为同一轮。</p>
+<p>从<a href="../../02/%E6%B7%B1%E5%85%A5-Play-00-%E6%9C%80%E5%B0%8F%E5%BA%94%E7%94%A8/">第00篇</a>取得累计工程并配置 JDK 21，在 play-lab 目录执行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash">bash sbtw clean <span class="hljs-built_in">test</span> stage<br>python3 lab/stream_checks.py --evidence evidence/batch18-21/replay<br></code></pre></td></tr></table></figure>
+<p>历史隔离证据在 <code>evidence/batch18-21/isolated/</code>：<code>run-final-io/observations.json</code> 的 sse 与 localProxyOnly 保存事件字段、游标状态码和时间；<code>junit/TEST-StreamLabTest.xml</code> 包含事件编码、游标规则与应用停止测试。本轮隔离工程 36 项 JUnit 与 stage 通过，不代表另一次共享工程构建的结果。</p>
+<p>反例题：Source 为每条事件生成 id，但发送完马上丢弃对象。客户端重新提交旧 id 后，服务器能否凭这个 id 恢复 payload？不能；标识与保存的内容是两个独立条件。</p>
+<p>改动练习：把保留集合改为最多 8 条的滑动日志，在生成第 121 条后删除最旧项。分别以“刚好仍可重放”“比最旧项早一步”“超过最新项”的游标连接，写出明确断言。并发生成与读取时，应从同一受保护的快照计算最旧位置和待发送集合，避免先通过游标校验、随后记录已经被淘汰。</p>
+<p>另一个练习是在消费者处理第三条事件之后、保存游标之前模拟崩溃。重连后记录重复事件，并用业务去重键验证效果只发生一次。这个练习验证消费者恢复，不能用服务端给事件编号的单元测试代替。</p>
+<p>上一篇：<a href="../%E6%B7%B1%E5%85%A5-Play-18-HTTP%E6%B5%81%E5%BC%8F%E5%93%8D%E5%BA%94/">HTTP流式响应</a>。下一篇：<a href="../%E6%B7%B1%E5%85%A5-Play-20-WebSocket%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/">WebSocket生命周期</a>。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/">https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Play/">Play</a><a class="post-meta__tags" href="/tags/SSE/">SSE</a></div><div class="post-share"><div class="social-share" data-image="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2022/04/25/%E5%9F%BA%E4%BA%8E-Play-%E6%A1%86%E6%9E%B6%E8%BF%9B%E8%A1%8C%E5%BC%80%E5%8F%91/" title="基于 Play 框架进行开发"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2022/04/25/%E5%9F%BA%E4%BA%8E-Play-%E6%A1%86%E6%9E%B6%E8%BF%9B%E8%A1%8C%E5%BC%80%E5%8F%91/%E5%8A%A0%E8%BD%BD%E8%B0%83%E8%AF%95%E5%99%A8.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2022-04-25</div><div class="info-item-2">基于 Play 框架进行开发</div></div><div class="info-2"><div class="info-item-1">构建和编译的方法 sbt clean &quot;project leads-web&quot; &quot;universal:packageZipTarball&quot; 常用命令 1234567891011121314151617# 在 sbt 里# 刷新命令reload;update;clean;compile# 切换到项目 aproject a# 在 sbt 的项目 a 里run &quot;-Dotel.resource.attributes=serviceName=iouy&quot;# 如果使用了 coursier 来管理依赖的话，查看依赖coursierDependencyTree# 在普通的 shell 里# 开启远程调试sbt -jvm-debug 9999 run# 传递 jvm 参数sbt -J-javaagent:skywalking-agent.jar -jvm-debug 9999 run   ORM ebean 1234567891011121314151617181920212223242526lazy val `model-base` = ...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-17-%E7%BC%93%E5%AD%98%E5%8A%A0%E8%BD%BD%E4%B8%8E%E5%A4%B1%E6%95%88/" title="深入 Play 17：缓存加载、失效与并发回源"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-17-%E7%BC%93%E5%AD%98%E5%8A%A0%E8%BD%BD%E4%B8%8E%E5%A4%B1%E6%95%88/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 17：缓存加载、失效与并发回源</div></div><div class="info-2"><div class="info-item-1">四个线程同时请求同一个不存在的缓存 key。加载函数返回一个尚未完成的 Future，四个调用者都在等待，但加载计数只有一。完成这个 Future 后，四个调用者得到相同的 loaded；随后热读仍没有增加加载次数。 这不是从 AsyncCacheApi 的名称推出来的保证。实际使用的 Caffeine provider 把进行中的加载结果放进同一个 key 的槽位，后续调用共享该结果。更换 provider、换成两个 JVM 或改成先 get 再 set，都需要重新验证回源次数。  key、值与进行中的加载 本篇使用 Play 3.0.6 的 caffeine 模块和解析得到的 Caffeine 3.1.8，累计工程基于 JDK 21。CacheLab 注入 AsyncCacheApi，以唯一实验前缀隔离 key，结束时只删除这组 key，避免清空应用共享缓存。    状态 调用者可见结果 本实验加载计数     冷 key，加载未完成 四个 Stage 均 pending 1   完成受控加载 四个调用者均得到 loaded 1   同 key 热读 loaded 1   另...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/" title="深入 Play 15：超时、取消与重试的任务终态"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 15：超时、取消与重试的任务终态</div></div><div class="info-2"><div class="info-item-1">一个任务已经进入工作线程，随后停在受控闸门前。给它包装 100 毫秒超时，包装 Stage 以 TimeoutException 结束；读取原任务，done 与 cancelled 却都是 false。释放闸门后，原任务返回 late-success。 这组结果区分了两个事件：调用者停止等待，工作本身完成。若工作在完成前还会扣库存或提交事务，前一个事件不足以证明后一个事件没有发生。超时处理需要同时回答返回什么、谁停止工作、哪些副作用已经发生。  一次调用有多个终态 本篇沿用 Play 3.0.6、Scala 2.13.15、JDK 21 的累计工程。app/labbudget/TimeoutLab.java 使用合成任务、CountDownLatch 和有限工作线程，把迟到完成、协作取消、重试分类放在同一组确定时序中。实验不访问数据库，也没有真实订单。    观察对象 可直接证明的事实 不能据此推出的事实     超时包装 Stage 等待结果已变成失败 原任务已停止   原任务 Stage 值或异常已完成 外部事务必然回滚   取消标记 取消意图已发布 执行方已经检查标记   ...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/" title="深入 Play 21：上传下载、临时文件与 IO 关闭"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 21：上传下载、临时文件与 IO 关闭</div></div><div class="info-2"><div class="info-item-1">一个 multipart 请求声明 50000 字节，实际发送文件前缀后就关闭 TCP。断连前，临时目录里已经存在 part 文件；断连后，controller 没有机会处理完整请求，但 parser 的失败路径清理了文件，FileIO 的开始与完成计数均为一。 把删除操作只放在 controller 的 finally 中，覆盖不了这个生命周期。临时文件在 body parser 阶段创建，清理责任也必须从这个阶段开始，直到成功移交给应用或失败终止。  请求尺寸、文件尺寸与路径是三个约束 文件接口接收的不只是文件字节。multipart 请求还包含边界、字段头、普通表单项和其他文件部分，因此“单个文件不超过 64 KiB”与“整个请求不超过 64 KiB”不是同一个限制。实验为整个 multipart body 设置 65536 字节上限，同时只允许一个文件。 Content-Length 提供提前拒绝的机会，但不能作为唯一依据。chunked 请求没有可直接使用的总长度，parser 必须在消费字节的过程中累计。若只在 controller 中读取文件大小再比较，请求可能已经...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-18-HTTP%E6%B5%81%E5%BC%8F%E5%93%8D%E5%BA%94/" title="深入 Play 18：HTTP 流式响应、背压与资源终止"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-18-HTTP%E6%B5%81%E5%BC%8F%E5%93%8D%E5%BA%94/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 18：HTTP 流式响应、背压与资源终止</div></div><div class="info-2"><div class="info-item-1">一个响应最多输出 32 MiB，每次只产生 16 KiB。客户端收到响应头以后暂停读取，服务端生产计数停在 49 块；客户端随后只读一块就关闭真实 socket，服务端流进入终态，关闭计数为一。 这个实验测到了当前链路中的需求反馈与取消传播。49 块已经远大于客户端实际读取的一块，差额可以停留在流、服务器和内核缓冲中。把应用 Source 的 inputBuffer 设成一，不能把整条网络链路理解成“只允许提前产生一个元素”。  生产速率、消费速率与待发送字节 流式响应首先改变的是生产方式。有限列表先把所有对象构造完再交给 Source，虽然输出按元素传输，列表占用的内存已经发生。实验的 Source.range 只产生整数索引，map 在获得下游需求时分配一个 16384 字节数组，上限为 2048 块，不构造完整字节列表。 先忽略对象开销，以字节计算未消费数据。假设生产速率为每秒 8 MiB、消费速率为每秒 1 MiB，持续两秒且生产端没有减速，待发送数据会增加 14 MiB。这是速率差的积分，不是已经测出的 JVM 堆占用。如果可用缓冲只有 512 KiB，差额不能永久累积...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-20-WebSocket%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/" title="深入 Play 20：WebSocket 握手、消息上限与连接生命周期"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-20-WebSocket%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 20：WebSocket 握手、消息上限与连接生命周期</div></div><div class="info-2"><div class="info-item-1">同样一个 65537 字节的 WebSocket 帧，用一次 socket 写入发送时，本次实验观察到应用的 4096 字符限制报错；改成每次写 8192 字节，服务端返回了 1009 关闭码。这里变化的是 TCP 写入与后端帧聚合路径，业务消息内容没有变化。 因此，验证 WebSocket 限制需要同时记录帧的构造、消息分片、应用处理量和关闭终态。只看到配置里有一个 64k，或者只看到连接已关闭，都不足以定位到底由哪一层拒绝了输入。  握手以前能拒绝，握手以后要管理流 WebSocket 连接先经过 HTTP 握手。实验使用 WebSocket.Text.acceptOrResult，验证合成 token，再验证精确 Origin。错误 token 返回 401，错误 Origin 返回 403；两条拒绝路径都在创建连接账本与 Flow 之前结束。 “拒绝没有分配应用流”需要证据。脚本先发送真实 Upgrade 请求，读取 HTTP 状态，然后查询同一个 id 的账本。两次查询均不存在记录。若在认证以前先建立 Actor、队列或数据库订阅，即使最终返回 401，仍需另外处理已经...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E6%9D%A1%E4%BA%8B%E4%BB%B6%E5%8F%AF%E4%BB%A5%E8%B7%A8%E8%B6%8A%E5%A4%9A%E4%B8%AA%E8%AF%BB%E5%8F%96%E6%93%8D%E4%BD%9C"><span class="toc-number">1.</span> <span class="toc-text">一条事件可以跨越多个读取操作</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#eventsource-flow-%E7%BC%96%E7%A0%81%E7%9A%84%E8%8C%83%E5%9B%B4"><span class="toc-number">2.</span> <span class="toc-text">EventSource.flow 编码的范围</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%98%8E%E7%A1%AE%E6%9C%89%E9%99%90%E9%87%8D%E6%94%BE%E7%9A%84%E6%B8%B8%E6%A0%87%E8%A7%84%E5%88%99"><span class="toc-number">3.</span> <span class="toc-text">明确有限重放的游标规则</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E4%BA%8B%E4%BB%B6%E6%96%AD%E7%BA%BF%E9%87%8D%E8%BF%9E%E7%9A%84%E7%9C%9F%E5%AE%9E%E8%A7%82%E6%B5%8B"><span class="toc-number">4.</span> <span class="toc-text">三事件断线重连的真实观测</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E7%A7%92%E7%BC%93%E5%86%B2%E6%80%8E%E6%A0%B7%E6%94%B9%E5%8F%98%E9%A6%96%E4%BA%8B%E4%BB%B6%E6%97%B6%E9%97%B4"><span class="toc-number">5.</span> <span class="toc-text">两秒缓冲怎样改变首事件时间</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%93%8D%E5%BA%94%E5%B7%B2%E7%BB%8F%E5%BC%80%E5%A7%8B%E4%BB%A5%E5%90%8E%E7%9A%84%E5%A4%B1%E8%B4%A5"><span class="toc-number">6.</span> <span class="toc-text">响应已经开始以后的失败</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%87%8D%E8%B7%91%E4%B8%8E%E7%BB%83%E4%B9%A0"><span class="toc-number">7.</span> <span class="toc-text">重跑与练习</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

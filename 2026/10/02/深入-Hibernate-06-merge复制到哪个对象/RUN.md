@@ -4,7 +4,7 @@
 
 从 `examples/hibernate-lab/` 运行 `./mvnw -B -ntp -Dtest=Chapter06Test test`；通过 `HIBERNATE_LAB_JDBC_URL`、`HIBERNATE_LAB_USER`、`HIBERNATE_LAB_PASSWORD` 提供专用库连接，密码不入库。
 
-当前可追溯记录为 `examples/hibernate-lab/evidence/06/20261003T031711Z-pg16-first/` 的 `command.txt`、`environment.txt`、`test.stdout.txt`、`exit-code.txt`、JUnit XML 和另起连接执行的 `db-final.txt`。上一版提及的 `/private/tmp` 路径及 PostgreSQL 17.6 原始输出未随当前仓库收录，不作为当前检出版本的通过证据。
+云端 PostgreSQL 16.15 记录为 `examples/hibernate-lab/evidence/06/20261003T031711Z-pg16-first/` 的 `command.txt`、`environment.txt`、`test.stdout.txt`、`exit-code.txt`、JUnit XML 和另起连接执行的 `db-final.txt`。主仓还保留此前 PostgreSQL 17.6 原始输出，同步后另跑 `examples/hibernate-lab/evidence/00-12/20261003-pg17-synced-local/`，未增强累计 50/50。各轮环境和终态分别保留，临时路径描述不代替仓库原始证据。
 
 | 场景 | 二元可观测结果 | 原始仓库证据 |
 |---|---|---|

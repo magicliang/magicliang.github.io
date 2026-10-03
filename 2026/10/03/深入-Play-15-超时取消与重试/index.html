@@ -1,0 +1,760 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Play 15：超时、取消与重试的任务终态 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="一个任务已经进入工作线程，随后停在受控闸门前。给它包装 100 毫秒超时，包装 Stage 以 TimeoutException 结束；读取原任务，done 与 cancelled 却都是 false。释放闸门后，原任务返回 late-success。 这组结果区分了两个事件：调用者停止等待，工作本身完成。若工作在完成前还会扣库存或提交事务，前一个事件不足以证明后一个事件没有发生。超时处理需要同时">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Play 15：超时、取消与重试的任务终态">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="一个任务已经进入工作线程，随后停在受控闸门前。给它包装 100 毫秒超时，包装 Stage 以 TimeoutException 结束；读取原任务，done 与 cancelled 却都是 false。释放闸门后，原任务返回 late-success。 这组结果区分了两个事件：调用者停止等待，工作本身完成。若工作在完成前还会扣库存或提交事务，前一个事件不足以证明后一个事件没有发生。超时处理需要同时">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/cover.svg">
+<meta property="article:published_time" content="2026-10-03T09:15:00.000Z">
+<meta property="article:modified_time" content="2026-10-03T12:38:38.659Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Play">
+<meta property="article:tag" content="异步">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Play 15：超时、取消与重试的任务终态",
+  "url": "https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/",
+  "image": "https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/cover.svg",
+  "datePublished": "2026-10-03T09:15:00.000Z",
+  "dateModified": "2026-10-03T12:38:38.659Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Play 15：超时、取消与重试的任务终态',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1481</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1568</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">27</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Play 15：超时、取消与重试的任务终态</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Play 15：超时、取消与重试的任务终态</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-03T09:15:00.000Z" title="Created 2026-10-03 17:15:00">2026-10-03</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-03T12:38:38.659Z" title="Updated 2026-10-03 20:38:38">2026-10-03</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/Play-Framework/">Play Framework</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.6k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>8mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-03 20:38:38&quot;}" hidden></div><p>一个任务已经进入工作线程，随后停在受控闸门前。给它包装 100 毫秒超时，包装 Stage 以 TimeoutException 结束；读取原任务，done 与 cancelled 却都是 false。释放闸门后，原任务返回 late-success。</p>
+<p>这组结果区分了两个事件：调用者停止等待，工作本身完成。若工作在完成前还会扣库存或提交事务，前一个事件不足以证明后一个事件没有发生。超时处理需要同时回答返回什么、谁停止工作、哪些副作用已经发生。</p>
+<span id="more"></span>
+<h2 id="一次调用有多个终态">一次调用有多个终态</h2>
+<p>本篇沿用 Play 3.0.6、Scala 2.13.15、JDK 21 的累计工程。<code>app/labbudget/TimeoutLab.java</code> 使用合成任务、CountDownLatch 和有限工作线程，把迟到完成、协作取消、重试分类放在同一组确定时序中。实验不访问数据库，也没有真实订单。</p>
+<table>
+<thead>
+<tr>
+<th>观察对象</th>
+<th>可直接证明的事实</th>
+<th>不能据此推出的事实</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>超时包装 Stage</td>
+<td>等待结果已变成失败</td>
+<td>原任务已停止</td>
+</tr>
+<tr>
+<td>原任务 Stage</td>
+<td>值或异常已完成</td>
+<td>外部事务必然回滚</td>
+</tr>
+<tr>
+<td>取消标记</td>
+<td>取消意图已发布</td>
+<td>执行方已经检查标记</td>
+</tr>
+<tr>
+<td>工作线程终止</td>
+<td>该线程资源已退出</td>
+<td>远端服务没有继续处理</td>
+</tr>
+</tbody>
+</table>
+<p>把这些状态压缩成一个 success 布尔值，会丢失故障定位所需的信息。实验报告分别保留 timeoutOutcome、originalDoneAtTimeout、lateOutcome 和 workerTerminated；因此可以定位失败发生在等待层，随后工作仍正常结束。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">工作线程       entered ─── 等待 release ───────────── late-success<br>原始 Stage     pending ───────────────────────────── completed<br>超时包装       pending ── 100ms 到期 ── TimeoutException<br>观察动作                         读取原任务状态 ── release<br></code></pre></td></tr></table></figure>
+<p>这里的 100 毫秒是配置值，不是精确调度承诺。运行时调度、CPU 竞争和暂停都可能使异常晚于配置时间被观察到。正确性断言应约束事件先后和有界结束，不能要求墙钟采样恰好等于 100。</p>
+<h2 id="play-的-timeout-组合了两个结果">Play 的 timeout 组合了两个结果</h2>
+<p>Java 入口 <code>Futures.timeout(stage, duration)</code> 由 <a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play/src/main/java/play/libs/concurrent/DefaultFutures.java#L63-L70">DefaultFutures</a> 把 Duration 与 CompletionStage 转给 Scala 实现。固定源码为 Play 提交 <code>2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6</code>，不以滚动的 3.0.x 文档替代该实现。</p>
+<p><a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play/src/main/scala/play/api/libs/concurrent/Futures.scala#L97-L104">Scala DefaultFutures</a> 先用 Pekko scheduler 创建一个延迟失败的 Future，再调用 <code>Future.firstCompletedOf(Seq(f, timeoutFuture))</code>。返回结果取决于两个 Future 谁先完成；这个方法没有调用原任务的 cancel，也没有获得它所持有的数据库连接、文件句柄或业务撤销接口。</p>
+<p>因此，给一个已经提交的任务包上 timeout，不会增加任务停止协议。把同一任务包装两次，也只是产生两个等待视角；两个超时失败不能相加解释成两次取消。</p>
+<p>下面是可放进累计工程 <code>app/TimeoutView.java</code> 编译的最小观察类。原始 Future 暂不完成，因此能够直接观察等待超时；handle 记录状态后再人为补入迟到结果。它不创建线程，也不替代后面的工作线程实验。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">import</span> java.time.Duration;<br><span class="hljs-keyword">import</span> java.util.concurrent.CompletableFuture;<br><span class="hljs-keyword">import</span> java.util.concurrent.CompletionStage;<br><span class="hljs-keyword">import</span> play.libs.concurrent.Futures;<br><br><span class="hljs-keyword">public</span> <span class="hljs-keyword">final</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">TimeoutView</span> &#123;<br>    <span class="hljs-keyword">public</span> <span class="hljs-keyword">static</span> CompletionStage&lt;String&gt; <span class="hljs-title function_">observe</span><span class="hljs-params">(Futures futures)</span> &#123;<br>        CompletableFuture&lt;String&gt; original = <span class="hljs-keyword">new</span> <span class="hljs-title class_">CompletableFuture</span>&lt;&gt;();<br>        <span class="hljs-keyword">return</span> futures.timeout(original, Duration.ofMillis(<span class="hljs-number">100</span>))<br>            .handle((value, failure) -&gt; &#123;<br>                <span class="hljs-type">boolean</span> <span class="hljs-variable">done</span> <span class="hljs-operator">=</span> original.isDone();<br>                <span class="hljs-type">boolean</span> <span class="hljs-variable">cancelled</span> <span class="hljs-operator">=</span> original.isCancelled();<br>                original.complete(<span class="hljs-string">&quot;late-success&quot;</span>);<br>                <span class="hljs-keyword">return</span> <span class="hljs-string">&quot;failed=&quot;</span> + (failure != <span class="hljs-literal">null</span>)<br>                    + <span class="hljs-string">&quot;,done=&quot;</span> + done + <span class="hljs-string">&quot;,cancelled=&quot;</span> + cancelled<br>                    + <span class="hljs-string">&quot;,late=&quot;</span> + original.getNow(<span class="hljs-string">&quot;missing&quot;</span>);<br>            &#125;);<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>超时包装适合限制调用者等待结果的时间。要限制实际工作持续时间，还需要执行方可理解的截止时间、取消接口或协作检查点。两种限制可以一起使用，但应分别观察。</p>
+<h2 id="cancel-与协作停止的区别">cancel 与协作停止的区别</h2>
+<p>JDK 的 <a target="_blank" rel="noopener" href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html#cancel(boolean)">CompletableFuture.cancel</a> 将尚未完成的 Future 置为取消完成状态；该类不通过 mayInterruptIfRunning 控制计算线程。由此不能把 <code>cancel(true)</code> 当作任意任务的强制中断，更不能把 Future 的取消状态当作业务副作用的撤销记录。</p>
+<p>实验的协作版本保留原任务 Stage，另设 AtomicBoolean 作为取消意图。调用者观察超时后设置标记，再释放闸门。执行方通过闸门后先检查标记，发现已取消便返回 cooperatively-cancelled，只有未取消分支才递增 sideEffects。</p>
+<p>这次观测为 cooperativeTimeoutOutcome=TimeoutException、cooperativeTerminal=cooperatively-cancelled、cooperativeSideEffects=0。能成立的结论是：在这个检查点和受控时序下，合成副作用没有发生。测试没有调用 CompletableFuture.cancel，因此协作终态与 JDK Future 取消契约是两个论据，不能混写成一次 cancel 测试。</p>
+<p>把检查点移到副作用之后，即使取消标记最终被读取，sideEffects 仍可能已经加一。即使保留原顺序，真实并发中的“检查未取消”和“开始写入”之间仍有竞争窗口。原子标记解决意图可见性，不会把外部数据库操作与标记检查合并为一个事务。</p>
+<p>这类取消协议应由资源所有者实现：计算循环可以在安全点检查，数据库调用应使用驱动支持的机制，远程任务可能需要独立的取消命令和任务标识。调用者必须继续采集任务终态；只丢弃 Future 会让迟到异常与资源泄漏更难被发现。</p>
+<h2 id="重试先分类-再分配预算">重试先分类，再分配预算</h2>
+<p>TimeoutLab 的 retry 接收 Supplier，每次尝试才创建一个新 Stage。若复用同一个已经失败的 Stage，所谓三次重试只是读取同一结果三次，没有重新执行操作。</p>
+<p>实现先捕获 Supplier 同步抛出的 RuntimeException，再用 handle 处理异步失败。异常展开 CompletionException 与 ExecutionException 后，仅 TransientFailure 允许进入下一次尝试；其余异常原样失败。<code>thenCompose</code> 展开 handle 返回的新 Stage，保持调用者只看到最终结果。</p>
+<table>
+<thead>
+<tr>
+<th>合成输入</th>
+<th style="text-align:right">尝试上限</th>
+<th style="text-align:right">实际尝试</th>
+<th>最终结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>前两次临时失败，第三次成功</td>
+<td style="text-align:right">3</td>
+<td style="text-align:right">3</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>连续临时失败</td>
+<td style="text-align:right">3</td>
+<td style="text-align:right">3</td>
+<td>failed</td>
+</tr>
+<tr>
+<td>第一次永久失败</td>
+<td style="text-align:right">3</td>
+<td style="text-align:right">1</td>
+<td>failed</td>
+</tr>
+</tbody>
+</table>
+<p>这里的上限包含首次调用，即“三次尝试”，不是“首次加三次重试”。实验只有错误分类与次数边界，没有实现退避、抖动和共享截止时间。同步完成的失败 Stage 会立即触发下一步，因此小上限有助于限定该演示；它不是可直接复制的无限重试工具。</p>
+<p>若上游只剩 500 毫秒，给三次尝试各配置 300 毫秒并不满足总预算。预算应从同一个截止时间推导：剩余时间等于截止时间减去当前单调时钟；每次下游超时取配置上限与剩余时间中的较小值，还需为本地处理和返回留余量。重试间隔也消耗同一份预算，剩余时间不足时应停止创建新尝试。</p>
+<p>错误可重试与操作可重复是两个条件。远端完成写入但响应丢失时，本地只能得到失败或超时；直接重试可能再次执行写入。幂等键、唯一约束与结果查询解决的是业务重复问题，错误分类解决的是再次尝试的时机问题。当前 synthetic task 无数据库，不能替代这组事务验证。</p>
+<h2 id="重跑与实验边界">重跑与实验边界</h2>
+<p>从<a href="../../02/%E6%B7%B1%E5%85%A5-Play-00-%E6%9C%80%E5%B0%8F%E5%BA%94%E7%94%A8/">第00篇</a>下载累计工程，按 <a target="_blank" rel="noopener" href="http://RUN.md">RUN.md</a> 准备 JDK 21 与 sbt 1.10.7，在 play-lab 目录执行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">bash sbtw <span class="hljs-string">&#x27;testOnly BudgetTest&#x27;</span> stage<br></code></pre></td></tr></table></figure>
+<p>检查 BudgetTest 中 <code>timeoutDoesNotCancelAndCooperativeProtocolStopsEffect</code>，以及控制器适配测试 <code>timeoutRouteReturnsStructuredResult</code>。前者输出 <code>BUDGET timeout</code> JSON，后者通过 Helpers 调用 GET /budget/timeout，验证 HTTP Result 为 200、lateOutcome 为 late-success。这里的 200 表示实验执行成功，超时情形作为 JSON 中的被测结果返回。</p>
+<p>本批隔离应用的完整 <code>test stage</code> 共通过30个JUnit测试；BudgetTest占其中4个。集成CPU对照后，共享累计工程34项测试与stage通过；<code>python3 lab/async_checks.py --dev</code>和<code>python3 lab/async_checks.py</code>各通过198次真实HTTP检查。上述单元测试使用真实执行器与Play注入的Futures，Helpers路由测试未启动生产监听端口；共享HTTP记录则另存于batch12-17。源码中暴露的实验端点每次创建有限工作资源，并在finally释放闸门、关闭执行器，不能据此推荐生产请求按次创建线程池。</p>
+<p>原始记录位于工程的 <code>evidence/batch15-17/isolated/isolated-test-stage.log</code>、<code>TEST-BudgetTest.xml</code> 与 <code>observations.json</code>。复核报告至少应保存 timeoutOutcome、原任务两个状态、lateOutcome、协作副作用计数、三类尝试次数与 workerTerminated。只保留“测试通过”会丢失最重要的迟到完成证据。</p>
+<p>第18篇共享实验已补验入站断连：<code>/streamlab/work</code> 接受请求后将任务定时安排在750毫秒后，客户端在账本仍为scheduled、terminated=false时实际关闭TCP。另一个连接最终读到completed、futureCancelled=false、producedChunks=1。断连没有取消这个普通CompletionStage；同轮流式响应只读16KiB后断开则终止Source且closeCount=1。两种终态分别保存在<code>evidence/batch18-21/shared-socket/observations.json</code>的httpStreams中。真实JDBC迟提交和事务终态仍为NOT_RUN，待第23篇回填。</p>
+<h2 id="反例与改动练习">反例与改动练习</h2>
+<p>反例题：一次有副作用的调用在 80 毫秒提交，在 100 毫秒被上游判超时，响应在 120 毫秒到达。上游在 105 毫秒重试。如果只检查第二次响应成功，最多能证明什么？它只能证明第二次调用返回成功；第一次是否已经提交、第二次是否重复写入，需要按业务键查最终记录。</p>
+<p>改动练习：复制协作分支，把 sideEffects.incrementAndGet 移到标记检查前，保留两个闸门和超时设置。增加断言，使报告同时给出协作终态与 sideEffects=1，然后恢复检查点。再将副作用替换为具有幂等键的持久化操作时，应新增数据库终态断言，不能继续使用这个内存计数器证明回滚。</p>
+<p>下一篇：<a href="../%E6%B7%B1%E5%85%A5-Play-16-WS%E5%AE%A2%E6%88%B7%E7%AB%AF%E4%B8%8E%E8%AF%B7%E6%B1%82%E9%A2%84%E7%AE%97/">WS客户端与请求预算</a>。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/">https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Play/">Play</a><a class="post-meta__tags" href="/tags/%E5%BC%82%E6%AD%A5/">异步</a></div><div class="post-share"><div class="social-share" data-image="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-20-WebSocket%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/" title="深入 Play 20：WebSocket 握手、消息上限与连接生命周期"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-20-WebSocket%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 20：WebSocket 握手、消息上限与连接生命周期</div></div><div class="info-2"><div class="info-item-1">同样一个 65537 字节的 WebSocket 帧，用一次 socket 写入发送时，本次实验观察到应用的 4096 字符限制报错；改成每次写 8192 字节，服务端返回了 1009 关闭码。这里变化的是 TCP 写入与后端帧聚合路径，业务消息内容没有变化。 因此，验证 WebSocket 限制需要同时记录帧的构造、消息分片、应用处理量和关闭终态。只看到配置里有一个 64k，或者只看到连接已关闭，都不足以定位到底由哪一层拒绝了输入。  握手以前能拒绝，握手以后要管理流 WebSocket 连接先经过 HTTP 握手。实验使用 WebSocket.Text.acceptOrResult，验证合成 token，再验证精确 Origin。错误 token 返回 401，错误 Origin 返回 403；两条拒绝路径都在创建连接账本与 Flow 之前结束。 “拒绝没有分配应用流”需要证据。脚本先发送真实 Upgrade 请求，读取 HTTP 状态，然后查询同一个 id 的账本。两次查询均不存在记录。若在认证以前先建立 Actor、队列或数据库订阅，即使最终返回 401，仍需另外处理已经...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-16-WS%E5%AE%A2%E6%88%B7%E7%AB%AF%E4%B8%8E%E8%AF%B7%E6%B1%82%E9%A2%84%E7%AE%97/" title="深入 Play 16：WS 客户端的响应消费与请求预算"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-16-WS%E5%AE%A2%E6%88%B7%E7%AB%AF%E4%B8%8E%E8%AF%B7%E6%B1%82%E9%A2%84%E7%AE%97/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 16：WS 客户端的响应消费与请求预算</div></div><div class="info-2"><div class="info-item-1">本地下游先发送响应头和 prefix-，随后等待闸门。普通 get 的 Stage 仍未完成，stream 的响应 Stage 已经完成，而消费响应体的 Stage 仍在等待。释放闸门，服务端写入 suffix，两条路径最终得到相同的 13 字节正文。 同一个 HTTP 响应具有不同的可观察完成点。调用者如果把“拿到 WSResponse”理解为“所有字节已消费、连接已可复用”，在流式路径上就会提前结束资源管理。超时放在哪里，也取决于它要覆盖哪个完成点。  固定客户端后端与实验输入 累计工程使用 Play 3.0.6、JDK 21，通过 javaWs 注入应用级 WSClient。解析产物为 standalone WS 3.0.6；其源码提交固定为 8380c047c5cf19182be56bdb831a28c9724e87bc。这里讨论的是该版本的 AHC 实现，不把 AsyncHttpClient、JDK HttpClient 或其他 WS 后端视作可互换语义。 底层构建记录对应 AsyncHttpClient 2.12.3 和 netty-reactive-streams ...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/" title="深入 Play 19：SSE 编码、重连游标与慢客户端"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 19：SSE 编码、重连游标与慢客户端</div></div><div class="info-2"><div class="info-item-1">客户端收到 id 为 101、102、103 的三个事件后关闭连接，再携带 Last-Event-ID: 103 建立新请求，得到 104、105、106。这次连续性来自服务器保存的事件集合与游标选择规则；仅给事件加一个递增 id，无法提供相同的重放能力。 同一个有限事件源经过两种本地代理模式时，首个事件的交付时间也不同。立即转发模式几乎立刻交付，按两秒条件刷出的缓冲模式约等待 2.279 秒。控制器已经生成事件，不代表下游每一层都已把事件交给客户端。  一条事件可以跨越多个读取操作 Server-Sent Events 使用文本格式表达服务端事件。应用需要同时处理 HTTP 传输边界和 SSE 事件边界。网络上的一个 read 可能只得到半行，也可能包含多个事件；使用“一次 read 对应一个事件”的解析方法会把 TCP 分段误当业务分段。 本篇的每个 sample 事件包含两行 data、一行 id 和一行 event，空行结束事件。首次消息格式如下： 12345event: sampleid: 101data: line-one-101data: line-two-101 ...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-30-MVC%E5%BC%82%E6%AD%A5%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E8%B5%84%E6%BA%90%E5%9B%9E%E6%94%B6/" title="深入 Spring 30：MVC 异步超时取消与资源回收"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-30-MVC%E5%BC%82%E6%AD%A5%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E8%B5%84%E6%BA%90%E5%9B%9E%E6%94%B6/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring 30：MVC 异步超时取消与资源回收</div></div><div class="info-2"><div class="info-item-1">响应已经超时，后台为何还在工作 客户端收到 503，服务器的一项外部生产任务仍停在等待中。稍后任务结束，尝试把结果写回 DeferredResult，却得到 false。请求超时只结束了可向客户端交付结果的窗口，没有自动取得并终止应用自行创建的任务。 相似的误判也发生在断连场景：客户端关闭连接后，服务器不一定立即知道；通常要到读写触及网络错误时才能发现。即使发现了断连，也需要业务代码释放持有的资源。Servlet 异步把请求线程释放出来，并没有把这些生命周期合并成一个自动完成的对象。 本篇使用 Spring Framework 6.2.11，固定源码提交 4c134254642d88e058aa004bdaf44168e1be7bb2，JDK 21 与 Tomcat 10.1.46。完整实验 MvcLab 30 运行真实容器，分别观察 HTTP 响应、重新分派、任务状态及资源计数。断连负例使用真实 Socket 发送 RST，不以取消模拟 Future 代替网络故障。  Callable 与 DeferredResult 的任务归属 Callable 返回值把任务交给 MVC 的...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-17-%E7%BC%93%E5%AD%98%E5%8A%A0%E8%BD%BD%E4%B8%8E%E5%A4%B1%E6%95%88/" title="深入 Play 17：缓存加载、失效与并发回源"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-17-%E7%BC%93%E5%AD%98%E5%8A%A0%E8%BD%BD%E4%B8%8E%E5%A4%B1%E6%95%88/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 17：缓存加载、失效与并发回源</div></div><div class="info-2"><div class="info-item-1">四个线程同时请求同一个不存在的缓存 key。加载函数返回一个尚未完成的 Future，四个调用者都在等待，但加载计数只有一。完成这个 Future 后，四个调用者得到相同的 loaded；随后热读仍没有增加加载次数。 这不是从 AsyncCacheApi 的名称推出来的保证。实际使用的 Caffeine provider 把进行中的加载结果放进同一个 key 的槽位，后续调用共享该结果。更换 provider、换成两个 JVM 或改成先 get 再 set，都需要重新验证回源次数。  key、值与进行中的加载 本篇使用 Play 3.0.6 的 caffeine 模块和解析得到的 Caffeine 3.1.8，累计工程基于 JDK 21。CacheLab 注入 AsyncCacheApi，以唯一实验前缀隔离 key，结束时只删除这组 key，避免清空应用共享缓存。    状态 调用者可见结果 本实验加载计数     冷 key，加载未完成 四个 Stage 均 pending 1   完成受控加载 四个调用者均得到 loaded 1   同 key 热读 loaded 1   另...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-18-HTTP%E6%B5%81%E5%BC%8F%E5%93%8D%E5%BA%94/" title="深入 Play 18：HTTP 流式响应、背压与资源终止"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-18-HTTP%E6%B5%81%E5%BC%8F%E5%93%8D%E5%BA%94/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 18：HTTP 流式响应、背压与资源终止</div></div><div class="info-2"><div class="info-item-1">一个响应最多输出 32 MiB，每次只产生 16 KiB。客户端收到响应头以后暂停读取，服务端生产计数停在 49 块；客户端随后只读一块就关闭真实 socket，服务端流进入终态，关闭计数为一。 这个实验测到了当前链路中的需求反馈与取消传播。49 块已经远大于客户端实际读取的一块，差额可以停留在流、服务器和内核缓冲中。把应用 Source 的 inputBuffer 设成一，不能把整条网络链路理解成“只允许提前产生一个元素”。  生产速率、消费速率与待发送字节 流式响应首先改变的是生产方式。有限列表先把所有对象构造完再交给 Source，虽然输出按元素传输，列表占用的内存已经发生。实验的 Source.range 只产生整数索引，map 在获得下游需求时分配一个 16384 字节数组，上限为 2048 块，不构造完整字节列表。 先忽略对象开销，以字节计算未消费数据。假设生产速率为每秒 8 MiB、消费速率为每秒 1 MiB，持续两秒且生产端没有减速，待发送数据会增加 14 MiB。这是速率差的积分，不是已经测出的 JVM 堆占用。如果可用缓冲只有 512 KiB，差额不能永久累积...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E6%AC%A1%E8%B0%83%E7%94%A8%E6%9C%89%E5%A4%9A%E4%B8%AA%E7%BB%88%E6%80%81"><span class="toc-number">1.</span> <span class="toc-text">一次调用有多个终态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#play-%E7%9A%84-timeout-%E7%BB%84%E5%90%88%E4%BA%86%E4%B8%A4%E4%B8%AA%E7%BB%93%E6%9E%9C"><span class="toc-number">2.</span> <span class="toc-text">Play 的 timeout 组合了两个结果</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#cancel-%E4%B8%8E%E5%8D%8F%E4%BD%9C%E5%81%9C%E6%AD%A2%E7%9A%84%E5%8C%BA%E5%88%AB"><span class="toc-number">3.</span> <span class="toc-text">cancel 与协作停止的区别</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%87%8D%E8%AF%95%E5%85%88%E5%88%86%E7%B1%BB-%E5%86%8D%E5%88%86%E9%85%8D%E9%A2%84%E7%AE%97"><span class="toc-number">4.</span> <span class="toc-text">重试先分类，再分配预算</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%87%8D%E8%B7%91%E4%B8%8E%E5%AE%9E%E9%AA%8C%E8%BE%B9%E7%95%8C"><span class="toc-number">5.</span> <span class="toc-text">重跑与实验边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%8D%E4%BE%8B%E4%B8%8E%E6%94%B9%E5%8A%A8%E7%BB%83%E4%B9%A0"><span class="toc-number">6.</span> <span class="toc-text">反例与改动练习</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

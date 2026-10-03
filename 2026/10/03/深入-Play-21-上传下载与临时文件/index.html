@@ -1,0 +1,801 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Play 21：上传下载、临时文件与 IO 关闭 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="一个 multipart 请求声明 50000 字节，实际发送文件前缀后就关闭 TCP。断连前，临时目录里已经存在 part 文件；断连后，controller 没有机会处理完整请求，但 parser 的失败路径清理了文件，FileIO 的开始与完成计数均为一。 把删除操作只放在 controller 的 finally 中，覆盖不了这个生命周期。临时文件在 body parser 阶段创建，清理">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Play 21：上传下载、临时文件与 IO 关闭">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="一个 multipart 请求声明 50000 字节，实际发送文件前缀后就关闭 TCP。断连前，临时目录里已经存在 part 文件；断连后，controller 没有机会处理完整请求，但 parser 的失败路径清理了文件，FileIO 的开始与完成计数均为一。 把删除操作只放在 controller 的 finally 中，覆盖不了这个生命周期。临时文件在 body parser 阶段创建，清理">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/cover.svg">
+<meta property="article:published_time" content="2026-10-03T09:21:00.000Z">
+<meta property="article:modified_time" content="2026-10-03T12:38:38.659Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Play">
+<meta property="article:tag" content="文件IO">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Play 21：上传下载、临时文件与 IO 关闭",
+  "url": "https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/",
+  "image": "https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/cover.svg",
+  "datePublished": "2026-10-03T09:21:00.000Z",
+  "dateModified": "2026-10-03T12:38:38.659Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Play 21：上传下载、临时文件与 IO 关闭',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1481</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1568</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">27</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Play 21：上传下载、临时文件与 IO 关闭</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Play 21：上传下载、临时文件与 IO 关闭</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-03T09:21:00.000Z" title="Created 2026-10-03 17:21:00">2026-10-03</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-03T12:38:38.659Z" title="Updated 2026-10-03 20:38:38">2026-10-03</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/Play-Framework/">Play Framework</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>11mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-03 20:38:38&quot;}" hidden></div><p>一个 multipart 请求声明 50000 字节，实际发送文件前缀后就关闭 TCP。断连前，临时目录里已经存在 part 文件；断连后，controller 没有机会处理完整请求，但 parser 的失败路径清理了文件，FileIO 的开始与完成计数均为一。</p>
+<p>把删除操作只放在 controller 的 finally 中，覆盖不了这个生命周期。临时文件在 body parser 阶段创建，清理责任也必须从这个阶段开始，直到成功移交给应用或失败终止。</p>
+<span id="more"></span>
+<h2 id="请求尺寸-文件尺寸与路径是三个约束">请求尺寸、文件尺寸与路径是三个约束</h2>
+<p>文件接口接收的不只是文件字节。multipart 请求还包含边界、字段头、普通表单项和其他文件部分，因此“单个文件不超过 64 KiB”与“整个请求不超过 64 KiB”不是同一个限制。实验为整个 multipart body 设置 65536 字节上限，同时只允许一个文件。</p>
+<p>Content-Length 提供提前拒绝的机会，但不能作为唯一依据。chunked 请求没有可直接使用的总长度，parser 必须在消费字节的过程中累计。若只在 controller 中读取文件大小再比较，请求可能已经消耗了解析、磁盘与连接资源。</p>
+<p>路径约束则处理另一种输入。客户端 filename 是不可信 metadata，不能直接拼接到目标目录。实验拒绝 <code>../bad</code>、<code>/absolute</code>、反斜杠与超出限制的字符，并为成功文件生成独立 UUID 文件名。原文件名只作为受限 metadata 返回。</p>
+<table>
+<thead>
+<tr>
+<th>约束</th>
+<th>实施位置</th>
+<th>被约束对象</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>总请求 65536 字节</td>
+<td>multipart parser</td>
+<td>文件内容、字段头与边界等完整 body</td>
+</tr>
+<tr>
+<td>恰好一个、非空文件</td>
+<td>controller</td>
+<td>已解析的文件部分</td>
+</tr>
+<tr>
+<td>限制原始文件名格式</td>
+<td>controller</td>
+<td>不可信 metadata</td>
+</tr>
+<tr>
+<td>UUID 存储名</td>
+<td>目标路径构造</td>
+<td>服务器实际保存位置</td>
+</tr>
+<tr>
+<td>IO 完成与删除</td>
+<td>parser 失败路径或成功移交后的清理</td>
+<td>临时资源生命周期</td>
+</tr>
+</tbody>
+</table>
+<p>目标路径不包含客户端原文件名，即使未来放宽 metadata 的字符规则，也不会顺带扩大文件系统路径能力。这种分离比“先拼接、再检查是否看起来正常”更容易审计。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="cover.svg" alt="上传 parser 与下载 FileIO 的生命周期"></p>
+<h2 id="bodyparser-在-action-之前持有资源">BodyParser 在 action 之前持有资源</h2>
+<p>Play 3.0.6 固定提交为 <code>2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6</code>。<a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play/src/main/java/play/mvc/BodyParser.java#L578-L600">core/play/src/main/java/play/mvc/BodyParser.java</a> 提供显式 maxLength 的 MultipartFormData 构造方式；同文件的 DelegatingMultipartFormDataBodyParser 支持自定义文件部分处理器。</p>
+<p>实验的 <code>app/streamlab/UploadLabParser.java</code> 选择后一种扩展点，以 maxMemoryBuffer=1024、maxLength=65536、allowEmptyFiles=true 构造每请求 parser。允许解析空文件，是为了让 controller 明确返回 empty file，而不是将空部分静默排除后变成另一个含义的“缺少文件”。</p>
+<p>每次 apply 都建立自己的 created 路径集合和 failed 标记。文件 handler 在专用 tmp 目录创建随机临时文件，把入站字节接到 FileIO.toPath。文件 IO 的物化完成 Stage 负责增加关闭计数；解析结果为 Left 或异常时，parser 清理本请求已经创建的路径。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">HTTP body ──&gt; 限长 multipart parser ──&gt; FileIO.toPath ──&gt; 文件部分结果<br>                     │                         │<br>                     │解析超限/断连             └─ materialized IOResult 完成<br>                     └─ 清理本请求临时路径<br><br>解析成功 ──&gt; controller 校验 ──&gt; UUID 目标路径<br>                        └─ finally 清理尚未移交的临时文件<br></code></pre></td></tr></table></figure>
+<p>文件 sink 与总 parser 的终止回调可能先后到达，因此实现不能假设“外层报错时所有文件 sink 已完成”。外层先设置 failed 并清理已知路径；文件 handler 在完成时再次检查 failed，必要时再执行幂等删除。测试在断言终态前同时等待 fileIoClosed 与 fileIoStarted 相等。</p>
+<p>这仍然是有限实验实现。它用同步文件系统操作创建目录、删除与移动文件，没有测量繁忙磁盘上的调度影响。部署时若要把这些操作放入专用阻塞执行器，需要进一步测试线程池容量、拒绝与关闭，而不能从上传字节使用 FileIO 推出所有文件操作都已非阻塞化。</p>
+<h2 id="文件-io-的物化值比文件名更接近关闭事实">文件 IO 的物化值比文件名更接近关闭事实</h2>
+<p>Pekko Streams 1.0.3 固定提交为 <code>4f77c8108aaf548a65531d2c8807da13dbba8146</code>。<a target="_blank" rel="noopener" href="https://github.com/apache/pekko/blob/4f77c8108aaf548a65531d2c8807da13dbba8146/stream/src/main/scala/org/apache/pekko/stream/javadsl/FileIO.scala">stream/src/main/scala/org/apache/pekko/stream/javadsl/FileIO.scala</a> 给 toPath 和 fromPath 的物化类型均使用 CompletionStage<IOResult>，其中包含处理量与 IO 结果。</p>
+<p>目录里看不到文件，不足以单独证明句柄已经关闭。某些文件系统允许先删除名字、仍由打开的句柄继续持有内容。文件 IO 的完成回调和目录快照回答两个不同问题，实验同时保留它们。</p>
+<p>下面是 JDK 21 下可在累计工程中编译的完整文件 sink 工厂。它记录 FileIO 何时物化、何时完成；完成不保证成功，因此错误仍通过原 Stage 交给调用者，不能仅增加计数后吞掉失败。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">import</span> java.nio.file.Path;<br><span class="hljs-keyword">import</span> java.util.concurrent.CompletionStage;<br><span class="hljs-keyword">import</span> java.util.concurrent.atomic.AtomicInteger;<br><span class="hljs-keyword">import</span> org.apache.pekko.stream.IOResult;<br><span class="hljs-keyword">import</span> org.apache.pekko.stream.javadsl.FileIO;<br><span class="hljs-keyword">import</span> org.apache.pekko.stream.javadsl.Sink;<br><span class="hljs-keyword">import</span> org.apache.pekko.util.ByteString;<br><br><span class="hljs-keyword">public</span> <span class="hljs-keyword">final</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">TrackedFileSink</span> &#123;<br>    <span class="hljs-keyword">public</span> <span class="hljs-keyword">static</span> Sink&lt;ByteString, CompletionStage&lt;IOResult&gt;&gt; <span class="hljs-title function_">create</span><span class="hljs-params">(</span><br><span class="hljs-params">            Path path, AtomicInteger started, AtomicInteger closed)</span> &#123;<br>        <span class="hljs-keyword">return</span> FileIO.toPath(path).mapMaterializedValue(done -&gt; &#123;<br>            started.incrementAndGet();<br>            <span class="hljs-keyword">return</span> done.whenComplete((result, failure) -&gt; &#123;<br>                closed.incrementAndGet();<br>            &#125;);<br>        &#125;);<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>计数相等只证明已开始的文件 IO 均进入终态，还要读取 IOResult 或异常判断写入是否成功。零开始、零完成则可能表示提前拒绝，请求根本没有创建文件 sink；它不能被解读成写入成功。</p>
+<p>默认 TemporaryFile 也有自己的删除机制。<a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play/src/main/scala/play/api/libs/Files.scala#L265-L309">core/play/src/main/scala/play/api/libs/Files.scala</a> 展示显式 delete 与引用跟踪相关实现。实验使用自建路径和自定义 parser，是为了记录确定的失败清理时序；没有通过等待 GC 来验证默认引用回收器，也不把目录清理结果归因于未测试的 PhantomReference 路径。</p>
+<h2 id="上传结果与保存路径">上传结果与保存路径</h2>
+<p>成功路径只接受 <code>[A-Za-z0-9][A-Za-z0-9._-]{0,63}</code> 形式的原文件名，并进一步拒绝 <code>..</code>。文件非空且数量恰好为一后，将临时路径移动到 saved 目录下的 UUID 名称。所有文件部分都经过 finally 的 deleteIfExists，因此无论校验失败还是文件已经移走，原临时路径都执行幂等清理。</p>
+<p>下面的完整类展示同样的路径分离规则。调用方应传入由服务端配置确定的目录，不能把请求参数当作 directory。它只构造路径，不执行实际移动。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">import</span> java.nio.file.Path;<br><span class="hljs-keyword">import</span> java.util.UUID;<br><br><span class="hljs-keyword">public</span> <span class="hljs-keyword">final</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">UploadDestination</span> &#123;<br>    <span class="hljs-keyword">public</span> <span class="hljs-keyword">static</span> Path <span class="hljs-title function_">create</span><span class="hljs-params">(Path directory, String originalName)</span> &#123;<br>        <span class="hljs-keyword">if</span> (!originalName.matches(<span class="hljs-string">&quot;[A-Za-z0-9][A-Za-z0-9._-]&#123;0,63&#125;&quot;</span>)<br>                || originalName.contains(<span class="hljs-string">&quot;..&quot;</span>)) &#123;<br>            <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">IllegalArgumentException</span>(<span class="hljs-string">&quot;invalid filename metadata&quot;</span>);<br>        &#125;<br>        <span class="hljs-keyword">return</span> directory.resolve(UUID.randomUUID().toString());<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>UUID 命名减少与原名冲突的耦合，但不自动解决磁盘配额、重复请求或恶意内容。上传接口还需要根据业务定义存储容量、保留时间与访问权限；本实验在每个场景 finally 删除自己成功保存的 UUID 文件，没有声称提供长期存储服务。</p>
+<p>返回的 contentType 固定为 application/octet-stream，下载也使用该类型。客户端上传的 MIME 字段没有被当作可信内容识别结果。本实验没有进行图片解析、病毒扫描或媒体类型嗅探，因此不宣称这些能力存在。</p>
+<h2 id="已知长度-chunked-与中断上传">已知长度、chunked 与中断上传</h2>
+<p>真实 HTTP 客户端发送 70000 字节文件内容，并加上 multipart 元数据，分别采用 Content-Length 与 chunked。两个请求都超过整体 65536 上限，均得到 413，但已经发生的文件 IO 不同。</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th style="text-align:right">HTTP 状态</th>
+<th style="text-align:right">FileIO started / closed</th>
+<th>最终临时目录</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>good.bin，3 字节</td>
+<td style="text-align:right">200</td>
+<td style="text-align:right">1 / 1</td>
+<td>恢复基线，成功文件以 UUID 保存</td>
+</tr>
+<tr>
+<td>…/bad</td>
+<td style="text-align:right">400</td>
+<td style="text-align:right">1 / 1</td>
+<td>恢复基线</td>
+</tr>
+<tr>
+<td>/absolute</td>
+<td style="text-align:right">400</td>
+<td style="text-align:right">1 / 1</td>
+<td>恢复基线</td>
+</tr>
+<tr>
+<td>empty.bin</td>
+<td style="text-align:right">400</td>
+<td style="text-align:right">1 / 1</td>
+<td>恢复基线</td>
+</tr>
+<tr>
+<td>已知总长度超限</td>
+<td style="text-align:right">413</td>
+<td style="text-align:right">0 / 0</td>
+<td>恢复基线</td>
+</tr>
+<tr>
+<td>chunked 超限</td>
+<td style="text-align:right">413</td>
+<td style="text-align:right">1 / 1</td>
+<td>恢复基线</td>
+</tr>
+<tr>
+<td>body 尚未结束便关闭 TCP</td>
+<td style="text-align:right">无完整业务响应</td>
+<td style="text-align:right">1 / 1</td>
+<td>恢复基线</td>
+</tr>
+</tbody>
+</table>
+<p>已知长度分支在创建文件 sink 之前拒绝。chunked 只有随着字节消费才能发现总量超限，所以已经创建并写入过临时文件；其正确性不仅要求返回 413，还要求这个部分写入也被清理。</p>
+<p>中断场景先发送约 20 KiB 文件前缀并等待临时文件出现在目录中，然后对真实 socket 执行 SHUT_RDWR 与 close。脚本通过第二条连接轮询账本，确认 parser 终止和 fileIoStarted=fileIoClosed=1，再检查目录回到基线。这样避免用“请求发出去后马上断开但 parser 可能尚未启动”的空场景冒充中断清理测试。</p>
+<p>HTTP 断连后没有可继续读取的业务响应，验收依据必须转向服务器状态与文件 IO。不能要求已经关闭的客户端还必须收到一个 JSON 错误，或把没有错误 JSON 解释成服务端未处理失败。</p>
+<h2 id="下载取消怎样触发关闭回调">下载取消怎样触发关闭回调</h2>
+<p>下载端点用一个可复用的 16 KiB 数组生成 32 MiB 临时文件，然后调用 sendPath。生成过程没有把全部文件读进 byte[]；实际响应由 FileIO 读取。这个有限文件准备阶段同步写盘，目的是让取消测试具有稳定的大文件输入，不代表高并发导出任务的最终架构。</p>
+<p>Play 的 <a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play/src/main/java/play/mvc/StatusHeader.java#L1680-L1708">core/play/src/main/java/play/mvc/StatusHeader.java</a> 将 onClose 连接到文件 Source 的 IOResult 完成 Stage。Scala <a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/core/play/src/main/scala/play/api/mvc/Results.scala#L640-L650">Results.scala</a> 也提供对应文件流与关闭关联入口。资源观察应跟随这次文件流运行，不能在 controller 返回 Result 的 finally 里提前删除仍待读取的文件。</p>
+<p>本次响应为 Content-Length: 33554432、Content-Type: application/octet-stream，并带 attachment 文件名 export.bin。客户端只读取 16384 字节，短暂等待后关闭连接。服务器 onClose 增加 closeCount，删除生成的临时文件；有限轮询最终确认 closeCount=1、目录恢复基线。</p>
+<p>sendPath 的 IO 完成属于服务端流生命周期。即使没有取消，它也不是“对端已经收到并保存全部文件”的业务确认；网络缓冲、客户端写盘与应用处理还在其他阶段。需要下载成功证明时，应设计客户端回执或独立校验，不能重命名一个服务器 onClose 回调来获得这个语义。</p>
+<p>删除回调也可能失败。实验将删除异常写入账本并继续抛出，不把 closeCount=1 当作删除成功。真实系统还需要为清理失败留下可重试记录，而不是在日志里报错后永久遗留无法定位的文件。</p>
+<h2 id="重跑与练习">重跑与练习</h2>
+<p>共享累计工程已另行验收：39项JUnit与stage通过，8个流/文件class与生产jar字节一致；DEV/PROD各198次既有HTTP和五组真实socket通过。共享记录在<code>evidence/batch18-21/shared-socket/observations.json</code>；隔离样本保留原测量值，不将两轮耗时、RSS、块数混为同一轮。</p>
+<p>从<a href="../../02/%E6%B7%B1%E5%85%A5-Play-00-%E6%9C%80%E5%B0%8F%E5%BA%94%E7%94%A8/">第00篇</a>取得累计工程并配置 JDK 21，在 play-lab 目录执行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash">bash sbtw clean <span class="hljs-built_in">test</span> stage<br>python3 lab/stream_checks.py --evidence evidence/batch18-21/replay<br></code></pre></td></tr></table></figure>
+<p><code>lab/stream_checks.py</code> 的 files 场景记录请求前目录基线、每次状态、FileIO 计数和最终目录。成功上传的 UUID 保存在客户端的清理列表里，并在 finally 逐个删除；脚本不清空其他文件，也不依赖手工删除整个临时目录来使测试通过。</p>
+<p>历史网络证据在 <code>evidence/batch18-21/isolated/run-final-io/observations.json</code> 的 files 节点，生产服务器日志在同目录 production.log。本轮隔离 clean test 共 36 项 JUnit 通过，stage 与五组真实 socket 检查通过。默认临时文件 GC 回收、磁盘耗尽、移动失败、跨文件系统移动、生产存储配额与客户端文件落盘回执均未在这些场景中执行。</p>
+<p>反例题：上传中断后目录已经为空，是否可以省略 FileIO 终止观察？不能；名称删除与已打开资源关闭是不同事件。反过来，FileIO 完成也不保证临时路径已被删除，需要同时断言。</p>
+<p>改动练习：将文件大小设在总上限附近，保持内容相同但改变 multipart 文件名长度与普通字段数量。比较请求总长度和文件内容长度，验证 413 依据完整 body；不要把恰好 65536 字节文件内容当成必然允许的上传。</p>
+<p>另一个练习是在成功解析之后、移动文件之前注入失败。断言返回错误、原临时文件清理完成、没有新增 UUID 目标。随后单独测试目标目录不可写，观察失败发生在创建、移动还是清理；不同失败点的恢复责任不能合并为一次成功路径测试。</p>
+<p>上一篇：<a href="../%E6%B7%B1%E5%85%A5-Play-20-WebSocket%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/">WebSocket生命周期</a>。下一篇为第22篇 JDBC 与连接池，将进一步检查阻塞调用、连接占用和流式结果之间的关系。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/">https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Play/">Play</a><a class="post-meta__tags" href="/tags/%E6%96%87%E4%BB%B6IO/">文件IO</a></div><div class="post-share"><div class="social-share" data-image="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-18-HTTP%E6%B5%81%E5%BC%8F%E5%93%8D%E5%BA%94/" title="深入 Play 18：HTTP 流式响应、背压与资源终止"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-18-HTTP%E6%B5%81%E5%BC%8F%E5%93%8D%E5%BA%94/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 18：HTTP 流式响应、背压与资源终止</div></div><div class="info-2"><div class="info-item-1">一个响应最多输出 32 MiB，每次只产生 16 KiB。客户端收到响应头以后暂停读取，服务端生产计数停在 49 块；客户端随后只读一块就关闭真实 socket，服务端流进入终态，关闭计数为一。 这个实验测到了当前链路中的需求反馈与取消传播。49 块已经远大于客户端实际读取的一块，差额可以停留在流、服务器和内核缓冲中。把应用 Source 的 inputBuffer 设成一，不能把整条网络链路理解成“只允许提前产生一个元素”。  生产速率、消费速率与待发送字节 流式响应首先改变的是生产方式。有限列表先把所有对象构造完再交给 Source，虽然输出按元素传输，列表占用的内存已经发生。实验的 Source.range 只产生整数索引，map 在获得下游需求时分配一个 16384 字节数组，上限为 2048 块，不构造完整字节列表。 先忽略对象开销，以字节计算未消费数据。假设生产速率为每秒 8 MiB、消费速率为每秒 1 MiB，持续两秒且生产端没有减速，待发送数据会增加 14 MiB。这是速率差的积分，不是已经测出的 JVM 堆占用。如果可用缓冲只有 512 KiB，差额不能永久累积...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/" title="深入 Play 19：SSE 编码、重连游标与慢客户端"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-19-SSE%E4%B8%8E%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 19：SSE 编码、重连游标与慢客户端</div></div><div class="info-2"><div class="info-item-1">客户端收到 id 为 101、102、103 的三个事件后关闭连接，再携带 Last-Event-ID: 103 建立新请求，得到 104、105、106。这次连续性来自服务器保存的事件集合与游标选择规则；仅给事件加一个递增 id，无法提供相同的重放能力。 同一个有限事件源经过两种本地代理模式时，首个事件的交付时间也不同。立即转发模式几乎立刻交付，按两秒条件刷出的缓冲模式约等待 2.279 秒。控制器已经生成事件，不代表下游每一层都已把事件交给客户端。  一条事件可以跨越多个读取操作 Server-Sent Events 使用文本格式表达服务端事件。应用需要同时处理 HTTP 传输边界和 SSE 事件边界。网络上的一个 read 可能只得到半行，也可能包含多个事件；使用“一次 read 对应一个事件”的解析方法会把 TCP 分段误当业务分段。 本篇的每个 sample 事件包含两行 data、一行 id 和一行 event，空行结束事件。首次消息格式如下： 12345event: sampleid: 101data: line-one-101data: line-two-101 ...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-16-WS%E5%AE%A2%E6%88%B7%E7%AB%AF%E4%B8%8E%E8%AF%B7%E6%B1%82%E9%A2%84%E7%AE%97/" title="深入 Play 16：WS 客户端的响应消费与请求预算"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-16-WS%E5%AE%A2%E6%88%B7%E7%AB%AF%E4%B8%8E%E8%AF%B7%E6%B1%82%E9%A2%84%E7%AE%97/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 16：WS 客户端的响应消费与请求预算</div></div><div class="info-2"><div class="info-item-1">本地下游先发送响应头和 prefix-，随后等待闸门。普通 get 的 Stage 仍未完成，stream 的响应 Stage 已经完成，而消费响应体的 Stage 仍在等待。释放闸门，服务端写入 suffix，两条路径最终得到相同的 13 字节正文。 同一个 HTTP 响应具有不同的可观察完成点。调用者如果把“拿到 WSResponse”理解为“所有字节已消费、连接已可复用”，在流式路径上就会提前结束资源管理。超时放在哪里，也取决于它要覆盖哪个完成点。  固定客户端后端与实验输入 累计工程使用 Play 3.0.6、JDK 21，通过 javaWs 注入应用级 WSClient。解析产物为 standalone WS 3.0.6；其源码提交固定为 8380c047c5cf19182be56bdb831a28c9724e87bc。这里讨论的是该版本的 AHC 实现，不把 AsyncHttpClient、JDK HttpClient 或其他 WS 后端视作可互换语义。 底层构建记录对应 AsyncHttpClient 2.12.3 和 netty-reactive-streams ...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/" title="深入 Play 15：超时、取消与重试的任务终态"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 15：超时、取消与重试的任务终态</div></div><div class="info-2"><div class="info-item-1">一个任务已经进入工作线程，随后停在受控闸门前。给它包装 100 毫秒超时，包装 Stage 以 TimeoutException 结束；读取原任务，done 与 cancelled 却都是 false。释放闸门后，原任务返回 late-success。 这组结果区分了两个事件：调用者停止等待，工作本身完成。若工作在完成前还会扣库存或提交事务，前一个事件不足以证明后一个事件没有发生。超时处理需要同时回答返回什么、谁停止工作、哪些副作用已经发生。  一次调用有多个终态 本篇沿用 Play 3.0.6、Scala 2.13.15、JDK 21 的累计工程。app/labbudget/TimeoutLab.java 使用合成任务、CountDownLatch 和有限工作线程，把迟到完成、协作取消、重试分类放在同一组确定时序中。实验不访问数据库，也没有真实订单。    观察对象 可直接证明的事实 不能据此推出的事实     超时包装 Stage 等待结果已变成失败 原任务已停止   原任务 Stage 值或异常已完成 外部事务必然回滚   取消标记 取消意图已发布 执行方已经检查标记   ...</div></div></div></a><a class="pagination-related" href="/2022/04/25/%E5%9F%BA%E4%BA%8E-Play-%E6%A1%86%E6%9E%B6%E8%BF%9B%E8%A1%8C%E5%BC%80%E5%8F%91/" title="基于 Play 框架进行开发"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2022/04/25/%E5%9F%BA%E4%BA%8E-Play-%E6%A1%86%E6%9E%B6%E8%BF%9B%E8%A1%8C%E5%BC%80%E5%8F%91/%E5%8A%A0%E8%BD%BD%E8%B0%83%E8%AF%95%E5%99%A8.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2022-04-25</div><div class="info-item-2">基于 Play 框架进行开发</div></div><div class="info-2"><div class="info-item-1">构建和编译的方法 sbt clean &quot;project leads-web&quot; &quot;universal:packageZipTarball&quot; 常用命令 1234567891011121314151617# 在 sbt 里# 刷新命令reload;update;clean;compile# 切换到项目 aproject a# 在 sbt 的项目 a 里run &quot;-Dotel.resource.attributes=serviceName=iouy&quot;# 如果使用了 coursier 来管理依赖的话，查看依赖coursierDependencyTree# 在普通的 shell 里# 开启远程调试sbt -jvm-debug 9999 run# 传递 jvm 参数sbt -J-javaagent:skywalking-agent.jar -jvm-debug 9999 run   ORM ebean 1234567891011121314151617181920212223242526lazy val `model-base` = ...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-20-WebSocket%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/" title="深入 Play 20：WebSocket 握手、消息上限与连接生命周期"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-20-WebSocket%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 20：WebSocket 握手、消息上限与连接生命周期</div></div><div class="info-2"><div class="info-item-1">同样一个 65537 字节的 WebSocket 帧，用一次 socket 写入发送时，本次实验观察到应用的 4096 字符限制报错；改成每次写 8192 字节，服务端返回了 1009 关闭码。这里变化的是 TCP 写入与后端帧聚合路径，业务消息内容没有变化。 因此，验证 WebSocket 限制需要同时记录帧的构造、消息分片、应用处理量和关闭终态。只看到配置里有一个 64k，或者只看到连接已关闭，都不足以定位到底由哪一层拒绝了输入。  握手以前能拒绝，握手以后要管理流 WebSocket 连接先经过 HTTP 握手。实验使用 WebSocket.Text.acceptOrResult，验证合成 token，再验证精确 Origin。错误 token 返回 401，错误 Origin 返回 403；两条拒绝路径都在创建连接账本与 Flow 之前结束。 “拒绝没有分配应用流”需要证据。脚本先发送真实 Upgrade 请求，读取 HTTP 状态，然后查询同一个 id 的账本。两次查询均不存在记录。若在认证以前先建立 Actor、队列或数据库订阅，即使最终返回 401，仍需另外处理已经...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%AF%B7%E6%B1%82%E5%B0%BA%E5%AF%B8-%E6%96%87%E4%BB%B6%E5%B0%BA%E5%AF%B8%E4%B8%8E%E8%B7%AF%E5%BE%84%E6%98%AF%E4%B8%89%E4%B8%AA%E7%BA%A6%E6%9D%9F"><span class="toc-number">1.</span> <span class="toc-text">请求尺寸、文件尺寸与路径是三个约束</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#bodyparser-%E5%9C%A8-action-%E4%B9%8B%E5%89%8D%E6%8C%81%E6%9C%89%E8%B5%84%E6%BA%90"><span class="toc-number">2.</span> <span class="toc-text">BodyParser 在 action 之前持有资源</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%96%87%E4%BB%B6-io-%E7%9A%84%E7%89%A9%E5%8C%96%E5%80%BC%E6%AF%94%E6%96%87%E4%BB%B6%E5%90%8D%E6%9B%B4%E6%8E%A5%E8%BF%91%E5%85%B3%E9%97%AD%E4%BA%8B%E5%AE%9E"><span class="toc-number">3.</span> <span class="toc-text">文件 IO 的物化值比文件名更接近关闭事实</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%8A%E4%BC%A0%E7%BB%93%E6%9E%9C%E4%B8%8E%E4%BF%9D%E5%AD%98%E8%B7%AF%E5%BE%84"><span class="toc-number">4.</span> <span class="toc-text">上传结果与保存路径</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%B2%E7%9F%A5%E9%95%BF%E5%BA%A6-chunked-%E4%B8%8E%E4%B8%AD%E6%96%AD%E4%B8%8A%E4%BC%A0"><span class="toc-number">5.</span> <span class="toc-text">已知长度、chunked 与中断上传</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%8B%E8%BD%BD%E5%8F%96%E6%B6%88%E6%80%8E%E6%A0%B7%E8%A7%A6%E5%8F%91%E5%85%B3%E9%97%AD%E5%9B%9E%E8%B0%83"><span class="toc-number">6.</span> <span class="toc-text">下载取消怎样触发关闭回调</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%87%8D%E8%B7%91%E4%B8%8E%E7%BB%83%E4%B9%A0"><span class="toc-number">7.</span> <span class="toc-text">重跑与练习</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
