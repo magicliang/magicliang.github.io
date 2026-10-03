@@ -1,4 +1,4 @@
-# Play 00–08 累计工程重跑说明
+# Play 00–11 累计工程重跑说明
 
 解压同目录 play-lab-source.zip，在 play-lab/ 中执行。需要 JDK 21、Python 3、首次依赖下载所需网络；不需要 Docker 或全局 sbt。
 
@@ -13,11 +13,13 @@ python3 lab/verify.py
 python3 lab/verify.py --negative
 python3 lab/pipeline_checks.py --dev
 python3 lab/pipeline_checks.py
+python3 lab/content_checks.py --dev
+python3 lab/content_checks.py
 ```
 
 launcher SHA-256：3cca02818047327a83efde776103a1ef92f76f72c062badbbb062499a3270c07。
 
-预期：累计JUnit 12/12；原verify开发和生产各56请求，pipeline_checks复用回归并增加31组实验，各118请求。路由、模板与dependsOn三个单变量反例均为编译失败；首批反例记录保留在batch00-05。本批Action/Filter/parser的真实状态、正文、头、阶段与字节观测在evidence/batch06-08。
+预期：累计JUnit 19/19；原verify两模式各56请求，pipeline_checks各118请求，content_checks累计各185请求/37组内容检查。本批JSON/Form/Twirl/Assets证据在batch09-11。真实浏览器截图与记录独立保存；Html(Int)临时编译反例退出1。首批三个单变量编译反例仍保留在batch00-05。
 
 HTTP 只监听 127.0.0.1 的空闲端口，密钥随机且不保存。finally 终止启动进程，受控 SIGTERM 退出通常143。负例临时副本自动清理。有限实验队列、观测接口和合成请求 CSRF bypass 不用于生产。
 

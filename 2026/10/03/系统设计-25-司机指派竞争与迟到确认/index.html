@@ -1,0 +1,727 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>系统设计 25：司机指派竞争与迟到确认 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="两名乘客同时命中同一位最近司机，地理查询都没有错，却只能有一单得到有效指派。附近搜索解决“谁可能接单”；派单解决“谁独占接单权”。如果将位置索引中的司机从“可用”改为“忙碌”就算确认，两个请求仍可能在旧副本中各拿到一次成功。 本文用一位本地模拟司机、十二个并发乘客请求和真实 SQLite 写事务划清派单边界；不假设任何网约车公司的内部实现。规模和服务目标均为教学假设，非实测性能。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="系统设计 25：司机指派竞争与迟到确认">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-25-%E5%8F%B8%E6%9C%BA%E6%8C%87%E6%B4%BE%E7%AB%9E%E4%BA%89%E4%B8%8E%E8%BF%9F%E5%88%B0%E7%A1%AE%E8%AE%A4/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="两名乘客同时命中同一位最近司机，地理查询都没有错，却只能有一单得到有效指派。附近搜索解决“谁可能接单”；派单解决“谁独占接单权”。如果将位置索引中的司机从“可用”改为“忙碌”就算确认，两个请求仍可能在旧副本中各拿到一次成功。 本文用一位本地模拟司机、十二个并发乘客请求和真实 SQLite 写事务划清派单边界；不假设任何网约车公司的内部实现。规模和服务目标均为教学假设，非实测性能。">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-24.jpg">
+<meta property="article:published_time" content="2026-10-03T00:25:00.000Z">
+<meta property="article:modified_time" content="2026-10-03T10:23:18.403Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="出行匹配">
+<meta property="article:tag" content="系统设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-24.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "系统设计 25：司机指派竞争与迟到确认",
+  "url": "https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-25-%E5%8F%B8%E6%9C%BA%E6%8C%87%E6%B4%BE%E7%AB%9E%E4%BA%89%E4%B8%8E%E8%BF%9F%E5%88%B0%E7%A1%AE%E8%AE%A4/",
+  "image": "https://magicliang.github.io/img/wall-paper-24.jpg",
+  "datePublished": "2026-10-03T00:25:00.000Z",
+  "dateModified": "2026-10-03T10:23:18.403Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-25-%E5%8F%B8%E6%9C%BA%E6%8C%87%E6%B4%BE%E7%AB%9E%E4%BA%89%E4%B8%8E%E8%BF%9F%E5%88%B0%E7%A1%AE%E8%AE%A4/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '系统设计 25：司机指派竞争与迟到确认',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1437</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1535</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">28</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-24.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">系统设计 25：司机指派竞争与迟到确认</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">系统设计 25：司机指派竞争与迟到确认</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-03T00:25:00.000Z" title="Created 2026-10-03 08:25:00">2026-10-03</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-03T10:23:18.403Z" title="Updated 2026-10-03 18:23:18">2026-10-03</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.1k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>7mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-03 18:23:18&quot;}" hidden></div><p>两名乘客同时命中同一位最近司机，地理查询都没有错，却只能有一单得到有效指派。附近搜索解决“谁可能接单”；派单解决“谁独占接单权”。如果将位置索引中的司机从“可用”改为“忙碌”就算确认，两个请求仍可能在旧副本中各拿到一次成功。</p>
+<p>本文用一位本地模拟司机、十二个并发乘客请求和真实 SQLite 写事务划清派单边界；不假设任何网约车公司的内部实现。规模和服务目标均为教学假设，非实测性能。</p>
+<span id="more"></span>
+<h2 id="把一次派单拆成两个确认">把一次派单拆成两个确认</h2>
+<p>乘客请求 <code>POST /trips &#123;pickup, destination, request_key&#125;</code>；服务返回 <code>trip_id</code>、状态。派单内部接口 <code>offer(trip_id, driver_id, offer_token, deadline)</code> 把“占有接单机会”写入权威存储；司机本地模拟回调 <code>POST /offers/&#123;token&#125;/ack</code>。状态路径为 <code>requested → offered → accepted → started → completed</code>，在发车前可 <code>cancelled</code>，超时可 <code>expired</code>。本次实验只实现至 accepted 的发车前取消；发车后的取消、计价、资金清算和真实司机设备均不在范围内。</p>
+<p>不变量：同一司机同一时刻至多有一个 <code>offered/accepted</code> 行程；同一行程只能接受其当前有效 offer token；迟到确认不能复活已超时或已取消的行程。一次 API 重试还需用稳定 <code>request_key</code> 返回同一行程，不能凭 HTTP 超时就创建第二单；实验只验证指派竞争，不验证请求入口的幂等键。教学 SLO：候选查询 p99 ≤ 100 ms、从下单到得到有效司机确认 p95 ≤ 15 s、取消到该司机重回可派池 p99 ≤ 2 s，均未做负载验证。排除真实 GPS 漂移、派单最优解、司机作弊、跨城漫游与支付。</p>
+<p>权威表可简化为 <code>drivers(id PK, state, location_version)</code>、<code>trips(id PK, request_key UNIQUE, state, driver_id, deadline, offer_token)</code>，在 <code>trips(driver_id) WHERE state IN ('offered','accepted')</code> 上建部分唯一索引；位置索引是非权威候选视图。数据库事务里先确认行程仍 requested，再条件地占司机、更新行程和提交，事务提交后才推送 offer。推送失败回收租约，而非把“没收到消息”解释为司机已确认。<a target="_blank" rel="noopener" href="https://www.sqlite.org/lang_transaction.html">SQLite 事务说明</a>对 <code>BEGIN IMMEDIATE</code> 的写事务有明确语义；<a target="_blank" rel="noopener" href="https://www.sqlite.org/partialindex.html">部分索引文档</a>说明 <code>WHERE</code> 如何只索引满足条件的行。部分唯一索引是多行行程表的候选防线；本地脚本只用一行 driver 的条件更新验证单司机指派，不代表跨地域多主写入已被协调。</p>
+<h2 id="候选再多也不能突破单车容量">候选再多也不能突破单车容量</h2>
+<p>假设 10 万活跃司机每 5 s 发一次 96 B 的位置更新，均值为 <code>100,000 / 5 = 20,000 update/s</code>、有效数据约 <code>1.92 MB/s</code>；短时 3 倍为 60,000 update/s、<code>5.76 MB/s</code>。假设每天 200 万次下单，平均 <code>23.15 request/s</code>，晚高峰系数 12 得约 <code>277.8 request/s</code>；每次半径检索 30 个候选，调度判断约 <code>8,334 candidate-check/s</code>，并不是 8,334 次数据库写入。假设请求/响应共 1 KiB，峰值 API 有效带宽约 <code>277.8 KiB/s</code>；推送另计。</p>
+<p>当前司机状态按 128 B/人估计是 12.8 MB 逻辑量，三副本 38.4 MB；若每次位置上报都保留 80 B 且保留一天，新增日志约 <code>20,000 × 86,400 × 80 B = 138.24 GB/天</code>，三副本 414.72 GB/天（未计压缩与索引）。将上报频率从 5 s 缩为 1 s，写入增为 100,000 update/s、一天约 691.2 GB 日志，却不会把可用车辆增为五倍。若商业活动让 30% 峰值订单在同一商圈，热点大约 <code>83.3 order/s</code>，应监控候选司机复用率与事务冲突，而非只看整体 QPS。</p>
+<pre><code class="hljs mermaid">flowchart LR
+    M[司机位置更新] --&gt; G[(地理候选索引)]
+    C[乘客行程] --&gt; Q[筛选邻近司机]
+    G --&gt; Q
+    Q --&gt; D[派单事务服务]
+    D --&gt; T[(权威司机与行程表)]
+    D --&gt; O[本地模拟司机 offer]
+    O --&gt; A[带 token 的确认]
+    A --&gt; D
+    D --&gt; C</code></pre>
+<p>起步方案是单写者 SQLite（工程部署可选一套具有同等条件更新和唯一约束能力的事务库），完整设计要求司机与行程同一事务；本实验压缩为 driver 上的 owner、state、generation、deadline 四个字段，避免靠事件通知决定占用状态。第二方案是按司机 ID 划归属分片、每位司机只有一名有效写入者，可扩展不同司机的写入，但分区迁移、栅栏令牌、主从切换和跨分片重试变复杂；未验证前不宣称其能消除跨节点竞态。另一个被放弃的方案是“每个派单 worker 在本地缓存可用标记”：读取快，但两个 worker 在同一时刻仍会各发 offer，适合仅生成候选、再交由权威事务做最终占位，不适合确认独占。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant P1 as 乘客甲
+    participant P2 as 乘客乙
+    participant D as 派单事务
+    participant S as 模拟司机
+    P1-&gt;&gt;D: 请求司机 1
+    P2-&gt;&gt;D: 请求司机 1
+    D--&gt;&gt;P1: 占位并提交 offer token 1
+    D--&gt;&gt;P2: 已被占用 换候选
+    D-&gt;&gt;S: 发送 offer 有效至 t=110
+    Note over D,S: 无确认 到期释放司机
+    S-&gt;&gt;D: t=111 迟到确认 token 1
+    D--&gt;&gt;S: 拒绝 已过期</code></pre>
+<p>恢复由权威状态驱动：过期定时器重放时用 <code>deadline &lt;= now AND state=offered</code> 条件更新，释放司机必须和行程状态更新处于同一事务；取消请求重复到达时返回终态，不得再次释放已分配给新行程的司机。若事务成功却丢失派单响应，按行程 ID/幂等键查询终态，不盲目再次占用司机。司机已经确认后的取消只覆盖发车前状态；发车后订单与司机资源需另一套明确的结算流程。主库不可写时停止发放“已占用成功”答复，恢复后扫描过期 offer、对账司机与 active 行程数，确认索引与权威表一致再开放派单。</p>
+<p>实测命令 <code>python3 -B examples/system-design/labs/25/dispatch.py</code>，版本、逻辑时间、输出与退出码见 <code>examples/system-design/evidence/25/RUN.md</code>。12 个线程各自连接同一磁盘 SQLite，只有一个条件更新把司机从 idle 改为 offered。t=10 释放旧占位后，订单 99 获得 generation 2；t=11 的旧代际确认更新 0 行，当前代际确认更新 1 行，取消后迟到确认再次更新 0 行。最终司机 idle。脚本未创建 trips 表或部分唯一索引，未验证请求幂等键；两表生产候选设计须另做事务约束实验。线程赢家不固定，断言与赢家 ID 无关。</p>
+<p>[PATTERN] 候选与承诺分离：地理筛选返回可能对象集合，权威原子占位才授予资源；确认携带版本/令牌且检查截止时间。换成仓库工位或共享设备，资源 ID、过期时间和确认消息换参数即可复用；只有最终写入点能作出“已经分配”的承诺。</p>
+<h2 id="追问与速查">追问与速查</h2>
+<p>司机确认恰好和超时在同一秒抵达，谁赢？约定严格 <code>now &lt; deadline</code> 才接受，以权威事务顺序和统一时钟裁决。司机端显示“已接单”，但确认响应丢失，该怎样查询？按 token 查询行程状态，而非发新 offer。一个司机跨城迁移时旧分片仍在写，该怎样防止旧写者复活？需要排他归属或栅栏版本，不是把缓存 TTL 调低。</p>
+<table>
+<thead>
+<tr>
+<th>触发条件</th>
+<th>模式</th>
+<th>恢复条件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>并发命中一位司机</td>
+<td>原子占位 + active 唯一约束</td>
+<td>确认事务提交</td>
+</tr>
+<tr>
+<td>确认超时/迟到</td>
+<td>deadline + token 条件转移</td>
+<td>回收后才能重派</td>
+</tr>
+<tr>
+<td>取消与新派单交错</td>
+<td>条件释放对应行程</td>
+<td>状态与司机一致</td>
+</tr>
+</tbody>
+</table>
+<p><a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-24-%E7%A9%BA%E9%97%B4%E7%BD%91%E6%A0%BC%E7%9A%84%E8%BE%B9%E7%95%8C%E4%B8%8E%E4%BD%8D%E7%BD%AE%E6%96%B0%E9%B2%9C%E5%BA%A6/">24 空间候选</a>负责“附近”；<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-26-%E5%8D%A0%E5%BA%A7%E5%88%B0%E6%9C%9F%E4%B8%8E%E6%94%AF%E4%BB%98%E5%9B%9E%E8%B0%83%E7%9A%84%E5%BA%93%E5%AD%98%E8%BE%B9%E7%95%8C/">26 票务库存</a>把同类资源独占问题推进到付款与补偿。</p>
+<p>实验附件：<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-25-%E5%8F%B8%E6%9C%BA%E6%8C%87%E6%B4%BE%E7%AB%9E%E4%BA%89%E4%B8%8E%E8%BF%9F%E5%88%B0%E7%A1%AE%E8%AE%A4/dispatch.py" title="权威实验源码">权威实验源码</a>；<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-25-%E5%8F%B8%E6%9C%BA%E6%8C%87%E6%B4%BE%E7%AB%9E%E4%BA%89%E4%B8%8E%E8%BF%9F%E5%88%B0%E7%A1%AE%E8%AE%A4/RUN.md" title="运行记录">运行记录</a>；<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-25-%E5%8F%B8%E6%9C%BA%E6%8C%87%E6%B4%BE%E7%AB%9E%E4%BA%89%E4%B8%8E%E8%BF%9F%E5%88%B0%E7%A1%AE%E8%AE%A4/verification.json" title="版本与源码哈希">版本与源码哈希</a>；<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-25-%E5%8F%B8%E6%9C%BA%E6%8C%87%E6%B4%BE%E7%AB%9E%E4%BA%89%E4%B8%8E%E8%BF%9F%E5%88%B0%E7%A1%AE%E8%AE%A4/run.json" title="本地原始结果">本地原始结果</a>。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-25-%E5%8F%B8%E6%9C%BA%E6%8C%87%E6%B4%BE%E7%AB%9E%E4%BA%89%E4%B8%8E%E8%BF%9F%E5%88%B0%E7%A1%AE%E8%AE%A4/">https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-25-%E5%8F%B8%E6%9C%BA%E6%8C%87%E6%B4%BE%E7%AB%9E%E4%BA%89%E4%B8%8E%E8%BF%9F%E5%88%B0%E7%A1%AE%E8%AE%A4/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E5%87%BA%E8%A1%8C%E5%8C%B9%E9%85%8D/">出行匹配</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-24.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-35-%E4%B8%89%E5%9C%BA%E9%99%90%E6%97%B6%E8%AE%BE%E8%AE%A1%E4%B8%8E%E7%BA%A6%E6%9D%9F%E6%94%B9%E5%8F%98%E5%A4%8D%E7%9B%98/" title="系统设计 35：三场限时设计与约束改变复盘"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-51.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 35：三场限时设计与约束改变复盘</div></div><div class="info-2"><div class="info-item-1">限时系统设计的复盘应记录“哪个新约束迫使哪个决策变化”，而不是统计最终画了多少组件。短链、派单、票务都可能从单库开始，流量增长后的变化却不同：短链先遇到热读，派单先遇到空间候选与资源竞争，票务先遇到集中争抢和支付确认。 本篇提供三份原创的四十五分钟书面设计练习，每份包含时间段、方案推导、约束注入和复盘。这里没有进行或声称进行三场真实持续四十五分钟的面试；时间是可供读者执行的议程，附带程序只核对议程总和与容量反例，不把脚本耗时伪装成面试时长。  练习一：可以撤销的短链 0–5 分钟，明确目标。 创建、重定向、过期和撤销是范围；公开搜索、点击计费与恶意链接扫描只记为后续需求。链接 ID 唯一，创建超时重试不能生成两份，同一个幂等键换目标要拒绝。撤销确认后开始的新读取不返回目标，已在途响应和用户复制的 URL 无法撤回。拟定读 p99 100 ms、创建 p99 300 ms，均为教学目标。 5–13 分钟，容量与接口。 基准读 2000 request/s、写 20 request/s，读写比 100:1，响应按 500 B，出口 1 MB/s。每条元数据 400 B，保留三十天、三...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-01-%E9%9C%80%E6%B1%82%E6%BE%84%E6%B8%85%E4%B8%8E%E6%95%B0%E6%8D%AE%E4%B8%8D%E5%8F%98%E9%87%8F/" title="系统设计 01：需求澄清——功能、SLO、数据不变量与范围"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-105.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 01：需求澄清——功能、SLO、数据不变量与范围</div></div><div class="info-2"><div class="info-item-1">“做一个分享服务”不能直接变成组件清单。它还没有说明：分享给谁，链接可以撤销吗，读者缓存了旧内容怎么办，创建响应丢了还能不能重试。这些问题的答案会直接改变读写路径。 延续第 00 篇：系统设计题究竟交付什么的教学场景，本篇只处理一件事：把含混需求转成可验证的契约，不借课程题解推测真实产品架构。  先问会改变架构的问题 产品希望用户创建一条分享，接收方打开链接，创建者以后可以撤销。选择以下教学假设，而不是默许它们：只有登录的创建者能撤销；现在分享目标是 URL 元数据，非文件正文；读者无需登录，但链接转发即可能被别人读取；撤销确认之后才开始的新读取，不得返回目标。撤销确认之前已发出响应的读取，不承诺能在网络中撤回。 排除公开搜索、按创建者列举、链接到期、屏蔽恶意 URL 和隐私内容的接收者鉴权。这些是后续产品决策，不是“先不画出来就自动解决”。若用户问“这条链接必须仅让指定同事读取吗”，应先改变接口和访问控制模型，而不是把随机分享 ID 当成授权。若用户问“网页已被别人保存怎么办”，服务端撤销不能抹去接收方保存的副本；必须缩小承诺。    问题 本题确认 可观察验收     创建超...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-E04-%E6%B5%81%E5%BC%8F%E6%A8%A1%E5%9E%8B%E7%BD%91%E5%85%B3%E7%9A%84%E5%8F%96%E6%B6%88%E4%B8%8E%E7%94%A8%E9%87%8F%E8%BE%B9%E7%95%8C/" title="系统设计 E04：流式模型网关的取消与用量边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-163.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 E04：流式模型网关的取消与用量边界</div></div><div class="info-2"><div class="info-item-1">流式接口发出第一段内容之后，失败重试就不再只是重新请求一次。用户可能已经看到半句，模型端可能已经产生全部用量，网关却只记录了几个片段。取消、计费与重试必须共享同一个请求状态，而不能由三个互不相干的中间件分别处理。 本篇设计多租户 LLM 服务网关，范围包含流式转发、有限并发、准入配额、显式取消和用量核对；排除真实模型推理、供应商账单、工具调用与训练。实验启动真实回环 HTTP 服务和客户端，但“模型”仅按序生成数字片段，每段不等于真实 tokenizer 的 token，结果不能用来估算任何模型价格或 GPU 吞吐。  把首段、完成和取消分别建模 业务不变量是一个请求不能同时占用多个有效执行槽，取消后其本地执行应释放资源，已发送部分输出的请求不能被透明重试成另一段独立回答。目标拟定为准入后首 token p99 两秒以内、显式取消在一秒内停止本地任务；完整回答延迟取决于输出长度，不能拿首 token 指标代替。 接口候选为 POST /generations，携带租户身份、请求 ID、输入与最大输出预算，返回流；POST /generations/&#123;id&#125;/c...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-E02-%E4%BA%8B%E4%BB%B6%E5%BD%92%E5%9B%A0%E7%9A%84%E5%8E%BB%E9%87%8D%E8%BF%9F%E5%88%B0%E4%B8%8E%E4%BF%AE%E6%AD%A3/" title="系统设计 E02：事件归因的去重迟到与修正"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-112.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 E02：事件归因的去重迟到与修正</div></div><div class="info-2"><div class="info-item-1">同一笔转化被上报两次，是重复事件问题；点击在转化之后才到达，是迟到数据问题；转化原先归给广告甲、补齐数据后改归广告乙，是归因修正问题。把三者都交给“消息去重”处理，会让统计稳定地算错。 本篇只使用合成曝光、点击与转化，构建一个固定窗口的最后点击归因模型。没有真实广告用户数据，没有接入投放平台，也不计算应付账款。教学不变量是同一转化 ID 只进入一次业务总额、修正保持该笔总额守恒、窗口外点击不得获得归因。归因报表与资金账务的边界必须在模型之前确定。  事件时间、到达时间与业务时间不能混用 事件采用 event_id, kind, user_key, campaign_id, event_time, ingest_time；转化另带 conversion_id, amount_minor, currency。金额使用最小货币单位整数，本例 500 表示五百单位的教学金额，不暗示任何真实币种。身份关联键采用合成 u1，不讨论跨设备身份识别；若身份关联不可靠，归因本身应允许未知结果。 接入接口 POST /events 返回“已接受并持久保存”，不承诺归因结果立即最终化。查询 GET /...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-20-%E7%A4%BE%E4%BA%A4%E5%86%85%E5%AE%B9%E6%90%9C%E7%B4%A2%E7%9A%84%E5%A2%9E%E9%87%8F%E7%B4%A2%E5%BC%95%E4%B8%8E%E6%96%B0%E9%B2%9C%E5%BA%A6/" title="系统设计 20：社交内容搜索的增量索引与新鲜度"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-58.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">系统设计 20：社交内容搜索的增量索引与新鲜度</div></div><div class="info-2"><div class="info-item-1">一条动态先写下 blue bird，后来改成 green bird，最后被删除。搜索端如果只追加“新增词项”，blue 和 green 可能同时搜到同一条；即使正确删除了词项，迟到的旧编辑事件还能把已删内容重新放回结果。这是 Twitter Search 类型题目里比“用什么倒排索引”更先要回答的问题：一次修改怎样替换旧词集，重放为什么不能覆盖新版本，以及用户究竟在等哪个“可搜索”时刻。 本文设计公共短文本搜索，不声称是 Twitter 的真实架构；第 19 篇信息流候选排序与权限撤销处理旧候选的读时安全门禁，下一篇输入联想则查询词条前缀而不是全文。分片与排名是教学设计；实验的延迟是本地 SQLite FTS5 查询观测，不代表分布式搜索引擎性能。  “发布成功”和“能搜到”分开定义 允许发帖、编辑、删除、按单词查询公开内容；搜索结果不得混入另一个租户或私密帖子。帖子权威数据与索引分离，发帖成功表示权威状态及可重放变更记录已持久接受，不等于已经刷新可搜索索引。编辑在索引里必须替换旧版本的词项，删除必须同时撤掉词项并保留能挡住旧事件的墓碑。对任一 post_id，索引应用的版本只能...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-31-%E5%A4%9A%E5%9C%B0%E5%9F%9F%E5%88%87%E6%8D%A2%E4%B8%8E%E6%95%B0%E6%8D%AE%E6%81%A2%E5%A4%8D%E7%9A%84%E4%B8%8D%E5%90%8C%E8%BE%B9%E7%95%8C/" title="系统设计 31：多地域切换与数据恢复的不同边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-117.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 31：多地域切换与数据恢复的不同边界</div></div><div class="info-2"><div class="info-item-1">地域切换解决的是服务入口和写入权限的变化；数据恢复解决的是哪些已确认记录仍然存在。DNS 已切到另一座城市，既不能证明旧地域停止写入，也不能证明最后一笔订单没有丢失。多地域设计必须分别给出这三个答案。 本文把教学分享服务扩展到两个地域，采用每个账户只有一个写入归属地域的候选方案。它不描述任何公司的内部架构，也不实现跨地域共识协议。正常情况下归属地域提交元数据，另一地域异步接收日志；只有公开且允许陈旧的统计可以就近读取。  从业务损失反推复制确认 需求卡先区分内容和权限：普通草稿允许灾难后丢失最近五秒更新，撤销权限的成功确认不允许在恢复后被当作从未发生。前者可以接受有界的数据损失目标，后者需要更强的提交条件，或在无法确认撤销状态时拒绝访问。不能用“系统 RPO 五秒”抹平两个业务对象之间的差异。 RPO 是恢复点目标，用时间表达可接受的最近数据损失范围；RTO 是恢复时间目标，从业务中断开始，直到指定业务功能恢复。目标必须说明故障范围：本题只讨论单地域失效、备用地域及控制面仍可用；两个地域同时永久丢失、账号密钥泄露和逻辑误删不由地域复制自动处理。Google SRE 的数据完整性章...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%8A%8A%E4%B8%80%E6%AC%A1%E6%B4%BE%E5%8D%95%E6%8B%86%E6%88%90%E4%B8%A4%E4%B8%AA%E7%A1%AE%E8%AE%A4"><span class="toc-number">1.</span> <span class="toc-text">把一次派单拆成两个确认</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%80%99%E9%80%89%E5%86%8D%E5%A4%9A%E4%B9%9F%E4%B8%8D%E8%83%BD%E7%AA%81%E7%A0%B4%E5%8D%95%E8%BD%A6%E5%AE%B9%E9%87%8F"><span class="toc-number">2.</span> <span class="toc-text">候选再多也不能突破单车容量</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%BF%BD%E9%97%AE%E4%B8%8E%E9%80%9F%E6%9F%A5"><span class="toc-number">3.</span> <span class="toc-text">追问与速查</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

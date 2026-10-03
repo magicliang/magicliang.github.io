@@ -4,7 +4,7 @@
 
 ## 准备与边界
 
-在专用 Linux VM、专用 Kubernetes 集群运行，下载本文全部附件到同一个空目录。使用 Bash，在同一终端按顺序执行各代码块；失败即停，先保留日志。需要 Docker Compose、kubectl、Python 3、curl、可拉取的自有探针镜像，以及能给 UID/GID 65532 提供可写卷的 CSI StorageClass。kind 默认存储插件不等同于 CSI；需另行安装适用驱动。NetworkPolicy 只有支持它的 CNI 才会执行，本例只验证允许客户端的路径，不证明拒绝规则生效。
+在专用 Linux VM、专用 Kubernetes 集群运行，下载本文全部附件到同一个空目录，并从仓库工作树中的同名素材目录执行。使用 Bash，在同一终端按顺序执行各代码块；失败即停，先保留日志。需要 Docker Compose、kubectl、Python 3、curl、可拉取的自有探针镜像，以及能给 UID/GID 65532 提供可写卷的 CSI StorageClass。kind 默认存储插件不等同于 CSI；需另行安装适用驱动。NetworkPolicy 只有支持它的 CNI 才会执行，本例只验证允许客户端的路径，不证明拒绝规则生效。所有下载内容及日志写入仓库内本任务独占 `.lab-work/36`；不可在共享节点执行 Compose/CSI/Kubernetes 对象操作。
 
 先在实验环境按规范包的 `Dockerfile.single` 构建并推送到自有仓库，固定基础镜像 digest，记录构建日志、平台和产物 manifest。将实际值导出为 `PROBE_IMAGE=仓库/probe@sha256:64位摘要`、`STORAGE_CLASS_NAME=实际存储类`、`C36_CONTEXT=专用集群context`。认证通过实验环境自己的 Docker/节点凭据配置；附件不携带 Secret。多平台 index 还需另外保存两端选中的 manifest，不能直接把 Docker image ID 与 Kubernetes imageID 字符串相等当成验收条件。
 
@@ -15,7 +15,11 @@ export PROBE_IMAGE STORAGE_CLASS_NAME
 python3 -c 'import os,re; assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}", os.environ["PROBE_IMAGE"]); assert re.fullmatch(r"[a-z0-9][a-z0-9.-]*", os.environ["STORAGE_CLASS_NAME"])'
 sha256sum -c CHECKSUMS.sha256
 sha256sum -c C36_CHECKSUMS.sha256
-export C36_EVIDENCE="$(mktemp -d "$PWD/c36-evidence.XXXXXX")"
+C36_WORK_ROOT="$(git rev-parse --show-toplevel)/examples/containers/.lab-work/36"
+mkdir -p "$C36_WORK_ROOT"
+test ! -L "$C36_WORK_ROOT"
+chmod 700 "$C36_WORK_ROOT"
+export C36_EVIDENCE="$(mktemp -d "$C36_WORK_ROOT/evidence.XXXXXX")"
 mkdir "$C36_EVIDENCE/bundle"
 tar -xzf probe-bundle.tar.gz -C "$C36_EVIDENCE/bundle"
 cmp compose.yaml "$C36_EVIDENCE/bundle/compose.yaml"

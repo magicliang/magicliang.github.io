@@ -1,19 +1,17 @@
 # 第06篇运行记录
 
-2026-10-02 本地执行：LAB_VERIFIED。PostgreSQL17.6 / JDK21.0.11 / Hibernate7.1.36.Final，2项JUnit测试覆盖3场景，0失败、0错误、0跳过；退出码0。完整实现位于 examples/hibernate-lab/src/test/java/blog/hibernate/Chapter06Test.java。
+2026-10-03 当前检出版本在专用 PostgreSQL 16.15 / OpenJDK 21.0.12.1 / Hibernate 7.1.36.Final 实跑：2 项 JUnit 测试覆盖 3 场景，0 失败、0 错误、0 跳过；退出码 0。完整实现为 `examples/hibernate-lab/src/test/java/blog/hibernate/Chapter06Test.java`。
 
-从 examples/hibernate-lab 目录运行 `./mvnw -B -ntp -Dtest=Chapter06Test test`，需要 HIBERNATE_LAB_JDBC_URL、HIBERNATE_LAB_USER、HIBERNATE_LAB_PASSWORD 指向隔离 PostgreSQL。
+从 `examples/hibernate-lab/` 运行 `./mvnw -B -ntp -Dtest=Chapter06Test test`；通过 `HIBERNATE_LAB_JDBC_URL`、`HIBERNATE_LAB_USER`、`HIBERNATE_LAB_PASSWORD` 提供专用库连接，密码不入库。
 
-此次本机使用离线依赖缓存与仅含Maven Central的临时settings，精确命令：`source /private/tmp/hibernate-runtime-pg17/env.sh && ./mvnw -o -s /private/tmp/hibernate-maven-central.xml -Dmaven.repo.local=/private/tmp/hibernate-m2 -B -ntp -Dtest=Chapter06Test test`。临时绝对路径仅描述这次本机执行；迁移机器后使用标准命令和当地环境变量。
+当前可追溯记录为 `examples/hibernate-lab/evidence/06/20261003T031711Z-pg16-first/` 的 `command.txt`、`environment.txt`、`test.stdout.txt`、`exit-code.txt`、JUnit XML 和另起连接执行的 `db-final.txt`。上一版提及的 `/private/tmp` 路径及 PostgreSQL 17.6 原始输出未随当前仓库收录，不作为当前检出版本的通过证据。
 
 | 场景 | 二元可观测结果 | 原始仓库证据 |
 |---|---|---|
-| merge后只改输入 | id9输入99.00、返回仍20.00、contains身份断言通过；新连接最终20.00 | examples/hibernate-lab/evidence/06/20261002-pg17/test.txt；surefire.xml |
-| merge后只改返回 | id10输入仍20.00、返回30.00；新连接最终30.00 | 同上 |
-| 两个脱管副本同id级联 | merge调用内IllegalStateException含Multiple representations；新连接最终10.00 | 同上；observables.txt |
+| merge 后只改输入 | 输入 99.00、返回仍 20.00、身份断言通过；新连接最终 20.00 | `test.stdout.txt`、JUnit XML、`db-final.txt` |
+| merge 后只改返回 | 输入仍 20.00、返回 30.00；新连接最终 30.00 | 同上 |
+| 两个脱管副本同 id 级联 | merge 调用内 `IllegalStateException` 含 `Multiple representations`；回滚后新连接最终 10.00 | 同上 |
 
-测试内的新JDBC连接明确设置READ_COMMITTED。图冲突订单id为7461045945920866618，已回滚金额修改；数据库终态由测试内SQL查询断言。SQL及bind原始日志保留在test.txt，观察器异常并非数据库异常，不能伪造SQLState。
+测试内的新 JDBC 连接显式使用 READ COMMITTED，`db-final.txt` 是测试后另一条 PostgreSQL 连接的读取。冲突是 ORM 侧异常而非数据库异常，不能填充 SQLState。StatementInspector 的语句文本不能单独证明提交成功。
 
-编译、来源核对、写作扫描和全部证据索引在 examples/hibernate-lab/evidence/06/20261002-pg17/README.md。Hexo生成和浏览器视觉验收由父任务执行，此记录不宣称已完成这两项。
-
-上游Gradle测试、allow/log覆盖策略及正文练习均未运行，状态NOT_RUN。
+上游 Gradle 测试、allow/log 覆盖策略及正文练习均未运行，状态为 `NOT_RUN`。页面和浏览器验收以本批新生成的记录为准，不由测试通过代替。

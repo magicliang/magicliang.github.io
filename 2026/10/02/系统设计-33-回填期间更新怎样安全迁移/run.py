@@ -1,4 +1,4 @@
-"""Real SQLite backfill/upsert; separate connections, deterministic schedule."""
+"""Real SQLite backfill/upsert; single connection, deterministic schedule."""
 import json, sqlite3, tempfile, pathlib, platform
 with tempfile.TemporaryDirectory() as tmp:
     db=sqlite3.connect(pathlib.Path(tmp)/'migration.db')

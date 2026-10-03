@@ -1,0 +1,698 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>系统设计 27：通知系统的逻辑去重与送达边界 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="用户提交订单两次刷新页面，只应该看到一条“订单已受理”的逻辑通知；短信渠道返回超时，却无法据此判断短信没有发出。前一句是自己数据库能控制的去重，后一句是跨渠道的确认缺口。把两句话合成“通知恰好送达一次”，会让重试策略无法落地。 这里设计的是本地假渠道支持的教学方案，不代表任何邮件、短信平台的实际送达语义。业务事件先落地，再根据收件人偏好、安静时段与渠道错误决定投递时机。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="系统设计 27：通知系统的逻辑去重与送达边界">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-27-%E9%80%9A%E7%9F%A5%E7%B3%BB%E7%BB%9F%E7%9A%84%E9%80%BB%E8%BE%91%E5%8E%BB%E9%87%8D%E4%B8%8E%E9%80%81%E8%BE%BE%E8%BE%B9%E7%95%8C/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="用户提交订单两次刷新页面，只应该看到一条“订单已受理”的逻辑通知；短信渠道返回超时，却无法据此判断短信没有发出。前一句是自己数据库能控制的去重，后一句是跨渠道的确认缺口。把两句话合成“通知恰好送达一次”，会让重试策略无法落地。 这里设计的是本地假渠道支持的教学方案，不代表任何邮件、短信平台的实际送达语义。业务事件先落地，再根据收件人偏好、安静时段与渠道错误决定投递时机。">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-116.jpg">
+<meta property="article:published_time" content="2026-10-03T04:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-03T10:23:18.404Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="系统设计">
+<meta property="article:tag" content="通知系统">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-116.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "系统设计 27：通知系统的逻辑去重与送达边界",
+  "url": "https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-27-%E9%80%9A%E7%9F%A5%E7%B3%BB%E7%BB%9F%E7%9A%84%E9%80%BB%E8%BE%91%E5%8E%BB%E9%87%8D%E4%B8%8E%E9%80%81%E8%BE%BE%E8%BE%B9%E7%95%8C/",
+  "image": "https://magicliang.github.io/img/wall-paper-116.jpg",
+  "datePublished": "2026-10-03T04:00:00.000Z",
+  "dateModified": "2026-10-03T10:23:18.404Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-27-%E9%80%9A%E7%9F%A5%E7%B3%BB%E7%BB%9F%E7%9A%84%E9%80%BB%E8%BE%91%E5%8E%BB%E9%87%8D%E4%B8%8E%E9%80%81%E8%BE%BE%E8%BE%B9%E7%95%8C/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '系统设计 27：通知系统的逻辑去重与送达边界',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1437</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1535</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">28</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-116.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">系统设计 27：通知系统的逻辑去重与送达边界</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">系统设计 27：通知系统的逻辑去重与送达边界</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-03T04:00:00.000Z" title="Created 2026-10-03 12:00:00">2026-10-03</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-03T10:23:18.404Z" title="Updated 2026-10-03 18:23:18">2026-10-03</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">1.8k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>6mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-03 18:23:18&quot;}" hidden></div><p>用户提交订单两次刷新页面，只应该看到一条“订单已受理”的逻辑通知；短信渠道返回超时，却无法据此判断短信没有发出。前一句是自己数据库能控制的去重，后一句是跨渠道的确认缺口。把两句话合成“通知恰好送达一次”，会让重试策略无法落地。</p>
+<p>这里设计的是本地假渠道支持的教学方案，不代表任何邮件、短信平台的实际送达语义。业务事件先落地，再根据收件人偏好、安静时段与渠道错误决定投递时机。</p>
+<span id="more"></span>
+<h2 id="需求从收件人开始">需求从收件人开始</h2>
+<p>输入为 <code>event_id, recipient_id, template_version</code>。教学契约规定同一事件、收件人、模板版本最多生成一条逻辑通知；渠道改变不是新事件，但一次明确的用户主动重发要带新请求键。偏好以创建通知时的版本作为路由快照；取消订阅则是更强的安全约束，投递前还需重新查最新授权。营销退订不能因旧的排队任务而失效。</p>
+<p>假设目标：事件受理成功响应意味着<strong>事件及通知意图已经持久化</strong>，不意味着外部送达；近 30 天的 99.9% 合法事件在受理后 60 秒内进入终态（渠道接受、永久拒绝或待人工核查），计时从入口收到请求至本地状态记录，按自然月窗口统计。安静时段里的营销通知不计入这一目标，应另报延迟分布。认证、跨设备已读、法律规定的退订时限、短信供应商资费和真正的到达率均在本题排除项内；欠缺供应商回执时不承诺手机屏幕已显示。</p>
+<p>容量先用假设而非“规模很大”：日均 120 万条事件、每事件平均 1.5 个收件人，生成 180 万条通知/天，平均 <code>1,800,000 / 86,400 ≈ 20.8 条/秒</code>。若峰值系数为 12，峰值 250 条/秒；假设每条元数据 0.8 KiB、保留 30 天、双副本，物理量约 <code>180万 × 0.8 KiB × 30 × 2 ≈ 82.4 GiB</code>，不含索引、渠道响应和备份。若一次批量活动把收件人数从 1.5 提到 5，写入和外呼同时变为约 3.33 倍，峰值约 833 次/秒；此时先限渠道外呼并扩展排队能力，不是先增加读缓存。60 秒目标下，以 250 次/秒持续一分钟等待最多形成 1.5 万条待投递记录；这只是预算上界假设，不能冒充队列实测吞吐。</p>
+<h2 id="写入确认与状态归属">写入确认与状态归属</h2>
+<p><code>POST /notifications</code> 带事件 ID、收件人、模板版本；重复提交返回原 <code>notification_id</code> 和当前状态。<code>GET /notifications/&#123;id&#125;</code> 只返回本地意图和尝试状态，不能把 <code>ACCEPTED_BY_CHANNEL</code> 命名为 <code>DELIVERED</code>。数据库候选模型：<code>notifications(id, event_id, recipient_id, template_version, preference_version, state, due_at)</code>，唯一键 <code>(event_id,recipient_id,template_version)</code>；<code>attempts(notification_id,seq,channel,started_at,result,next_at)</code> 保留 <code>TIMEOUT_UNKNOWN</code>、<code>RATE_LIMITED</code> 和 <code>ACCEPTED</code>。真实数据库的唯一键与事务必须在选型后验证；本篇用实际 SQLite 复合主键 <code>(event,recipient,channel)</code> 去重固定模板的通知，Python 集合只记录假渠道接受状态；没有测试多进程消费竞争。</p>
+<pre><code class="hljs mermaid">flowchart LR
+    E[事件入口] --&gt; T[意图存储和偏好快照]
+    T --&gt; Q[到期任务索引]
+    Q --&gt; W[限速投递者]
+    W --&gt; C&#123;本地假渠道&#125;
+    C --&gt; A[尝试记录和待核查队列]
+    P[退订状态] --&gt; W</code></pre>
+<p>受理写入与投递任务要在同一事务里提交，或使用可补偿的 outbox；任务获取需有领取期限，避免工作者崩溃永久卡住。到期扫描按 <code>due_at, id</code> 分页，不用只按当前时间截断全表。失败码要分开：真实 HTTP 下游若返回 429，可携带 <code>Retry-After</code>，该字段只能解释何时<strong>建议</strong>重试，不能证明请求未被处理，见 <a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc6585#section-4">RFC 6585 §4</a> 与 <a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3">RFC 9110 §10.2.3</a>。供应商不接受幂等键时，本地唯一键不能阻止超时后的外部重复。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant E as 事件入口
+    participant W as 投递者
+    participant C as 假短信渠道
+    participant R as 记录库
+    E-&gt;&gt;R: 写入同一事件的唯一通知意图
+    E-&gt;&gt;R: 重复事件：取回同一意图
+    W-&gt;&gt;C: attempt 1
+    C-&gt;&gt;C: 已接受
+    C--xW: 回复超时
+    W-&gt;&gt;R: 标记 UNKNOWN，等待核查/限次重试
+    W-&gt;&gt;C: attempt 2，同一逻辑键
+    C--&gt;&gt;W: 接受（可能二次外送）
+    W-&gt;&gt;R: 记录接受，不声称恰好到达一次</code></pre>
+<p>方案 A 为“立即写库、定时任务按偏好投递”，故障时易追账，但需要扫描和过期清理；方案 B 为“事件处理线程直接调渠道”，端到端延迟少一跳，却在渠道超时、入口重放或安静时段无法可靠安排后续工作。若渠道能按稳定外部幂等键查询投递结果，优先查询消除 <code>UNKNOWN</code>；否则设置有限重试次数和人工核查阈值，避免无限放大。永久拒绝则终止该渠道、评估偏好是否允许安全回退，不能把“转推送”偷偷当成用户已同意。</p>
+<h2 id="固定输入能证明什么">固定输入能证明什么</h2>
+<p>运行 <code>python3 -B examples/system-design/labs/27/notify.py</code>：重复 ok 入队返回 0，不增加通知；limited 第一次限流、返回重试时点 3，t=3 再请求被接受。uncertain 的假渠道已接受但返回超时，本地先记 unknown，再查询假渠道集合对账成 accepted，没有盲目重发。投递 revoked 前关闭偏好，状态为 suppressed、尝试数为 0。最终四条通知，尝试数分别为 limited=2、ok=1、revoked=0、uncertain=1；三个假渠道接受记录均不是用户送达证明。脚本没有安静时段、多渠道回退或实际 HTTP 429；上方二次发送时间图是无查询接口时的风险分析。原始输出、版本、命令、退出码见 <code>examples/system-design/evidence/27/RUN.md</code>。</p>
+<p>恢复要从 <code>UNKNOWN/WAIT</code> 按重试预算扫描，先查退订和偏好，再选择查询渠道或重投；重新入队必须保留原逻辑键及已用次数。若队列积压持续超过 60 秒，先对非关键营销通知限流，展示过期数量、各渠道未知数和用户投诉数，再恢复入口额度。面试追问：用户在排队期退订怎么办？渠道只支持“接收成功”如何报告送达率？两渠道都失败会不会自动转发给不在偏好里的渠道？这些问题决定数据模型和承诺边界，而非再加一个队列就结束。</p>
+<p>[PATTERN] 先明确“产生意图、外部接受、用户送达”三个不同确认点，再为每个确认点选择去重、重试及核查策略。</p>
+<p>实验源码 <code>examples/system-design/labs/27/notify.py</code>，证据 <code>examples/system-design/evidence/27/RUN.md</code>。<a href="/2026/10/01/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-00-%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E9%A2%98%E7%A9%B6%E7%AB%9F%E4%BA%A4%E4%BB%98%E4%BB%80%E4%B9%88/">系列导读</a>；本篇是自拟工程扩展题，不是付费课程译稿。</p>
+<p>实验附件：<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-27-%E9%80%9A%E7%9F%A5%E7%B3%BB%E7%BB%9F%E7%9A%84%E9%80%BB%E8%BE%91%E5%8E%BB%E9%87%8D%E4%B8%8E%E9%80%81%E8%BE%BE%E8%BE%B9%E7%95%8C/notify.py" title="权威实验源码">权威实验源码</a>；<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-27-%E9%80%9A%E7%9F%A5%E7%B3%BB%E7%BB%9F%E7%9A%84%E9%80%BB%E8%BE%91%E5%8E%BB%E9%87%8D%E4%B8%8E%E9%80%81%E8%BE%BE%E8%BE%B9%E7%95%8C/RUN.md" title="运行记录">运行记录</a>；<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-27-%E9%80%9A%E7%9F%A5%E7%B3%BB%E7%BB%9F%E7%9A%84%E9%80%BB%E8%BE%91%E5%8E%BB%E9%87%8D%E4%B8%8E%E9%80%81%E8%BE%BE%E8%BE%B9%E7%95%8C/verification.json" title="版本与源码哈希">版本与源码哈希</a>；<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-27-%E9%80%9A%E7%9F%A5%E7%B3%BB%E7%BB%9F%E7%9A%84%E9%80%BB%E8%BE%91%E5%8E%BB%E9%87%8D%E4%B8%8E%E9%80%81%E8%BE%BE%E8%BE%B9%E7%95%8C/run.json" title="本地原始结果">本地原始结果</a>。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-27-%E9%80%9A%E7%9F%A5%E7%B3%BB%E7%BB%9F%E7%9A%84%E9%80%BB%E8%BE%91%E5%8E%BB%E9%87%8D%E4%B8%8E%E9%80%81%E8%BE%BE%E8%BE%B9%E7%95%8C/">https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-27-%E9%80%9A%E7%9F%A5%E7%B3%BB%E7%BB%9F%E7%9A%84%E9%80%BB%E8%BE%91%E5%8E%BB%E9%87%8D%E4%B8%8E%E9%80%81%E8%BE%BE%E8%BE%B9%E7%95%8C/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E9%80%9A%E7%9F%A5%E7%B3%BB%E7%BB%9F/">通知系统</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-116.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-05-%E7%BD%91%E5%85%B3%E6%80%8E%E6%A0%B7%E5%88%86%E9%85%8D%E8%AF%B7%E6%B1%82%E4%B8%8E%E5%AE%88%E4%BD%8F%E8%BF%9E%E6%8E%A5%E8%BE%B9%E7%95%8C/" title="系统设计 05：负载均衡与网关——请求分配不等于连接有余量"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-147.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 05：负载均衡与网关——请求分配不等于连接有余量</div></div><div class="info-2"><div class="info-item-1">两台后端均分请求，不能据此推断每台仍可接新连接。一次请求可以很快结束，也可以占住连接数秒；健康的实例也可能已用完连接名额。路由必须同时回答“往哪台送”和“这台现在能否接”，失败时还要说清拒绝与重试责任。 沿用先测瓶颈再扩容的分享元数据服务。本文只处理入口到无状态应用实例这一跳：POST /shares 写入、GET /shares/{id} 读取、所有者列表读取；权限和撤销仍由应用与权威库共同维护，不因为网关能缓存或改写请求而转移到入口。排除跨地域、会话黏性、TLS 证书生命周期和详细服务发现协议。  定义目标和连接负载 独立练习假设：每天 110 万次读和 10 万次写，读写比 11:1；峰值 360 次读/秒、40 次写/秒，共 400 次/秒（读、写各为日均的约 28.28 与 34.56 倍）。读响应平均有效载荷按 20 KiB，峰值约 360 × 20 KiB = 7.03 MiB/s ≈ 58.98 Mbit/s，不含 TLS、重试、连接升级和网关日志。写元数据平均 1 KiB，写入峰值约 0.039 MiB/s。 假设峰值请求中 80% 的连接平均占用 0.2 秒，...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-13-%E6%96%87%E6%9C%AC%E5%88%86%E4%BA%AB%E7%9A%84%E5%88%B0%E6%9C%9F%E6%92%A4%E9%94%80%E4%B8%8E%E7%89%A9%E7%90%86%E6%B8%85%E7%90%86/" title="系统设计 13：文本分享：到期拒绝与物理删除是两个时刻"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-144.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 13：文本分享：到期拒绝与物理删除是两个时刻</div></div><div class="info-2"><div class="info-item-1">文本分享服务允许用户存一段日志并发给别人。正文放进对象存储之后，数据库删除一行并不代表文本已经消失：缓存、搜索索引、对象版本和备份都可能保留副本。可验证的设计要先给出“何时不再允许读取”，再给出“哪些副本何时清除”，而不是用一个删除按钮替代全部承诺。 场景借用 Pastebin 题型，只讨论纯文本、公开或认证私密分享、有效期与撤销。协同编辑、富文本和全站推荐不在范围内。第 12 篇短链保存的是目标地址，这一篇必须负责正文的存储、交付和生命周期。  候选 SLO 是在线已授权读取在五分钟窗口内 p99 小于 200 ms；撤销事务提交后开始的新读取不得交付正文。物理对象在二十四小时内清理、备份按保留期自然淘汰是待批准的独立生命周期目标，不由这次使用整数时钟的本地实验担保。 不变量沿着访问权限定义 候选接口为 POST /pastes、GET /pastes/&#123;id&#125; 和 DELETE /pastes/&#123;id&#125;。创建时提交 UTF-8 文本、可见性及有效期，服务端校验编码、实际字节长度和最大 1 MiB 限额。返回值包含 ID、到期时间和状态；...</div></div></div></a><a class="pagination-related" href="/2021/09/15/SRE-%E8%B0%B7%E6%AD%8C%E8%BF%90%E7%BB%B4%E6%8F%AD%E7%A7%98/" title="SRE-谷歌运维揭秘"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2021/09/15/SRE-%E8%B0%B7%E6%AD%8C%E8%BF%90%E7%BB%B4%E6%8F%AD%E7%A7%98/sre%E5%B0%81%E9%9D%A2.jpeg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-09-15</div><div class="info-item-2">SRE-谷歌运维揭秘</div></div><div class="info-2"><div class="info-item-1"> SRE-谷歌运维揭秘.xmind </div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-18-%E5%BE%AE%E5%8D%9A%E6%97%B6%E9%97%B4%E7%BA%BF%E7%9A%84%E6%8E%A8%E6%8B%89%E4%B8%8E%E7%83%AD%E7%82%B9%E4%BD%9C%E8%80%85/" title="系统设计 18：微博时间线：同一负载下比较推、拉与混合"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-15.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 18：微博时间线：同一负载下比较推、拉与混合</div></div><div class="info-2"><div class="info-item-1">一个普通作者只有十个关注者，一个热点作者有一千个关注者。如果两人各发两条动态，全量写入扇出会产生 2020 份收件箱引用；如果只有五个人打开首页，其中大量预写永远不会被读到。时间线设计首先比较写时做多少工作与读时做多少工作，而不是先决定使用哪种缓存。 Twitter 在这里是公开发布和关注时间线的题型。基础时间线按发布时间倒序，不加入机器学习排序；排序信息流留给下一篇。本文使用固定关注图比较策略，不声称这些数字来自真实社交产品。  候选 SLO 是已授权用户取首页 20 条在五分钟窗口内 p99 小于 200 ms；99% 的普通作者帖子在三十秒内进入已关注读者的候选集。热点作者靠读时拉取，延迟单独定义；本次整数操作数模型没有真实时钟、队列和用户分布，不能把该目标写成已经达标。 发布与时间线不是同一份事实 POST /posts 提交正文与客户端幂等键，写入 posts(post_id, author_id, created_seq, body, version, deleted)；PUT /following/&#123;author_id&#125; 和 DELETE 修改关...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-33-%E5%9B%9E%E5%A1%AB%E6%9C%9F%E9%97%B4%E6%9B%B4%E6%96%B0%E6%80%8E%E6%A0%B7%E5%AE%89%E5%85%A8%E8%BF%81%E7%A7%BB/" title="系统设计 33：回填期间更新怎样安全迁移"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-59.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 33：回填期间更新怎样安全迁移</div></div><div class="info-2"><div class="info-item-1">迁移失败不一定发生在切流那一秒。旧库的一条 v1 记录被回填器读走，业务紧接着写入 v2，新库也已接收 v2；几秒后回填器把 v1 覆盖回去。两边都有记录、总行数相同、服务没有报错，用户却看到了旧值。 本篇把分享元数据从旧表迁到增加访问权限字段的新表。讨论在线回填、兼容读取与可回退范围，排除真实跨数据库复制的实现。本次本机实验使用 SQLite 3.51.3 执行版本条件 UPSERT；跨库原子性、CDC 完整性和线上性能不在实验结论内。  先确定迁移后必须相同的东西 业务不变量是同一分享的较旧版本不能覆盖较新版本，撤销墓碑不能被回填复活；同一个创建幂等键仍指向同一分享。迁移成功不是两个库行数接近，而是指定切换位点之前的业务状态可解释一致。读取目标拟定为 p99 200 ms、写入 p99 300 ms、回填每天不超过原存储可用 IO 的二成，这些是计划预算，不是本实验测出的能力。 旧模型为 shares(id, target, version, deleted)，新模型增加 owner_id, visibility, schema_version。更新接口 PATCH /sha...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-E02-%E4%BA%8B%E4%BB%B6%E5%BD%92%E5%9B%A0%E7%9A%84%E5%8E%BB%E9%87%8D%E8%BF%9F%E5%88%B0%E4%B8%8E%E4%BF%AE%E6%AD%A3/" title="系统设计 E02：事件归因的去重迟到与修正"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-112.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 E02：事件归因的去重迟到与修正</div></div><div class="info-2"><div class="info-item-1">同一笔转化被上报两次，是重复事件问题；点击在转化之后才到达，是迟到数据问题；转化原先归给广告甲、补齐数据后改归广告乙，是归因修正问题。把三者都交给“消息去重”处理，会让统计稳定地算错。 本篇只使用合成曝光、点击与转化，构建一个固定窗口的最后点击归因模型。没有真实广告用户数据，没有接入投放平台，也不计算应付账款。教学不变量是同一转化 ID 只进入一次业务总额、修正保持该笔总额守恒、窗口外点击不得获得归因。归因报表与资金账务的边界必须在模型之前确定。  事件时间、到达时间与业务时间不能混用 事件采用 event_id, kind, user_key, campaign_id, event_time, ingest_time；转化另带 conversion_id, amount_minor, currency。金额使用最小货币单位整数，本例 500 表示五百单位的教学金额，不暗示任何真实币种。身份关联键采用合成 u1，不讨论跨设备身份识别；若身份关联不可靠，归因本身应允许未知结果。 接入接口 POST /events 返回“已接受并持久保存”，不承诺归因结果立即最终化。查询 GET /...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9C%80%E6%B1%82%E4%BB%8E%E6%94%B6%E4%BB%B6%E4%BA%BA%E5%BC%80%E5%A7%8B"><span class="toc-number">1.</span> <span class="toc-text">需求从收件人开始</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%86%99%E5%85%A5%E7%A1%AE%E8%AE%A4%E4%B8%8E%E7%8A%B6%E6%80%81%E5%BD%92%E5%B1%9E"><span class="toc-number">2.</span> <span class="toc-text">写入确认与状态归属</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%BA%E5%AE%9A%E8%BE%93%E5%85%A5%E8%83%BD%E8%AF%81%E6%98%8E%E4%BB%80%E4%B9%88"><span class="toc-number">3.</span> <span class="toc-text">固定输入能证明什么</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

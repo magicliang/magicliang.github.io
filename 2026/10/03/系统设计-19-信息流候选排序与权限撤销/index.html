@@ -1,0 +1,739 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>系统设计 19：信息流候选排序与权限撤销 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="早上预先给读者生成的候选列表，下午依然排着一条帖子；但帖子已经被删除，读者也不再关注另一条帖子的作者。只把新帖子送进新的候选列表，无法修复早上的旧列表。信息流的难处不是给一条帖子算出多少分，而是派生列表中的旧引用何时可以展示。 本篇的问题是 Facebook Newsfeed 类型的关注信息流，而不是介绍某家公司实际采用的架构。上一章时间线的推拉与热点作者只按时间归并；这里在候选生成后加入确定性排">
+<meta property="og:type" content="article">
+<meta property="og:title" content="系统设计 19：信息流候选排序与权限撤销">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-19-%E4%BF%A1%E6%81%AF%E6%B5%81%E5%80%99%E9%80%89%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%9D%83%E9%99%90%E6%92%A4%E9%94%80/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="早上预先给读者生成的候选列表，下午依然排着一条帖子；但帖子已经被删除，读者也不再关注另一条帖子的作者。只把新帖子送进新的候选列表，无法修复早上的旧列表。信息流的难处不是给一条帖子算出多少分，而是派生列表中的旧引用何时可以展示。 本篇的问题是 Facebook Newsfeed 类型的关注信息流，而不是介绍某家公司实际采用的架构。上一章时间线的推拉与热点作者只按时间归并；这里在候选生成后加入确定性排">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-38.jpg">
+<meta property="article:published_time" content="2026-10-02T20:19:00.000Z">
+<meta property="article:modified_time" content="2026-10-03T10:23:18.402Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="信息流">
+<meta property="article:tag" content="系统设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-38.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "系统设计 19：信息流候选排序与权限撤销",
+  "url": "https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-19-%E4%BF%A1%E6%81%AF%E6%B5%81%E5%80%99%E9%80%89%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%9D%83%E9%99%90%E6%92%A4%E9%94%80/",
+  "image": "https://magicliang.github.io/img/wall-paper-38.jpg",
+  "datePublished": "2026-10-02T20:19:00.000Z",
+  "dateModified": "2026-10-03T10:23:18.402Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-19-%E4%BF%A1%E6%81%AF%E6%B5%81%E5%80%99%E9%80%89%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%9D%83%E9%99%90%E6%92%A4%E9%94%80/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '系统设计 19：信息流候选排序与权限撤销',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1437</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1535</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">28</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-38.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">系统设计 19：信息流候选排序与权限撤销</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">系统设计 19：信息流候选排序与权限撤销</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-02T20:19:00.000Z" title="Created 2026-10-03 04:19:00">2026-10-03</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-03T10:23:18.402Z" title="Updated 2026-10-03 18:23:18">2026-10-03</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">3.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>10mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-03 18:23:18&quot;}" hidden></div><p>早上预先给读者生成的候选列表，下午依然排着一条帖子；但帖子已经被删除，读者也不再关注另一条帖子的作者。只把新帖子送进新的候选列表，无法修复早上的旧列表。信息流的难处不是给一条帖子算出多少分，而是<strong>派生列表中的旧引用何时可以展示</strong>。</p>
+<p>本篇的问题是 Facebook Newsfeed 类型的关注信息流，而不是介绍某家公司实际采用的架构。上一章<a href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-18-%E5%BE%AE%E5%8D%9A%E6%97%B6%E9%97%B4%E7%BA%BF%E7%9A%84%E6%8E%A8%E6%8B%89%E4%B8%8E%E7%83%AD%E7%82%B9%E4%BD%9C%E8%80%85/" title="系统设计 18：微博时间线：同一负载下比较推、拉与混合">时间线的推拉与热点作者</a>只按时间归并；这里在候选生成后加入确定性排序，并让删除与权限变更越过旧候选生效。以下规模、时限和特征分数均为教学假设；实验使用真实 SQLite 内存数据库和固定候选列表，不是机器学习训练或线上排名效果。</p>
+<span id="more"></span>
+<h2 id="先界定什么不能错">先界定什么不能错</h2>
+<p>用户关注作者，作者发布公开或仅关注者可见的内容。<code>GET /feed</code> 返回当前用户能看的最多 20 条帖子，并给出继续读取的游标。作者能删除帖子、将可见范围收紧；读者取消关注后，不应通过旧收件箱继续读到仅关注者可见的帖子。候选可以延迟抵达，排序可以不是全局最优，但<strong>已经完成撤销的请求，不得靠旧候选继续泄露内容</strong>。</p>
+<p>这个承诺要写清边界：本设计只保证撤销接口成功返回之后<strong>开始的新读请求</strong>，对当前权威状态做完检查才返回；撤销前已经开始并做完权限检查的在途响应不在承诺内。若需要连在途响应都阻断，就要引入更重的同步、会话中断或延迟确认协议。权限检查服务不可用时返回明确的业务错误，不把没有查到授权误报为“信息流为空”。删除正文副本、CDN 与搜索索引的物理清理仍要跟踪，但它们的积压不能成为继续展示内容的理由。<a target="_blank" rel="noopener" href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html">OWASP Authorization Cheat Sheet</a>强调按请求校验权限并默认拒绝；下面的读取门禁是本题对这一原则的具体设计，而非该文档对本系统的性能保证。</p>
+<p>练习目标设为：从 API 入口到返回 p99 小于 150 ms；普通新帖 95% 在发布后 5 s 内成为候选；删除和权限收紧提交后的新请求不得展示撤销结果。p99 的测量窗口暂定滚动 24 小时，观测点在 API 网关入站至响应结束；两个新鲜度指标分别按发布提交时间和撤销确认时间计算。不存在这些目标的实测达成记录。排除训练排序模型、广告投放、实时反作弊、跨地域强一致和完整 GDPR 物理清除流程；这些不应借“排序服务”之名偷塞到核心承诺里。</p>
+<h2 id="从读写量找到预计算的代价">从读写量找到预计算的代价</h2>
+<p>设每天新增 100 万帖、每帖事实文本与元信息合计 300 B，保留 30 天、事实表三份副本。逻辑量 <code>100 万帖/天 × 300 B/帖 × 30 天 = 9 GB</code>，三副本为 <code>27 GB</code>，不含图片、索引、日志和备份。一天 2000 万次首页读取，平均 <code>2000 万/86400 = 231.48 request/s</code>，假设峰值系数 8，约 <code>1851.85 request/s</code>。一天 100 万次发帖，平均 <code>11.57 post/s</code>，峰值系数 6 得 <code>69.44 post/s</code>。每个普通作者平均给 100 个读者写候选、每条引用假设 24 B，峰值写约 <code>69.44 × 100 = 6944 reference/s</code>，即 <code>166656 B/s</code>；一日写 <code>2.4 GB</code> 引用，保留三天、三副本约 <code>21.6 GB</code>，均为十进制 GB。</p>
+<p>读时拉取另有成本。若每次从关注图与候选服务拉 100 条，按每条含特征引用平均 80 B 计，峰值内部传输预算约 <code>1851.85 × 100 × 80 = 14.8 MB/s</code>，尚未算网络协议、重试与批量权威状态检查。每次逐条走 100 次远程权限 RPC，延迟可能先于带宽成为瓶颈；所以门禁应批量查、做边界缓存时也必须声明撤销的同步语义。候选缓存即使命中 90%，不能因此省去<strong>本设计承诺的</strong>权威校验。上述数值是容量算式，非吞吐测量，稳态吞吐不能推出 p99。</p>
+<p>敏感性不是只乘一个峰值系数：若平均关注者从 100 提到 1000，写候选峰值增为约 <code>69444 reference/s</code>，三天复制引用增至约 <code>216 GB</code>；一个拥有百万粉丝的作者仅发一帖便产生百万次候选写，不能假定均匀分摊。改为对热点作者读时拉取会节省其写入，代价是每次打开首页都要再取其近期帖。若读请求频率提高十倍而发布不变，读时拉的批量查询与门禁而非写扇出更可能成为瓶颈。是否划分热点作者，应依据真实访问分布重新测量，而不是给出一个通用粉丝阈值。</p>
+<h2 id="接口-事实与派生数据各司其职">接口、事实与派生数据各司其职</h2>
+<p>写入契约可从 <code>POST /posts</code> 开始：传 <code>author_id</code>、正文、初始 <code>visibility</code> 和客户端幂等键，成功返回 <code>post_id</code> 与提交版本；<code>DELETE /posts/&#123;id&#125;</code> 写入墓碑，<code>PATCH /posts/&#123;id&#125;/visibility</code> 提交新可见性与版本，不能仅删缓存。关注关系由独立 <code>PUT/DELETE /following/&#123;author_id&#125;</code> 维护。<code>GET /feed?cursor=...&amp;limit=20</code> 读候选、批量校验当前帖子及关注状态，然后排序、截断并返回 <code>post_id, version, score, cursor</code>；正文要在相同授权上下文下获取，不能让另一个无门禁的详情接口绕过检查。</p>
+<p>权威模型是 <code>post(post_id, author_id, body_ref, visibility, deleted, version, created_at)</code> 与 <code>follow(reader_id, author_id, state, version)</code>。派生模型是 <code>candidate(reader_id, post_id, materialized_at, feature_snapshot, source_version)</code>，可由作者流补充。候选只负责“可能相关”，既不是帖子事实，也不是权限凭证；删除候选可异步重试，查询时仍须重新鉴权。具体存储引擎、事务隔离和多地域权威读取尚未验证；跨记录撤销时采用什么提交原语，必须在真实组件上另做故障实验，不能由本篇的单连接 SQLite 实验推出。</p>
+<p>教学排序式为 <code>2 × affinity + freshness</code>：两个字段都是示例整数而非学习特征，输出按得分降序、<code>post_id</code> 升序打破并列；实验先排完有限候选，再逐条鉴权，最后才返回。把当前读者的关联与实时互动作为特征可能改变排序，但不能改变授权门禁。排序前取有上界的候选窗口（例如 100 条）并过滤，再取 Top-20；如果先截断为 20 条才过滤，全部被删时第一页可能为空而第 21 条其实可见。若 100 条内仍不满一页，返回不足一页及 <code>has_more</code>/继续游标，或有界地继续扫描，不能无限补查。游标至少绑定读者、过滤条件与候选水位；跨页发生删除时允许页长变化，若要求稳定快照，需要额外会话版本，不能只在游标中保存末尾分数。</p>
+<pre><code class="hljs mermaid">flowchart LR
+    W[发帖 删除 权限变更] --&gt; D[(权威帖子与关注状态)]
+    D --&gt; E[候选事件或作者近期流]
+    E --&gt; C[(物化候选库)]
+    U[读者请求] --&gt; G[信息流接口]
+    G --&gt; C
+    G --&gt; E
+    G --&gt;|批量核对当前可见性| D
+    G --&gt;|仅可见候选参加打分| R[确定性排序与有界分页]
+    R --&gt; U</code></pre>
+<p>最小版其实只需事实表、关注图与读时有界归并；当关注规模和读流量让这一条路径超过预算，才引入物化候选。此后“存储一份排序后的 Top-20”也是可选优化，而不是排序与存储必须绑在一起：热点作者增量、特征更新、删除都会使静态顺序过时。把整页最终排序结果长期缓存，换来更便宜的读，同时多出读者维度的失效与安全验证负担。</p>
+<h2 id="一次权限收紧如何越过旧候选">一次权限收紧如何越过旧候选</h2>
+<p>假设物化候选里已有 p1、p2、p3。实验先将 p2 删除，再把 p1 从公开改为私有，旧候选列表保持不变。访客只能读到 p3，作者 alice 还能读到自己的 p1。取消关注后的好友权限传播属于更完整的候选设计，本实验只验证公开/私有及作者例外。</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant A as 作者与读者
+    participant D as 权威状态
+    participant C as 旧候选库
+    participant F as 信息流读取
+    A-&gt;&gt;D: 删除p2 收紧p1权限
+    D--&gt;&gt;A: 状态提交成功
+    Note over D,C: 清理事件滞留 候选仍有p1 p2
+    A-&gt;&gt;F: 发起新的首页读取
+    F-&gt;&gt;C: 获取有界候选
+    C--&gt;&gt;F: p1 p2 p3
+    F-&gt;&gt;D: 批量校验帖子与关注状态
+    D--&gt;&gt;F: p2已删 p1仅作者可见
+    F--&gt;&gt;A: 过滤并返回p3</code></pre>
+<p>若校验服务超时，不能把旧列表当安全回退；应返回可观测错误，短时限流或等待权威恢复。如果期望“删除提交后所有节点的新读”都满足承诺，还必须验证读路径不会读落后的权限副本；可以强读权威主路径，或者把撤销版本作为读取门禁的下界并等待达标，代价是故障时读服务受限。物化候选恢复时以事实帖子与关注关系重建、核对水位和版本，再灰度切换；候选索引可回退，撤销事实不能回退。需要监测删除提交至被过滤的年龄、门禁不可用率、候选可见率和过量扫描，不只看排序 p99。</p>
+<h2 id="取舍要围绕承诺而不是组件名">取舍要围绕承诺而不是组件名</h2>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>适用条件与收益</th>
+<th>放弃或回退的理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>读时从事实表和关注图拉取、即算即排</td>
+<td>规模小、读请求少；路径短、权限容易贴近事实</td>
+<td>大关注列表和高读量使聚合贵；实测超过 150 ms 预算再加候选库</td>
+</tr>
+<tr>
+<td>写时物化候选，读时过滤再排序</td>
+<td>首页读取多、更新相对少；读时只处理小窗口</td>
+<td>扇出、重放、热点作者及旧候选治理；热点写过载时改为混合拉取</td>
+</tr>
+<tr>
+<td>写时预计算最终 Top-20 并直接返回</td>
+<td>内容稳定且没有敏感权限时读极便宜</td>
+<td>删除、取消关注和特征更新让旧页不可信；本题拒绝绕过权威检查</td>
+</tr>
+</tbody>
+</table>
+<h2 id="用固定数据打破-排序好了就安全">用固定数据打破“排序好了就安全”</h2>
+<p>执行 <code>python3 -B examples/system-design/labs/19/feed.py</code>：三个固定候选按 <code>2*affinity+freshness</code> 排序，初始为 <code>p2,p1,p3</code>；p2 删除、p1 私有化后，访客结果为 <code>p3</code>，作者 alice 的结果为 <code>p1,p3</code>。<code>--unsafe</code> 跳过读取门禁，旧列表仍泄露 p1、p2，程序识别到反例后退出 2。<code>--authority-down</code> 删除权威表后调用同一个 feed 入口，SQLite 查询失败，程序返回 <code>AUTHORITY_UNAVAILABLE</code>、空候选数组并退出 3。版本、源码哈希、命令、原始输出及退出码见 <code>examples/system-design/evidence/19/RUN.md</code>。</p>
+<p>这是对固定排序和实际 SQLite 查询门禁的本地验证，不是缓存失效协议或端到端性能实验；真实事务提交与读副本一致性、用户私密内容的审计仍为未验证设计。面试里若追问“删除后旧候选怎么办”，应先给出新读请求的权限承诺与在途例外，再谈过滤、清理和恢复；追问“排序模型升级会影响删除吗”，答案应是不能：新模型改变分数，不能替代权威门禁。下一章<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-20-%E7%A4%BE%E4%BA%A4%E5%86%85%E5%AE%B9%E6%90%9C%E7%B4%A2%E7%9A%84%E5%A2%9E%E9%87%8F%E7%B4%A2%E5%BC%95%E4%B8%8E%E6%96%B0%E9%B2%9C%E5%BA%A6/" title="系统设计 20：社交内容搜索的增量索引与新鲜度">社交内容搜索</a>讨论同一删除事件进入倒排索引后为何还会有可搜索窗口。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html">OWASP Authorization Cheat Sheet</a>：逐请求校验与默认拒绝的安全原则；具体新请求时间边界由本文教学契约定义。</li>
+<li><code>examples/system-design/labs/19/feed.py</code> 与 <code>examples/system-design/evidence/19/RUN.md</code>：本篇 SQLite 实验和本 checkout 的原始结果。</li>
+</ul>
+<p>实验附件：<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-19-%E4%BF%A1%E6%81%AF%E6%B5%81%E5%80%99%E9%80%89%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%9D%83%E9%99%90%E6%92%A4%E9%94%80/feed.py" title="权威实验源码">权威实验源码</a>；<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-19-%E4%BF%A1%E6%81%AF%E6%B5%81%E5%80%99%E9%80%89%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%9D%83%E9%99%90%E6%92%A4%E9%94%80/RUN.md" title="运行记录">运行记录</a>；<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-19-%E4%BF%A1%E6%81%AF%E6%B5%81%E5%80%99%E9%80%89%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%9D%83%E9%99%90%E6%92%A4%E9%94%80/verification.json" title="版本与源码哈希">版本与源码哈希</a>；<a href="/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-19-%E4%BF%A1%E6%81%AF%E6%B5%81%E5%80%99%E9%80%89%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%9D%83%E9%99%90%E6%92%A4%E9%94%80/run.json" title="本地原始结果">本地原始结果</a>。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-19-%E4%BF%A1%E6%81%AF%E6%B5%81%E5%80%99%E9%80%89%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%9D%83%E9%99%90%E6%92%A4%E9%94%80/">https://magicliang.github.io/2026/10/03/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-19-%E4%BF%A1%E6%81%AF%E6%B5%81%E5%80%99%E9%80%89%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%9D%83%E9%99%90%E6%92%A4%E9%94%80/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E4%BF%A1%E6%81%AF%E6%B5%81/">信息流</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-38.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/04/01/Compound-Engineering-%E5%BD%93-AI-%E5%B7%A5%E7%A8%8B%E4%BB%8E-%E6%A8%A1%E5%9E%8B%E8%B0%83%E4%BC%98-%E8%B5%B0%E5%90%91-%E7%B3%BB%E7%BB%9F%E7%BB%84%E5%90%88/" title="Compound Engineering：当 AI 工程从&quot;模型调优&quot;走向&quot;系统组合&quot;"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-ai-agent.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-04-01</div><div class="info-item-2">Compound Engineering：当 AI 工程从&quot;模型调优&quot;走向&quot;系统组合&quot;</div></div><div class="info-2"><div class="info-item-1">2024 年，Berkeley AI Research 的文章 The Shift from Models to Compound AI Systems 把一个已经在工程现场发生的变化命名了：AI 应用的能力不再只来自单个模型，而越来越来自多个组件的组合。 模型仍然重要。但在知识更新、工具调用、权限控制、成本预算、延迟约束和可审计性面前，单个模型很难独自承担完整系统的责任。检索器（Retriever）、路由器、工具、工作流、验证器、监控和降级策略开始进入同一个架构图。围绕这种组合方式形成的工程实践，可以称为 Compound Engineering。  先把定义压实 Compound AI System，通常译作复合 AI 系统，指的是由多个相互作用的组件共同完成 AI 任务的系统。这些组件可以包括一次或多次模型调用、检索器、数据库、外部 API、代码执行器、专用模型、规则引擎、评估器和人工审核节点。 BAIR 对这个转向的判断很直接：不少 AI 任务的性能提升，已经不只依赖更大的模型，而依赖围绕模型搭建的系统。Databricks 后续也把复合 AI 系统描述为由模型、工具、检...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-18-%E5%BE%AE%E5%8D%9A%E6%97%B6%E9%97%B4%E7%BA%BF%E7%9A%84%E6%8E%A8%E6%8B%89%E4%B8%8E%E7%83%AD%E7%82%B9%E4%BD%9C%E8%80%85/" title="系统设计 18：微博时间线：同一负载下比较推、拉与混合"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-15.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 18：微博时间线：同一负载下比较推、拉与混合</div></div><div class="info-2"><div class="info-item-1">一个普通作者只有十个关注者，一个热点作者有一千个关注者。如果两人各发两条动态，全量写入扇出会产生 2020 份收件箱引用；如果只有五个人打开首页，其中大量预写永远不会被读到。时间线设计首先比较写时做多少工作与读时做多少工作，而不是先决定使用哪种缓存。 Twitter 在这里是公开发布和关注时间线的题型。基础时间线按发布时间倒序，不加入机器学习排序；排序信息流留给下一篇。本文使用固定关注图比较策略，不声称这些数字来自真实社交产品。  候选 SLO 是已授权用户取首页 20 条在五分钟窗口内 p99 小于 200 ms；99% 的普通作者帖子在三十秒内进入已关注读者的候选集。热点作者靠读时拉取，延迟单独定义；本次整数操作数模型没有真实时钟、队列和用户分布，不能把该目标写成已经达标。 发布与时间线不是同一份事实 POST /posts 提交正文与客户端幂等键，写入 posts(post_id, author_id, created_seq, body, version, deleted)；PUT /following/&#123;author_id&#125; 和 DELETE 修改关...</div></div></div></a><a class="pagination-related" href="/2025/07/29/%E5%89%AF%E6%9C%AC%E5%A4%8D%E5%88%B6%E7%AE%97%E6%B3%95%E4%B8%8E%E6%9E%B6%E6%9E%84/" title="副本复制算法与架构——PacificA、Elasticsearch、Kafka、Pulsar 全面对比"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-database.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-07-29</div><div class="info-item-2">副本复制算法与架构——PacificA、Elasticsearch、Kafka、Pulsar 全面对比</div></div><div class="info-2"><div class="info-item-1">本文将深入剖析 PacificA、Elasticsearch、Kafka、Pulsar 四大分布式系统的副本复制机制，揭示它们在一致性、可用性和性能之间的精妙权衡。这些系统虽然都通过副本复制来保证数据可靠性和高可用性，但在具体的实现策略上各有特色，反映了不同的设计哲学和适用场景。  引言：为什么需要副本复制 数据可靠性与高可用性 在分布式系统中，硬件故障是常态而非例外。Google 的统计数据显示，一个拥有 10,000 台服务器的数据中心，每天平均会有 2-3 台服务器发生故障。如果数据只存储在一台机器上，那么这台机器的故障就意味着数据的永久丢失。 副本复制（Replication） 是解决这个问题的核心手段：将数据复制到多台机器上，即使部分机器故障，数据仍然可用。 CAP 定理的实际影响 CAP 定理告诉我们，在网络分区（Partition）发生时，分布式系统只能在**一致性（Consistency）和可用性（Availability）**之间二选一：    选择 含义 代表系统     CP 网络分区时拒绝服务，保证一致性 ZooKeeper、etcd、HBase   AP...</div></div></div></a><a class="pagination-related" href="/2025/07/29/Java-%E9%9B%86%E5%90%88%E6%A1%86%E6%9E%B6%E5%AE%8C%E5%85%A8%E6%8C%87%E5%8D%97/" title="Java 集合框架完全指南"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2025/07/29/Java-%E9%9B%86%E5%90%88%E6%A1%86%E6%9E%B6%E5%AE%8C%E5%85%A8%E6%8C%87%E5%8D%97/Collection-Hierarchy.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2025-07-29</div><div class="info-item-2">Java 集合框架完全指南</div></div><div class="info-2"><div class="info-item-1">Java 集合框架完全指南 本文系统性地介绍 Java 集合框架的核心概念、实现原理和设计模式。内容涵盖集合框架体系结构、列表与队列机制、哈希表家族的扩缩容策略、缓存淘汰算法实现以及系统级扩缩容设计。通过深入分析源码实现和性能特征，帮助理解各集合类的适用场景和最佳实践。 第一章：全景导图 文章结构  模式总览    模式名 口诀 覆盖场景     扩容因子1.5倍 扩容1.5倍，平衡空间时间 ArrayList扩容、StringBuilder扩容   队列六操作 add/offer/put，peek，poll/take 所有队列实现的标准操作   优先级堆 小顶堆TopK，大顶堆调度 PriorityQueue、任务调度   延迟队列 getDelay负值出队，compareTo排序 DelayQueue、缓存过期、订单超时   扰动函数 高16异或低16，分散哈希冲突 HashMap哈希优化   2的幂容量 位运算取余，快速计算索引 HashMap、ConcurrentHashMap   树化阈值8 泊松分布概率，红黑树优化 HashMap性能优化   反树化阈值6 低于阈值退...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-04-%E4%BB%8E%E5%8D%95%E6%9C%BA%E5%88%B0%E5%88%86%E5%B8%83%E5%BC%8F%E5%85%88%E6%B5%8B%E7%93%B6%E9%A2%88/" title="系统设计 04：从单机到分布式——先测瓶颈，再加节点"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-71.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 04：从单机到分布式——先测瓶颈，再加节点</div></div><div class="info-2"><div class="info-item-1">“流量涨了，就把应用从一台扩到四台”没有回答瓶颈在哪。如果应用实例尚有余量，但每个请求都在等同一处数据库写入，加应用机器只会让更多请求同时排队。扩容先要有一份能被负载实验推翻的容量假设。 沿用访问模式与游标分页里的分享元数据服务：创建、按 ID 读取、按所有者列表读取。但以下流量是新的教学输入，不是 03 的实测流量，更不是某家服务的生产配置。  单机版本先说清楚承诺 服务包含 HTTP 应用和一个权威数据库；POST /shares 写分享与幂等键映射，GET /shares/{id} 查主键，GET /users/{owner}/shares?after=... 按 (owner_id,created_at,id) 读有序索引。应用实例可重启，不在实例内保存权限、游标或写入归属；授权检查仍发生在每次读之前。已确认的撤销请求不能再返回公开内容；这是数据不变量，不可通过增加只读节点放松。本文排除对象上传、跨地域容灾和多主写入，暂不把读副本当成默认选项。 目标先限定为合法读取服务端 p99 小于 200 ms、十秒峰值窗口的请求拒绝率小于 0.1%；写入确认还需要单独记录成功率与延...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-03-%E8%AE%BF%E9%97%AE%E6%A8%A1%E5%BC%8F%E5%86%B3%E5%AE%9A%E6%95%B0%E6%8D%AE%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%88%86%E9%A1%B5/" title="系统设计 03：API 与数据模型——访问模式如何决定表、键和分页"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-10.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">系统设计 03：API 与数据模型——访问模式如何决定表、键和分页</div></div><div class="info-2"><div class="info-item-1">先画一张“万能分享表”再补索引，常会漏掉实际最昂贵的访问：按用户和时间翻页。键、索引和游标应从查询与更新方式反推；如果列表在持续插入期间出现重复，补一台数据库机器也不会修正页面语义。 沿用前两篇的分享元数据场景：需求与撤销约束决定谁能看；容量估算给出怎么算峰值。本篇只回答“用户按时间查看自己的分享列表”，实验使用真实 SQLite，而不是用 Python 排序冒充数据库查询。  API 的三种访问，写入只有一个归属 教学范围有三条请求：POST /shares 创建分享，GET /shares/{share_id} 按标识取单条，GET /users/{owner_id}/shares?limit=20&amp;after=... 按创建时间倒序取列表。已登录的创建者可以 DELETE /shares/{share_id} 撤销；只有本人可以列出自己的分享，列表允许展示已撤销状态但不展示给读者。排除按目标 URL 搜索、全站热度排名及跨用户浏览。对外读取仍按第 01 篇的强撤销契约判断。 读者用链接查单条，创建者按时间浏览列表，两个路径的定位方式不同。候选表 shares(sha...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%88%E7%95%8C%E5%AE%9A%E4%BB%80%E4%B9%88%E4%B8%8D%E8%83%BD%E9%94%99"><span class="toc-number">1.</span> <span class="toc-text">先界定什么不能错</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BB%8E%E8%AF%BB%E5%86%99%E9%87%8F%E6%89%BE%E5%88%B0%E9%A2%84%E8%AE%A1%E7%AE%97%E7%9A%84%E4%BB%A3%E4%BB%B7"><span class="toc-number">2.</span> <span class="toc-text">从读写量找到预计算的代价</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%8E%A5%E5%8F%A3-%E4%BA%8B%E5%AE%9E%E4%B8%8E%E6%B4%BE%E7%94%9F%E6%95%B0%E6%8D%AE%E5%90%84%E5%8F%B8%E5%85%B6%E8%81%8C"><span class="toc-number">3.</span> <span class="toc-text">接口、事实与派生数据各司其职</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E6%AC%A1%E6%9D%83%E9%99%90%E6%94%B6%E7%B4%A7%E5%A6%82%E4%BD%95%E8%B6%8A%E8%BF%87%E6%97%A7%E5%80%99%E9%80%89"><span class="toc-number">4.</span> <span class="toc-text">一次权限收紧如何越过旧候选</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%96%E8%88%8D%E8%A6%81%E5%9B%B4%E7%BB%95%E6%89%BF%E8%AF%BA%E8%80%8C%E4%B8%8D%E6%98%AF%E7%BB%84%E4%BB%B6%E5%90%8D"><span class="toc-number">5.</span> <span class="toc-text">取舍要围绕承诺而不是组件名</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E5%9B%BA%E5%AE%9A%E6%95%B0%E6%8D%AE%E6%89%93%E7%A0%B4-%E6%8E%92%E5%BA%8F%E5%A5%BD%E4%BA%86%E5%B0%B1%E5%AE%89%E5%85%A8"><span class="toc-number">6.</span> <span class="toc-text">用固定数据打破“排序好了就安全”</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">7.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
