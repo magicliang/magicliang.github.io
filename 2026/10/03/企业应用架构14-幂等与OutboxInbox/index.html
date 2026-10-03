@@ -1,0 +1,703 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>企业应用架构14：幂等、Outbox与Inbox的退出恢复 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="合同提交成功以后，发布进程可能尚未发送消息就退出。接收方已经记账以后，也可能尚未确认消息就退出。前一种情况可能漏发，后一种情况会引发重复投递。只在正常流程里调用一次发送函数，无法说明这两个故障窗口怎样恢复。 本实验把业务、待发记录、传输队列和接收方结果分别写入真实文件数据库。业务事务原子写合同与 Outbox，独立发布 JVM 把消息写进持久 SQL 队列，独立消费 JVM 用 Inbox 与记账">
+<meta property="og:type" content="article">
+<meta property="og:title" content="企业应用架构14：幂等、Outbox与Inbox的退出恢复">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/03/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%8414-%E5%B9%82%E7%AD%89%E4%B8%8EOutboxInbox/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="合同提交成功以后，发布进程可能尚未发送消息就退出。接收方已经记账以后，也可能尚未确认消息就退出。前一种情况可能漏发，后一种情况会引发重复投递。只在正常流程里调用一次发送函数，无法说明这两个故障窗口怎样恢复。 本实验把业务、待发记录、传输队列和接收方结果分别写入真实文件数据库。业务事务原子写合同与 Outbox，独立发布 JVM 把消息写进持久 SQL 队列，独立消费 JVM 用 Inbox 与记账">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-60.jpg">
+<meta property="article:published_time" content="2026-10-03T09:14:00.000Z">
+<meta property="article:modified_time" content="2026-10-03T14:04:10.482Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Outbox">
+<meta property="article:tag" content="企业应用架构">
+<meta property="article:tag" content="幂等">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-60.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "企业应用架构14：幂等、Outbox与Inbox的退出恢复",
+  "url": "https://magicliang.github.io/2026/10/03/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%8414-%E5%B9%82%E7%AD%89%E4%B8%8EOutboxInbox/",
+  "image": "https://magicliang.github.io/img/wall-paper-60.jpg",
+  "datePublished": "2026-10-03T09:14:00.000Z",
+  "dateModified": "2026-10-03T14:04:10.482Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/03/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%8414-%E5%B9%82%E7%AD%89%E4%B8%8EOutboxInbox/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '企业应用架构14：幂等、Outbox与Inbox的退出恢复',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1510</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1587</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">28</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-60.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">企业应用架构14：幂等、Outbox与Inbox的退出恢复</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">企业应用架构14：幂等、Outbox与Inbox的退出恢复</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-03T09:14:00.000Z" title="Created 2026-10-03 17:14:00">2026-10-03</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-03T14:04:10.482Z" title="Updated 2026-10-03 22:04:10">2026-10-03</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%84/">企业应用架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.7k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>8mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-03 22:04:10&quot;}" hidden></div><p>合同提交成功以后，发布进程可能尚未发送消息就退出。接收方已经记账以后，也可能尚未确认消息就退出。前一种情况可能漏发，后一种情况会引发重复投递。只在正常流程里调用一次发送函数，无法说明这两个故障窗口怎样恢复。</p>
+<p>本实验把业务、待发记录、传输队列和接收方结果分别写入真实文件数据库。业务事务原子写合同与 Outbox，独立发布 JVM 把消息写进持久 SQL 队列，独立消费 JVM 用 Inbox 与记账更新组成另一个事务。驱动在三个已提交位置调用进程级强制退出，再启动新进程读取和恢复，每一步保留实际 SQL 与退出码。</p>
+<span id="more"></span>
+<h2 id="同一事务能够解决的范围">同一事务能够解决的范围</h2>
+<p>Transactional Outbox 模式要求业务更新与消息记录在同一个数据库事务中持久化，再由另外的发布器发送。这样避免了“业务已提交但没有任何待发依据”的空隙。发布器本身仍可能重复发送，因此消费者需要幂等处理。<a target="_blank" rel="noopener" href="https://microservices.io/patterns/data/transactional-outbox.html">Transactional Outbox 原文</a></p>
+<p>本例 sender 数据库中有合同表与 Outbox 表。合同编号 R1 对应整数金额二十五，Outbox 的消息编号 M1 携带相同金额。一次事务插入两条记录并提交，然后进程立即退出。恢复进程断言合同数是一、未发送 Outbox 数也是一，传输队列仍为空。这个状态说明消息尚未发送，却有可继续执行的持久工作。</p>
+<p>金额在此是固定教学单位的整数，没有实现完整币种与计费模型。消息只有编号和金额两个业务字段，传输队列另外添加投递编号与确认状态。前面冻结租赁基线没有被更改，本章关注的是一次已确定副作用的传递，不把这个整数示例称为完整租赁账务系统。</p>
+<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%8414-%E5%B9%82%E7%AD%89%E4%B8%8EOutboxInbox/boundary.svg" class="" title="业务Outbox、独立发布与接收方Inbox">
+<h2 id="发送与发送确认之间">发送与发送确认之间</h2>
+<p>发布进程查询尚未发送的 Outbox，把消息写入另一份 H2 文件中的持久队列并提交。随后它才把发送方记录标记为已发送。两个数据库不在同一事务中，因此中间存在明确窗口：队列已经有消息，发送方仍显示待发。实验在这个窗口强制终止 JVM，恢复查询确认该状态确实存在。</p>
+<p>再次启动发布进程时，它会重新发送同一条消息，队列里因此出现两条物理投递记录。两条记录有不同的投递编号，但相同的业务消息编号 M1。发送方随后标记完成。把投递编号和业务消息编号分开，是理解去重范围的关键：传输发生了两次，业务事实仍然只有一次。</p>
+<p>不能在真正发送之前标记 Outbox 已完成。若先标记，再在发送途中失败，后续扫描不会再找到这条记录，消息就可能永久遗漏。相反，发送后标记允许重复，但可以通过稳定消息编号在接收方消除重复业务效果。这种选择接受了重复投递成本，并没有消除网络和进程故障。</p>
+<p>本例传输层是有真实磁盘状态的 SQL spool，不是 Kafka、JMS 或其他消息代理，也没有声称验证代理的持久订阅、事务确认和故障转移。它用三个独立数据库明确展示确认窗口。下一步替换消息运行时时，必须按该运行时的发送完成和消费确认语义重新做故障注入，不能沿用 SQL 队列结果推断代理保证。</p>
+<h2 id="inbox-与业务更新一起提交">Inbox 与业务更新一起提交</h2>
+<p>消费者读取一条未确认投递，先按业务消息编号查询 Inbox。如果尚未处理，它在同一个接收方事务中插入 Inbox，再把账本增加二十五并提交。如果已经处理且载荷一致，则返回已有结果，不再增加金额。Idempotent Consumer 模式的核心就在于把已处理消息的判定与业务事务组合起来。<a target="_blank" rel="noopener" href="https://microservices.io/patterns/communication-style/idempotent-consumer.html">Idempotent Consumer 原文</a></p>
+<p>实验在 Inbox 和账本提交以后、传输队列确认以前退出。新进程读回接收方时，Inbox 已有一条，账本已经是二十五；队列仍有两条未确认投递。恢复消费会再次遇到第一条，再遇到发布重试产生的第二条，二者都匹配同一个 Inbox，因此都不会追加金额。最终两条投递已确认，账本仍为二十五。</p>
+<p>如果只把 Inbox 放在内存集合里，进程退出后集合就会丢失，恢复消费会再次记账。如果先提交 Inbox，再用另一个事务更新账本，中间失败又可能让后续重试认为已经处理而永远不记账。检查“重复请求返回成功”不足以发现这两类错误，必须检查接收方持久状态和事务边界。</p>
+<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%8414-%E5%B9%82%E7%AD%89%E4%B8%8EOutboxInbox/sequence.svg" class="" title="三个提交后退出窗口与恢复路径">
+<p>本例只启动一个消费者，顺序读取队列。并发消费者同时查询不存在的 Inbox 时，还需要依靠唯一约束竞争、事务回滚和重新读取决定谁已成功处理。本实验没有做这项并发消费测试，所以结果只覆盖顺序重投递与跨进程恢复；不能据此宣称任意并发下的消费幂等都已验证。</p>
+<h2 id="相同编号不同载荷">相同编号不同载荷</h2>
+<p>同一个幂等键并不意味着所有后续请求都可以忽略。若 M1 原来表示二十五，后来又被用于九十九，系统需要区分重试和身份冲突。实验在最终恢复后故意调用这种冲突载荷，消费进程必须以非零退出，错误信息包含载荷冲突，随后再启动验证进程确认账本仍为二十五。</p>
+<p>实际载荷可能包含多字段、浮点表达差异和不同序列化顺序。可以保存规范化后的关键字段，或保存规范化载荷的摘要再比较，但规范化规则本身必须稳定。直接对任意 JSON 原始字节求摘要，会把字段顺序不同而语义相同的请求当成不同输入。反过来只比较编号，又可能掩盖错误复用。</p>
+<p>幂等记录还需要保留策略。Inbox 一旦删除，旧消息再次出现就可能重新产生副作用；保留得无限长，又会增加存储和索引成本。应结合消息最长重投递周期、上游补偿方式和业务数据生命周期决定清理时间。这里的实验不执行清理，因此验证的是记录仍保留时的去重，不涵盖跨清理窗口的重复。</p>
+<h2 id="故障注入怎样发生">故障注入怎样发生</h2>
+<p>三个故障点都位于真实 <code>commit</code> 返回以后，使用 <code>Runtime.halt(73)</code> 直接终止 JVM。驱动期望退出码恰好是七十三，并检查输出中的故障位置，再继续启动恢复进程。H2 连接使用零写延迟配置，以减少缓存写入对本机进程退出实验的干扰；该实验仍没有模拟主机断电或磁盘控制器故障。</p>
+<p>业务退出场景的原始文件是 <code>business-crash.stdout.txt</code>，发布退出是 <code>publish-crash.stdout.txt</code>，消费退出是 <code>consume-crash.stdout.txt</code>。各自后面的读回进程保存 <code>after-business</code>、<code>after-publish</code> 和 <code>after-consume</code> 日志。故障位置、实际退出码和读回状态三者应同时成立，单独看某条“崩溃已模拟”的字符串不能证明恢复路径运行过。</p>
+<p>最后一个验证 JVM 同时读取发送方、队列和接收方。判定要求发送完成记录一条、已确认物理投递两条、Inbox 一条、账本金额二十五。这个组合故意保留重复传输的事实，避免用业务去重成功掩盖发生过两次发送。日志中的绑定参数还能把 M1 从 Outbox 一直追踪到 Inbox。</p>
+<h2 id="独立运行">独立运行</h2>
+<p><a href="enterprise-architecture-14.zip">下载本章累计源码</a> · <a href="SHA256SUMS">校验清单</a></p>
+<p>进入解压目录，设置 Java 21 后执行 <code>bash run-lab.sh 14</code>。Python 驱动编译源码，解析固定 H2 2.1.214，再为每个阶段启动新的 JVM。三个故障阶段的非零退出都是预期结果，载荷冲突也必须失败；只有恢复断言全部通过，最外层入口才返回零。不要把日志中的非零子进程直接当成实验整体失败。</p>
+<p><code>processes.json</code> 保存实际命令、期望退出码和捕获文件名；<code>database-files.json</code> 保存临时文件数据库的大小与摘要。数据库在驱动结束后清理，原始 SQL、提交、退出和新进程读回输出留下。源码中的故障点可直接定位，读者可以把它移到提交前，再观察后续断言为何不再成立。</p>
+<p>新增业务字段时，要同时修改 Outbox 载荷、队列持久格式和 Inbox 冲突比较；只修改发送端会使接收端缺乏足够的信息判断重复。新增消费者实例时，要补充分区或领取机制，并重新验证唯一约束冲突。当前发布器也没有多实例争抢、退避、死信和监控，不能直接作为生产消息框架使用。</p>
+<h2 id="局部一次效果的边界">局部一次效果的边界</h2>
+<p>最终金额只增加一次，是接收方数据库内的业务效果约束。物理消息已经发送两次，发送方与接收方也没有一个跨系统原子提交点。因此结果支持“持久重试下的局部幂等”，不支持“全局恰好一次”。区分这两句话，会直接影响重试、告警和运维补偿的设计。</p>
+<p>如果副作用是调用外部支付或发送短信，Inbox 与本地账本事务无法包住外部系统。外部接口还需要稳定幂等键、状态查询或补偿协议，否则本地已经去重不等于远端没有重复动作。Outbox 解决待发事实的保存，Inbox 解决接收方本地重复效果；它们的保证都止于各自可控制的事务边界。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://microservices.io/patterns/data/transactional-outbox.html">Richardson：Transactional Outbox</a></li>
+<li><a target="_blank" rel="noopener" href="https://microservices.io/patterns/communication-style/idempotent-consumer.html">Richardson：Idempotent Consumer</a></li>
+<li><a target="_blank" rel="noopener" href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Runtime.html#halt(int)">Java Runtime.halt</a></li>
+<li><a target="_blank" rel="noopener" href="https://github.com/h2database/h2database/releases/tag/version-2.1.214">H2 2.1.214 官方版本</a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/03/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%8414-%E5%B9%82%E7%AD%89%E4%B8%8EOutboxInbox/">https://magicliang.github.io/2026/10/03/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%8414-%E5%B9%82%E7%AD%89%E4%B8%8EOutboxInbox/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%B9%82%E7%AD%89/">幂等</a><a class="post-meta__tags" href="/tags/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%84/">企业应用架构</a><a class="post-meta__tags" href="/tags/Outbox/">Outbox</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-60.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/01/%E6%9C%8D%E5%8A%A1%E7%BD%91%E6%A0%BC-14-%E9%87%8D%E8%AF%95%E6%94%BE%E5%A4%A7%E4%B8%8E%E5%89%AF%E4%BD%9C%E7%94%A8/" title="服务网格 14：重试为何会放大副作用"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/01/%E6%9C%8D%E5%8A%A1%E7%BD%91%E6%A0%BC-14-%E9%87%8D%E8%AF%95%E6%94%BE%E5%A4%A7%E4%B8%8E%E5%89%AF%E4%BD%9C%E7%94%A8/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-01</div><div class="info-item-2">服务网格 14：重试为何会放大副作用</div></div><div class="info-2"><div class="info-item-1">没收到响应，是否可以再发一次 不行，除非请求本身可安全重复，或者应用明确实现并验证了去重。第 13 篇已经看到客户端退出后上游仍可能完成；本篇在同一 inventory 的合成 POST /reserve 上检查响应丢失之后重发。业务输入固定为 operation_id=op-01、X-Request-ID=sm-01-repeat，两次使用相同标识不是应用幂等的证明。  库存 handler 的顺序是解析操作 ID → 追加内存账本并记录 201 → 人为延迟 400ms → 写响应。客户端第一次等待只有 100ms；看到超时，不知道服务器停在提交前还是提交后。第二次把等待放宽到 2s 并发送同一输入，若没有去重便得到第二笔。对 read 请求的重试也可能增加下游负载，但不会由此自动推出“读请求永远安全”：日志、计费、外部副作用或应用错误实现都要另查。 两层重试如何相乘 假设仅作为配置上界的示意：SDK 对失败调用最多尝试 2 次，每一次调用都被代理各尝试 2 次；一笔用户操作最多触发 2 × 2 = 4 次后端尝试，而不是“额外重试两次”。这不是本仓库实际代理配置或观测比例。...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%8413-EventSourcing%E4%B8%8E%E9%87%8D%E6%94%BE/" title="企业应用架构13：Event Sourcing与持久事件重放"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-163.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">企业应用架构13：Event Sourcing与持久事件重放</div></div><div class="info-2"><div class="info-item-1">合同当前状态是“已取消、累计五天”，并不能说明它最初租了几天、何时延期、为什么保留这个计费长度。普通状态存储可以另加审计日志，但事件溯源采用更强的约定：事件序列本身就是恢复当前状态的事实依据。应用状态可以删除，只要事件流完整、解释规则一致，就应能重新计算出来。 这个约定增加了历史解释责任。过去保存的事件会长期参与恢复，新代码不能随意改变旧事件含义。重放还必须避免再次执行外部动作，否则一次修复读模型可能重新发出取消通知。本实验用真实 H2 事件表、版本条件追加、纯状态折叠和独立进程恢复，把这些要求分别变成二值检查。  事件流与审计记录 Fowler 的 Event Sourcing 文章讨论了通过事件序列重建应用状态，以及事件处理与外部系统交互之间的边界。审计日志可能只是已经更新完状态后的说明；事件溯源则要求它能够作为重建输入，遗漏一条必要事件就可能无法恢复正确状态。Event Sourcing 原文 本例事件具有流内版本、事件编号、种类、格式版本和一个整数载荷。合同创建、延期、取消各占一条。当前状态用 State 表示版本、天数和状态，派生表仅保存重放结果。事件表以流版本作为主键...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%8410-DTO%E4%B8%8E%E8%BF%9C%E7%A8%8B%E8%BE%B9%E7%95%8C/" title="企业应用架构10：DTO、Assembler与远程边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-110.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">企业应用架构10：DTO、Assembler与远程边界</div></div><div class="info-2"><div class="info-item-1">合作方提交一次租赁预留，需要提供设备、时段、金额和请求编号。把内部合同对象直接序列化，很容易把数据库主键、租户归属或持久化版本一起变成外部接口。以后修改实体结构时，原本只影响数据库适配器的变更，也会变成合作方升级。DTO 的实际作用是给这个变化设置一个明确边界：远程请求只携带完成用例所需的数据，应用代码决定怎样构造内部对象，响应只暴露经过选择的结果。 本实验沿用系列中的租赁语义，但只实现单租户、单设备的教学端点。运行时固定 Java 21 与 H2 2.1.214，HTTP 使用 JDK 自带的 HttpServer。请求编码选用标准表单编码，响应使用一个字段集合固定的 JSON 对象。这样可以直接观察编码、解析、组装和落库四个环节，也避免把序列化框架配置当成 DTO 模式本身。  一次远程调用携带哪些数据 Fowler 的 DTO 条目把减少远程方法调用次数作为主要动机，并把序列化机制的封装列为额外好处。租赁接口如果分别请求合同编号、金额、币种，就需要三个往返。一次返回三个字段，调用次数可以降为一次。这是接口形状产生的差别；本机环回请求的耗时无法说明跨地域网络能节省多少毫秒。D...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%8401-%E4%B8%89%E7%A7%8D%E9%A2%86%E5%9F%9F%E9%80%BB%E8%BE%91%E7%BB%84%E7%BB%87/" title="企业应用架构01：三种领域逻辑组织"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-103.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">企业应用架构01：三种领域逻辑组织</div></div><div class="info-2"><div class="info-item-1">租赁费用只有“天数乘单价”时，一个过程就能清楚表达。价格在租期中途变化以后，报价与延期两个入口都要理解有效期；如果报价改成分段收费，延期仍按起租日单价算全期，同一份租期就会出现两个答案。 本篇用 Transaction Script、Domain Model、Table Module 分别实现相同计费输入，实际运行旧规则、新规则和漏改入口的反例。固定租赁基线 保持不变；这里的整日分段价格是隔离的新教学规则，没有偷偷替换上游的小时计费。  先把价格变化说清楚 输入是整日的 LocalDate 半开区间。十月一日至五日每日一百元，五日至十日每日一百五十元；结束日不计费。这里没有把日期转换为时区瞬间，也不涉及夏令时、按小时补差或跨币种换汇。 旧规则以起租日费率计算全期：三日至六日共三天，收费三百元。新规则按租期落入的有效段计算，三日和四日各一百元，五日一百五十元，共三百五十元。这是业务结果的改变，不能称为仅调整结构的等价重构。 延期输入由旧租期与新结束日组成，返回重新计算的全期总额。三日至五日延期到七日，新总额为五百元；它不是新增应收三百元，也没有执行预留或实际收费。缩短结束日不属于此...</div></div></div></a><a class="pagination-related" href="/2026/06/20/%E5%B9%82%E7%AD%89-Producer-%E4%B8%8E%E5%BA%8F%E5%88%97%E5%8F%B7-%E6%B6%88%E6%81%AF%E4%B8%8D%E9%87%8D%E4%B8%8D%E4%B8%A2%E7%9A%84%E7%AC%AC%E4%B8%80%E5%B1%82/" title="幂等 Producer 与序列号：消息不重不丢的第一层"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/20/%E5%B9%82%E7%AD%89-Producer-%E4%B8%8E%E5%BA%8F%E5%88%97%E5%8F%B7-%E6%B6%88%E6%81%AF%E4%B8%8D%E9%87%8D%E4%B8%8D%E4%B8%A2%E7%9A%84%E7%AC%AC%E4%B8%80%E5%B1%82/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">幂等 Producer 与序列号：消息不重不丢的第一层</div></div><div class="info-2"><div class="info-item-1">上一篇走完了 Producer 的发送管线。这一篇解决一个写入端的经典问题：网络超时后重试，消息会不会写两遍。 重试导致重复是分布式系统的常见症状。Producer 发出一个请求，broker 写入成功但响应在网络中丢失，Producer 不知道成功了于是重发——同一条消息在日志中出现了两次。Kafka 从 0.11 版本开始，在 broker 端引入了基于序列号的去重机制，称为 idempotent producer。 本文只抓一个问题：幂等 Producer 是怎么用 PID 和序列号在 broker 端做去重的，它的边界在哪里。 重复问题的根源 先看一个没有幂等保护时的场景： 1234567891011Producer                          Broker (Leader)   |                                  |   |--- ProduceRequest(msg-A) -------&gt;|   |                                  |--- 写入 partition log...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8%E6%9E%B6%E6%9E%8411-MVC%E4%B8%8E%E5%B1%95%E7%A4%BA%E5%88%86%E7%A6%BB/" title="企业应用架构11：MVC、Presentation Model与展示分离"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-174.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">企业应用架构11：MVC、Presentation Model与展示分离</div></div><div class="info-2"><div class="info-item-1">租赁金额输入为负数时，页面应显示错误，数据库应保持不变。把金额修正为正数后，页面才显示保存结果。这个交互很小，却同时涉及输入状态、领域规则、数据库事务、HTTP 跳转和浏览器焦点。只验证一个控制器方法返回“成功”，无法证明用户实际看到了与后端一致的结果。 MVC 描述模型、视图与控制器的职责分配。Presentation Model 则进一步把展示状态和展示行为从界面控件中提取出来。本实验使用服务端渲染表单和一个简单的 Presentation 类型：控制器调用上一章的租赁入口，再将业务响应转换为错误提示或跳转决定。表单保持普通 HTML，领域中的金额和时段类型不依赖浏览器或控件库。  视图需要什么状态 租赁领域关心设备、时段和金额是否允许预留。页面还关心当前提示应该使用错误语义还是成功语义、按钮是否可用、用户输入是否应保留。这些信息通常不是合同实体的一部分。若把它们放进领域对象，命令行或批处理也会被迫认识页面提示；若全部写在模板中，展示决策又难以单独检查。 Fowler 的 Presentation Model 将展示状态与行为组织为独立对象，视图负责表现这些状态。它可以服务于...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%90%8C%E4%B8%80%E4%BA%8B%E5%8A%A1%E8%83%BD%E5%A4%9F%E8%A7%A3%E5%86%B3%E7%9A%84%E8%8C%83%E5%9B%B4"><span class="toc-number">1.</span> <span class="toc-text">同一事务能够解决的范围</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%91%E9%80%81%E4%B8%8E%E5%8F%91%E9%80%81%E7%A1%AE%E8%AE%A4%E4%B9%8B%E9%97%B4"><span class="toc-number">2.</span> <span class="toc-text">发送与发送确认之间</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#inbox-%E4%B8%8E%E4%B8%9A%E5%8A%A1%E6%9B%B4%E6%96%B0%E4%B8%80%E8%B5%B7%E6%8F%90%E4%BA%A4"><span class="toc-number">3.</span> <span class="toc-text">Inbox 与业务更新一起提交</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%9B%B8%E5%90%8C%E7%BC%96%E5%8F%B7%E4%B8%8D%E5%90%8C%E8%BD%BD%E8%8D%B7"><span class="toc-number">4.</span> <span class="toc-text">相同编号不同载荷</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%85%E9%9A%9C%E6%B3%A8%E5%85%A5%E6%80%8E%E6%A0%B7%E5%8F%91%E7%94%9F"><span class="toc-number">5.</span> <span class="toc-text">故障注入怎样发生</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%8B%AC%E7%AB%8B%E8%BF%90%E8%A1%8C"><span class="toc-number">6.</span> <span class="toc-text">独立运行</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B1%80%E9%83%A8%E4%B8%80%E6%AC%A1%E6%95%88%E6%9E%9C%E7%9A%84%E8%BE%B9%E7%95%8C"><span class="toc-number">7.</span> <span class="toc-text">局部一次效果的边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">8.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

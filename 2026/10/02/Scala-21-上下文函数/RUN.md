@@ -21,5 +21,4 @@ constructed=1;evaluated=0->2->4;context=100,200;captured=100;later=200
 
 隔离反例 negative/21/missing-context 实际 exit=1，并匹配 case.json 的全部诊断正则。完整命令、退出码与输出位于 examples/scala-lab/evidence/20261002-ch21-r3/21.json、21.log、negative-21-missing-context.json 和对应 .log；environment.txt 保存工具版本。
 
-普通 build 工厂内记录构造次数，make 计算体内记录执行次数。最终版本采用普通 final class 保存上下文函数；旧 run-id 和 -r2 不代表最终验收。 本章不包含全站页面或全工程集成验收。
-
+普通 build 工厂内记录构造次数，make 计算体内记录执行次数。最终版本采用普通 final class 保存上下文函数。 本章不包含全站页面或全工程集成验收。

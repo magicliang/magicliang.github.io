@@ -1,6 +1,6 @@
 # 第 35 篇实验说明
 
-LAB_VERIFIED。正文基于最终独立运行 20261002-ch35-r3，固定 sbt 1.11.7 / JDK 21.0.11-amzn / Scala 3.3.7、2.13.16；旧运行只保留故障定位，不作为完成证据。
+LAB_VERIFIED。正文基于最终独立运行 20261002-ch35-r3，固定 sbt 1.11.7 / JDK 21.0.11-amzn / Scala 3.3.7、2.13.16。
 
 ## 从仓库根目录复现
 
@@ -45,5 +45,4 @@ python3 examples/scala-lab/run.py chapter 35 --run-id local-35-smoke
 
 strict只针对lab.scala35组织；全局strict还可能拒绝文档工具传递依赖的淘汰。override只验证解析选择，不能证明任意新版本兼容。干净重建不复用target，但复用工具与下载缓存及本轮已发布仓库；没有空缓存、离线或新操作系统验证。正文的discount修改练习未纳入已跑实验。
 
-文章固定源码链接对应sbt v1.11.7解引用提交9d2a5f478bde5d45562423cb6decf92b255b9517。说明汇总位于writing-plans/scala/verification/35-lab.md，文章核验回执在.omo/evidence/scala-07-21/ch35-article-verification.txt。
-
+文章固定源码链接对应sbt v1.11.7解引用提交9d2a5f478bde5d45562423cb6decf92b255b9517。说明汇总位于writing-plans/scala/verification/35-lab.md。
