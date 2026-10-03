@@ -1,0 +1,791 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入 Play 22：JDBC 与连接池，异步接口为何仍会等连接 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="连接池最多提供两个连接，四个线程同时执行 JDBC：两个执行 SQL，另外两个停在借连接的位置。把执行器缩为两个线程后，连接池等待者变成零，执行器队列里多出两个任务。请求总数没有改变，等待发生的位置变了。 这种区别决定了排障时应检查什么。返回 CompletionStage&lt;Result&gt; 只能说明结果稍后交付；借连接和执行 SQL 仍会占用执行它们的线程。只记录 HTTP 总耗时，无">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入 Play 22：JDBC 与连接池，异步接口为何仍会等连接">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-22-JDBC%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="连接池最多提供两个连接，四个线程同时执行 JDBC：两个执行 SQL，另外两个停在借连接的位置。把执行器缩为两个线程后，连接池等待者变成零，执行器队列里多出两个任务。请求总数没有改变，等待发生的位置变了。 这种区别决定了排障时应检查什么。返回 CompletionStage&lt;Result&gt; 只能说明结果稍后交付；借连接和执行 SQL 仍会占用执行它们的线程。只记录 HTTP 总耗时，无">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-22-JDBC%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0/cover.svg">
+<meta property="article:published_time" content="2026-10-03T10:22:00.000Z">
+<meta property="article:modified_time" content="2026-10-03T13:39:25.230Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Play">
+<meta property="article:tag" content="PostgreSQL">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-22-JDBC%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0/cover.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入 Play 22：JDBC 与连接池，异步接口为何仍会等连接",
+  "url": "https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-22-JDBC%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0/",
+  "image": "https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-22-JDBC%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0/cover.svg",
+  "datePublished": "2026-10-03T10:22:00.000Z",
+  "dateModified": "2026-10-03T13:39:25.230Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-22-JDBC%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入 Play 22：JDBC 与连接池，异步接口为何仍会等连接',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1501</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1581</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">27</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/2026/10/03/%E6%B7%B1%E5%85%A5-Play-22-JDBC%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0/cover.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入 Play 22：JDBC 与连接池，异步接口为何仍会等连接</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入 Play 22：JDBC 与连接池，异步接口为何仍会等连接</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-03T10:22:00.000Z" title="Created 2026-10-03 18:22:00">2026-10-03</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-03T13:39:25.230Z" title="Updated 2026-10-03 21:39:25">2026-10-03</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/Play-Framework/">Play Framework</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.8k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>9mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-03 21:39:25&quot;}" hidden></div><p>连接池最多提供两个连接，四个线程同时执行 JDBC：两个执行 SQL，另外两个停在借连接的位置。把执行器缩为两个线程后，连接池等待者变成零，执行器队列里多出两个任务。请求总数没有改变，等待发生的位置变了。</p>
+<p>这种区别决定了排障时应检查什么。返回 <code>CompletionStage&lt;Result&gt;</code> 只能说明结果稍后交付；借连接和执行 SQL 仍会占用执行它们的线程。只记录 HTTP 总耗时，无法区分排队、借连接、数据库执行和响应调度。</p>
+<span id="more"></span>
+<h2 id="从提交到归还-分别记录时间">从提交到归还，分别记录时间</h2>
+<p>累计工程 <code>examples/play-lab/app/labdb/PoolLab.java</code> 为每个任务记录提交、开始执行、开始借连接、借到连接、SQL 开始、SQL 结束和归还连接的相对微秒数。所有时间来自同一次实验的单调时钟起点，不用不同机器的墙上时间相减。</p>
+<pre><code class="hljs mermaid">flowchart LR
+    Submit[提交任务] --&gt; Queue[执行器队列]
+    Queue --&gt; Start[工作线程开始]
+    Start --&gt; Borrow[等待连接池]
+    Borrow --&gt; SQL[执行 JDBC SQL]
+    SQL --&gt; Close[关闭句柄 归还连接]
+    Close --&gt; Reply[完成结果与响应]</code></pre>
+<p><code>started - submitted</code> 包含任务调度等待，<code>borrowed - borrowStarted</code> 是借连接耗时。SQL 的计时只覆盖调用执行查询的区间；归还时间则在 try-with-resources 离开后记录。响应完成还有框架调度和网络过程，不能把 SQL 结束直接记成 HTTP 结束。</p>
+<p>实验先提交两个执行 <code>pg_sleep(1.5)</code> 的任务，再通过独立 PostgreSQL 连接检查 <code>pg_stat_activity</code>，确认两个 SQL 都进入 PgSleep。之后才提交另外两个任务并读取池和执行器状态，因此快照不依赖“睡一小段时间应该够了”的猜测。</p>
+<table>
+<thead>
+<tr>
+<th>执行器线程数</th>
+<th>池最大连接数</th>
+<th>数据库正在执行</th>
+<th>连接池等待者</th>
+<th>执行器队列</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4</td>
+<td>2</td>
+<td>2</td>
+<td>2</td>
+<td>0</td>
+</tr>
+<tr>
+<td>2</td>
+<td>2</td>
+<td>2</td>
+<td>0</td>
+<td>2</td>
+</tr>
+</tbody>
+</table>
+<p>两组的四个任务最终都返回 <code>ok</code>，<code>activeAfterTasks=0</code>。这组观测没有证明线程池应永久等于连接池大小：一个工作线程可能执行多个阶段，应用也可能还有其他使用同一池的入口。它证明的是，在固定容量和工作负载下，增加工作线程不能制造更多数据库连接。</p>
+<p>排查同类问题时，可先写出 <code>提交 → 开始 → 借到 → 执行完 → 归还</code> 的事件，再把每段等待归入它所属的资源。这个方法也适用于 HTTP 客户端连接池和文件处理执行器；具体容量不同，时间边界相同。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="cover.svg" alt="执行器队列与连接池等待"></p>
+<h2 id="database-负责借还-调用者决定执行位置">Database 负责借还，调用者决定执行位置</h2>
+<p>本系列固定 Play 3.0.6，源码提交为 <code>2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6</code>。<a target="_blank" rel="noopener" href="https://github.com/playframework/playframework/blob/2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6/persistence/play-jdbc/src/main/scala/play/api/db/Databases.scala#L174-L201">Databases.scala 的 withConnection 实现</a> 先获取连接，调用 block，最后在 finally 中关闭连接。该方法没有把 block 自动提交到另一个线程。</p>
+<p>Hikari 返回的是池管理的连接句柄。应用关闭这个句柄后，池才能重新分配底层连接；关闭一次借用与关闭整个池是两个层级。实验还读取 Hikari 的 active、idle 和等待者指标，并在场景结束后调用 <code>Database.shutdown()</code>。</p>
+<p>下面的完整 Java 类把一次 JDBC 借用放进调用者提供的执行器，返回已经脱离连接的整数结果。类使用 JDK 21 编译；它不创建执行器，也不拥有注入的 Database，因此不在每次查询后关闭整个池。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">import</span> java.sql.Connection;<br><span class="hljs-keyword">import</span> java.sql.ResultSet;<br><span class="hljs-keyword">import</span> java.sql.SQLException;<br><span class="hljs-keyword">import</span> java.sql.Statement;<br><span class="hljs-keyword">import</span> java.util.concurrent.CompletableFuture;<br><span class="hljs-keyword">import</span> java.util.concurrent.CompletionException;<br><span class="hljs-keyword">import</span> java.util.concurrent.CompletionStage;<br><span class="hljs-keyword">import</span> java.util.concurrent.Executor;<br><span class="hljs-keyword">import</span> play.db.Database;<br><br><span class="hljs-keyword">public</span> <span class="hljs-keyword">final</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">JdbcLeaseProbe</span> &#123;<br>    <span class="hljs-keyword">private</span> <span class="hljs-keyword">final</span> Database database;<br>    <span class="hljs-keyword">private</span> <span class="hljs-keyword">final</span> Executor executor;<br><br>    <span class="hljs-keyword">public</span> <span class="hljs-title function_">JdbcLeaseProbe</span><span class="hljs-params">(Database database, Executor executor)</span> &#123;<br>        <span class="hljs-built_in">this</span>.database = database;<br>        <span class="hljs-built_in">this</span>.executor = executor;<br>    &#125;<br><br>    <span class="hljs-keyword">public</span> CompletionStage&lt;Integer&gt; <span class="hljs-title function_">selectOne</span><span class="hljs-params">()</span> &#123;<br>        <span class="hljs-keyword">return</span> CompletableFuture.supplyAsync(() -&gt; &#123;<br>            <span class="hljs-keyword">try</span> (<span class="hljs-type">Connection</span> <span class="hljs-variable">connection</span> <span class="hljs-operator">=</span> database.getConnection();<br>                 <span class="hljs-type">Statement</span> <span class="hljs-variable">statement</span> <span class="hljs-operator">=</span> connection.createStatement()) &#123;<br>                statement.setQueryTimeout(<span class="hljs-number">5</span>);<br>                <span class="hljs-keyword">try</span> (<span class="hljs-type">ResultSet</span> <span class="hljs-variable">rows</span> <span class="hljs-operator">=</span> statement.executeQuery(<span class="hljs-string">&quot;SELECT 1&quot;</span>)) &#123;<br>                    <span class="hljs-keyword">if</span> (!rows.next()) &#123;<br>                        <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">SQLException</span>(<span class="hljs-string">&quot;SELECT 1 returned no row&quot;</span>);<br>                    &#125;<br>                    <span class="hljs-keyword">return</span> rows.getInt(<span class="hljs-number">1</span>);<br>                &#125;<br>            &#125; <span class="hljs-keyword">catch</span> (SQLException failure) &#123;<br>                <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">CompletionException</span>(failure);<br>            &#125;<br>        &#125;, executor);<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>如果执行器在提交时拒绝任务，<code>supplyAsync</code> 可以同步抛出拒绝异常；应用仍需在提交边界映射错误，不能只依赖 Stage 的异常回调。第 13 篇的有界执行器实验覆盖了这一边界。</p>
+<p>连接、Statement 和 ResultSet 都在同一个任务内创建、使用和关闭。把 ResultSet 或 Connection 放进结果对象返回，会把资源作用域交给后续代码，原有 finally 无法继续保证消费阶段的有效性。第 23 篇用待完成 Stage 展示这一反例。</p>
+<h2 id="轻量接口是否与-jdbc-争用线程">轻量接口是否与 JDBC 争用线程</h2>
+<p><code>/db/load?dedicated=false</code> 和 <code>dedicated=true</code> 分别把两个真实 JDBC 查询提交到默认执行上下文和 <code>lab-blocking-dispatcher</code>。测试进程将默认 dispatcher 的并行度最小值、最大值都设为 2，并从应用配置读回确认；每个查询执行有限的 <code>pg_sleep(2)</code> 后再读取 <code>SELECT 1</code>。</p>
+<p>驱动程序在 PostgreSQL 中观察到两个带实验标记的 PgSleep 后，才请求 <code>/health</code>。数据库活动与 HTTP 请求来自不同观察通道，这避免了仅凭 Java 线程名判断 SQL 当时仍在执行。</p>
+<table>
+<thead>
+<tr>
+<th>执行位置</th>
+<th>第一、第二、第三次 health 耗时，秒</th>
+<th>HTTP 状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>默认 dispatcher</td>
+<td>0.881692、0.005473、0.005100</td>
+<td>全部 200</td>
+</tr>
+<tr>
+<td>专用 dispatcher</td>
+<td>0.010628、0.005715、0.004915</td>
+<td>全部 200</td>
+</tr>
+</tbody>
+</table>
+<p>默认组记录到 <code>application-pekko.actor.default-dispatcher-*</code>，专用组记录到 <code>application-lab-blocking-dispatcher-*</code>。第一组首个 health 请求等待较长，后两次已经接近 SQL 释放后的时段；不能把三个数当成同一饱和区间的独立样本。</p>
+<p>这些数值只描述本次受控功能实验。它没有预热、稳定到达率、长时间采样或延迟分位数，不能推出吞吐能力，也不能声称专用池普遍快多少倍。可迁移的结论是把阻塞工作放到明确的执行资源，并同时观察该资源和轻量请求的竞争关系。</p>
+<h2 id="失败之后-连接是否还能借出">失败之后，连接是否还能借出</h2>
+<p>借连接失败、SQL 失败和应用代码失败发生在不同位置。实验先等池内两个物理连接初始化完成，再持有两次借用，以 300 ms 的连接预算申请第三个连接。这样测到的超时才对应池耗尽，避免把建立首批连接的耗时误当成排队。</p>
+<table>
+<thead>
+<tr>
+<th>注入位置</th>
+<th>实际结果</th>
+<th>随后检查</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第三次借连接</td>
+<td><code>SQLTransientConnectionException</code></td>
+<td>已有借用关闭后可继续查询</td>
+</tr>
+<tr>
+<td><code>SELECT 1/0</code></td>
+<td>SQLSTATE <code>22012</code></td>
+<td>active 回到 0</td>
+</tr>
+<tr>
+<td>借到连接后抛应用异常</td>
+<td><code>IllegalStateException</code></td>
+<td>active 回到 0</td>
+</tr>
+<tr>
+<td>三类失败之后</td>
+<td><code>SELECT 1</code> 返回 1</td>
+<td><code>activeAfterFailures=0</code></td>
+</tr>
+</tbody>
+</table>
+<p>异常类型只能说明故障被观察到了。连接是否归还必须另查池状态和后续借用；一条 error 日志不提供资源终态。</p>
+<p>清理代码还要处理清理自身失败。<code>finally { close(executor); database.shutdown(); }</code> 中前一条抛出异常，会跳过后一条。<code>PoolLab.closeExperiment</code> 使用嵌套 finally 继续关闭数据库，把清理错误加入主异常的 suppressed，并保留线程原有中断状态。</p>
+<p><code>/db/interrupted-cleanup</code> 先执行真实 <code>SELECT 1</code>，再对清理驱动线程设置中断。该次结果为主异常 <code>synthetic primary failure</code>、<code>suppressed=1</code>、<code>interrupted=true</code>，并且 <code>poolClosed=true</code>、<code>executorTerminated=true</code>。这证明了本次中断路径继续尝试两项清理；它没有模拟磁盘或驱动关闭过程中所有可能的故障。</p>
+<h2 id="复现入口与证据分层">复现入口与证据分层</h2>
+<p>依赖只增加 <code>javaJdbc</code>、<code>evolutions</code> 和 <code>org.postgresql:postgresql:42.7.5</code>。实际 stage 中的 jar 确认为 HikariCP 5.0.1 与 PostgreSQL JDBC 42.7.5，服务器报告 PostgreSQL 17.6；版本与 SHA-256 记录在 <code>examples/play-lab/evidence/batch22-25/isolated/resolved-jdbc-artifacts.json</code>，镜像摘要保存在同目录的 <code>image-inspect.json</code>。</p>
+<p>数据库默认禁用。先为实验创建唯一命名的回环容器；以下 5432 端口必须空闲，名字已存在时换一个新名字。<code>lab-only-password</code> 是公开的合成实验口令。镜像固定为 PostgreSQL 17.6，复测还应保存 inspect 输出中的 RepoDigests 和服务器版本。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash">podman run --name play-db-local -e POSTGRES_PASSWORD=lab-only-password -e POSTGRES_DB=play_lab -p 127.0.0.1:5432:5432 -d docker.io/library/postgres:17.6<br>podman <span class="hljs-built_in">exec</span> play-db-local pg_isready -U postgres -d play_lab<br></code></pre></td></tr></table></figure>
+<p>等待 readiness 命令成功后，从仓库根目录执行以下单行命令。macOS 可使用下方 java_home 选择已安装的 JDK 21；其他系统将 JAVA_HOME 设置为本地 JDK 21 安装目录。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">export</span> JAVA_HOME=<span class="hljs-string">&quot;<span class="hljs-subst">$(/usr/libexec/java_home -v 21)</span>&quot;</span><br>PLAY_LAB_DB_ENABLED=<span class="hljs-literal">true</span> PLAY_LAB_JDBC_URL=<span class="hljs-string">&#x27;jdbc:postgresql://127.0.0.1:5432/play_lab?connectTimeout=3&amp;socketTimeout=5&#x27;</span> bash examples/play-lab/sbtw <span class="hljs-built_in">test</span> stage<br>python3 examples/play-lab/lab/database_checks.py --container play-db-local --jdbc-url <span class="hljs-string">&#x27;jdbc:postgresql://127.0.0.1:5432/play_lab?connectTimeout=3&amp;socketTimeout=5&#x27;</span> --evidence examples/play-lab/evidence/local-db-run<br></code></pre></td></tr></table></figure>
+<p><code>play-db-local</code> 和端口 5432 必须对应本次自建容器。脚本只负责启动、验证和停止自己的应用进程；不要把已有业务数据库作为实验目标。实验为请求创建小型池以隔离计数，生产应用应把池的创建与关闭放到应用资源生命周期。</p>
+<p>历史隔离证据的38项JUnit及stage、37次HTTP观察保留在<code>isolated/</code>。共享累计工程数据库启用后46项JUnit及stage通过，<code>shared-http/summary.json</code>与HTTP/SQL原始记录有37次真实HTTP观察；9个新增class与生产jar字节一致。共享health样本与隔离时间分开保留，默认位置本轮首个请求约1.582秒、专用位置约0.012秒，不能要求每轮复现历史的同一个数字。</p>
+<p>隔离DB禁用回归执行原有31项、另7个数据库方法跳过；共享DB禁用则实际执行39项、跳过7项。接口为每个跳过方法产生两条XML通知，原始共53条，归并后只有46个不同方法，不能把Passed46解读为46个无数据库场景。<code>shared-db-free.json</code>保存原始条数、实际执行数与跳过数。</p>
+<p>四篇的完整 Java 类也保存在 writing/examples，可在 stage 构建后单独进行编译检查。该命令只编译示例，不启动数据库或应用；JDK 21 的编译输出和实际数据库实验应分别保存。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-string">&quot;<span class="hljs-variable">$JAVA_HOME</span>/bin/javac&quot;</span> -Xlint:all -Werror -<span class="hljs-built_in">cp</span> <span class="hljs-string">&#x27;examples/play-lab/target/universal/stage/lib/*&#x27;</span> -d examples/play-lab/target/article-examples examples/play-lab/evidence/batch22-25/writing/examples/*.java<br></code></pre></td></tr></table></figure>
+<h2 id="两个改动练习">两个改动练习</h2>
+<ol>
+<li>保持执行器四线程，把池从 2 改为 1，再记录每个任务的七个时点。验收只检查快照中的数据库活动、借连接等待和最终 active=0，不预写总耗时必须增加几倍。</li>
+<li>在借到连接之后、创建 Statement 之前抛异常，再把清理驱动线程中断。验收主异常保留、suppressed 可见、中断位恢复，以及池关闭和执行器终止；删掉其中任何一项，说明少观察了哪个资源。</li>
+</ol>
+<p>上一篇：<a href="../%E6%B7%B1%E5%85%A5-Play-21-%E4%B8%8A%E4%BC%A0%E4%B8%8B%E8%BD%BD%E4%B8%8E%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6/">上传下载与临时文件</a> · 下一篇：<a href="../%E6%B7%B1%E5%85%A5-Play-23-%E4%BA%8B%E5%8A%A1%E4%B8%8E%E5%B9%82%E7%AD%89/">事务与幂等</a> · 系列起点：<a href="../../02/%E6%B7%B1%E5%85%A5-Play-00-%E6%9C%80%E5%B0%8F%E5%BA%94%E7%94%A8/">最小应用</a></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-22-JDBC%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0/">https://magicliang.github.io/2026/10/03/%E6%B7%B1%E5%85%A5-Play-22-JDBC%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Play/">Play</a><a class="post-meta__tags" href="/tags/PostgreSQL/">PostgreSQL</a></div><div class="post-share"><div class="social-share" data-image="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-22-JDBC%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B1%A0/cover.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-24-Evolutions%E4%B8%8E%E6%A8%A1%E5%BC%8F%E5%8D%87%E7%BA%A7/" title="深入 Play 24：Evolutions 与模式升级，应用和数据库怎样协同"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-24-Evolutions%E4%B8%8E%E6%A8%A1%E5%BC%8F%E5%8D%87%E7%BA%A7/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 24：Evolutions 与模式升级，应用和数据库怎样协同</div></div><div class="info-2"><div class="info-item-1">一段升级脚本先创建表，再向不存在的表插入。自动提交开启时，第一张表留在数据库中，play_evolutions 留下一条 applying_up 记录；自动提交关闭时，这次实验的表创建和版本记录都回滚了。 应用启动失败只是共同的表面结果。下一步应先检查实际 schema 和迁移元数据，确定哪些语句已生效，再决定修复方案。把版本记录直接改成成功，无法补上缺失的数据或撤销已经执行的 DDL。  脚本版本、元数据和数据库事务 Evolutions 按版本组织 up/down 脚本，比较待应用脚本与数据库中的迁移记录，再执行差异。Play 的机制负责版本与执行流程；DDL 是否能够回滚、语句会取得哪些锁，仍由具体数据库及语句决定。 实验固定 Play 3.0.6，源码 SHA 为 2e56aff7d4e7a74af61e4bd39ec9e3ed7f300cd6。入口是 ApplicationEvolutions.scala 的启动应用逻辑，以及 Evolutions.scala 中的脚本计算和执行。 flowchart LR     Files[版本脚本] --&gt; Diff[比较版...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-23-%E4%BA%8B%E5%8A%A1%E4%B8%8E%E5%B9%82%E7%AD%89/" title="深入 Play 23：事务与幂等，数据库提交如何关联 HTTP 结果"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-23-%E4%BA%8B%E5%8A%A1%E4%B8%8E%E5%B9%82%E7%AD%89/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 23：事务与幂等，数据库提交如何关联 HTTP 结果</div></div><div class="info-2"><div class="info-item-1">两个请求都收到 HTTP 504，一个对应的订单尚未提交，另一个对应的订单已经提交。外层响应预算耗尽时，数据库操作可能处于不同阶段；重试若直接生成新订单，就会把“没有收到成功响应”误当成“没有发生写入”。 事务负责一组数据库修改的原子性，幂等键负责把多次请求关联到同一次业务操作。响应超时、任务完成和事务提交需要分别观察，单独检查 Stage 或 HTTP 状态不能替代数据库终态查询。  withTransaction 等待同步 block 返回 Play 3.0.6 的 Databases.scala 把连接设为非自动提交，调用 block，取得返回值后 commit；普通异常路径 rollback，外层 withConnection 再关闭连接。 返回值的泛型没有改变这一时序。若 block 返回 CompletionStage&lt;T&gt;，这里取得的是 Stage 对象，源码不会等待它完成。事务边界包住的是同步调用 block 的过程。 sequenceDiagram     participant Worker as 工作线程     participant Tx a...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/" title="深入 Play 15：超时、取消与重试的任务终态"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-15-%E8%B6%85%E6%97%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E9%87%8D%E8%AF%95/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 15：超时、取消与重试的任务终态</div></div><div class="info-2"><div class="info-item-1">一个任务已经进入工作线程，随后停在受控闸门前。给它包装 100 毫秒超时，包装 Stage 以 TimeoutException 结束；读取原任务，done 与 cancelled 却都是 false。释放闸门后，原任务返回 late-success。 这组结果区分了两个事件：调用者停止等待，工作本身完成。若工作在完成前还会扣库存或提交事务，前一个事件不足以证明后一个事件没有发生。超时处理需要同时回答返回什么、谁停止工作、哪些副作用已经发生。  一次调用有多个终态 本篇沿用 Play 3.0.6、Scala 2.13.15、JDK 21 的累计工程。app/labbudget/TimeoutLab.java 使用合成任务、CountDownLatch 和有限工作线程，把迟到完成、协作取消、重试分类放在同一组确定时序中。实验不访问数据库，也没有真实订单。    观察对象 可直接证明的事实 不能据此推出的事实     超时包装 Stage 等待结果已变成失败 原任务已停止   原任务 Stage 值或异常已完成 外部事务必然回滚   取消标记 取消意图已发布 执行方已经检查标记   ...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-20-WebSocket%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/" title="深入 Play 20：WebSocket 握手、消息上限与连接生命周期"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-20-WebSocket%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 20：WebSocket 握手、消息上限与连接生命周期</div></div><div class="info-2"><div class="info-item-1">同样一个 65537 字节的 WebSocket 帧，用一次 socket 写入发送时，本次实验观察到应用的 4096 字符限制报错；改成每次写 8192 字节，服务端返回了 1009 关闭码。这里变化的是 TCP 写入与后端帧聚合路径，业务消息内容没有变化。 因此，验证 WebSocket 限制需要同时记录帧的构造、消息分片、应用处理量和关闭终态。只看到配置里有一个 64k，或者只看到连接已关闭，都不足以定位到底由哪一层拒绝了输入。  握手以前能拒绝，握手以后要管理流 WebSocket 连接先经过 HTTP 握手。实验使用 WebSocket.Text.acceptOrResult，验证合成 token，再验证精确 Origin。错误 token 返回 401，错误 Origin 返回 403；两条拒绝路径都在创建连接账本与 Flow 之前结束。 “拒绝没有分配应用流”需要证据。脚本先发送真实 Upgrade 请求，读取 HTTP 状态，然后查询同一个 id 的账本。两次查询均不存在记录。若在认证以前先建立 Actor、队列或数据库订阅，即使最终返回 401，仍需另外处理已经...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-E03-Repository%E4%BB%A3%E7%90%86%E6%9F%A5%E8%AF%A2%E4%B8%8E%E4%BA%8B%E5%8A%A1/" title="深入 Spring E03：Repository 代理如何叠加查询与事务"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/02/%E6%B7%B1%E5%85%A5-Spring-E03-Repository%E4%BB%A3%E7%90%86%E6%9F%A5%E8%AF%A2%E4%B8%8E%E4%BA%8B%E5%8A%A1/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">深入 Spring E03：Repository 代理如何叠加查询与事务</div></div><div class="info-2"><div class="info-item-1">接口没有实现类，事务却不能省略归属 继承 JpaRepository 后，saveAndFlush 可以把实体写入数据库；自定义 findByLabel 能执行查询；增加一个带 @Modifying 的更新方法，却可能立即抛出事务异常。这三个方法都从同一个 Repository 引用调用，默认事务行为仍然不同。 Repository 接口描述的操作由代理、查询执行器与基础实现共同完成。事务配置是这条调用链中的另一层规则，不会因为一个接口继承 JpaRepository，就自动给每个后来声明的方法赋予相同事务属性。 实验固定 JDK 21、Boot 3.5.6 BOM、Framework 6.2.11、Spring Data JPA/Commons 3.5.4、Hibernate 6.6.29.Final、pgJDBC 42.7.7 和 PostgreSQL 18.0。独立 ecosystem-lab 使用这组实际解析依赖，不复用主线 ORM 实验中另一个 Hibernate 补丁版本，也不把两个版本的结果混合。  Repository 代理上叠加了哪些职责 实验声明 Purcha...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-18-HTTP%E6%B5%81%E5%BC%8F%E5%93%8D%E5%BA%94/" title="深入 Play 18：HTTP 流式响应、背压与资源终止"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/03/%E6%B7%B1%E5%85%A5-Play-18-HTTP%E6%B5%81%E5%BC%8F%E5%93%8D%E5%BA%94/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">深入 Play 18：HTTP 流式响应、背压与资源终止</div></div><div class="info-2"><div class="info-item-1">一个响应最多输出 32 MiB，每次只产生 16 KiB。客户端收到响应头以后暂停读取，服务端生产计数停在 49 块；客户端随后只读一块就关闭真实 socket，服务端流进入终态，关闭计数为一。 这个实验测到了当前链路中的需求反馈与取消传播。49 块已经远大于客户端实际读取的一块，差额可以停留在流、服务器和内核缓冲中。把应用 Source 的 inputBuffer 设成一，不能把整条网络链路理解成“只允许提前产生一个元素”。  生产速率、消费速率与待发送字节 流式响应首先改变的是生产方式。有限列表先把所有对象构造完再交给 Source，虽然输出按元素传输，列表占用的内存已经发生。实验的 Source.range 只产生整数索引，map 在获得下游需求时分配一个 16384 字节数组，上限为 2048 块，不构造完整字节列表。 先忽略对象开销，以字节计算未消费数据。假设生产速率为每秒 8 MiB、消费速率为每秒 1 MiB，持续两秒且生产端没有减速，待发送数据会增加 14 MiB。这是速率差的积分，不是已经测出的 JVM 堆占用。如果可用缓冲只有 512 KiB，差额不能永久累积...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BB%8E%E6%8F%90%E4%BA%A4%E5%88%B0%E5%BD%92%E8%BF%98-%E5%88%86%E5%88%AB%E8%AE%B0%E5%BD%95%E6%97%B6%E9%97%B4"><span class="toc-number">1.</span> <span class="toc-text">从提交到归还，分别记录时间</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#database-%E8%B4%9F%E8%B4%A3%E5%80%9F%E8%BF%98-%E8%B0%83%E7%94%A8%E8%80%85%E5%86%B3%E5%AE%9A%E6%89%A7%E8%A1%8C%E4%BD%8D%E7%BD%AE"><span class="toc-number">2.</span> <span class="toc-text">Database 负责借还，调用者决定执行位置</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%BD%BB%E9%87%8F%E6%8E%A5%E5%8F%A3%E6%98%AF%E5%90%A6%E4%B8%8E-jdbc-%E4%BA%89%E7%94%A8%E7%BA%BF%E7%A8%8B"><span class="toc-number">3.</span> <span class="toc-text">轻量接口是否与 JDBC 争用线程</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%B1%E8%B4%A5%E4%B9%8B%E5%90%8E-%E8%BF%9E%E6%8E%A5%E6%98%AF%E5%90%A6%E8%BF%98%E8%83%BD%E5%80%9F%E5%87%BA"><span class="toc-number">4.</span> <span class="toc-text">失败之后，连接是否还能借出</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%8D%E7%8E%B0%E5%85%A5%E5%8F%A3%E4%B8%8E%E8%AF%81%E6%8D%AE%E5%88%86%E5%B1%82"><span class="toc-number">5.</span> <span class="toc-text">复现入口与证据分层</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E4%B8%AA%E6%94%B9%E5%8A%A8%E7%BB%83%E4%B9%A0"><span class="toc-number">6.</span> <span class="toc-text">两个改动练习</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
