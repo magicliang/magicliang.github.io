@@ -1,0 +1,728 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>函数式编程35：性能实验中的时间、分配与保留空间 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="循环、管道、不可变数据和惰性求值各自改变了不同的成本。一次计时无法同时回答执行时间、分配流量、历史版本保留空间和缓存命中率。把这些指标混成“函数式代码快不快”，得到的结论很难指导具体修改。 本章给出一个可复现的 Java 21 微实验：相同整数输入上比较循环与 IntStream，分别记录多轮时间和当前线程分配量；另用可达对象图比较复制与共享历史；最后检查严格求值、按需消费和有界缓存。它不是 JM">
+<meta property="og:type" content="article">
+<meta property="og:title" content="函数式编程35：性能实验中的时间、分配与保留空间">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B35-%E6%97%B6%E9%97%B4%E5%88%86%E9%85%8D%E4%B8%8E%E4%BF%9D%E7%95%99%E7%A9%BA%E9%97%B4/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="循环、管道、不可变数据和惰性求值各自改变了不同的成本。一次计时无法同时回答执行时间、分配流量、历史版本保留空间和缓存命中率。把这些指标混成“函数式代码快不快”，得到的结论很难指导具体修改。 本章给出一个可复现的 Java 21 微实验：相同整数输入上比较循环与 IntStream，分别记录多轮时间和当前线程分配量；另用可达对象图比较复制与共享历史；最后检查严格求值、按需消费和有界缓存。它不是 JM">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-99.jpg">
+<meta property="article:published_time" content="2026-10-03T02:35:00.000Z">
+<meta property="article:modified_time" content="2026-10-04T04:02:49.390Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="函数式编程">
+<meta property="article:tag" content="性能">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-99.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "函数式编程35：性能实验中的时间、分配与保留空间",
+  "url": "https://magicliang.github.io/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B35-%E6%97%B6%E9%97%B4%E5%88%86%E9%85%8D%E4%B8%8E%E4%BF%9D%E7%95%99%E7%A9%BA%E9%97%B4/",
+  "image": "https://magicliang.github.io/img/wall-paper-99.jpg",
+  "datePublished": "2026-10-03T02:35:00.000Z",
+  "dateModified": "2026-10-04T04:02:49.390Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B35-%E6%97%B6%E9%97%B4%E5%88%86%E9%85%8D%E4%B8%8E%E4%BF%9D%E7%95%99%E7%A9%BA%E9%97%B4/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '函数式编程35：性能实验中的时间、分配与保留空间',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1584</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1648</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">28</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-99.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">函数式编程35：性能实验中的时间、分配与保留空间</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">函数式编程35：性能实验中的时间、分配与保留空间</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-03T02:35:00.000Z" title="Created 2026-10-03 10:35:00">2026-10-03</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-04T04:02:49.390Z" title="Updated 2026-10-04 12:02:49">2026-10-04</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E8%AE%A1%E7%AE%97%E7%90%86%E8%AE%BA/">计算理论</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">5.4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>16mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-04 12:02:49&quot;}" hidden></div><p>循环、管道、不可变数据和惰性求值各自改变了不同的成本。一次计时无法同时回答执行时间、分配流量、历史版本保留空间和缓存命中率。把这些指标混成“函数式代码快不快”，得到的结论很难指导具体修改。</p>
+<p>本章给出一个可复现的 Java 21 微实验：相同整数输入上比较循环与 IntStream，分别记录多轮时间和当前线程分配量；另用可达对象图比较复制与共享历史；最后检查严格求值、按需消费和有界缓存。它不是 JMH 基准，不给出生产容量建议。每个结论都限定在实际测量或断言能够支持的范围内。</p>
+<h2 id="先确定计算的是同一件事">先确定计算的是同一件事</h2>
+<p>输入是从零到九千九百九十九的 int 数组。两种实现都选择偶数，计算平方，再用 long 汇总。乘法前先转换成 long，避免把 int 乘法溢出的结果再扩宽。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">static</span> <span class="hljs-type">long</span> <span class="hljs-title function_">loop</span><span class="hljs-params">(<span class="hljs-type">int</span>[] xs)</span> &#123;<br>    <span class="hljs-type">long</span> <span class="hljs-variable">s</span> <span class="hljs-operator">=</span> <span class="hljs-number">0</span>;<br>    <span class="hljs-keyword">for</span> (<span class="hljs-type">int</span> x : xs) <span class="hljs-keyword">if</span> ((x &amp; <span class="hljs-number">1</span>) == <span class="hljs-number">0</span>) s += (<span class="hljs-type">long</span>) x * x;<br>    <span class="hljs-keyword">return</span> s;<br>&#125;<br><span class="hljs-keyword">static</span> <span class="hljs-type">long</span> <span class="hljs-title function_">pipeline</span><span class="hljs-params">(<span class="hljs-type">int</span>[] xs)</span> &#123;<br>    <span class="hljs-keyword">return</span> Arrays.stream(xs)<br>            .filter(x -&gt; (x &amp; <span class="hljs-number">1</span>) == <span class="hljs-number">0</span>)<br>            .mapToLong(x -&gt; (<span class="hljs-type">long</span>) x * x)<br>            .sum();<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>循环没有构造中间集合，管道使用基本类型流，也没有把每个元素包装成 Integer。若把它改成 Stream<Integer>，比较的内容就增加了装箱与对象访问，不能继续沿用当前结果。若一边缓存预计算结果、一边每次重新求值，则更不是同一个任务。</p>
+<p>测量包装器接收 LongSupplier，执行后先校验结果等于预期，再把结果写入 volatile blackhole。这个名称只描述防止结果完全无人使用的意图，不意味着复制了专业基准工具的黑洞实现。重复相同输入仍可能受到内联、循环优化和公共子表达式等因素影响。</p>
+<p>结果相等是性能比较的前提，但不是全部行为等价。这个输入域没有异常、外部回调、顺序敏感状态和无限流。把其中一个实现替换到含副作用的管道中，还需要独立回归业务行为。不能用整数求和的等值断言授权改变订单处理顺序。</p>
+<h2 id="预热与多轮测量">预热与多轮测量</h2>
+<p>程序先执行五轮预热，每轮各运行两种实现一百次，然后进行八轮测量。每次测量内部重复一百次，用总结果检查没有漏算；偶数轮先循环后管道，奇数轮交换顺序。交换顺序能减轻固定先后造成的偏差，不能消除进程内的所有干扰。</p>
+<p>时间使用 System.nanoTime 的差值，记录的是这一段调用的经过时间，不是 CPU 指令数，也不是严格的 CPU 占用时间。操作系统调度、同机负载和 JIT 编译都会影响它。纳秒是数值单位，不是测量精度的保证。</p>
+<p>预热次数是实验配置，不是“JIT 已完全稳定”的证明。当前小函数可能很快进入稳定状态，换成复杂调用图后，同样五轮未必足够。观察多轮数据可以发现趋势或异常，但不能仅因为曲线看起来平坦，就断言所有优化都已完成。</p>
+<p>公共 runner 的原始输出逐轮记录循环与管道的纳秒值，每个数都对应一百次计算。同机环境负载不受控，应同时查看全部八轮，不挑选最快一轮。准确值、运行环境和源码散列以<a target="_blank" rel="noopener" href="https://github.com/magicliang/hexo-blog/blob/main/examples/functional-programming/evidence/35/result.json">运行证据</a>为准；重新执行可能产生不同数值，正文不固定某次耗时范围。</p>
+<p>这些数值支持“本次实验条件下循环记录值较低”，不支持“所有函数式代码都慢若干倍”。程序没有多进程 fork，没有置信区间，没有隔离其他进程负载，也没有模拟数据库、序列化或实际订单规模。八轮是同一 JVM 内的重复观察，不是八个相互独立的机器样本。</p>
+<p>若业务请求的大部分时间在网络等待，缩短这个求和函数可能几乎不改变端到端延迟。反过来，如果相同内核在大批量计算中重复数百万次，小差异也可能有意义。是否优化应由真实热点、输入分布和预算决定，而不是由代码风格标签决定。</p>
+<h2 id="分配流量与存活空间分开读">分配流量与存活空间分开读</h2>
+<p>实验使用 com.sun.management.ThreadMXBean 的当前线程分配计数，在执行前后取差。启动时先检查该能力是否受支持，并启用计数；不支持时实验直接失败，不用零代替不可用值。这个接口提供线程累计分配的近似字节数，是 JDK 扩展能力，不是所有 JVM 都必须提供的可移植指标。<a target="_blank" rel="noopener" href="https://docs.oracle.com/en/java/javase/21/docs/api/jdk.management/com/sun/management/ThreadMXBean.html">ThreadMXBean API</a></p>
+<p>本次八轮循环记录的分配差值为零，管道为每轮三万四千四百字节。每轮执行一百次，因此不能把三万四千四百写成单次分配。这个结果也不意味着源代码层面绝对没有对象表达式：优化器可能消除分配，计数器本身也有适用范围。</p>
+<p>计数只覆盖当前平台线程。若被测实现把工作交给线程池，而包装器仍只读取调用线程计数，就会漏掉工作线程上的分配。本章两种实现均在当前线程顺序执行，没有把 parallel 流与普通循环混在一个线程计数口径中比较。</p>
+<p>分配过的对象可能马上变成不可达。累计分配大，不等于方法返回后长期占用的堆大；存活对象少，也不意味着分配成本低。高频短命对象会给垃圾收集带来压力，而缓存中的少量长寿对象可能长期保留很大的依赖图。这两个问题需要不同观察。</p>
+<p>测量对象 Measurement 在计数取差之后构造，打印发生在测量结束后。这样减少了日志和结果包装对区间的直接污染，但仍不构成完全隔离。若把 println 放进被测 supplier，计时就会包含格式化、锁竞争和输出，得到的是另一个工作负载。</p>
+<p>零也必须按原口径解释。它表示当前计数器在本次区间记录的增量为零，不能外推成“此算法永远零分配”，更不能用它证明该代码不会造成任何内存压力。输入数组本身、JVM 元数据和测量前建立的对象都不在这个增量里。</p>
+<h2 id="保留历史时比较可达图">保留历史时比较可达图</h2>
+<p>第二个实验逐次建立三百个版本，且保留每个版本的根。复制版本每次把旧列表内容复制到新列表并在头部加入元素；共享版本建立一个 Node(value, tail)，tail 指向上一个根。两者都允许访问全部历史。</p>
+<p>复制列表的逻辑元素槽总数为一加二一直到三百，即四万五千一百五十。共享版本用 IdentityHashMap 按身份遍历所有根可达的 Node，去重后是三百个。另一个断言确认最新根的 tail 就是前一个根。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">record</span> <span class="hljs-title class_">Node</span><span class="hljs-params">(<span class="hljs-type">int</span> value, Node tail)</span> &#123;&#125;<br><span class="hljs-type">var</span> <span class="hljs-variable">seen</span> <span class="hljs-operator">=</span> Collections.newSetFromMap(<br>        <span class="hljs-keyword">new</span> <span class="hljs-title class_">IdentityHashMap</span>&lt;Node, Boolean&gt;());<br><span class="hljs-keyword">for</span> (Node root : shared) &#123;<br>    <span class="hljs-keyword">for</span> (<span class="hljs-type">Node</span> <span class="hljs-variable">p</span> <span class="hljs-operator">=</span> root; p != <span class="hljs-literal">null</span> &amp;&amp; seen.add(p); p = p.tail()) &#123;&#125;<br>&#125;<br><span class="hljs-keyword">assert</span> seen.size() == <span class="hljs-number">300</span>;<br><span class="hljs-keyword">assert</span> shared.get(<span class="hljs-number">299</span>).tail() == shared.get(<span class="hljs-number">298</span>);<br></code></pre></td></tr></table></figure>
+<p>这里比较的是复制列表的逻辑元素槽数和共享链表的节点数，不是两个精确堆字节值。列表包装对象、底层数组容量、对象头、对齐、Integer 共享、根容器和 JVM 压缩指针配置都会影响实际堆占用。不能拿四万五千一百五十除以三百，就声称节省了一百五十点五倍内存。</p>
+<p>程序明确输出 exact-heap-bytes=NOT_MEASURED。没有执行堆转储、对象布局分析或可靠的存活空间测量，因此不提供精确 retained bytes。System.gc 后读取 Runtime 空闲空间也不足以自动变成精确对象大小测量，本实验没有使用这种替代说法。</p>
+<p>模型仍然有价值。它准确展示了“保留全部历史”这个条件下，重复复制怎样累计存储位置，尾部共享怎样复用节点。这个结论依赖更新方式：头部插入天然适合单链表；若频繁更新中间元素，需要复制到修改点的前缀，成本模型就不同。</p>
+<p>如果只保留最新版本，复制列表最终只有三百个元素槽，共享链表也有三百个节点，历史累积差异不再按同一个公式成立。旧根是否被闭包、日志、缓存或 UI 历史列表持有，直接决定实际可回收范围。谈持久化结构的空间优势，必须同时说明根集合。</p>
+<p>结构共享还会延长某些数据的可达时间。一个看似很小的切片或尾指针可能保留后续整段链。如果业务只需要十个值，却把原大结构的根一并缓存，就不能从“每次更新只分配一个节点”推断长期空间很小。分配局部性与对象寿命是两个独立维度。</p>
+<h2 id="惰性节省的是未被需求的工作">惰性节省的是未被需求的工作</h2>
+<p>第三个实验给变换函数加入计数器。严格版本先把一千个整数全部平方并收集，再取前十个；惰性版本在流上 limit(10) 后收集。两个结果列表相同，严格版本回调执行一千次，惰性版本十次。</p>
+<p>这个断言测量的是调用次数，没有把次数直接换算成纳秒。对非常便宜的函数，惰性管道自身的管理成本可能占更大比例；对昂贵解析或远程请求，减少九百九十次工作则可能很重要。需要用对应场景的指标判断，不应把“少调用”直接写成固定速度提升。</p>
+<p>同时，limit 的位置也决定需求。在 filter 之后取十个，可能需要检查超过十个输入；在 map 之后取十个，通常只需要变换十个被消费元素；如果排序需要完整输入，后面的 limit 无法阻止排序阶段收集所有元素。把任何流都描述为逐元素常量空间是不准确的。</p>
+<p>惰性还会推迟错误发生的位置。严格版本在函数返回前可能已经发现第九百个元素非法；只消费前十个的惰性版本不会看到那个错误。这是否可接受取决于契约：预览前十条允许忽略后续，完整文件校验则不允许把未消费区域当成有效。</p>
+<p>计数器本身属于测试观察，不应原样放进被测纯变换来宣称函数仍然纯。实验故意通过它观察需求传播；实际业务可以保留纯变换，并在外层用独立测试记录调用。不同观察目的应分开，不要让测量工具改变被承诺的生产接口语义。</p>
+<h2 id="有界缓存也可能持续失效">有界缓存也可能持续失效</h2>
+<p>最后一个实验创建容量十六的访问顺序 LinkedHashMap，依次访问二十个不同键并循环五轮，共一百次。每次缺席才计算并插入，超出容量时淘汰最久未访问项。断言最终容量十六，缺失次数一百。</p>
+<p>这不是随机坏运气。循环工作集大于容量，每个键再次出现之前已经经历十九个其他键，旧值早已被淘汰。因此有界缓存控制了空间，却没有减少这个访问序列的计算次数，还增加了查找、插入和淘汰成本。</p>
+<p>如果把容量改为二十，第一轮之后的重复访问会命中；如果把访问集中在四个热点键，即使容量十六也可能有较高命中率。缓存收益取决于工作集与局部性，不能只由“函数是纯的，所以可以缓存”推出“应该缓存”。</p>
+<p>纯函数允许复用结果，但键策略和结果持有关系仍然要设计。可变参数作为键可能在插入后改变哈希语义，结果可能引用很大的输入图，缓存也可能需要区分正常缺席与未计算。本章只用整数键值，避免把这些额外语义混进当前容量实验。</p>
+<p>旧文<a href="/2017/12/17/%E5%87%BD%E6%95%B0%E7%BC%93%E5%AD%98-memoize/">函数缓存 memoize</a>中的假值命中问题关注的是正确性：用真值判断会把零或 false 当作未缓存。本章缓存只存非 null 整数，因此用 get 返回 null 判断缺席，零仍是有效命中。访问顺序 LinkedHashMap 的 get 会刷新命中项的位置，containsKey 不会；这一差别由 <a target="_blank" rel="noopener" href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/LinkedHashMap.html">JDK 21 API</a>规定。</p>
+<p>容量断言之外，另一个样例先填入键零至十五，get(0) 确认零值命中，再插入十六。断言容量仍为十六、键一被淘汰、键零仍保留，完整键顺序为二至十五、零、十六。输出 lru-hit-refresh、evicted=1、retained=0 对应这组观察。全部缺失的循环样例无法检验命中刷新，必须用这个包含命中的访问序列区分 LRU 与仅按插入顺序淘汰。</p>
+<h2 id="如何读一份性能报告">如何读一份性能报告</h2>
+<p>一份可以复核的报告至少要让读者知道被比较的函数、输入规模、结果是否相同、预热和重复方式，以及指标的口径。只列一行“快两倍”，没有说明总耗时对应多少次调用，读者无法区分单位错误、冷启动效应和真实差异。</p>
+<p>本章证据记录 Java 版本、操作系统、架构、runner 环境、执行命令和源码散列；程序输出明确列出 input=10000、warmup=5x100、rounds=8、repetitions=100。CPU 信息由公共 runner 环境记录。没有设置 CPU 亲和性，没有控制温度或频率，也没有把其他代理任务视为静止背景。</p>
+<p>因此原始数据应与这些限制一起保留。若后来修改实现或运行环境，不要只覆盖文章中的最快数值而保持旧散列不变。应重新运行整个相关场景，核对等值断言和全部轮次，再讨论变化是否可归因。当前 evidence 文件是一次实际执行记录，不是跨版本性能历史数据库。</p>
+<p>对单个热点做生产决策时，还需要更接近业务的输入分布、独立进程运行和误差分析。本章的最小实验负责训练指标区分，并暴露一些常见错误推理；它没有完成这些生产评估，也不把缺失项目标记为通过。</p>
+<p>旧文<a href="/2026/10/02/Scala-10-%E4%B8%8D%E5%8F%AF%E5%8F%98%E9%9B%86%E5%90%88%E4%B8%8E%E7%BB%93%E6%9E%84%E5%85%B1%E4%BA%AB/">不可变集合与结构共享</a>通过共享尾部解释旧版本保留，本章增加根集合和可达图计数的口径。旧文<a href="/2026/10/02/Scala-11-Iterator%E4%B8%8EView%E4%B8%8ELazyList/">Iterator、View 与 LazyList</a>讨论需求与缓存，本章用一千次对十次的回调观察和容量十六的循环访问分别验证两种成本，避免把惰性与记忆化混为一谈。</p>
+<h2 id="修改实验时一次改变一个因素">修改实验时一次改变一个因素</h2>
+<p>要判断管道开销是否随输入规模变化，可以固定当前实现与重复次数，分别用小数组和大数组运行。小数组可能更受建立管道的固定成本影响，大数组则包含更多实际遍历工作。但在没有运行这些规模之前，这只是待检验解释，不能从当前一万个元素的结果画出一条虚构增长曲线。</p>
+<p>要判断装箱成本，应增加一个明确使用对象流的第三实现，并保持相同筛选、乘法范围和汇总结果。不要同时改成并行流，因为那又引入任务调度、线程计数范围和合并成本。把多个因素同时改变后，即使差异很大，也很难回答差异来自哪里。</p>
+<p>要判断结果使用是否影响优化，可以让每次重复使用不同但确定的输入，并仍然计算独立期望。当前程序固定输入并汇总一百次结果，适合最小演示，却不保证能阻止所有跨迭代优化。更强的实验需要把输入分布设计成协议的一部分，而不是在计时函数里临时调用随机数增加另一种成本。</p>
+<p>预热同样不能只看次数。若新实现会在第一次调用时加载配置或初始化缓存，应区分冷启动和稳定调用两个问题。将初始化移出区间会改变测量对象，并非天然更公平；业务若每次短命进程只调用一次，冷启动本来就是用户成本。报告需要说明为何选择当前口径。</p>
+<p>垃圾收集发生时，时间样本可能变大，但单凭一个较慢值不能确认是 GC。需要相应运行时事件或其他证据才能归因。不能将慢轮次全部删除后称为去噪，也不能把所有抖动都归咎于函数式结构。当前报告保留全部八轮，没有给单轮变化指定未经观察的原因。</p>
+<h2 id="图模型中的对象身份与业务相等">图模型中的对象身份与业务相等</h2>
+<p>共享节点去重使用 IdentityHashMap，原因是要统计同一个对象是否从多个根可达。如果改为按 Node 的结构相等去重，两棵内容相同但独立分配的链可能被当成同一棵，得到虚假的共享结论。业务值相等适合检查计算结果，引用身份适合当前对象图问题，二者不能互换。</p>
+<p>反过来，仅凭两条 tail 引用相同，也不能知道整个库的结构布局。当前实验拥有手写 Node 的定义，可以解释每次头插新增一个节点；对复杂持久化向量，还需要检查分支因子、路径复制和内部数组等实现。不能把链表结论无条件推广到所有不可变集合。</p>
+<p>复制版本统计的是每个历史列表的 size 之和，不声称底层一定逐槽分配独立对象。某些值对象可以被共享，某些集合实现可能保存额外元数据。模型刻意选择一个稳定、可复核的逻辑量，再把无法从这个量推出的精确堆占用标为未测量。</p>
+<p>这些区别还影响缓存评估。缓存一个函数结果可能只新增一条引用，也可能因为这条引用让原本可回收的整张输入图继续存活。观察一次插入的分配量无法回答后者；需要从缓存根出发看可达关系，或者使用适合的堆分析。当前缓存实验只验证容量与缺失次数，没有偷偷把它扩大成 retained heap 测试。</p>
+<p>样本范围只能描述这八次观察，不能代替总体分布。报告没有计算统计显著性，也没有据此推荐修改线上服务的资源配额。当前线程分配值同样不能用来估计整个服务进程在请求峰值下需要多少堆容量。</p>
+<h2 id="复现与修改练习">复现与修改练习</h2>
+<p>完整<a target="_blank" rel="noopener" href="https://github.com/magicliang/hexo-blog/blob/main/examples/functional-programming/labs/35/Main.java">实验源码</a>包含所有断言；<a target="_blank" rel="noopener" href="https://github.com/magicliang/hexo-blog/blob/main/examples/functional-programming/evidence/35/result.json">结果文件</a>包含此次运行的实际输出。仓库根目录执行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">node examples/functional-programming/run.mjs 35<br></code></pre></td></tr></table></figure>
+<p>手算题：保留十个逐次增长版本时，复制列表共有多少逻辑元素槽，共享链表有多少不同节点？若只留下最新根，哪些数字需要改变？答案是五十五个槽与十个节点；删除旧根后应按最新结构重新计算，不能沿用全部历史的总和。</p>
+<p>修改题：把缓存容量从十六改为二十，先写出预期缺失次数，再运行验证；随后把输入规模增大，并仍保留全部八轮时间和分配输出。不得只保留最快轮次。另加一个“仅保留最新根”的图模型，对照历史根删除前后的可达节点，明确它仍然不是精确堆字节测量。</p>
+<p>阅读结果时分别作出三个判断：当前返回值是否正确，当前测量是否覆盖所声称的指标，这个输入是否代表需要优化的业务。只有第一个问题通过，不能推出后两个问题也已解决。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B35-%E6%97%B6%E9%97%B4%E5%88%86%E9%85%8D%E4%B8%8E%E4%BF%9D%E7%95%99%E7%A9%BA%E9%97%B4/">https://magicliang.github.io/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B35-%E6%97%B6%E9%97%B4%E5%88%86%E9%85%8D%E4%B8%8E%E4%BF%9D%E7%95%99%E7%A9%BA%E9%97%B4/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B/">函数式编程</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD/">性能</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-99.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B20-Monad%E5%AE%9A%E5%BE%8B%E4%B8%8EKleisli%E7%BB%84%E5%90%88/" title="函数式编程20：Monad 定律与 Kleisli 组合，接续计算需要什么保证"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-algorithm-math.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">函数式编程20：Monad 定律与 Kleisli 组合，接续计算需要什么保证</div></div><div class="info-2"><div class="info-item-1">能编译的 flatMap 也可能无法可靠组合 一个列表组合器先运行普通 flatMap，再把整个结果反转。它的输入输出类型完全正确：接收 List[A] 和 A =&gt; List[B]，返回 List[B]。有些单元素测试也能通过。但把一串组合提取成辅助函数以后，结果顺序可能变化。类型正确还不足以支持这种重构，组合还需要满足规律。 Monad 描述一族类型 M 的接续能力及其规则。pure 把已有值表示为 M 中的计算，flatMap 允许后一步根据前一步得到的值选择另一个 M 计算。这个定义既适用于缺席传播，也适用于多结果、环境读取和状态传递。将 Monad 解释成“一个装东西的盒子”，无法说明环境函数为什么也能满足同一规则。 前置是 map、join 与 flatMap的四种查询形式。已有 Scala 高阶类型与组合定律中“Monad 加入 pure 与依赖组合”展示了最小接口与 Option/List 实例，本章承接这个背景，重点增加可观察等价、坏实现反例、Kleisli 组合及 for 的局部展开。 独立实验源码使用 Scala 3.3.7、Cats Core 2.1...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B39-%E6%9C%AC%E5%9C%B0%E8%AE%A2%E5%8D%95%E5%AF%BC%E5%85%A5%E7%BB%BC%E5%90%88%E5%B7%A5%E7%A8%8B/" title="函数式编程39：有界并发的本地订单导入工程"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-99.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">函数式编程39：有界并发的本地订单导入工程</div></div><div class="info-2"><div class="info-item-1">本章把金额计算、输入校验、不可变状态、效果描述、资源作用域和有界并发放到同一条可运行路径中。程序读取真实本地文件，按订单聚合商品行，查询模拟折扣报价，计算应付金额，产生已处理订单，并在整批成功后一次保存结果与命令回执。 它是进程内教学工具，不连接生产服务。输入、故障和调度关系由测试确定；文件确实创建、读取并关闭，效果确实执行，取消也等待任务结束。保存使用 Ref 中的内存快照，不把内存成功报告为数据库提交。完整实现自包含在本章目录，没有依赖其他章节的 Main 类。 从基线保留什么 导读与能力自测的金额样本是两件单价十二元五角的商品，加一件三元二角的商品，九折后应付二十五元三角八分。本章保留相同计算顺序：先汇总订单行金额，再应用折扣率，最后以 HALF_UP 舍入到两位小数。 这里的 discount 表示减免比例，0.10 对应九折，而不是直接乘以 0.10。零折扣得到原金额，全额折扣得到零。模拟报价端返回折扣率，因此它不是文件中单价的来源。商品单价来自输入，外部步骤决定折扣，这两个来源在模型中明确分开。 日期不参与本章结果，程序也不读取系统时钟或随机数。与第 00 章相比，这...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B31-%E6%80%A7%E8%B4%A8%E7%94%9F%E6%88%90%E5%99%A8%E4%B8%8E%E7%BC%A9%E5%87%8F%E5%8F%8D%E4%BE%8B/" title="函数式编程31：性质生成器与缩减反例"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-99.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">函数式编程31：性质生成器与缩减反例</div></div><div class="info-2"><div class="info-item-1">一个把结果倒序返回的 map，在空列表和单元素列表上都可能通过测试。输入只有一个订单时，倒序没有可见差异；订单增加到两条且内容不同，恒等映射就改变了业务顺序。测试需要找到能区分实现的输入，还需要把输入缩小到足以解释错误的程度。 本章用 Java 21 实现一个有限的性质测试实验：生成数值与函数参数，检查组合关系，主动制造错误，再保存随机种子与缩减样本。它不替代完整测试框架，也不把一千次成功称为数学证明。重点是让每一项“通过”都能回答输入来自哪里、比较了什么、什么情况下本应失败。 前置知识是 map、flatMap、错误累积与显式状态。完整的 Main.java 包含生成器、缩减器与可失败断言；本次运行证据 保存环境、源文件摘要、命令和实际输出。  先确定观察等价 表达式两边都返回 Optional，还不足以说明它们相等。本实验比较 Optional 内部整数的值；错误列表比较元素及顺序；账户转换比较转换后的余额和失败时是否保持旧余额。对象地址、分配次数和耗时不在本次代数等价关系中。 选择观察方式会改变测试。错误集合若允许按任意顺序显示，可以采用集合等价；如果界面按字段顺序提示，就...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B21-List%E4%B8%8EReader%E7%9A%84%E7%BB%84%E5%90%88/" title="函数式编程21：List 与 Reader，多结果和共享环境怎样接续"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-algorithm-math.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">函数式编程21：List 与 Reader，多结果和共享环境怎样接续</div></div><div class="info-2"><div class="info-item-1">一个报价程序可能有多个答案，也可能等待配置 订单数量有多个候选，每个数量又对应若干价格方案，程序需要保留所有组合及其顺序。这可以用 List 表达。另一种报价程序已经确定数量，只差单价和附加费配置，此时计算可以表示为 Env =&gt; Amount。两者都能提供 pure 与 flatMap，但接续规则完全不同。 List 的 flatMap 为每个已有结果产生一段后续结果，再依次连接。Reader 的 flatMap 构造一个函数，等环境到来后计算前一步，用其结果选择后一步，并将同一个环境交给后一步。Reader 无需内部存放一个现成的金额；这正是“Monad 必须是物理容器”解释不充分的地方。 前置为 Monad 定律与 Kleisli 组合。Scala for 推导式的双生成器示例已经介绍两层有序组合，本章保留其顺序语义，再加入依赖候选、重复项和函数环境。已有 Scala Typeclass 与组合实例说明能力对象与数据可分离，Reader 的核心则是运行时函数组合，不要把它与 given 搜索混为一谈。 实验源码固定 Scala 3.3.7、Cats Core 2.12...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B14-Scala%E6%A1%A5%E6%8E%A5%E4%B8%8E%E7%B1%BB%E5%9E%8B%E7%B1%BB/" title="函数式编程14：最小Scala桥接与类型类"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">函数式编程14：最小Scala桥接与类型类</div></div><div class="info-2"><div class="info-item-1">Optional 与 List 都能 map，但 Java 方法通常分别写成 Optional&lt;A&gt; 和 List&lt;A&gt;。若希望同一个算法只要求“能映射”，就需要把外层结构也当成参数。Scala 的 F[_] 用于表达这一层抽象；它与接受一个函数作为参数的高阶函数不是同一个概念。 本章只引入后续组合章节需要的 Scala 3 语法：函数类型、enum、模式匹配、泛型、given/using、类型构造器和最小 for 表达式。实验固定 Scala 3.3.7、Scala CLI 1.9.1 与 JDK 21，不依赖 Cats。目标是能读懂并实现一个小型能力接口，不要求先掌握宏、复杂型变或整个 Scala 生态。 系列导读与能力自测 函数值仍然是值 Int =&gt; Int 表示接收整数、返回整数的函数类型。n =&gt; n * 125 是一个函数值，val 给它绑定名字。函数体在被调用时执行，写出 lambda 并不会自动执行其中的乘法。 12val cents: Int =&gt; Int = n =&gt; n * 125assert(cents(2...</div></div></div></a><a class="pagination-related" href="/2026/06/26/%E6%80%A7%E8%83%BD%E6%A8%A1%E5%9E%8B-%E6%90%9C%E7%B4%A2%E5%BB%B6%E8%BF%9F-%E5%86%99%E5%85%A5%E5%90%9E%E5%90%90%E4%B8%8E%E8%B0%83%E4%BC%98%E6%80%9D%E8%B7%AF/" title="深入 Elasticsearch（14）：搜索延迟、写入吞吐与调优思路"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/06/26/%E6%80%A7%E8%83%BD%E6%A8%A1%E5%9E%8B-%E6%90%9C%E7%B4%A2%E5%BB%B6%E8%BF%9F-%E5%86%99%E5%85%A5%E5%90%9E%E5%90%90%E4%B8%8E%E8%B0%83%E4%BC%98%E6%80%9D%E8%B7%AF/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-26</div><div class="info-item-2">深入 Elasticsearch（14）：搜索延迟、写入吞吐与调优思路</div></div><div class="info-2"><div class="info-item-1">上一篇解决了 segment 和索引的生命周期管理——merge 控制 segment 数量，ILM 管理索引的存储分层。这一篇进入 ES 的性能瓶颈在哪里、调优的思维框架是什么。 性能调优不是背参数表。参数是工具，瓶颈定位才是方法。ES 的性能受搜索延迟和写入吞吐两个维度的独立因素影响，先确定瓶颈在哪个维度的哪个因素上，再针对性调整。 本文只抓一个问题：ES 的性能模型——搜索延迟和写入吞吐分别受什么因素影响，用什么工具定位瓶颈。  搜索延迟的关键因素 1搜索延迟 = f(segment数, query复杂度, shard数, cache命中率, 数据结构选择)    因素 影响机制 观察方式     Segment 数量 每个 segment 独立搜索，结果合并 _segments API   Query 复杂度 深层嵌套 bool、wildcard、regexp 代价高 _search?profile=true   Shard 数量 scatter-gather 开销随 shard 数线性增长 _cat/shards   Filesystem cache Lucene 文件...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%88%E7%A1%AE%E5%AE%9A%E8%AE%A1%E7%AE%97%E7%9A%84%E6%98%AF%E5%90%8C%E4%B8%80%E4%BB%B6%E4%BA%8B"><span class="toc-number">1.</span> <span class="toc-text">先确定计算的是同一件事</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%A2%84%E7%83%AD%E4%B8%8E%E5%A4%9A%E8%BD%AE%E6%B5%8B%E9%87%8F"><span class="toc-number">2.</span> <span class="toc-text">预热与多轮测量</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%88%86%E9%85%8D%E6%B5%81%E9%87%8F%E4%B8%8E%E5%AD%98%E6%B4%BB%E7%A9%BA%E9%97%B4%E5%88%86%E5%BC%80%E8%AF%BB"><span class="toc-number">3.</span> <span class="toc-text">分配流量与存活空间分开读</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BF%9D%E7%95%99%E5%8E%86%E5%8F%B2%E6%97%B6%E6%AF%94%E8%BE%83%E5%8F%AF%E8%BE%BE%E5%9B%BE"><span class="toc-number">4.</span> <span class="toc-text">保留历史时比较可达图</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%83%B0%E6%80%A7%E8%8A%82%E7%9C%81%E7%9A%84%E6%98%AF%E6%9C%AA%E8%A2%AB%E9%9C%80%E6%B1%82%E7%9A%84%E5%B7%A5%E4%BD%9C"><span class="toc-number">5.</span> <span class="toc-text">惰性节省的是未被需求的工作</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%89%E7%95%8C%E7%BC%93%E5%AD%98%E4%B9%9F%E5%8F%AF%E8%83%BD%E6%8C%81%E7%BB%AD%E5%A4%B1%E6%95%88"><span class="toc-number">6.</span> <span class="toc-text">有界缓存也可能持续失效</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A6%82%E4%BD%95%E8%AF%BB%E4%B8%80%E4%BB%BD%E6%80%A7%E8%83%BD%E6%8A%A5%E5%91%8A"><span class="toc-number">7.</span> <span class="toc-text">如何读一份性能报告</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BF%AE%E6%94%B9%E5%AE%9E%E9%AA%8C%E6%97%B6%E4%B8%80%E6%AC%A1%E6%94%B9%E5%8F%98%E4%B8%80%E4%B8%AA%E5%9B%A0%E7%B4%A0"><span class="toc-number">8.</span> <span class="toc-text">修改实验时一次改变一个因素</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%BE%E6%A8%A1%E5%9E%8B%E4%B8%AD%E7%9A%84%E5%AF%B9%E8%B1%A1%E8%BA%AB%E4%BB%BD%E4%B8%8E%E4%B8%9A%E5%8A%A1%E7%9B%B8%E7%AD%89"><span class="toc-number">9.</span> <span class="toc-text">图模型中的对象身份与业务相等</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%8D%E7%8E%B0%E4%B8%8E%E4%BF%AE%E6%94%B9%E7%BB%83%E4%B9%A0"><span class="toc-number">10.</span> <span class="toc-text">复现与修改练习</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

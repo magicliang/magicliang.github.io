@@ -1,0 +1,728 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>函数式编程30：效果流、背压与资源作用域 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="逐行读取文件，看起来只需要一个惰性迭代器。可是调用方读取五行就返回时，谁关闭文件？第三行转换失败时，是否还会读第四行？消费者正在等待一个外部请求时，上游已经读了多少数据？这些不是“按需求值”四个字能够完整回答的问题。它们同时涉及需求传播、效果失败、任务取消与资源范围。 本文用 FS2 把这些问题放进一条可执行管道。依赖固定为 Scala 3.3.7、Cats Effect 3.5.7、Cats 2">
+<meta property="og:type" content="article">
+<meta property="og:title" content="函数式编程30：效果流、背压与资源作用域">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B30-%E6%95%88%E6%9E%9C%E6%B5%81%E8%83%8C%E5%8E%8B%E4%B8%8E%E8%B5%84%E6%BA%90%E4%BD%9C%E7%94%A8%E5%9F%9F/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="逐行读取文件，看起来只需要一个惰性迭代器。可是调用方读取五行就返回时，谁关闭文件？第三行转换失败时，是否还会读第四行？消费者正在等待一个外部请求时，上游已经读了多少数据？这些不是“按需求值”四个字能够完整回答的问题。它们同时涉及需求传播、效果失败、任务取消与资源范围。 本文用 FS2 把这些问题放进一条可执行管道。依赖固定为 Scala 3.3.7、Cats Effect 3.5.7、Cats 2">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-java-jvm.svg">
+<meta property="article:published_time" content="2026-10-03T08:30:00.000Z">
+<meta property="article:modified_time" content="2026-10-04T04:02:49.390Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="FS2">
+<meta property="article:tag" content="函数式编程">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-java-jvm.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "函数式编程30：效果流、背压与资源作用域",
+  "url": "https://magicliang.github.io/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B30-%E6%95%88%E6%9E%9C%E6%B5%81%E8%83%8C%E5%8E%8B%E4%B8%8E%E8%B5%84%E6%BA%90%E4%BD%9C%E7%94%A8%E5%9F%9F/",
+  "image": "https://magicliang.github.io/img/cover-java-jvm.svg",
+  "datePublished": "2026-10-03T08:30:00.000Z",
+  "dateModified": "2026-10-04T04:02:49.390Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B30-%E6%95%88%E6%9E%9C%E6%B5%81%E8%83%8C%E5%8E%8B%E4%B8%8E%E8%B5%84%E6%BA%90%E4%BD%9C%E7%94%A8%E5%9F%9F/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '函数式编程30：效果流、背压与资源作用域',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1584</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1648</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">28</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-java-jvm.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">函数式编程30：效果流、背压与资源作用域</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">函数式编程30：效果流、背压与资源作用域</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-03T08:30:00.000Z" title="Created 2026-10-03 16:30:00">2026-10-03</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-04T04:02:49.390Z" title="Updated 2026-10-04 12:02:49">2026-10-04</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E8%AE%A1%E7%AE%97%E7%90%86%E8%AE%BA/">计算理论</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">5.4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>16mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-04 12:02:49&quot;}" hidden></div><p>逐行读取文件，看起来只需要一个惰性迭代器。可是调用方读取五行就返回时，谁关闭文件？第三行转换失败时，是否还会读第四行？消费者正在等待一个外部请求时，上游已经读了多少数据？这些不是“按需求值”四个字能够完整回答的问题。它们同时涉及需求传播、效果失败、任务取消与资源范围。</p>
+<p>本文用 FS2 把这些问题放进一条可执行管道。依赖固定为 Scala 3.3.7、Cats Effect 3.5.7、Cats 2.12.0、FS2 3.11.0。完整 <a target="_blank" rel="noopener" href="https://github.com/magicliang/hexo-blog/blob/main/examples/functional-programming/labs/30/Main.scala">Main.scala</a> 在临时目录创建真实文件，不依赖仓库 fixture；<a target="_blank" rel="noopener" href="https://github.com/magicliang/hexo-blog/blob/main/examples/functional-programming/evidence/30/result.json">result.json</a> 保存本次十四条断言、运行命令、环境与源码摘要。初次依赖获取曾遇到 DNS 失败，联网重试后才完成当前验证，没有将下载失败记作测试通过。</p>
+<span id="more"></span>
+<h1 id="集合的惰性不等于效果的生命周期">集合的惰性不等于效果的生命周期</h1>
+<p>一个 <code>Iterator[Int]</code> 可以逐个产生整数，但这个类型没有表达文件如何获取、谁拥有句柄，以及遍历中断时如何归还。把迭代器从同步资源范围里返回，甚至可能让第一次 <code>next()</code> 就面对已经关闭的文件。给集合增加惰性，并不会自动把资源寿命延长到最后一个消费者。</p>
+<p><code>Stream[IO, Int]</code> 同时描述输出元素与执行这些步骤需要的效果。它仍然是计算描述，不是已经在后台读取的文件。只有把流编译为 <code>IO</code> 并执行时，文件读取、类型转换与 finalizer 才进入运行过程。这里的 <code>compile</code> 不是生成机器码，而是把流的解释与收集方式转成目标效果，例如 <code>compile.toList</code> 或 <code>compile.drain</code>。</p>
+<p><code>toList</code> 收集全部输出，因而可能消耗与输出总量成比例的内存；<code>drain</code> 丢弃输出，但依然执行流中的效果。把 <code>toList</code> 改为 <code>drain</code> 不会自动消除上游缓冲，也不能让一次本来会产生外部写入的 <code>evalMap</code> 变成无副作用。输出收集策略与管道执行策略要分开理解。</p>
+<p>本文不是在比较所有语言里名为 Stream 的类型。Java Stream、Scala 惰性集合和 FS2 的效果流有不同接口与范围协议。名字相同不是可替换的依据。判断某种抽象能否处理文件导入，应具体看它如何表示获取、读取、失败、停止和关闭，而不是看它是否有 <code>map</code>。</p>
+<h1 id="让文件句柄属于流的范围">让文件句柄属于流的范围</h1>
+<p>实验将文件获取放进 <code>Resource</code>，再通过 <code>Stream.resource</code> 引入流。文件中有整数一到二十，每行一个。使用 JDK <code>BufferedReader</code> 是为了同时观察真实句柄的关闭状态与应用层逐行读取次数；这里运行的是实际 FS2 流，但没有调用 <code>fs2-io</code> 的文件 API，也不宣称验证了那个模块的内部实现。</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs scala"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">lines</span></span>(path: <span class="hljs-type">Path</span>, p: <span class="hljs-type">Probe</span>): <span class="hljs-type">Stream</span>[<span class="hljs-type">IO</span>, <span class="hljs-type">Int</span>] =<br>  <span class="hljs-type">Stream</span>.resource(<span class="hljs-type">Resource</span>.make(<br>    <span class="hljs-type">IO</span>.blocking(<span class="hljs-type">Files</span>.newBufferedReader(path, <span class="hljs-type">UTF_8</span>))<br>      .flatTap(r =&gt; p.handle.set(<span class="hljs-type">Some</span>(r)))<br>  )(r =&gt; <span class="hljs-type">IO</span>.blocking(r.close()) *&gt; p.closed.update(_ + <span class="hljs-number">1</span>)))<br>    .flatMap &#123; r =&gt;<br>      <span class="hljs-type">Stream</span>.repeatEval(<span class="hljs-type">IO</span>.blocking(<span class="hljs-type">Option</span>(r.readLine())))<br>        .unNoneTerminate<br>        .evalTap(_ =&gt; p.read.update(_ + <span class="hljs-number">1</span>))<br>        .evalMap(s =&gt; <span class="hljs-type">IO</span>(s.toInt))<br>    &#125;<br></code></pre></td></tr></table></figure>
+<p><code>readLine()</code> 在 EOF 返回 <code>null</code>，因此用 <code>Option</code> 把它转换为结束信号；<code>unNoneTerminate</code> 在没有下一行时停止。读取计数放在结束信号之后，所以它数的是实际获得的文本行，不包含 EOF 探测。解析放进 <code>IO</code>，使格式错误进入效果的失败通道，而不是在构造流描述时提前抛出。</p>
+<p><code>Probe</code> 由三个 <code>Ref</code> 组成：已读行数、成功关闭次数、实际句柄。它不是业务对象，是测试观察面。关闭动作先执行 <code>r.close()</code>，成功后才增加次数，因此次数一表示这一段关闭动作确实返回，而不是仅进入了 finalizer。之后再对保存的实际句柄调用 <code>readLine</code>，要求得到 <code>IOException</code>，避免只用一个人为布尔值宣称资源已关闭。</p>
+<p>保存句柄仅用于关闭后的否定检查，生产代码不应把它暴露给范围外调用方。这个测试也不需要在关闭后再次写入文件或依赖平台特定的删除行为。文件删除在外层临时文件资源的 finalizer 里执行；内层每个场景各自打开并关闭 reader，便于逐场景计量，不共享已消费的读取位置。</p>
+<h1 id="分批处理先定义批次的含义">分批处理先定义批次的含义</h1>
+<p>正常路径将行流按四个元素组成一块，每块求和，最终输出 <code>10、26、42、58、74</code>。这覆盖真实文件打开、逐行读取、解析、分批计算、输出收集和关闭。求和是一个可复核的导入处理替身，不是已经完成数据库批量写入的宣称；实验没有连接数据库，也没有测试事务提交。</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs scala">lines(path, p)<br>  .chunkN(<span class="hljs-number">4</span>)<br>  .evalMap(chunk =&gt; <span class="hljs-type">IO</span>.pure(chunk.toList.sum))<br>  .compile.toList<br></code></pre></td></tr></table></figure>
+<p>四行一块意味着处理函数一次得到一组元素，不意味着四行共享一个数据库事务。事务范围需要由实际数据库接口表达。类似地，失败后从哪一行恢复、是否允许重复批次、批次号如何持久化，都不由 <code>chunkN</code> 自动决定。流解决组合和范围问题，业务提交协议仍然必须设计。</p>
+<p>当前输入二十行刚好被四整除，正常路径没有验证尾部不足一块时的业务处理要求。若导入规定尾批也应提交，应增加二十一行的案例并验证最后一个和为二十一；若规定尾批必须拒绝，则应在业务校验处表达。本文不从整除输入的一次通过推断所有批次边界都已覆盖。</p>
+<p>分批还影响失败粒度。若把解析放在分块前，解析到坏行时可能已经得到本批前面的合法行，但尚未执行整批处理。若先读文本块再在块内解析，则错误收集和内存保留方式会变化。选择哪一种需要看是否允许局部导入、是否要报告所有坏行，以及失败时已经发生哪些外部动作。</p>
+<h1 id="提前取五行-必须检查没有第六次逻辑读取">提前取五行，必须检查没有第六次逻辑读取</h1>
+<p>早停路径执行 <code>lines(path, p).take(5).compile.toList</code>。输出必须是 <code>1</code> 到 <code>5</code>，读取计数必须为五，关闭次数必须为一，实际句柄必须拒绝后续读取。只看五个输出不足以证明需求没有提前扩大；上游可能已经把二十行全读进内存，再返回前五个值。</p>
+<p>这一场景没有显式预取或并行操作，源通过一次次 <code>repeatEval</code> 提供行。实验的否定断言针对这个具体管道：没有第六个非 EOF 行被交付到计数点。它不是 FS2 中任意 <code>take(5)</code> 管道的普遍读取上界，后面的分块反例会改变这个数字。</p>
+<p>也不能把逻辑行数五写成“操作系统只读了五行对应的字节”。<code>BufferedReader</code> 可能预先填充字符缓冲，底层文件系统也有页缓存。探针位于应用层 <code>readLine</code> 之后，只能观察返回的逻辑行。讨论背压时必须说清计量单位：元素、字符、字节、块、请求数以及占用连接数，不是同一个量。</p>
+<p>旧文 <a href="/2026/10/02/Scala-E02-FS2%E7%9A%84%E9%9C%80%E6%B1%82%E4%B8%8E%E8%B5%84%E6%BA%90%E4%BD%9C%E7%94%A8%E5%9F%9F/">FS2 的需求与资源作用域</a> 已经用真实 reader 说明过提前取五行与关闭。本文保留同样的最小观察面，但将定时等待替换为信号，并增加下游失败、取消、分块需求扩大与并发上限。这些新增路径不能由旧文的早停例子直接推出。</p>
+<h1 id="下游失败与跳过错误行的差别">下游失败与跳过错误行的差别</h1>
+<p>失败场景让下游在收到第三个整数时返回 <code>IO.raiseError</code>。随后用 <code>attempt</code> 收集整个编译效果的错误，检查错误消息为 <code>downstream</code>，并断言读取计数为三。第四行没有经过读取计数点，reader 仍只关闭一次，实际关闭检查仍然失败于 <code>IOException</code>。</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs scala">lines(path, p).evalMap &#123; n =&gt;<br>  <span class="hljs-keyword">if</span> n == <span class="hljs-number">3</span> <span class="hljs-keyword">then</span> <span class="hljs-type">IO</span>.raiseError[<span class="hljs-type">Int</span>](<span class="hljs-keyword">new</span> <span class="hljs-type">Exception</span>(<span class="hljs-string">&quot;downstream&quot;</span>))<br>  <span class="hljs-keyword">else</span> <span class="hljs-type">IO</span>.pure(n)<br>&#125;.compile.toList.attempt<br></code></pre></td></tr></table></figure>
+<p>这里错误产生在下游处理函数，不是文件读取本身。这样能检验消费者失败是否导致上游资源范围结束，避免只验证源自身能关文件。<code>attempt</code> 放在整个编译结果外部，所以一旦流失败，结果是失败值，而不是一个装着前两行的成功列表。</p>
+<p>若改成在每行内部执行 <code>job(n).attempt</code>，错误就可能成为流中的普通元素，后面还会继续读取。这可以用于收集逐行错误，但会改变导入语义。此时“失败后没有第四行”的断言理应不再成立。错误处理器放置的位置不仅改变返回类型，也改变需求是否继续向上游传播。</p>
+<p>此外，前两行已经执行过的外部效果不会因第三行失败自动回滚。当前处理只是返回整数，因而没有持久化副作用需要补偿。如果改为发送消息或写数据库，应明确每行、每批还是整个文件的事务范围。资源最终被关闭，和此前业务写入被撤销，没有逻辑等价关系。</p>
+<h1 id="消费者停住时-用信号测需求而不是猜时长">消费者停住时，用信号测需求而不是猜时长</h1>
+<p>取消场景让消费者处理第一行时完成 <code>entered</code>，随后停在 <code>IO.never</code>。观察者等待 <code>entered</code> 后，读取计数必须为一。这表示消费者当前不再请求后继元素；然后取消承载 <code>compile.drain</code> 的 fiber，等待取消返回，检查 outcome 和实际句柄关闭。</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs scala">fiber &lt;- lines(path, p)<br>  .evalMap(_ =&gt; entered.complete(()) *&gt; <span class="hljs-type">IO</span>.never[<span class="hljs-type">Unit</span>])<br>  .compile.drain.start<br>_ &lt;- entered.get<br>n &lt;- p.read.get<br>_ &lt;- <span class="hljs-type">IO</span>(assert(n == <span class="hljs-number">1</span>))<br>_ &lt;- fiber.cancel<br>outcome &lt;- fiber.join<br>_ &lt;- <span class="hljs-type">IO</span>(assert(outcome.isCanceled))<br></code></pre></td></tr></table></figure>
+<p><code>entered</code> 放在消费者已经拿到元素之后，因而读取一次是已发生事实。消费者后面是不会自行完成的等待，所以不存在“观察稍晚就多读几行”的计时窗口。若用一个很短的 sleep 模拟慢消费者，机器负载变化可能让它在断言前结束，测试就把调度偶然性当成了需求协议。</p>
+<p>取消路径还检查实际关闭，与早停和失败各自独立打开文件。不要只在正常路径检查 close，然后把同一个关闭次数当成所有终止路径的证明。不同路径的 bug 可能藏在编译效果的取消传播、异常转换或范围嵌套中。每次重建独立探针，也避免上个场景遗留的计数掩盖漏关闭。</p>
+<p>这个取消实验没有阻塞在操作系统文件读取上，而是阻塞在下游的可取消等待上。因此它证明的是消费者取消能结束流资源范围，不证明正在进行的任意磁盘读取可以被立即打断。前一章对阻塞与协作取消的限制在这里仍然成立，换成流并不会删除底层 API 的边界。</p>
+<h1 id="分块后取五个元素-上游可以已经读了八行">分块后取五个元素，上游可以已经读了八行</h1>
+<p>背压不是“消费者需要一个值，上游恰好只计算一个值”的统一承诺。考虑在 <code>take(5)</code> 前增加 <code>chunkN(4)</code>，再把块展开为元素：</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs scala">lines(path, p)<br>  .chunkN(<span class="hljs-number">4</span>)<br>  .flatMap(<span class="hljs-type">Stream</span>.chunk)<br>  .take(<span class="hljs-number">5</span>)<br>  .compile.toList<br></code></pre></td></tr></table></figure>
+<p>为了提供第五个元素，需要第二块；形成第二块时，上游已经读到第八行。因此实验同时断言输出仍是前五行，逻辑读取计数却是八。这个反例不表示需求控制失效，而是需求单位在中间变成了块。关闭检查继续通过，说明“多读了一部分已获准的块”和“早停后泄漏资源”是两类不同问题。</p>
+<p>这个差异在真实导入中会影响成本。若读取之后立即附带某种外部效果，块内虽未最终输出的元素也可能已触发该效果。应尽量让容易提前发生的上游步骤只做读取或纯转换，把必须严格控制次数的业务动作放在符合需求的位置。即便如此，也应通过实际管道测试来判断，不依赖直觉推导任意组合的预取范围。</p>
+<p>块大小不是越小越安全或越大越高效的单向参数。小块减少一次需求带来的元素数量，但可能增加调度、调用和批处理次数；大块可以摊薄部分开销，却扩大暂存与失败恢复单位。本文没有做性能基准，因此只报告四行块造成八次逻辑读取，不提供吞吐提升比例或所谓最佳块大小。</p>
+<h1 id="有界并发限制任务-不直接给出总内存上界">有界并发限制任务，不直接给出总内存上界</h1>
+<p>最后一个场景在实际文件流上使用 <code>parEvalMap(2)</code>。处理函数的资源范围增加当前活跃数并更新最大值，退出时减少；前两个任务停在门闩上。观察者等到两个任务进入后，检查当前与最大值都是二，然后放行全部工作。</p>
+<figure class="highlight scala"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs scala"><span class="hljs-keyword">val</span> processed: <span class="hljs-type">Stream</span>[<span class="hljs-type">IO</span>, <span class="hljs-type">Int</span>] = lines(path, p).parEvalMap(<span class="hljs-number">2</span>)(job)<br><span class="hljs-keyword">val</span> result: <span class="hljs-type">IO</span>[<span class="hljs-type">List</span>[<span class="hljs-type">Int</span>]] = processed.compile.toList<br></code></pre></td></tr></table></figure>
+<p>结束后，当前活跃数必须归零，历史最大值仍为二，输出为一到二十的原输入顺序，文件已关闭。这里的保序是输出顺序，不是工作完成顺序。实验没有人为制造每个任务的反向完成过程；第28章用双门闩检验的是业务事件逆序写入时元组结果仍保持位置，没有证明两个子 fiber 的终态逆序。那个实验的业务事件序列也不能冒充本章文件任务的实际序列。</p>
+<p>本场景没有断言并行暂停点的总读取行数等于二。并发处理、内部交接、结果保序和上游分块都可能影响已读取但尚未交付的数据量；当前探针只精确限定 job 的活跃区间为二。若要建立严格的总缓冲上界，应在选定版本与完整算子链上增加对应观察点，并把源缓冲、处理中、完成但待排序的结果以及最终收集器分别计量。</p>
+<p>保序还可能产生队首阻塞：较早的任务慢时，后面的已完成结果不能越过它直接输出。是否采用不保序处理，取决于业务是否能用编号恢复关联，不能仅凭“更快”选择。即使换成不保序操作，资源归属、错误传播和取消行为也要重新核对，不应只更新最终列表的断言。</p>
+<p>本文最后收集二十个整数，规模明确且很小。生产导入若有数百万行，照抄 <code>compile.toList</code> 会保留所有输出；限制两个处理任务不解决这个问题。若只需要处理成功数量，可在流中做汇总并返回一个计数，或者在所有必要效果后 <code>drain</code>。需要保存所有失败记录时，也应设计其存储边界，而不是让一个不断增长的内存列表承担持久化职责。</p>
+<h1 id="把流类型当作接口契约的一部分">把流类型当作接口契约的一部分</h1>
+<p>返回 <code>Stream[IO, Row]</code> 的函数应说明每次编译是否重新打开数据源，数据是否可以重复读取，以及消费者提前停止会触发什么清理。本文每次调用 <code>lines</code> 都在运行范围内打开新的 reader；重复编译同一描述并不意味着复用已关闭的句柄。若应用将资源提前分配再返回流，寿命规则会改变，类型外还需要相应契约。</p>
+<p>消费端也应说明错误策略。整流失败、逐行累积错误和跳过错误行是三种不同操作。跳过策略若没有错误计数或记录，可能让导入返回成功但静默遗漏数据；累积策略若无限保留异常，又可能使一个可流式处理的文件变成内存问题。流组合让这些选择显式，但不会替业务确定哪一种正确。</p>
+<p>效果流并不要求所有逻辑都藏在 <code>evalMap</code> 里。可将字符串解析、字段校验与记录转换保留为纯函数，只有读取、持久化和必要观察放在效果边界。这样既能独立测试转换，也能在流层集中检验失败如何终止需求、取消如何清理资源。纯核心和效果范围各自有可观察契约，通常比一个包揽全部动作的处理函数更易验证。</p>
+<h1 id="eof-空输入与失败输入不能共用一个成功判据">EOF、空输入与失败输入不能共用一个成功判据</h1>
+<p>当前文件含二十行合法整数，正常路径会读到 EOF；提前停止则不会为了寻找 EOF 而继续读完整个文件。两种路径都应关闭资源，但结束原因不同。若把关闭判断写成“只有读到 null 才 close”，正常文件可能通过，早停与下游失败却会泄漏。将 close 绑定到范围退出，而不是绑定到某个数据值，才能覆盖这些出口。</p>
+<p>空文件还需要独立思考：它没有任何元素交给消费者，但只要 reader 已获得，仍有释放责任。如果取消测试将 ready 放在第一行的消费者中，却改用空文件，观察者就会永远等不到 ready。这不是空流不能关闭，而是测试准备条件不可能成立。换输入时必须同时检查控制协议的前提，不能只复用相同门闩。</p>
+<p>格式错误文件与下游错误也不同。当前失败注入发生在整数解析之后，验证的是消费者拒绝第三个值。如果把第三行改成非数字，错误会发生在 <code>lines</code> 的解析阶段；此时计数器已增加，因为该文本行已成功读取。要验证这一路径，应断言解析错误、读到第三行且关闭，而不是继续要求错误消息为 downstream。两种故障虽然都终止流，负责产生错误的阶段不同。</p>
+<p>EOF、空输入、解析失败和消费者失败分别对应没有下一项、从未有项、项无法构造以及项无法处理。将这些状态分清，可以避免把所有异常都映射成“文件为空”，也让故障测试有明确靶点。本文已运行消费者失败，空文件和坏文本属于扩展验收项，不列入当前十四条通过结论。</p>
+<h1 id="复跑与练习">复跑与练习</h1>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs bash">node examples/functional-programming/run.mjs 30<br></code></pre></td></tr></table></figure>
+<p>十四条断言覆盖正常分批与真实关闭两条、早停两条、下游失败两条、取消需求与结果及关闭三条、分块早停两条、并发范围与结果及关闭三条。所有文件由运行时创建并清理，仓库没有额外输入夹具、缓存或临时数据。当前运行仅说明这些有限场景成立，不包括磁盘损坏、读取权限失败、reader 关闭失败或真实数据库事务。</p>
+<p>手算题：从 <code>readLine(): String</code> 到 <code>IO[Option[String]]</code>，再到 <code>Stream[IO, String]</code>、<code>Stream[IO, Int]</code>、<code>IO[List[Int]]</code>，逐步写出每次转换消除了什么结构、保留了什么效果。为什么把 <code>compile.toList</code> 放在资源范围外不能修复一个已经关闭的共享 reader？再比较原始流和四行分块流，解释为什么同样输出五个元素会对应五与八两种读取次数。</p>
+<p>修改题：把文件变为二十一行，并将批大小改成六。先手算正常批次和，再调整断言；随后在原始逐行流的第七个元素制造下游失败，要求计数七、没有第八次逻辑读取、真实句柄已关闭。最后在分块展开后做同样失败注入，重新观察读取范围，不应机械保留计数七的预期。</p>
+<p>另一个修改题是给取消场景的关闭动作增加可控门闩，检查取消调用在关闭完成前不返回。这会把第29章的生命周期中间态与本章真实 reader 结合起来。新增实验需要单独复跑；当前十四条记录没有包含人为阻塞 reader finalizer 的场景。</p>
+<h1 id="参考资料">参考资料</h1>
+<p>本文实际阅读 <a target="_blank" rel="noopener" href="https://github.com/typelevel/fs2/blob/ff9b4d19e0040855a35e00560eb3cc0f35c7c2c7/site/guide.md">FS2 3.11.0 Guide</a> 的流构造、编译、错误、资源和分块说明，以及 <a target="_blank" rel="noopener" href="https://typelevel.org/cats-effect/docs/std/resource">Cats Effect Resource</a> 与 <a target="_blank" rel="noopener" href="https://typelevel.org/cats-effect/docs/typeclasses/sync">Sync</a>。文档用于核对抽象与 API 边界，具体五行、八行、活跃上限二和关闭次数一来自本文所链接的实验，不能从这些数值推导任意管道的内存或性能结论。</p>
+<p><a href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B00-%E5%AF%BC%E8%AF%BB%E4%B8%8E%E8%83%BD%E5%8A%9B%E8%87%AA%E6%B5%8B/">系列导读</a> · <a href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B29-%E5%8F%96%E6%B6%88%E8%B6%85%E6%97%B6%E4%B8%8E%E4%BB%BB%E5%8A%A1%E5%BD%92%E5%B1%9E/">上一篇：29</a></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B30-%E6%95%88%E6%9E%9C%E6%B5%81%E8%83%8C%E5%8E%8B%E4%B8%8E%E8%B5%84%E6%BA%90%E4%BD%9C%E7%94%A8%E5%9F%9F/">https://magicliang.github.io/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B30-%E6%95%88%E6%9E%9C%E6%B5%81%E8%83%8C%E5%8E%8B%E4%B8%8E%E8%B5%84%E6%BA%90%E4%BD%9C%E7%94%A8%E5%9F%9F/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B/">函数式编程</a><a class="post-meta__tags" href="/tags/FS2/">FS2</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-java-jvm.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B04-%E9%83%A8%E5%88%86%E5%BA%94%E7%94%A8%E6%9F%AF%E9%87%8C%E5%8C%96%E4%B8%8E%E5%81%8F%E5%87%BD%E6%95%B0/" title="函数式编程04：部分应用、柯里化与偏函数"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-algorithm-math.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">函数式编程04：部分应用、柯里化与偏函数</div></div><div class="info-2"><div class="info-item-1">系列导读与能力自测 九折规则固定之后还剩什么 报价公式接收费率与订单金额，返回按两位小数舍入的应付金额。活动期间费率固定为 0.9，订单金额则逐笔变化。把费率先提供给报价函数，可以得到一个只等待金额的策略。这是部分应用：某次使用已经固定了一部分实参，剩余实参决定之后的调用形状。 另一个接口可以把二元函数改写成“接收费率，返回接收金额的函数”。这个转换是柯里化。再考虑仅允许非负订单金额的报价规则，它没有在所有 BigDecimal 输入上定义正常金额结果，这是偏函数的定义域问题。三个概念会同时出现在一个例子中，但回答的问题不同。 Scala 03 的“多参数列表、柯里化和偏应用”以及“PartialFunction 的部分指输入定义域”已经给出语言侧对照。本章延续其区分，使用 Java 21 写出每一步类型，并检查固定参数之后仍可能遇到非法输入。这里的偏函数是数学建模用语，不声称 Java Function 自动带有 Scala 的 isDefinedAt 方法。 从同一公式推导三个类型 教学金额类型直接采用 BigDecimal。费率在零至一之间，金额非负，最终用 HALF_UP...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B13-Result%E4%B8%8E%E5%BC%82%E5%B8%B8%E7%9A%84%E5%A4%B1%E8%B4%A5%E8%BE%B9%E7%95%8C/" title="函数式编程13：Result、Either 与异常的失败边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">函数式编程13：Result、Either 与异常的失败边界</div></div><div class="info-2"><div class="info-item-1">订单第七行的数量是 bad。返回 empty 可以阻止继续报价，却不能告诉导入界面哪个字段出了问题。若数量能解析为四，但模拟库存只有三，又是另一种失败：输入格式正确，业务拒绝本次请求。两者都与代码内部意外抛出的 IllegalStateException 不同。 本章用 Java 21 手写 Result&lt;E,A&gt;，把成功值与结构化错误分开，并演示短路组合。异常只在字符串解析这个狭窄边界被翻译，业务回调中的程序缺陷继续向外传播。这里的 Result 名字是教学选择；Scala Either 常用 Left 表示错误、Right 表示成功，表达的两分支结构相同，但具体库方法仍应按契约使用。 系列导读与能力自测 错误需要保留哪些信息 错误类型取决于消费它的程序。导入界面至少需要行号、字段名与稳定代码；库存拒绝则需要请求量与可用量。把所有信息塞进一条字符串，展示容易，程序化处理却会依赖自然语言格式。 123sealed interface Problem permits InputError, Rejection &#123;&#125;record InputError(...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B19-map%E4%B8%8Ejoin%E4%B8%8EflatMap/" title="函数式编程19：map、join 与 flatMap，嵌套从哪里产生"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-algorithm-math.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">函数式编程19：map、join 与 flatMap，嵌套从哪里产生</div></div><div class="info-2"><div class="info-item-1">查到订单以后，为什么还不能直接查配送区 订单查询返回 Maybe&lt;Order&gt;，地址查询接收 Order，返回 Maybe&lt;Address&gt;，配送区查询又接收 Address，返回 Maybe&lt;String&gt;。每一步都可能缺席。订单不存在时，没有订单可以交给地址查询；地址不存在时，也没有地址可以交给配送区查询。这条依赖关系决定后续函数能否调用，不能靠给空值补一个默认订单来消除。 本章采用内存中的合成查询，正常路径得到配送区 Z1。实验通过参数分别让第一、第二、第三步缺席，观察最终结果和三项调用次数。它不访问数据库，也不模拟异步请求。这样可以把关注点限定在组合规则上：同一业务链条分别写成嵌套分支、嵌套 map、map 后 join，以及 flatMap，比较改变写法以后究竟保留了什么。 前置是能够读懂函数参数与返回值、理解 Maybe 的有值和缺席两个分支，以及 map 对普通结果的变换。Scala map、flatMap 与 fold中“flatMap 连接每项贡献的结果段”已经解释集合展开。本章承接其类型分析方法，但改为逐步查询；多结果列表展...</div></div></div></a><a class="pagination-related" href="/2026/10/02/Scala-E02-FS2%E7%9A%84%E9%9C%80%E6%B1%82%E4%B8%8E%E8%B5%84%E6%BA%90%E4%BD%9C%E7%94%A8%E5%9F%9F/" title="Scala E02：FS2 的需求、背压与资源作用域"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">Scala E02：FS2 的需求、背压与资源作用域</div></div><div class="info-2"><div class="info-item-1">从一百万条订单里取前五条，不应先把一百万条读入集合。可是把集合改成 Iterator，仍然没有说明谁负责关闭文件，也没有说明把处理交给异步任务后，上游可以领先多少。流式处理至少要回答三个问题：何时请求下一份数据，允许保留多少未消费数据，以及消费提前结束时谁关闭资源。 FS2 将这些问题放进带效果的流描述。一个 Stream[IO, A] 可以分批产生 A，在生产过程中执行 IO，并把资源作用域与消费过程连接起来。它不是预先装满的容器；compile 把流整理为目标效果，随后效果运行时才进行本次消费。 本篇使用 Scala 3.3.7、FS2 3.11.0、Cats Effect 3.5.7 与 JDK 21。实验位于 examples/scala-lab/electives/E02，只处理本机临时文件，没有远端服务、消息队列或吞吐量基准。最终通过记录是 evidence/20261002-d/file-backpressure.log。 从需求端解释读取次数 输入文件包含 1 到 100，每行一个整数。生产端每次执行一次 readLine，把成功读到的行计入 Ref。消费端先等待...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B09-%E6%8C%81%E4%B9%85%E5%8C%96%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%E4%B8%8E%E7%BB%93%E6%9E%84%E5%85%B1%E4%BA%AB/" title="函数式编程09：持久化数据结构与结构共享"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-algorithm-math.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">函数式编程09：持久化数据结构与结构共享</div></div><div class="info-2"><div class="info-item-1">系列导读与能力自测 更新一行，不必销毁旧版本 订单编辑器当前保存数量列表二、三。一次操作在头部增加一，另一次操作在同一个旧版本头部增加零。两个新版本分别是一二三、零二三，旧版本仍应是二三。如果每次都复制整个数组，这个行为容易实现，但头插也要搬运所有旧引用。不可变链表可以只新建首节点，让三个版本共享同一段旧尾部。 这里的“持久化”指更新之后旧版本仍可使用，不表示已经写入数据库或磁盘。结构共享是实现这种多版本行为的一种方法，不是定义本身。完整复制也可以保留旧版本，只是成本不同；共享若涉及可变节点，则可能破坏历史。 本章承接 Scala 10“List 的头插为何能够共享旧尾部”。旧段落使用 prepended.tail eq old 观察身份共享，并提醒可变元素仍然泄漏。本章在 Java 21 手写节点构造与路径复制，让共享关系直接对应可阅读的源码，同时与复制 ArrayList 对照。 空节点与非空节点 12345678sealed interface PList&lt;A&gt; permits Nil, Cons &#123;&#125;record Nil&lt;A&gt;(...</div></div></div></a><a class="pagination-related" href="/2026/10/03/%E5%87%BD%E6%95%B0%E5%BC%8F%E7%BC%96%E7%A8%8B28-%E5%BC%82%E6%AD%A5%E4%B8%8E%E6%9C%89%E7%95%8C%E5%B9%B6%E8%A1%8C%E7%BB%84%E5%90%88/" title="函数式编程28：异步与有界并行组合"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-java-jvm.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-03</div><div class="info-item-2">函数式编程28：异步与有界并行组合</div></div><div class="info-2"><div class="info-item-1">两个查询都返回 IO[Int]，并不意味着它们已经启动，也不意味着把它们放进同一个 for 就会并行。异步程序至少有三个不同的问题：描述何时构造，任务何时开始，以及结果按什么顺序交给调用者。再加上资源限制，还要问同一时刻允许多少任务占用连接。混淆这些问题，常见后果不是类型错误，而是一个看似并行的服务实际串行，或者一个看似有界的批量操作提前启动了全部外部请求。 本文用可控信号隔离这些差异。示例版本固定为 Scala 3.3.7、Cats Effect 3.5.7、Cats 2.12.0。完整程序在 Main.scala，本次实际运行的命令、环境、源码摘要及九条断言输出在 result.json。实验不用随机等待猜测任务是否启动，也不测吞吐量。  类型中的依赖和执行中的重叠 设 loadUser: IO[User]，loadOrders: User =&gt; IO[List[Order]]。第二步需要第一步产生的用户，因而组合必须等到这个值存在。loadUser.flatMap(loadOrders) 表达的是数据依赖，不是“把两个线程接起来”。第一步可以异步等待网络，也可以立即完...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E9%9B%86%E5%90%88%E7%9A%84%E6%83%B0%E6%80%A7%E4%B8%8D%E7%AD%89%E4%BA%8E%E6%95%88%E6%9E%9C%E7%9A%84%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F"><span class="toc-number">1.</span> <span class="toc-text">集合的惰性不等于效果的生命周期</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E8%AE%A9%E6%96%87%E4%BB%B6%E5%8F%A5%E6%9F%84%E5%B1%9E%E4%BA%8E%E6%B5%81%E7%9A%84%E8%8C%83%E5%9B%B4"><span class="toc-number">2.</span> <span class="toc-text">让文件句柄属于流的范围</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%88%86%E6%89%B9%E5%A4%84%E7%90%86%E5%85%88%E5%AE%9A%E4%B9%89%E6%89%B9%E6%AC%A1%E7%9A%84%E5%90%AB%E4%B9%89"><span class="toc-number">3.</span> <span class="toc-text">分批处理先定义批次的含义</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E6%8F%90%E5%89%8D%E5%8F%96%E4%BA%94%E8%A1%8C-%E5%BF%85%E9%A1%BB%E6%A3%80%E6%9F%A5%E6%B2%A1%E6%9C%89%E7%AC%AC%E5%85%AD%E6%AC%A1%E9%80%BB%E8%BE%91%E8%AF%BB%E5%8F%96"><span class="toc-number">4.</span> <span class="toc-text">提前取五行，必须检查没有第六次逻辑读取</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E4%B8%8B%E6%B8%B8%E5%A4%B1%E8%B4%A5%E4%B8%8E%E8%B7%B3%E8%BF%87%E9%94%99%E8%AF%AF%E8%A1%8C%E7%9A%84%E5%B7%AE%E5%88%AB"><span class="toc-number">5.</span> <span class="toc-text">下游失败与跳过错误行的差别</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E6%B6%88%E8%B4%B9%E8%80%85%E5%81%9C%E4%BD%8F%E6%97%B6-%E7%94%A8%E4%BF%A1%E5%8F%B7%E6%B5%8B%E9%9C%80%E6%B1%82%E8%80%8C%E4%B8%8D%E6%98%AF%E7%8C%9C%E6%97%B6%E9%95%BF"><span class="toc-number">6.</span> <span class="toc-text">消费者停住时，用信号测需求而不是猜时长</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%88%86%E5%9D%97%E5%90%8E%E5%8F%96%E4%BA%94%E4%B8%AA%E5%85%83%E7%B4%A0-%E4%B8%8A%E6%B8%B8%E5%8F%AF%E4%BB%A5%E5%B7%B2%E7%BB%8F%E8%AF%BB%E4%BA%86%E5%85%AB%E8%A1%8C"><span class="toc-number">7.</span> <span class="toc-text">分块后取五个元素，上游可以已经读了八行</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E6%9C%89%E7%95%8C%E5%B9%B6%E5%8F%91%E9%99%90%E5%88%B6%E4%BB%BB%E5%8A%A1-%E4%B8%8D%E7%9B%B4%E6%8E%A5%E7%BB%99%E5%87%BA%E6%80%BB%E5%86%85%E5%AD%98%E4%B8%8A%E7%95%8C"><span class="toc-number">8.</span> <span class="toc-text">有界并发限制任务，不直接给出总内存上界</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E6%8A%8A%E6%B5%81%E7%B1%BB%E5%9E%8B%E5%BD%93%E4%BD%9C%E6%8E%A5%E5%8F%A3%E5%A5%91%E7%BA%A6%E7%9A%84%E4%B8%80%E9%83%A8%E5%88%86"><span class="toc-number">9.</span> <span class="toc-text">把流类型当作接口契约的一部分</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#eof-%E7%A9%BA%E8%BE%93%E5%85%A5%E4%B8%8E%E5%A4%B1%E8%B4%A5%E8%BE%93%E5%85%A5%E4%B8%8D%E8%83%BD%E5%85%B1%E7%94%A8%E4%B8%80%E4%B8%AA%E6%88%90%E5%8A%9F%E5%88%A4%E6%8D%AE"><span class="toc-number">10.</span> <span class="toc-text">EOF、空输入与失败输入不能共用一个成功判据</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%A4%8D%E8%B7%91%E4%B8%8E%E7%BB%83%E4%B9%A0"><span class="toc-number">11.</span> <span class="toc-text">复跑与练习</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">12.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>
