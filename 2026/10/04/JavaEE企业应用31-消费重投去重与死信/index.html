@@ -1,0 +1,700 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>Java EE 企业应用 31：消费重投、去重与死信 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="处理过，不等于已经确认 订单通知任务从 outbox 发到队列后，消费端可能写好本地收据，却在 JMS 提交前回滚；再投递必须被设计进去。当前消息体实际只有十进制 event ID，本地仅写收据，并没有“通知结果”副作用。另一个尚未实现的路径是永远无法解析的旧版本消息，若无限重试便会占住队列。数据库收据、JMS 重投、外部通知真正生效，分别需要证据。 已实现的接收入口是 BrokerLabReso">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Java EE 企业应用 31：消费重投、去重与死信">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A831-%E6%B6%88%E8%B4%B9%E9%87%8D%E6%8A%95%E5%8E%BB%E9%87%8D%E4%B8%8E%E6%AD%BB%E4%BF%A1/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="处理过，不等于已经确认 订单通知任务从 outbox 发到队列后，消费端可能写好本地收据，却在 JMS 提交前回滚；再投递必须被设计进去。当前消息体实际只有十进制 event ID，本地仅写收据，并没有“通知结果”副作用。另一个尚未实现的路径是永远无法解析的旧版本消息，若无限重试便会占住队列。数据库收据、JMS 重投、外部通知真正生效，分别需要证据。 已实现的接收入口是 BrokerLabReso">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-12.jpg">
+<meta property="article:published_time" content="2026-10-04T08:31:00.000Z">
+<meta property="article:modified_time" content="2026-10-05T08:31:39.817Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Jakarta EE">
+<meta property="article:tag" content="Java EE">
+<meta property="article:tag" content="Messaging">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-12.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "Java EE 企业应用 31：消费重投、去重与死信",
+  "url": "https://magicliang.github.io/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A831-%E6%B6%88%E8%B4%B9%E9%87%8D%E6%8A%95%E5%8E%BB%E9%87%8D%E4%B8%8E%E6%AD%BB%E4%BF%A1/",
+  "image": "https://magicliang.github.io/img/wall-paper-12.jpg",
+  "datePublished": "2026-10-04T08:31:00.000Z",
+  "dateModified": "2026-10-05T08:31:39.817Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A831-%E6%B6%88%E8%B4%B9%E9%87%8D%E6%8A%95%E5%8E%BB%E9%87%8D%E4%B8%8E%E6%AD%BB%E4%BF%A1/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: 'Java EE 企业应用 31：消费重投、去重与死信',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1644</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1695</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">31</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-12.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">Java EE 企业应用 31：消费重投、去重与死信</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">Java EE 企业应用 31：消费重投、去重与死信</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-04T08:31:00.000Z" title="Created 2026-10-04 16:31:00">2026-10-04</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-05T08:31:39.817Z" title="Updated 2026-10-05 16:31:39">2026-10-05</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java-EE-%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A8/">Java EE 企业应用</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>12mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-05 16:31:39&quot;}" hidden></div><h2 id="处理过-不等于已经确认">处理过，不等于已经确认</h2>
+<p>订单通知任务从 outbox 发到队列后，消费端可能写好本地收据，却在 JMS 提交前回滚；再投递必须被设计进去。当前消息体实际只有十进制 event ID，本地仅写收据，并没有“通知结果”副作用。另一个尚未实现的路径是永远无法解析的旧版本消息，若无限重试便会占住队列。数据库收据、JMS 重投、外部通知真正生效，分别需要证据。</p>
+<p>已实现的接收入口是 <a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/javaee-enterprise/webapp/src/main/java/blog/javaee/web/BrokerLabResource.java">BrokerLabResource.receiveOne</a>：只在 <code>JAVAEE_DEMO_MODE=true</code> 的回环实验服务中由 HTTP 显式调用，使用 <code>JMSContext.SESSION_TRANSACTED</code> 同步接收。它依赖 <a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/javaee-enterprise/deploy/server-messaging.xml">server-messaging.xml</a> 的内嵌队列与 <a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/javaee-enterprise/db/migrations/003-notification-receipt.sql">003 收据迁移</a>；<a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/javaee-enterprise/deploy/server.xml">普通 server.xml</a> 不含消息配置。当前没有 MDB、无毒消息隔离/死信地址，也没有真实邮件或外部供应商调用。</p>
+<h2 id="把重复投递转成一次业务结果">把重复投递转成一次业务结果</h2>
+<p>当前消息体只含 <code>notification_outbox.id</code> 的十进制文本。同步接收器解析 event ID，以 <code>INSERT INTO notification_receipt(event_id,tenant_id) SELECT id,tenant_id FROM notification_outbox WHERE id=? ON CONFLICT(event_id) DO NOTHING</code> 记账；收据表的唯一键是 <code>event_id bigint PRIMARY KEY</code>，没有 <code>task_id</code>、<code>effect_type</code>、<code>payload_hash</code> 或订单业务效果表。相同事件的消息可以送达两次，但后一次 <code>newReceipt=false</code>，这验证的是<strong>本地收据去重</strong>而非“供应商通知仅发生一次”。<code>JMSRedelivered</code> 和 <code>JMSMessageID</code> 不能替换稳定 event ID；当前脚本也没有断言这些 JMS 头字段。</p>
+<figure class="highlight routeros"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs routeros">消息 <span class="hljs-attribute">event_id</span>=T ──&gt; 同步解析 ──&gt; 数据库收据主键去重 ──&gt; JMS 提交<br>                                      │<br>                          回滚/超时 ──┴──&gt; 可重投<br>                          毒消息隔离/人工处置 ─────────&gt; FUTURE/NOT_RUN<br></code></pre></td></tr></table></figure>
+<p>当真实副作用是发给供应商的 HTTP 请求时，本地收据无法与供应商系统的提交做原子事务。请求可能成功但回包丢失；“先写收据”可能漏通知，“后写收据”可能重复通知。应传稳定幂等键并核对供应商侧结果；没有对端支持，就把未知结果标记为 <code>UNKNOWN</code> 等待查询或人工核对，而不是宣称端到端恰好一次。第 32 篇再对这个外部边界单独验收。</p>
+<p>当前同步入口在 <code>recordReceipt(eventId)</code> 提交数据库更新后，可通过 <code>abortAfterRecord=true</code> 显式回滚 JMS 本地事务并返回 HTTP 500。证据中 event 5 的收据先为 1；随后再次同步接收同一 event 返回 <code>newReceipt=false</code>，重启后的接收也返回 false。这里未建立数据库与消息队列的两资源 XA；对未来 MDB 的容器确认、事务回滚和重投行为必须另行配置、测试，不能把客户端 <code>JMSContext</code> 的显式 <code>commit()</code>/<code>rollback()</code> 或 <code>CLIENT_ACKNOWLEDGE</code> 推广成 MDB 保证。Jakarta Messaging 没有统一死信地址与固定重投次数。</p>
+<h2 id="确认与数据库提交不能靠口头约定">确认与数据库提交不能靠口头约定</h2>
+<p>未来 MDB 的 <code>onMessage()</code> 若参与容器事务，消息资源与数据库资源是否属于同一事务，要由实际激活配置和资源参与情况决定；不能仅凭“容器确认”四个字推断提交顺序。若 broker 与数据库都参加同一 XA 事务，必须连同事务日志与资源恢复配置一起验收；两资源在进程里同时调用不等于分布式原子性。如果只有数据库本地提交、消息另行确认，提交后而确认前退出会使同一业务任务重新出现。反过来，先确认消息、再写收据，一旦数据库失败便可能永久丢失待处理任务。此处保留稳定 event ID 与本地收据，不能将它们合称“恰好一次交付”。</p>
+<p>回调的抛错行为也不能只靠异常类名推断：选用容器事务时，应在隔离适配器上检验 <code>onMessage()</code> 返回、抛出运行时异常、显式回滚及服务器强停之后是否重投，消息头中是否设置 <code>JMSRedelivered</code> 和实际投递计数。确认模式 <code>CLIENT_ACKNOWLEDGE</code> 适用于另一类客户端接收契约，不能复制到 MDB 并声称设置了局部确认。对两条携带相同业务 ID 的独立消息，即使两条 <code>JMSRedelivered</code> 都是 false，业务去重仍需生效。消费时间线必须同时记录 MDB 开始/结束、DB 收据提交和 broker 中消息的终态。</p>
+<p>目前 <code>notification_receipt</code> 已存在，事件 ID 是主键；<code>recordReceipt</code> 对冲突回查收据是否存在，但不校验 payload 摘要或已存在行与消息声称的租户是否一致。更强的业务效果账本需将收据和对应副作用在同一数据库事务内更新，校验订单/租户/版本及重复消息载荷一致性；如果副作用是外部调用，还须远端幂等/结果查询。FUTURE/NOT_RUN：新的业务效果表至少需要 <code>(tenant_id, task_id, effect_type)</code> 唯一键，以及 <code>order_id</code>、<code>payload_hash</code>、完成时间；这些字段不是 003 的组成部分。不要在没有新迁移、载荷生成和事务验收的当前库里直接查询或写入它们。</p>
+<p><strong>当前</strong>收据只证明同一 event ID 的本地收据最多一行。上面的未来新表及事务方案也只能在实际写入业务效果并验收后证明对应本地效果；如果邮件或供应商 HTTP 调用已经发生，数据库事务回滚不了外部行为。FUTURE/NOT_RUN：需对端幂等键、结果查询与未知结果的人工核对，不能因本地唯一键便宣称整条链路只执行一次；<code>UNKNOWN</code> 也不是当前 003 表的状态列。</p>
+<h2 id="毒消息与业务失败是两类告警">毒消息与业务失败是两类告警</h2>
+<p>schema 版本不受支持、必需字段缺失和签名/租户验证失败可以被判为不可处理输入；供应商临时 503 或数据库连接不可用是可能恢复的故障。两类错误一律以同样间隔重投，会让永远不可能成功的旧消息占住队列。为不可恢复输入规定有限尝试与归档原因码；为可恢复错误规定退避、告警阈值和总预算，再交由实际 broker 的投递次数策略实现。规范不会替运维创建归档地址，也不会保证应用设置某个 <code>JMSXDeliveryCount</code> 后就自动死信。使用所选实现的版本化文档确认计数含义、调度延迟与配置加载位置。</p>
+<p>失败归档不是垃圾桶：需允许从 task ID 追到原始采购单、消费端版本、载荷摘要、首次/最后一次异常、尝试次数和当前人工处理人。人工重放前要检验原任务是否已有成功收据，对错误载荷制作修复版本，保留原 ID 与补偿关联；直接将归档原字节再塞回原队列，若解析错误仍在，会生成第二轮毒消息。归档的保留期与敏感内容脱敏也要由运行环境确定，不能把失败消息永久置于所有人可读的管理界面。</p>
+<h2 id="现在能复核哪些事情">现在能复核哪些事情</h2>
+<p>当前<a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/javaee-enterprise/webapp/src/main/java/blog/javaee/web/LabRequestsResource.java"><code>LabRequestsResource.order()</code></a>把业务订单与 outbox 一并入库，随后需调用受控 <a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/javaee-enterprise/webapp/src/main/java/blog/javaee/web/BrokerLabResource.java">BrokerLabResource</a> 的 HTTP 接口才会消费。部署消息配置并迁移 <code>002</code>/<code>003</code> 后，下列只读命令应得到 <code>false</code>（表已存在）和收据行数；普通 <code>server.xml</code> 不能代替消息配置：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">cd</span> examples/javaee-enterprise<br>rg -n <span class="hljs-string">&#x27;messagingEngine|jmsConnectionFactory|jmsQueue&#x27;</span> deploy/server-messaging.xml<br>PGPASSWORD=<span class="hljs-string">&quot;<span class="hljs-variable">$JAVAEE_LAB_PASSWORD</span>&quot;</span> psql -X -v ON_ERROR_STOP=1 \<br>  -h 127.0.0.1 -U javaee_lab -d javaee_lab \<br>  -Atc <span class="hljs-string">&quot;SELECT to_regclass(&#x27;public.notification_receipt&#x27;) IS NULL&quot;</span><br></code></pre></td></tr></table></figure>
+<p>若查询为 <code>true</code>，说明本机未正确执行 <code>003</code>，不能把该环境的 broker 实验标为通过；<code>false</code> 本身也不能证明有消息送达。详细场景的 SQL 收据行数、退出码与 WAR 摘要见 <code>verification/20261004T-broker-lab/</code>；MDB/死信地址仍未配置，不存在可引用的归档控制台命令。</p>
+<h2 id="验收重投与人工重放">验收重投与人工重放</h2>
+<p>在 Open Liberty 26.0.0.5 内嵌引擎下，<strong>同步消费和唯一收据去重已实测</strong>，<a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/javaee-enterprise/scenarios/30-broker-lab.sh">30 脚本</a>的原始记录位于 <code>verification/20261004T-broker-lab/</code>：event 5 在收据提交并触发 JMS 回滚后再次被消费，<code>newReceipt=false</code>，独立连接查询收据行数仍为 1；重启后另一条原始响应仍是 false。但发送侧故障先产生了两条携同一 ID 的独立消息；现有记录<strong>没有</strong> <code>JMSMessageID</code>/<code>JMSRedelivered</code>，不能确定后一次收到的是回滚那条还是另一条首次投递。WAR 构建/部署摘要一致，场景退出码 0。这不是 MDB <code>onMessage()</code>、毒消息或供应商效果的证据。复跑前需用 <code>server-messaging.xml</code> 部署，隔离库执行 001–003 迁移，准备 JDK 21、Maven wrapper、<code>jq</code> 与本地口令；仅限回环实验环境（<a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/javaee-enterprise/README.md">工程说明</a>）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs bash"><span class="hljs-built_in">cd</span> examples/javaee-enterprise<br>../hibernate-lab/mvnw -B -ntp -f <span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>/pom.xml&quot;</span> clean verify<br>JAVAEE_PORT=9085 JAVAEE_DEMO_MODE=<span class="hljs-literal">true</span> JAVAEE_LAB_USER=javaee_lab \<br>  JAVAEE_LAB_PASSWORD=<span class="hljs-string">&#x27;&lt;本地专用口令&gt;&#x27;</span> bash scenarios/30-broker-lab.sh<br></code></pre></td></tr></table></figure>
+<p>正常验收是脚本退出 0、注入回滚收到预期 HTTP 500、后续收到同一 event ID 且 <code>newReceipt=false</code>；回滚后 SQL 收据为 1。脚本最后只打印 <code>receipt_unchanged</code> 而不再断言，须人工检查该值仍为 <code>&lt;event_id&gt;|PUBLISHED|1</code>；计数变化判本次失败，不能借退出码 0 掩盖。接收十轮无同 ID 消息会使脚本非零退出。下一阶段 MDB/死信 <strong>FUTURE/NOT_RUN</strong>：新增入站激活配置、容器回调与实际失败归档后，再注入不支持的载荷版本；在冻结的重投上限内核对具体失败地址及人工重放。<code>003</code> 没有载荷版本或外部效果列，不能对现有表宣称这些验收已经通过。双实例同 event ID 并发、XA 恢复和真实外部调用也 <code>NOT_RUN</code>；步骤见 <a href="/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A831-%E6%B6%88%E8%B4%B9%E9%87%8D%E6%8A%95%E5%8E%BB%E9%87%8D%E4%B8%8E%E6%AD%BB%E4%BF%A1/31-%E6%B6%88%E8%B4%B9%E5%AE%9E%E9%AA%8C%E5%90%88%E5%90%8C.txt" title="消费实验合同" rel="noopener" target="_blank">消费实验合同</a>。</p>
+<h2 id="让同一消息的几种轨迹都可见">让同一消息的几种轨迹都可见</h2>
+<p>本次实际轨迹是 outbox event 5 <code>PUBLISHED</code>、同步 <code>receive-one</code> 写收据、按开关回滚 JMS、再次同步接收 <code>newReceipt=false</code>；一次服务器重启后的独立接收仍返回同一 event 且 <code>newReceipt=false</code>。脚本核对事件 ID 和独立数据库收据，<strong>没有</strong> MDB 回调日志、外部业务账本、毒消息或全部消息终态指标。未来若要单独证明某条消息的重投，发送侧应先隔离为唯一一条消息，保存 <code>JMSMessageID</code>、接收时间和 <code>JMSRedelivered</code>，让确认失败后再次接收与同一条物理消息相对应；若只想检验业务幂等，则应明确再发送独立消息，并检查两个不同 message ID 映射同一 event ID。两种测试都不能拿当前 HTTP 路由回包充数。</p>
+<p>不同故障不能混称“崩溃”：第 30 脚本在 JMS send commit 后抛异常、在收据 commit 后 JMS rollback，后者与实际杀进程、MDB 确认失败或数据库回滚都不是同一个实验。<code>recordReceipt</code> 的 <code>ON CONFLICT</code> 抵挡同一个 event ID 的收据重复；没有验证两条不同 ID 却指向同一供应商订单的幂等处理。FUTURE：若引入 MDB，分别测试接收前出错、收据前回滚、收据提交后实际进程退出及毒消息归档，并记录真实资源的确认与恢复边界。</p>
+<p>当前重复路径在 <code>ON CONFLICT(event_id)</code> 后仅查询行是否存在，没有核对原先记录的租户或关联订单摘要；错误地重用一个 event ID 时可能返回 <code>newReceipt=false</code>，这是教学去重不覆盖的安全边界。FUTURE：按受信订单/租户及载荷摘要校验重复消息，再让唯一约束裁决并发；对唯一键等待、超时、死锁单独做有界测试，不要把任何冲突都翻译成“已成功通知”。</p>
+<p>当前消息体又只有一个数字，不能从消息自身校验订单状态、事件类型或格式版本；接收器必须回查 outbox 才能把数字与租户关联。若查不到 event ID，<code>recordReceipt</code> 会报错而不是制造空收据；若出错前已经发生别处的外部效果，这个本地异常无法撤回它。未来引入丰富载荷时应定义哪些字段参与签名、哪些只用于显示，验证失败后保留消息和失败原因供隔离处理；现在既没有签名也没有这类失败归档。</p>
+<p>对人工重放也要规定可复核的决策：归档消息对应的订单若已撤销，不能无条件给供应商发通知；若订单已履约而收据缺失，应先查询外部供应商账本，再决定补写收据或再次调用；若只是旧 schema 格式不再可解析，应按经过审计的转换生成新版本载荷，保留来源归档 ID 和操作人。重放结束后，任务 T 在 broker、归档和消费收据三个位置只能有可解释的状态，不允许留下“归档删了、收据也没有”的隐性丢失。以上结果要在隔离 broker 的真实配置下核验，生产手工重放必须加审批和速率限制。同一订单有多种事件时，不应因为旧事件重放就把 <code>ORDERED</code> 倒退成 <code>APPROVED</code>；消费前读取当前订单版本与允许的状态转换，过期事件写入受限审计而不是覆盖新状态。顺序依赖不能靠消息抵达先后隐式保证。</p>
+<p>当前 <code>003</code> 已有收据表。下面是对脚本输出的 <code>event_id</code> 做只读终态核对的命令；请在已迁移的独立 <code>javaee_lab</code> 环境使用脚本实际 ID（<code>5</code> 只是上述一次原始记录），而非直接把样例参数当成新一次运行结果：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs bash">PGPASSWORD=<span class="hljs-string">&quot;<span class="hljs-variable">$JAVAEE_LAB_PASSWORD</span>&quot;</span> psql -X -v ON_ERROR_STOP=1 \<br>  -h 127.0.0.1 -U javaee_lab -d javaee_lab \<br>  -v event_id=5 -At &lt;&lt;<span class="hljs-string">&#x27;SQL&#x27;</span><br>SELECT COUNT(*) FROM notification_receipt<br>WHERE event_id = :event_id;<br>SQL<br></code></pre></td></tr></table></figure>
+<p>期望 <code>1</code> 仅证明该事件一次收据；<code>003</code> 不含 <code>order_id</code>、<code>payload_hash</code>，不能查询不存在的列，更不能以此推断 MDB 死信或供应商副作用。</p>
+<h2 id="两道练习">两道练习</h2>
+<p>练习一：<code>JMSRedelivered=false</code> 的消息还能命中已存在的收据吗？解：可以。发布器在标记 outbox 进度前失败，可能发送两条独立消息，传输层各自都是首次投递，却携带同一个 outbox event ID。现有收据的主键是这个稳定 ID，不是投递标志或 <code>JMSMessageID</code>。</p>
+<p>练习二：对不能解析的消息一直抛异常，等部署新版本再处理，可以吗？解：只有有限重试与可核对失败归档时才可控。冻结 broker/适配器的上限和归档策略，验证消息确实进入归档，再核对版本与业务状态后人工重放；未找到失败记录不能把消息视为已处理。</p>
+<p>如果消费顺序与审批状态有关，再投递一条旧通知不得覆盖新状态。针对任务携带的订单版本做条件校验，发现当前状态已经前进就保存“过期事件已审阅”的记录；只有业务明确要求重新通知，才生成一项新的业务任务。否则即使收据唯一键成功限制了相同消息，两个不同 ID 的旧新消息仍可能按相反顺序执行，业务上仍会出现错误结果。</p>
+<h2 id="适用范围与版本资料">适用范围与版本资料</h2>
+<p>已有内嵌 broker 的同步 HTTP 接收和本地唯一收据证据；外部邮件/供应商送达、MDB 激活与失败归档均 <code>NOT_RUN</code>。参考 <a target="_blank" rel="noopener" href="https://jakarta.ee/specifications/messaging/3.1/jakarta-messaging-spec-3.1">Jakarta Messaging 3.1：交付与重投</a>、<a target="_blank" rel="noopener" href="https://jakarta.ee/specifications/enterprise-beans/4.0/jakarta-enterprise-beans-spec-core-4.0">Jakarta Enterprise Beans 4.0：message-driven beans</a>、<a target="_blank" rel="noopener" href="https://jakarta.ee/specifications/transactions/2.0/">Jakarta Transactions 2.0</a>；实际死信策略须另附冻结实现的文档及运行记录。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A831-%E6%B6%88%E8%B4%B9%E9%87%8D%E6%8A%95%E5%8E%BB%E9%87%8D%E4%B8%8E%E6%AD%BB%E4%BF%A1/">https://magicliang.github.io/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A831-%E6%B6%88%E8%B4%B9%E9%87%8D%E6%8A%95%E5%8E%BB%E9%87%8D%E4%B8%8E%E6%AD%BB%E4%BF%A1/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Jakarta-EE/">Jakarta EE</a><a class="post-meta__tags" href="/tags/Java-EE/">Java EE</a><a class="post-meta__tags" href="/tags/Messaging/">Messaging</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-12.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A830-%E4%BB%8EOutbox%E5%88%B0%E7%9C%9F%E5%AE%9E%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/" title="Java EE 企业应用 30：从 Outbox 到真实消息队列"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-80.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">Java EE 企业应用 30：从 Outbox 到真实消息队列</div></div><div class="info-2"><div class="info-item-1">订单提交后，消息到底在哪里 采购单变为 ORDERED 时，通知供应商不能挡住数据库提交。若在同一个方法里先提交订单、再调用消息服务，进程恰好在两步之间退出，订单已经存在，通知却没有任何可恢复的记录；先发消息再提交，则消费者可能看到一张最后回滚的订单。现有工程已经让第 23 篇的订单与 outbox 在单库事务内写入，由本地 stub 增加尝试次数；本篇接上 Open Liberty 26.0.0.5 的内嵌持久消息引擎，通过受控 HTTP 实验入口发送和同步接收。第 33 篇再把一次发送提交给受管执行器。这个教学闭环并没有给真实供应商发邮件，也没有自动运行的 MDB。 从真实代码进入：采购用例的 order 方法、JDBC 存储实现与002 outbox 迁移负责订单与任务；003 收据迁移记录本地消费。消息配置定义内嵌引擎、jms/ProcurementCF 与 jms/ProcurementNotifications；BrokerLabResource以演示入口完成收发。这些是本地源码入口；外部 master blob 是否已同步到当前工作树版本，仍需发布前核对。 三个不同...</div></div></div></a><a class="pagination-related" href="/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A800-%E4%BB%8E%E7%A9%BA%E7%9B%AE%E5%BD%95%E5%88%B0%E6%9C%80%E5%B0%8FWAR/" title="Java EE 企业应用 00：从空目录到最小 WAR，健康响应证明了什么"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-37.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">Java EE 企业应用 00：从空目录到最小 WAR，健康响应证明了什么</div></div><div class="info-2"><div class="info-item-1">健康接口返回了 ready，采购系统就能交付了吗 一个开发者拿到采购审批应用，第一件事通常是运行服务。如果浏览器显示 ready，容易把它理解成“系统已经启动”。可是采购申请能否提交、订单是否只生成一次、其他租户能否读取申请，都没有经过这个接口。这里需要先把“从空目录运行”拆成可检验的阶段：命令行能编译源码；服务器能加载单个 WAR；HTTP 能抵达健康资源；业务事务能提交；权限和业务结果能被核对。第 00 章只走到前三项，不用健康响应冒充后面三项的证明。 教学对象是单 WAR 的企业采购系统。实际采购还需要申请明细、审批记录、订单、通知和审计；本章只检验健康接口。当前工程另有未认证的 /api/db-check 诊断入口，且在 JAVAEE_DEMO_MODE=true 时才开放未认证的 /api/lab/requests 教学入口；二者仅供监听回环地址的隔离实验使用，不能作为生产服务对外暴露。先修自测也因此很具体：能解释 HTTP 200 与响应体的区别，能从 Maven 的失败退出码定位编译或依赖问题，知道 Java 的 try 资源关闭和 SQL 提交并不是一回事。不会 ...</div></div></div></a><a class="pagination-related" href="/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A835-%E7%9C%9F%E5%AE%9E%E6%95%B0%E6%8D%AE%E5%BA%93%E4%B8%8E%E5%AE%B9%E5%99%A8%E6%B5%8B%E8%AF%95/" title="Java EE 企业应用 35：哪些测试必须运行在真实数据库和容器里"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-122.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">Java EE 企业应用 35：哪些测试必须运行在真实数据库和容器里</div></div><div class="info-2"><div class="info-item-1">一条采购链路，需要几种不同的证据 采购申请包含两支纸和三支笔，服务端核价后金额为 13.75；提交、审批、建单，重复建单仍返回原订单。这个业务结果可以在纯 Java 对象中推演，却不能用模拟仓储证明数据库真的拒绝重复订单，也不能用单独的 JDBC 测试证明 WAR 在容器中拿到了预期数据源。测试分层不是为了多跑几套测试，而是为了在失败时知道哪个边界已经被覆盖。 入口是 examples/javaee-enterprise/README.md。当前累计工程有 domain/ 的规则测试、PostgreSQL 16.15 上的显式 SQL、Open Liberty 26.0.0.5 的受管 DataSource 和隔离教学接口；它不是完整认证、消息或发布工程。JDK 21、Jakarta EE 11 Platform、pgJDBC 42.7.7 与 Maven Wrapper 3.9.9 是本地基线。先核对服务实际连接的 javaee_lab，不要复用 JPA 的 jpa_lab。容器 ZIP 的本机运行结果不是兼容性认证声明。 把断言放在负责该行为的边界 ProcurementRu...</div></div></div></a><a class="pagination-related" href="/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A811-%E6%9C%8D%E5%8A%A1%E7%AB%AF%E5%AE%A1%E6%89%B9%E9%A1%B5%E9%9D%A2%E6%80%8E%E6%A0%B7%E5%A4%84%E7%90%86%E6%8F%90%E4%BA%A4%E4%B8%8E%E6%B8%B2%E6%9F%93/" title="Java EE 企业应用 11：服务端审批页面怎样处理提交与渲染"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-9.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">Java EE 企业应用 11：服务端审批页面怎样处理提交与渲染</div></div><div class="info-2"><div class="info-item-1">页面显示“Approved”，申请就已经批准了吗 采购审批页展示单据 ID 与租户，操作员按下批准按钮。页面可以呈现成功文字，也可以在校验失败时展示消息；但页面字符串不是数据库提交记录。更危险的是，浏览器可修改隐藏字段、重放视图状态，甚至伪造租户值。在第 24–26 篇落实身份与对象授权之前，审批页只能在本机隔离实验中调用已有业务用例，不能对公网开放。当前工程确有最小 approval.xhtml 与 LabApprovalPage.java，但没有完整的页面提交脚本或数据库终态证据；不能把文件存在写成 Faces 生命周期实验 PASS。 本章使用 Jakarta Faces 4.1、Servlet 6.1、Jakarta EE 11 与既有 PostgreSQL 16 隔离库。REST 创建与提交单据的顺序脚本另有 PASS 记录；页面的视图状态、验证失败、重复提交、输出编码尚未受控执行。Faces 只是另一种 Web 适配器：领域状态机与价格计算仍由 ProcurementUseCases 和 JDBC 适配器管理，不应该复制一套“页面上的审批规则”。与 JPA 09：采购...</div></div></div></a><a class="pagination-related" href="/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A804-CDI%E5%A6%82%E4%BD%95%E5%88%9B%E5%BB%BA%E9%80%89%E6%8B%A9%E4%B8%8E%E9%94%80%E6%AF%81%E5%AF%B9%E8%B1%A1/" title="Java EE 企业应用 04：CDI 如何创建、选择与销毁对象"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-2.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">Java EE 企业应用 04：CDI 如何创建、选择与销毁对象</div></div><div class="info-2"><div class="info-item-1">一个请求要用哪一份对象 采购系统的用例服务要取得价格目录与存储端口。创建一个 ProcurementUseCases 并传入两个实现，看起来已经解决装配问题；但在 Web 应用中，还要回答目录由谁选、服务活多久、每个请求是否拿到同一份可变数据，以及结束时谁关闭它持有的资源。仅从构造函数的参数类型，回答不了这些问题。尤其不能把“类上有注解”当成“容器已经创建过对象”的证据。 累计工程的真实入口位于 GitLab 仓库路径 examples/javaee-enterprise/application/src/main/java/blog/javaee/application/ProcurementUseCases.java。目前该类使用 @ApplicationScoped、@Inject 构造函数与 @Transactional；FixedPriceCatalog 是唯一的 PriceCatalog 实现。另一个真实装配点是 examples/javaee-enterprise/adapters-jdbc/src/main/java/blog/javaee/jdbc/JdbcReq...</div></div></div></a><a class="pagination-related" href="/2026/10/04/JavaEE%E4%BC%81%E4%B8%9A%E5%BA%94%E7%94%A807-Filter%E4%B8%8EListener%E6%80%8E%E6%A0%B7%E5%8F%82%E4%B8%8E%E8%AF%B7%E6%B1%82%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/" title="Java EE 企业应用 07：Filter 与 Listener 怎样参与请求生命周期"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-137.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">Java EE 企业应用 07：Filter 与 Listener 怎样参与请求生命周期</div></div><div class="info-2"><div class="info-item-1">请求 ID 写上去了，为什么还可能丢失清理 采购申请查询进入 Web 应用之前，希望给每次调用分配一个请求 ID；无论后续成功、业务异常还是内部派发，都不应把本次的跟踪数据带进下一个请求。常见实现是在过滤器中设置 ID，然后调用 chain.doFilter()，最后移除。这里有两个容易混同的“之后”：调用链返回过滤器的时刻，与响应已写完且所有异步任务都结束的时刻。同步请求通常可以以 finally 清理本线程工作；异步请求的真正完成时点则需要额外机制。 现有工程已有 RequestIdFilter.java 和 StartupListener.java。前者覆盖 /servlet/*、/api/* 的 REQUEST、FORWARD、ASYNC 派发，后者在上下文初始化时保存启动时刻并在销毁时移除；源码存在不等于异常/异步派发已实际演练，也不等于这个请求 ID 可在服务器重启后恢复。 过滤的是一次派发，不一定是一次客户端请求 Jakarta Servlet 6.1 §6 描述过滤器生命周期和过滤链：容器在处理映射匹配的派发时调用过滤器，过滤器可以先检查请求、包裹请求/响应，再决...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%84%E7%90%86%E8%BF%87-%E4%B8%8D%E7%AD%89%E4%BA%8E%E5%B7%B2%E7%BB%8F%E7%A1%AE%E8%AE%A4"><span class="toc-number">1.</span> <span class="toc-text">处理过，不等于已经确认</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%8A%8A%E9%87%8D%E5%A4%8D%E6%8A%95%E9%80%92%E8%BD%AC%E6%88%90%E4%B8%80%E6%AC%A1%E4%B8%9A%E5%8A%A1%E7%BB%93%E6%9E%9C"><span class="toc-number">2.</span> <span class="toc-text">把重复投递转成一次业务结果</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%A1%AE%E8%AE%A4%E4%B8%8E%E6%95%B0%E6%8D%AE%E5%BA%93%E6%8F%90%E4%BA%A4%E4%B8%8D%E8%83%BD%E9%9D%A0%E5%8F%A3%E5%A4%B4%E7%BA%A6%E5%AE%9A"><span class="toc-number">3.</span> <span class="toc-text">确认与数据库提交不能靠口头约定</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%AF%92%E6%B6%88%E6%81%AF%E4%B8%8E%E4%B8%9A%E5%8A%A1%E5%A4%B1%E8%B4%A5%E6%98%AF%E4%B8%A4%E7%B1%BB%E5%91%8A%E8%AD%A6"><span class="toc-number">4.</span> <span class="toc-text">毒消息与业务失败是两类告警</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%8E%B0%E5%9C%A8%E8%83%BD%E5%A4%8D%E6%A0%B8%E5%93%AA%E4%BA%9B%E4%BA%8B%E6%83%85"><span class="toc-number">5.</span> <span class="toc-text">现在能复核哪些事情</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%AA%8C%E6%94%B6%E9%87%8D%E6%8A%95%E4%B8%8E%E4%BA%BA%E5%B7%A5%E9%87%8D%E6%94%BE"><span class="toc-number">6.</span> <span class="toc-text">验收重投与人工重放</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%AE%A9%E5%90%8C%E4%B8%80%E6%B6%88%E6%81%AF%E7%9A%84%E5%87%A0%E7%A7%8D%E8%BD%A8%E8%BF%B9%E9%83%BD%E5%8F%AF%E8%A7%81"><span class="toc-number">7.</span> <span class="toc-text">让同一消息的几种轨迹都可见</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%A4%E9%81%93%E7%BB%83%E4%B9%A0"><span class="toc-number">8.</span> <span class="toc-text">两道练习</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%80%82%E7%94%A8%E8%8C%83%E5%9B%B4%E4%B8%8E%E7%89%88%E6%9C%AC%E8%B5%84%E6%96%99"><span class="toc-number">9.</span> <span class="toc-text">适用范围与版本资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

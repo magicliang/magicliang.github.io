@@ -1,0 +1,705 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>JPA 持久化 07：本地事务、JTA 与冲突 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="审批成功，订单却可能失败 采购申请从 SUBMITTED 变成 APPROVED，随后才能创建订单；订单表对 request_id 有唯一约束。假如审批状态已经提交，创建订单时却发现另一个请求抢先插入，应用不能再声称“审批和建单是一次原子操作”。反过来，把所有步骤放入一个事务也不能保证两个审批员不会同时读到旧状态。事务边界、并发控制和数据库约束各解决一件事：前者决定哪些写入一起提交，版本或锁控制相">
+<meta property="og:type" content="article">
+<meta property="og:title" content="JPA 持久化 07：本地事务、JTA 与冲突">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9607-%E6%9C%AC%E5%9C%B0%E4%BA%8B%E5%8A%A1JTA%E4%B8%8E%E5%86%B2%E7%AA%81/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="审批成功，订单却可能失败 采购申请从 SUBMITTED 变成 APPROVED，随后才能创建订单；订单表对 request_id 有唯一约束。假如审批状态已经提交，创建订单时却发现另一个请求抢先插入，应用不能再声称“审批和建单是一次原子操作”。反过来，把所有步骤放入一个事务也不能保证两个审批员不会同时读到旧状态。事务边界、并发控制和数据库约束各解决一件事：前者决定哪些写入一起提交，版本或锁控制相">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-157.jpg">
+<meta property="article:published_time" content="2026-10-04T07:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-05T08:31:39.811Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="JPA">
+<meta property="article:tag" content="Jakarta Persistence">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="PostgreSQL">
+<meta property="article:tag" content="事务">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-157.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "JPA 持久化 07：本地事务、JTA 与冲突",
+  "url": "https://magicliang.github.io/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9607-%E6%9C%AC%E5%9C%B0%E4%BA%8B%E5%8A%A1JTA%E4%B8%8E%E5%86%B2%E7%AA%81/",
+  "image": "https://magicliang.github.io/img/wall-paper-157.jpg",
+  "datePublished": "2026-10-04T07:00:00.000Z",
+  "dateModified": "2026-10-05T08:31:39.811Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9607-%E6%9C%AC%E5%9C%B0%E4%BA%8B%E5%8A%A1JTA%E4%B8%8E%E5%86%B2%E7%AA%81/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: 'JPA 持久化 07：本地事务、JTA 与冲突',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1644</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1695</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">31</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-157.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">JPA 持久化 07：本地事务、JTA 与冲突</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">JPA 持久化 07：本地事务、JTA 与冲突</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-04T07:00:00.000Z" title="Created 2026-10-04 15:00:00">2026-10-04</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-05T08:31:39.811Z" title="Updated 2026-10-05 16:31:39">2026-10-05</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%8A%80%E6%9C%AF/">技术</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>14mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-05 16:31:39&quot;}" hidden></div><h2 id="审批成功-订单却可能失败">审批成功，订单却可能失败</h2>
+<p>采购申请从 SUBMITTED 变成 APPROVED，随后才能创建订单；订单表对 <code>request_id</code> 有唯一约束。假如审批状态已经提交，创建订单时却发现另一个请求抢先插入，应用不能再声称“审批和建单是一次原子操作”。反过来，把所有步骤放入一个事务也不能保证两个审批员不会同时读到旧状态。事务边界、并发控制和数据库约束各解决一件事：前者决定哪些写入一起提交，版本或锁控制相互覆盖，唯一键守住“每申请至多一单”。三者都不能代替租户鉴权和重复请求的业务语义。</p>
+<p>本系列以 Jakarta Persistence 3.2、Java 21、Hibernate ORM 7.1.36.Final 和 PostgreSQL 16 为讨论环境。已有累计工程 <code>examples/jpa/</code> 采用 <code>RESOURCE_LOCAL</code>，不是 JTA 容器。归档的 PostgreSQL 16.15 回归有六项测试通过，其中两项直接覆盖本章的 flush 回滚和乐观锁交错；悲观锁双会话和真实 JTA 仍未运行。前置知识是实体的托管、flush、回滚及申请/订单关联；没有读过前六篇，仍可凭本章给出的状态、路径和判据独立核对。</p>
+<h3 id="提交的单位不是一次方法调用">提交的单位不是一次方法调用</h3>
+<p>规范 §7.5.1–7.5.3 区分 JTA entity manager 与 resource-local entity manager。前者参与外部开始和结束的 JTA 事务；后者由应用通过 <code>EntityManager.getTransaction()</code> 返回的 <code>EntityTransaction</code> 控制资源事务。<code>persistence.xml</code> 中的 <code>&lt;persistence-unit name=&quot;procurement&quot; transaction-type=&quot;RESOURCE_LOCAL&quot;&gt;</code> 和测试里的一次 <code>begin()</code>、<code>commit()</code>，只覆盖数据库资源上的本地事务。把 <code>getTransaction()</code> 用到容器管理的 JTA entity manager 上既不是迁移方案，也不能证明消息队列和数据库共同提交；JTA 的事务管理器、数据源、上下文传播必须另有运行环境和测试。</p>
+<p>一个事务内托管实体的 Java 状态已变化，不等于数据库最终有这条变化。规范 §3.3.4 的 flush 是上下文与数据库的同步；成功执行 SQL 之后仍可回滚。规范 §3.4.3 还提醒：回滚后原托管对象可能带着不能安全复用的主键、版本等状态。故失败处理应回滚尚活动的事务、关闭该 <code>EntityManager</code>，再用新上下文检查数据库终态；不能靠观察内存中的 <code>request.status()</code> 宣告回滚成功。规范 §7.5.3 要求某些失败标记事务为仅回滚；<code>commit()</code> 失败时 Provider 必须回滚。数据库断连或提交结果不明等运维故障不能简单归类为“安全可重试”：先核对持久化终态与幂等键。</p>
+<p><a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/jpa/src/test/java/blog/jpa/ProcurementJpaTest.java"><code>ProcurementJpaTest.java</code></a> 的 <code>rollbackAfterFlushDoesNotPersistTransition()</code> 正好给出最小判据：先提交 DRAFT 申请；新事务里调用 <code>submit()</code> 并 <code>flush()</code>，随后 <code>rollback()</code>；再由第三个 <code>EntityManager</code> 读取，要求仍是 DRAFT。这检验的是本地回滚后的持久状态，<strong>不</strong>检验 JTA。<code>uniqueOrderAndTenantAndRetry()</code> 则在审批完成后，使用服务端租户参数建单并再次调用，最后查询订单数量为一；它没有构造真正并发的双重插单，也不能把“租户字段存在”当作所有读取路径均有鉴权。工程中的 <a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/jpa/src/main/java/blog/jpa/ProcurementService.java"><code>ProcurementService.java</code></a> 和数据库唯一键分别承担业务检查与最终唯一性防线。</p>
+<p>本地事务只有在 <code>begin()</code> 到 <code>commit()</code> 或 <code>rollback()</code> 的区间才提供原子性。测试里先将 DRAFT 申请提交，再启动第二笔事务更新为 SUBMITTED：因此第二笔失败时数据库保留 DRAFT，而不是将第一笔插入也撤销。若业务要求“审批并立即建单一起成功或一起失败”，不能沿用这个两次提交的示例作为服务实现。应先明确审批是否允许独立提交，再把需要共同成败的状态变更、订单写入放进同一事务；异常发生后检查两张表，要求状态和订单数量构成合法组合。单独检查 <code>commit()</code> 是否抛错仍不足够：如果服务捕获了订单唯一键冲突却继续向外返回成功，客户端得到的语义与数据库终态仍可能不一致。</p>
+<p>新建订单通常需要先读取申请、检查租户与 APPROVED 状态，再插入订单并把申请置为 ORDERED。检查与写入必须受同一个事务约束；否则读到的状态可在两次独立提交之间失效。仓库中的服务先找申请再检查状态，并以 <code>request_id</code> 唯一键兜底；它没有分布式幂等键，也没有为所有出站副作用定义补偿。重试时如果库中已经有订单，应返回可确认属于同一申请和租户的订单，而不是重新创建第二条；如果第一次提交的结果未知，要先从数据库确认订单是否存在。这里“回滚”只覆盖参与当前数据库事务的写入，已经发出的 HTTP 请求或消息不会被 <code>EntityTransaction.rollback()</code> 收回。</p>
+<h3 id="乐观锁把冲突移到写入时">乐观锁把冲突移到写入时</h3>
+<p><code>ProcurementRequest</code> 的 <code>@Version private long version</code> 是并发争用的依据。规范 §3.5.1–3.5.2 要求 Provider 在写入受版本管理实体时核对版本，不一致应报 <code>OptimisticLockException</code>；版本检查可能迟至 flush 或 commit（§3.5.5）。这不等于“每次读取立即加锁”，也不等于“所有业务不变量都受版本保护”。<code>purchase_order.request_id UNIQUE</code> 约束的跨行竞争，以及是否根据租户条件读取目标申请，仍须分别检查。映射的反向集合和实体以外的原生 SQL 更新也不能笼统算进这个版本检查范围。</p>
+<p>同一个 SUBMITTED 申请被两个事务读到：A 执行 <code>approve()</code>，B 执行 <code>reject()</code>。A 先提交后，B 带旧版本写回，理想终态是 APPROVED 且 B 失败；如果 B 的失败被吞掉或继续复用失败上下文，后续操作反而会制造新故障。已有 <code>optimisticConflictWithControlledInterleaving()</code> 以两个 <code>EntityManager</code> 先后读取、A 先提交、B 再提交，随后用第三个上下文断言 APPROVED。它以 <code>assertThrows(RuntimeException.class, ...)</code> 接收异常，<strong>没有</strong>断言精确的 <code>OptimisticLockException</code> 异常链；作为测试设计，后续运行还应记录包装异常及数据库版本列，而不是据此推断固定的 PostgreSQL SQL 或冲突出现的唯一时机。测试没有线程屏障，也没有保证可推广到其他 Provider 的 SQL 次序。</p>
+<p>一次冲突意味着当前决策所依赖的前提已失效。正确的重试单位是整个业务事务：新建 <code>EntityManager</code>，重新读取申请及租户、金额、状态，再决定是拒绝、保持已有 APPROVED，还是走新的审批请求；不是拿旧对象再 <code>merge()</code> 一次。规范 §3.5.5 允许在新事务中刷新或重新加载后重试，并规定 <code>OptimisticLockException</code> 使事务标记为回滚。若审批之后还发送通知，通知不能因事务回滚而提前对外宣称成功；出站消息与数据库的原子性并非 JPA 乐观锁所能提供。</p>
+<p>还要分清锁冲突与写偏差的触发条件。<code>@Version</code> 针对同一申请行的变更；若 A 审批申请 1、B 审批申请 2，两个版本各自更新成功，并不能证明“同一租户审批总额不得超过预算”。若总额要按租户汇总，两个事务各自读取相同的旧汇总、写入不同的行，就可能都认为仍有额度。把申请版本列的类型从 <code>long</code> 换成其他支持的类型，也不会凭空让这两行互相冲突；须设计能参与冲突检测的共同资源、数据库约束，或在明确隔离级别下执行整笔事务并处理序列化失败。判据不是“两次 <code>approve()</code> 都没有抛异常”，而是两次请求结束后，跨行总金额仍满足业务上限。</p>
+<h3 id="悲观锁阻塞谁-取决于锁住了什么">悲观锁阻塞谁，取决于锁住了什么</h3>
+<p>规范 §3.5.3–3.5.4 的 <code>PESSIMISTIC_WRITE</code> 在获取实体锁后阻止其他事务修改或删除该实体，底层必须锁对应的数据库行；关联目标实体、集合中的每条明细并不会因此自动都锁住。锁模式所针对的是一个已定位的申请，而“某租户是否还没有相同订单”是谓词/跨行条件。即便锁住申请，别的写入通道仍可能试图插订单；最终必须由 <code>UNIQUE(request_id)</code> 拒绝重复。若所有建单路径都先锁同一申请并在同事务完成决策，锁可以协调这些遵守协议的调用者，但不是绕过数据库约束的理由。</p>
+<p>在 PostgreSQL 16 的具体实现中，可以用两个<strong>独立连接</strong>演示行锁：连接 A 对某行执行 <code>SELECT ... FOR UPDATE</code> 后保持事务未提交；连接 B 设置短 <code>lock_timeout</code> 再请求同一行的 <code>FOR UPDATE</code>，预期 B 超时或等待 A 释放，随后在失败事务中显式 <code>ROLLBACK</code>。这是 PostgreSQL 行锁与超时实验，不是“每个 Provider 必须生成 <code>FOR UPDATE</code>”的承诺。规范的 <code>jakarta.persistence.lock.timeout</code> 是提示；实现/数据库可能不支持所要求的具体超时语义。要验证 JPA 的悲观锁，还需在真实测试中对两个不同 <code>EntityManager</code> 调用带 <code>LockModeType.PESSIMISTIC_WRITE</code> 的 <code>find</code>/<code>lock</code>，用栅栏控制顺序并记录实际连接、异常和最终行。<code>PessimisticLockException</code> 与 <code>LockTimeoutException</code> 的回滚范围不同（§3.5.3）；不能靠一个 catch 分支将两者都判为事务已可继续提交。PostgreSQL 语句报错后所在事务通常必须回滚，不能把 JPA API 的“仅语句回滚”解释为 PostgreSQL 此时一定还能继续执行 SQL。</p>
+<p>双会话实验必须控制“谁先获得锁”，否则所谓悲观锁失败很可能只是脚本次序差异。先插入并提交一条专用申请，记下真实 <code>id</code>；在连接 A <code>BEGIN</code> 后，对该 <code>id</code> 发 <code>SELECT ... FOR UPDATE</code>，不要提交；在独立连接 B 的事务中设置本地 <code>lock_timeout</code>，再对同一 <code>id</code> 查询。如果 B 在 A 未结束前立即成功，应先确认两边是否误用同一连接、是否用错行或 A 已经提交；如果 B 因超时报错，先将 B 回滚，再让 A 提交，最后新连接查询申请状态。这个 SQL 实验只能证明所选 PostgreSQL 会话的行锁竞争。切换到 JPA <code>PESSIMISTIC_WRITE</code> 时，必须另记取得锁的时点、SQL 和异常链；短超时未生效不能据此断言整个 JPA 悲观锁机制不存在，因为提示可能由实现或驱动以不同方式处理。</p>
+<p>事务失败还要区分“请求未得到锁”和“拿到锁后写入违反约束”。前者可能在尝试锁行时就失败；后者可能在 <code>flush()</code> 或提交阶段才抛错。两者的异常、事务是否还能继续以及客户端是否可重试，不能用同一个“乐观/悲观失败”枚举掩盖。PostgreSQL 普通事务里一条语句失败后会进入 aborted 状态，下一条查询通常只得到事务已中止的报错，须回滚并新开事务；这是数据库协议的观察要求，不应误写为所有数据库的 JPA 通则。为了排除连接池和 Provider 的影响，应分别保存两连接的会话标识、SQL 执行顺序、退出码及最终行版本；这些材料尚未采集，因此悲观锁实验仍为 NOT_RUN。</p>
+<h3 id="隔离级别属于数据库的可见性规则">隔离级别属于数据库的可见性规则</h3>
+<p>JPA 的 <code>@Version</code> 检测“这行自读入后是否被别人改过”，不规定 PostgreSQL 的隔离级别。PostgreSQL 16 默认 Read Committed：一条语句使用开始时的快照，同一事务的下一条 SELECT 可能看到别人刚提交的结果；更新相同行可能等待并重新判断条件。Repeatable Read 的快照更稳定，写入冲突可能以序列化失败结束；Serializable 还会检测序列化异常并要求应用准备重试<strong>整个事务</strong>。这些都是 PostgreSQL 16 的行为，非 Persistence 3.2 的跨数据库承诺。即使两名审批员各自修改不同申请的版本行，跨申请额度限制也不一定由单行 <code>@Version</code> 阻止；需要适当的约束、隔离与完整事务重试策略。对订单唯一性，数据库唯一键比依赖某一种隔离模式更直接。</p>
+<p>JTA 改变的是事务控制与传播边界，不自动把 PostgreSQL 升到 Serializable，也不替实体补版本列。在真实 Jakarta EE 容器，须配置 JTA persistence unit 与容器提供的数据源，选择容器管理或显式 JTA 边界；在同一事务里读申请、执行审批与订单写入，检查成功提交和异常回滚的数据库终态。若还声称跨资源原子性，需要列出参加 JTA 的实际资源并验证失败恢复。仅把 XML 中 <code>RESOURCE_LOCAL</code> 改成 <code>JTA</code>，在 Java SE 运行现有 <code>DatabaseSupport.factory()</code>，不构成 JTA 实验；现有工程也没有这样的配置和容器入口。<strong>JTA：NOT_RUN。</strong></p>
+<p>验证真实容器中的 JTA，至少要检查三个边界。容器发起事务后，JTA entity manager 必须参与同一事务；异常要使申请和订单一起回滚。新请求应在新事务中重读数据库，不能复用失败上下文。若测试跨资源提交，还须确认参与资源受同一事务管理器控制，模拟其中一个参与者失败并记录恢复行为。只把单库本地测试迁到容器里、或者只观察异常类型，都不足以证明跨资源原子性。该系列当前没有这些容器、数据源、恢复日志和可运行命令，因此不提供假定可复制的 JTA 成功输出。</p>
+<h3 id="代码入口与待运行判据">代码入口与待运行判据</h3>
+<p>在 <code>examples/jpa/</code> 创建专用 <code>jpa_lab</code> 数据库和账号，审阅 <a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/jpa/db/migrations/01-init.sql"><code>01-init.sql</code></a> 后参照 <a target="_blank" rel="noopener" href="https://gitlab.alibaba-inc.com/liangchuan.lc/my-blogs/-/blob/master/examples/jpa/README.md"><code>examples/jpa/README.md</code></a> 设置 <code>JPA_LAB_PSQL_URL</code>、<code>JPA_LAB_JDBC_URL</code>、<code>JPA_LAB_USER</code>、<code>JPA_LAB_PASSWORD</code>。不要指向其他系列或共享库。以下命令在该目录执行，使用已存在的 <code>../hibernate-lab/mvnw</code> 与上述测试文件；不要求读者创建本章尚未落盘的新测试：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs bash">bash ./migrate-lab.sh<br>../hibernate-lab/mvnw -B -ntp -f <span class="hljs-string">&quot;<span class="hljs-variable">$PWD</span>/pom.xml&quot;</span> -Dtest=ProcurementJpaTest#rollbackAfterFlushDoesNotPersistTransition+optimisticConflictWithControlledInterleaving <span class="hljs-built_in">test</span><br></code></pre></td></tr></table></figure>
+<p>归档回归见 <code>writing-plans/jpa/verification/20261004T053805Z-pg16-resource-local/RUN.md</code>：Java 21.0.12.1、Hibernate 7.1.36.Final、PostgreSQL 16.15、pgJDBC 42.7.7、Maven Wrapper 3.9.9，<code>clean test</code> 退出码 0，六项测试通过、零失败/错误/跳过；逐文件哈希、原始输出与退出码在同目录。覆盖本章的两项断言分别是回滚后 DRAFT、冲突后 APPROVED，旧版本提交由宽泛的 <code>RuntimeException</code> 捕获。上方的<strong>筛选命令本身未单独执行</strong>，不能将 6/6 改写为单独筛选运行记录；迁移 stdout 没有归档，不记为独立迁移验收。悲观锁双连接和 JTA 各为 <strong>NOT_RUN</strong>；操作步骤与隔离注意见 <a href="/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9607-%E6%9C%AC%E5%9C%B0%E4%BA%8B%E5%8A%A1JTA%E4%B8%8E%E5%86%B2%E7%AA%81/README.txt" title="实验说明" rel="noopener" target="_blank">实验说明</a>。</p>
+<h3 id="练习与解答">练习与解答</h3>
+<p><strong>练习一。</strong> 事务 A 和 B 都读到 SUBMITTED/version=4。A 审批提交后，B 将申请改为 REJECTED，B 的 <code>commit()</code> 失败。能否在 B 原有 <code>EntityManager</code> 上继续调用 <code>markOrdered()</code>，或只对 B 的 <code>commit()</code> 再试一次？</p>
+<p>不能。版本冲突使 B 的决策和事务无效；回滚尚活动的事务并关闭上下文，从新上下文重新读取数据库中的 APPROVED 与最新版本，再依据业务规则决定请求是否仍有效。不能靠旧 Java 实体状态推断数据库终态；若出现未知提交结果还须借持久化标识检查，避免重复订单。</p>
+<p><strong>练习二。</strong> 在 Read Committed 下，两个事务各对不同申请审批，企业规则是“同一租户同时只能有一个待下单申请”。两行都有 <code>@Version</code>，是否足够？<code>purchase_order.request_id UNIQUE</code> 能否代替该规则？</p>
+<p>都不足够。不同申请的行版本并不冲突；<code>UNIQUE(request_id)</code> 只约束同一申请的订单，不约束同一租户跨申请的状态组合。须把业务条件落到可检查的数据库约束或可串行化的事务协议，并对相关序列化失败重试整个事务；具体选型还要按 PostgreSQL 隔离行为和写入路径检验，不应声称 JPA 自行实现了跨行互斥。</p>
+<h3 id="限制与参考">限制与参考</h3>
+<p>本章只讨论同一数据库中的本地事务和可设计的并发实验；6/6 本地回归不能证明 JTA 容器、XA、双连接锁等待、SQL 形状与耗时，也没有提供跨租户鉴权的完整接口。已有冲突测试的异常断言比规范具体异常类型宽，不能替代包装链分析。未执行路径的预期不能当作观测结果。</p>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://jakarta.ee/specifications/persistence/3.2/jakarta-persistence-spec-3.2">Jakarta Persistence 3.2 §3.3.4、§3.4.3、§3.5.1–3.5.5、§7.5</a></li>
+<li><a target="_blank" rel="noopener" href="https://jakarta.ee/specifications/persistence/3.2/apidocs/jakarta.persistence/jakarta/persistence/EntityManager.html">Jakarta Persistence 3.2 API：EntityManager</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/transaction-iso.html">PostgreSQL 16：Transaction Isolation</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/explicit-locking.html">PostgreSQL 16：Explicit Locking</a></li>
+<li><a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/runtime-config-client.html">PostgreSQL 16：Runtime Configuration / lock_timeout</a></li>
+<li><a target="_blank" rel="noopener" href="https://docs.jboss.org/hibernate/orm/7.1/userguide/html_single/Hibernate_User_Guide.html">Hibernate ORM 7.1 User Guide</a>（仅用于本例实现行为，不作规范替代）</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9607-%E6%9C%AC%E5%9C%B0%E4%BA%8B%E5%8A%A1JTA%E4%B8%8E%E5%86%B2%E7%AA%81/">https://magicliang.github.io/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9607-%E6%9C%AC%E5%9C%B0%E4%BA%8B%E5%8A%A1JTA%E4%B8%8E%E5%86%B2%E7%AA%81/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/JPA/">JPA</a><a class="post-meta__tags" href="/tags/%E4%BA%8B%E5%8A%A1/">事务</a><a class="post-meta__tags" href="/tags/PostgreSQL/">PostgreSQL</a><a class="post-meta__tags" href="/tags/Jakarta-Persistence/">Jakarta Persistence</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-157.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9602-%E8%84%8F%E6%A3%80%E6%9F%A5flush%E4%B8%8E%E5%9B%9E%E6%BB%9A/" title="JPA 持久化 02：脏检查、flush 与回滚的三道边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-21.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">JPA 持久化 02：脏检查、flush 与回滚的三道边界</div></div><div class="info-2"><div class="info-item-1">发出了 UPDATE，申请为什么还是 DRAFT 采购申请在事务内从 DRAFT 改为 SUBMITTED，执行 flush() 后，数据库可能已经收到 UPDATE；接着审批前置检查失败，事务回滚，另一个上下文重读仍是 DRAFT。若把“SQL 已经执行”“同一上下文读到 SUBMITTED”和“数据库已提交”合成一个事实，就会误报审批进度。另一个方向也成立：在默认 AUTO flush mode 下，同一事务内的 JPQL 查询不能忽略会影响结果的托管状态修改；但由此推断“查询之前必然执行一条固定 SQL”仍是不成立的。 本章沿用真正的 examples/jpa/ 工程，使用 jpa_lab 独立 PostgreSQL 16 库，Java SE RESOURCE_LOCAL，而非另设教学数据库。00 讲启动，01 讲身份；这里固定同一申请的一次修改来拆开内存、数据库事务与提交后的行。实体的 submit() 在有明细且处于 DRAFT 时才合法，ORDERED 只能经后续审批流程；单行状态实验不等于完整采购审批服务。 规范要求结果，不规定快照算法 对 EntityManage...</div></div></div></a><a class="pagination-related" href="/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9608-Schema%E8%BF%81%E7%A7%BB%E4%B8%8E%E9%9B%86%E6%88%90%E6%B5%8B%E8%AF%95/" title="JPA 持久化 08：Schema 迁移与集成测试的证据边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-84.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">JPA 持久化 08：Schema 迁移与集成测试的证据边界</div></div><div class="info-2"><div class="info-item-1">新实体能启动，旧订单未必安全 假设申请实体新增 @Version。新库按映射生成表，插入、查询全部通过；生产旧库却没有 version 列。另一个风险更隐蔽：表和列都在，但 purchase_order.request_id 上没有唯一约束，双重建单在并发时才暴露。两种故障分别属于映射与库结构不匹配、业务约束缺失。把“Provider 启动成功”当成“迁移完成”，会同时漏掉数据搬迁、约束和上线顺序。采购审批里的金额、租户与订单唯一性，不能只交给 Java 注解；它们要在现存行、DDL 和事务测试之间取得一致。 本章以 Jakarta Persistence 3.2、Hibernate ORM 7.1.36.Final、PostgreSQL 16、Java 21 的 examples/jpa/ 为入口。实体映射与测试源码已存在；仅有 db/migrations/01-init.sql 一份初始化脚本，没有旧库升级链，也没有“08 专属迁移测试套件”。PostgreSQL 16.15 上的本地事务累计测试已有六项 PASS；建库初始化的原始 stdout 没有归档，旧库升级、坏结构与...</div></div></div></a><a class="pagination-related" href="/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9600-%E8%A7%84%E8%8C%83Provider%E4%B8%8E%E5%90%AF%E5%8A%A8/" title="JPA 持久化 00：规范、Provider 与启动的边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-101.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">JPA 持久化 00：规范、Provider 与启动的边界</div></div><div class="info-2"><div class="info-item-1">persist 能编译，却不一定能写入一行 采购申请调用 entityManager.persist(request)，编译成功只能说明 Java 类型与注解可用；EntityManagerFactory 创建成功，也不等于 PostgreSQL 里已经有申请行。依赖解析、Provider 发现、获取 JDBC 连接、映射校验、事务提交分别可能失败。判断一套 JPA 程序是否启动，首先要说明“启动”指哪一层，再用该层的证据验证。这里用采购审批累计工程中实际存在的入口，而不是搭建另一份互不兼容的演示数据库。 本系列的流程是 DRAFT → SUBMITTED → APPROVED → ORDERED，或 SUBMITTED → REJECTED；只有 APPROVED 可以创建订单。金额由明细计算，一张申请最多一张订单，租户不能跨界访问，重复请求不得重复创建。启动实验只建立第一条申请，并不能凭一条 INSERT 证明所有这些约束。与 Java EE/JDBC 主线共享业务语义，却使用独立的 jpa_lab 数据库；examples/jpa/ 使用实体、Provider 和 RESO...</div></div></div></a><a class="pagination-related" href="/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9609-%E9%87%87%E8%B4%AD%E5%AE%A1%E6%89%B9%E7%BB%BC%E5%90%88%E5%BA%94%E7%94%A8/" title="JPA 持久化 09：采购审批综合应用"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-111.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">JPA 持久化 09：采购审批综合应用</div></div><div class="info-2"><div class="info-item-1">采购审批综合应用：从一次合法调用到可恢复的终态 采购申请的页面显示“已下单”，数据库却没有订单，这不一定是 ORM 映射错误。状态改变、订单插入、事务提交、调用方收到响应是四个不同的时刻。要回答“审批成功后重试会不会多下一单”，不能只看 persist() 是否返回；还要回答同一租户以外能否读到申请，两次并发提交谁输，以及事务失败后是否有人仍拿着旧的 EntityManager 继续做事。本篇把前面 00–08 篇的实体、映射、查询和事务放进同一条采购链路，并严格区分代码已有的断言与尚未做的集成实验。 示例冻结为 Java 21、Jakarta Persistence 3.2、Hibernate ORM 7.1.36.Final、pgJDBC 42.7.7、PostgreSQL 16；入口为 工程说明、业务实现、测试源码 和 实验说明。已有代码是最小实验工程，不是可直接上线的采购服务：它没有 HTTP 身份认证、幂等请求表、跨行预算锁或完整异常分类。以下的“预期”不是运行记录。 一个订单为什么牵涉三个边界 把 2026 年 10 月 4 日的一笔办公耗材申请具体化：租户甲采购文件...</div></div></div></a><a class="pagination-related" href="/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9605-JPQL%E3%80%81Criteria%E4%B8%8E%E5%8E%9F%E7%94%9F%E6%9F%A5%E8%AF%A2/" title="JPA 持久化 05：JPQL、Criteria 与原生查询的边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-32.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">JPA 持久化 05：JPQL、Criteria 与原生查询的边界</div></div><div class="info-2"><div class="info-item-1">查询返回了对的行，为什么审批仍可能出错 采购审批列表通常只要申请编号、状态与金额；详情页才需要实体与明细。把两者都写成“查出申请实体，再遍历关联”会让列表承担不必要的对象加载，而在同一个工作单元里执行批量驳回，又可能让已经加载的申请仍显示为待审批。问题并非查询语言的选择，而是查询的结果形状、排序条件、持久化上下文与数据库行是否被当成了同一件事。 本篇只讨论 Jakarta Persistence 3.2 的查询契约，先修实体与关联见 01–04 篇。案例沿用 ProcurementRequest（申请）、ProcurementLine（明细）、ProcurementOrder（订单）：租户字段为 tenantId，申请状态从 DRAFT、SUBMITTED 走向 APPROVED 或 REJECTED，批准后才允许建单。查询代码负责选出候选申请，不能替代服务层的租户授权、状态校验和数据库的一申请一单约束。已有 ProcurementJpaTest 覆盖了小规模查询与 bulk 上下文边界；下文的 ApprovalQueries、ApprovalFilter、NativeAppro...</div></div></div></a><a class="pagination-related" href="/2026/10/04/JPA%E6%8C%81%E4%B9%85%E5%8C%9606-%E6%8A%93%E5%8F%96%E3%80%81N+1%E4%B8%8E%E7%BC%93%E5%AD%98/" title="JPA 持久化 06：抓取、N+1 与缓存不能混为一谈"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-175.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">JPA 持久化 06：抓取、N+1 与缓存不能混为一谈</div></div><div class="info-2"><div class="info-item-1">审批列表的查询很短，SQL 为什么可能很多 一页十条采购申请，界面要求在每条下方展开明细。先查询十条 ProcurementRequest，再循环调用 request.lines()，代码看起来只有一条显式查询，却可能在遍历时为每个尚未加载的集合再访问一次数据库。N+1 不是 JPQL 的语法错误，而是“先取 N 个根对象，再逐个访问未取到的关联”造成的访问路径问题。同一段代码在一级缓存已有对象、二级缓存命中或 provider 改用批量抓取时，SQL 条数都可能变化；1+N 是便于定位问题的模型，不是运行结果或规范保证。 本篇接续 04 篇的关系映射和 05 篇的排序分页。累计工程 examples/jpa/ 中，ProcurementRequest.lines 是 @OneToMany(mappedBy = &quot;request&quot;, fetch = LAZY)，ProcurementLine.request 为 @ManyToOne(fetch = LAZY)。申请还带 tenantId、金额与状态，订单只能从 APPROVED 申请生成且一申请最多一单。本文...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%A1%E6%89%B9%E6%88%90%E5%8A%9F-%E8%AE%A2%E5%8D%95%E5%8D%B4%E5%8F%AF%E8%83%BD%E5%A4%B1%E8%B4%A5"><span class="toc-number">1.</span> <span class="toc-text">审批成功，订单却可能失败</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%8F%90%E4%BA%A4%E7%9A%84%E5%8D%95%E4%BD%8D%E4%B8%8D%E6%98%AF%E4%B8%80%E6%AC%A1%E6%96%B9%E6%B3%95%E8%B0%83%E7%94%A8"><span class="toc-number">1.1.</span> <span class="toc-text">提交的单位不是一次方法调用</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B9%90%E8%A7%82%E9%94%81%E6%8A%8A%E5%86%B2%E7%AA%81%E7%A7%BB%E5%88%B0%E5%86%99%E5%85%A5%E6%97%B6"><span class="toc-number">1.2.</span> <span class="toc-text">乐观锁把冲突移到写入时</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%82%B2%E8%A7%82%E9%94%81%E9%98%BB%E5%A1%9E%E8%B0%81-%E5%8F%96%E5%86%B3%E4%BA%8E%E9%94%81%E4%BD%8F%E4%BA%86%E4%BB%80%E4%B9%88"><span class="toc-number">1.3.</span> <span class="toc-text">悲观锁阻塞谁，取决于锁住了什么</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%9A%94%E7%A6%BB%E7%BA%A7%E5%88%AB%E5%B1%9E%E4%BA%8E%E6%95%B0%E6%8D%AE%E5%BA%93%E7%9A%84%E5%8F%AF%E8%A7%81%E6%80%A7%E8%A7%84%E5%88%99"><span class="toc-number">1.4.</span> <span class="toc-text">隔离级别属于数据库的可见性规则</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%BB%A3%E7%A0%81%E5%85%A5%E5%8F%A3%E4%B8%8E%E5%BE%85%E8%BF%90%E8%A1%8C%E5%88%A4%E6%8D%AE"><span class="toc-number">1.5.</span> <span class="toc-text">代码入口与待运行判据</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%BB%83%E4%B9%A0%E4%B8%8E%E8%A7%A3%E7%AD%94"><span class="toc-number">1.6.</span> <span class="toc-text">练习与解答</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%99%90%E5%88%B6%E4%B8%8E%E5%8F%82%E8%80%83"><span class="toc-number">1.7.</span> <span class="toc-text">限制与参考</span></a></li></ol></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.6.1</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><script src="/js/tw_cn.js?v=5.6.1"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.6.1"></script></div></div></body></html>

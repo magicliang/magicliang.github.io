@@ -1,0 +1,14 @@
+33 受管执行器单次提交实验合同（局部实测；周期轮询 NOT_RUN）
+
+现行入口：examples/javaee-enterprise/webapp/src/main/java/blog/javaee/web/BrokerLabResource.java 的 schedule/sendNext；scenarios/33-managed-outbox.sh；deploy/server-messaging.xml 与 db/migrations/002-notification-outbox.sql、003-notification-receipt.sql。@Resource 注入 DefaultManagedExecutorService；ApplicationScoped 中 Semaphore(1) 单实例单在途；worker 在同一对象上直接调用 sendNext，不是经过另一个容器事务服务。HTTP /schedule 接受一次工作后返回 202，不自动扫描、没有数据库租约或取消句柄。202 不等于 PUBLISHED，更不等于通知送达。
+
+前提：JDK 21.0.12.1、Open Liberty 26.0.0.5 + Jakarta EE 11 Platform、PostgreSQL 16.15/pgJDBC 42.7.7、Maven wrapper、curl/jq/psql；按 examples/javaee-enterprise/README.md 在独立 javaee_lab 新库按 001→002→003 迁移，在回环启动消息配置对应 WAR，设置 JAVAEE_DEMO_MODE=true、JAVAEE_PORT=9085、JAVAEE_LAB_USER=javaee_lab、本机 JAVAEE_LAB_PASSWORD、JAVAEE_DRIVER_DIR、JAVAEE_REGISTRY_PASSWORD、JAVAEE_WAR。部署前后核对 WAR SHA-256；不在共享库或公网使用演示接口。运行：
+  cd examples/javaee-enterprise
+  ../hibernate-lab/mvnw -B -ntp -f "$PWD/pom.xml" clean verify
+  JAVAEE_PORT=9085 JAVAEE_DEMO_MODE=true JAVAEE_LAB_USER=javaee_lab JAVAEE_LAB_PASSWORD='<本机真实口令>' bash scenarios/33-managed-outbox.sh
+
+正常：单笔订单落 PENDING；schedule 返回 202；在十轮/每轮一秒上限内查询同一 event 为 PUBLISHED；显式同步 receive-one 返回 HTTP 200、newReceipt=true；收据 COUNT(*) 为 1，场景退出 0。故障：若十轮均未到 PUBLISHED、接收失败、event ID 不同或收据数不为 1 则非零退出，保留服务器日志与 SQL；异步 worker 异常可能只记日志，202 本身不能判通过。当前未注入 worker 崩溃或重启自动补扫，也没有 MDB/外部 broker，不能虚构其结果。
+
+原始记录 writing-plans/javaee-enterprise/verification/20261004T-managed-outbox/RUN.md：event 6、HTTP 202→SQL PUBLISHED→显式同步接收 HTTP 200→收据 1、退出码 0，构建/部署 WAR SHA-256 均为 691a0acb9811be0a1d3ee1c9ede81ed33e5f5a2ce1e0f7b6c452a6f67969a0d4。只对应当时 WAR；重跑要重存版本、源码/WAR 摘要与退出码。
+
+FUTURE/NOT_RUN：51 任务（单轮≤50、在途≤2）、上下文传播、取消/停机、周期调度、双实例及租约回收。002 无 lease_until/lease_token/next_attempt_at，不能对当前表执行租约 SQL；不存在可运行的 scenarios/33-poller.sh。未来实现后单独记录请求端/worker 主体、任务持久租户与事务，拒绝提交和强停时分别核对 PENDING 集合、数据库恢复和最终收据。规范 Jakarta Concurrency 3.1：https://jakarta.ee/specifications/concurrency/3.1/jakarta-concurrency-spec-3.1。

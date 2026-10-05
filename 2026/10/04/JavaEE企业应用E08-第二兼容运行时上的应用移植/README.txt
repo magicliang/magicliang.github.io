@@ -1,0 +1,1 @@
+E08 素材位。GlassFish 8.0.4 已校验 ZIP 并部署原 Liberty WAR；2026-10-05 的 09/11/18/23 回环实验见 writing-plans/javaee-enterprise/verification/20261005T-glassfish-scenarios/RUN.md。当前是同一实验库的不同租户数据，不是隔离库对照；正式身份、独立 broker、错误资源配置恢复与重启矩阵 NOT_RUN。M12 TCK 页面不证明 8.0.4 的认证。
