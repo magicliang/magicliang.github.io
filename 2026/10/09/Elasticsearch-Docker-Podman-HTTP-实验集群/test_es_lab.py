@@ -81,7 +81,7 @@ class LabTest(unittest.TestCase):
         folder = Path(__file__).resolve().parent
         path = folder / 'mapping-lab.http'
         if not path.exists():
-            path = folder.parent / '2026-09-29-Elasticsearch-查询为什么没命中-从字段能力到分词短语与评分' / 'mapping-lab.http'
+            path = folder.parent / '2026-09-29-Elasticsearch-查询与检索-字段分词Query-DSL与评分' / 'mapping-lab.http'
         requests = lab.parse_requests(path.read_text())
         self.assertEqual(len(requests), 137)
         self.assertEqual(sum(r['group'] in ('environment', 'core') for r in requests), 99)
