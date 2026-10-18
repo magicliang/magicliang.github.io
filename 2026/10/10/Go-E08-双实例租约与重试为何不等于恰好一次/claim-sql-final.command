@@ -1,0 +1,1 @@
+psql 'host=127.0.0.1 port=48725 user=admin dbname=postgres sslmode=disable' -Atc "SELECT t.id,t.status,t.words,t.lease_epoch,count(e.task_id) FROM go_tasks t LEFT JOIN go_task_effects e ON e.task_id=t.id WHERE t.id='lease[4dcc65f2fed931bef2f1f10b]' GROUP BY t.id"

@@ -1,0 +1,1 @@
+go build -o /tmp/go-language-10-unpack-EuFKv9/taskstats .

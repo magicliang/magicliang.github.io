@@ -1,0 +1,1 @@
+sha256sum -c SHA256SUMS

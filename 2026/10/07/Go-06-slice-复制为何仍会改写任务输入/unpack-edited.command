@@ -1,0 +1,1 @@
+/tmp/go-language-06-unpack-pCYhEJ/taskstats --batch one\ two\|Go\ 写\ Go --drop-first --append again

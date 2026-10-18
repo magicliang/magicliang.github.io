@@ -1,0 +1,1 @@
+python3 -c 'import socket,sys; [ (lambda address, sock: (sock.bind(("127.0.0.1",int(address.rsplit(":",1)[1]))),sock.close()))(address,socket.socket()) for address in sys.argv[1:] ]; print("ports released")' '127.0.0.1:36861' '127.0.0.1:34003'

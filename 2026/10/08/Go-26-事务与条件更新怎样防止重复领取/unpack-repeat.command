@@ -1,0 +1,1 @@
+cd '/tmp/go-language-26-reader.GfJdUg/go-language' && go test -count=30 -run 'TestSQLConcurrentClaimAndTransactionRollback|TestSQLHTTPRunningCancelWaitsForAnalysisExit|TestSQLHTTPQueuedCancelDoesNotStartAnalysis|TestSQLShutdownWaitsForWorkerBeforeTerminal' -v .

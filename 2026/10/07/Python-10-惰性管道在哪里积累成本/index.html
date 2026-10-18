@@ -1,0 +1,687 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>Python 10：惰性管道在哪里积累成本 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="词元改成生成器后，还要过滤停用词并分批消费。把数据分成两块，第一块里正好有两个词；取出第一批时如果第二块也被读取，管道就有了不必要的提前工作。只看最终词频相同，无法发现上游是否被额外消费。 09 用读取块记录验证过第一次 next 的范围；本章继续在 tasklab 上组合过滤与批处理，同时保持未过滤任务的词频业务合同。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Python 10：惰性管道在哪里积累成本">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/07/Python-10-%E6%83%B0%E6%80%A7%E7%AE%A1%E9%81%93%E5%9C%A8%E5%93%AA%E9%87%8C%E7%A7%AF%E7%B4%AF%E6%88%90%E6%9C%AC/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="词元改成生成器后，还要过滤停用词并分批消费。把数据分成两块，第一块里正好有两个词；取出第一批时如果第二块也被读取，管道就有了不必要的提前工作。只看最终词频相同，无法发现上游是否被额外消费。 09 用读取块记录验证过第一次 next 的范围；本章继续在 tasklab 上组合过滤与批处理，同时保持未过滤任务的词频业务合同。">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-158.jpg">
+<meta property="article:published_time" content="2026-10-07T02:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-18T05:40:14.516Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Python">
+<meta property="article:tag" content="itertools">
+<meta property="article:tag" content="惰性求值">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-158.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "Python 10：惰性管道在哪里积累成本",
+  "url": "https://magicliang.github.io/2026/10/07/Python-10-%E6%83%B0%E6%80%A7%E7%AE%A1%E9%81%93%E5%9C%A8%E5%93%AA%E9%87%8C%E7%A7%AF%E7%B4%AF%E6%88%90%E6%9C%AC/",
+  "image": "https://magicliang.github.io/img/wall-paper-158.jpg",
+  "datePublished": "2026-10-07T02:00:00.000Z",
+  "dateModified": "2026-10-18T05:40:14.516Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/07/Python-10-%E6%83%B0%E6%80%A7%E7%AE%A1%E9%81%93%E5%9C%A8%E5%93%AA%E9%87%8C%E7%A7%AF%E7%B4%AF%E6%88%90%E6%9C%AC/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: 'Python 10：惰性管道在哪里积累成本',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1964</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1986</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">38</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-158.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">Python 10：惰性管道在哪里积累成本</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">Python 10：惰性管道在哪里积累成本</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-07T02:00:00.000Z" title="Created 2026-10-07 10:00:00">2026-10-07</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-18T05:40:14.516Z" title="Updated 2026-10-18 13:40:14">2026-10-18</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Python-%E8%AF%AD%E8%A8%80%E4%B8%8E%E5%B7%A5%E7%A8%8B/">Python 语言与工程</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">1.1k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>3mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-18 13:40:14&quot;}" hidden></div><p>词元改成生成器后，还要过滤停用词并分批消费。把数据分成两块，第一块里正好有两个词；取出第一批时如果第二块也被读取，管道就有了不必要的提前工作。只看最终词频相同，无法发现上游是否被额外消费。</p>
+<p>09 用<a href="/2026/10/07/Python-09-yield-%E5%A6%82%E4%BD%95%E4%BF%9D%E5%AD%98%E6%9C%AA%E5%AE%8C%E6%88%90%E7%9A%84%E8%AE%A1%E7%AE%97/">读取块记录</a>验证过第一次 <code>next</code> 的范围；本章继续在 <code>tasklab</code> 上组合过滤与批处理，同时保持未过滤任务的词频业务合同。</p>
+<span id="more"></span>
+<h2 id="先知道过滤针对谁">先知道过滤针对谁</h2>
+<p><code>word_batches(chunks, skip=(), size=64)</code> 将 <code>iter_words(chunks)</code> 产生的词元交给生成器表达式筛选，再用 Python 3.12 标准库 <a target="_blank" rel="noopener" href="https://docs.python.org/3.12/library/itertools.html#itertools.batched"><code>itertools.batched</code></a> 组成固定容量的元组批次。核心路径是：</p>
+<figure class="highlight python"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs python">skipped = <span class="hljs-built_in">frozenset</span>(skip)<br>words = (word <span class="hljs-keyword">for</span> word <span class="hljs-keyword">in</span> iter_words(chunks) <span class="hljs-keyword">if</span> word <span class="hljs-keyword">not</span> <span class="hljs-keyword">in</span> skipped)<br><span class="hljs-keyword">return</span> batched(words, size)<br></code></pre></td></tr></table></figure>
+<p>过滤条件作用于单个词元，不是整份任务结果；<code>skip=&#123;&quot;skip&quot;&#125;</code> 时得到 <code>&quot;one&quot;</code> 两次、<code>&quot;two&quot;</code> 一次。正常的 <code>run</code> 不传过滤词，所以 <code>&quot;one two one skip&quot;</code> 的业务结果仍为 <code>&#123;&quot;one&quot;: 2, &quot;two&quot;: 1, &quot;skip&quot;: 1&#125;</code>。若把筛选偷偷用于所有任务，就破坏了从 00 开始的词频合同。</p>
+<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/07/Python-10-%E6%83%B0%E6%80%A7%E7%AE%A1%E9%81%93%E5%9C%A8%E5%93%AA%E9%87%8C%E7%A7%AF%E7%B4%AF%E6%88%90%E6%9C%AC/pipeline.svg" class="" title="两块输入经过词元生成与过滤后按需输出批次">
+<p>初始化批处理入口时先检查 <code>size &gt;= 1</code>；<code>size=0</code> 直接抛 <code>ValueError</code>，上游块读取计数仍为零。这条检查防止把无效参数错误拖到部分输入已被读取之后。停用词容器在创建批处理对象时转为 <code>frozenset</code>，所以调用后继续改外部停用词列表也不会改变正在执行的这一轮过滤规则。</p>
+<h2 id="用读取次数检验-按需">用读取次数检验“按需”</h2>
+<p>给 <code>word_batches</code> 两段合成输入 <code>&quot;one two &quot;</code> 和 <code>&quot;one skip &quot;</code>，指定 <code>skip=&#123;&quot;skip&quot;&#125;</code> 与批次大小 2。第一次 <code>next(batches)</code> 返回 <code>(&quot;one&quot;, &quot;two&quot;)</code>，此时记录的已读取块只有 <code>&quot;one two &quot;</code>。再消费余下批次才读到第二块，最终读入记录里每块各出现一次。实验 JSON 将元组编码成数组，因此原始标准输出中的首批显示为 <code>[&quot;one&quot;, &quot;two&quot;]</code>；这不是应用把批次类型改为列表。</p>
+<p>管道惰性只保证“需求到来前不做尚不必做的上游读取”，不保证每次操作的成本为零。<code>frozenset(skip)</code> 先分配过滤表，<code>batched</code> 内部需要凑足一批，<code>iter_words</code> 仍暂存尚未遇到空白的一个词；若上游有副作用，重复建立一条新的管道并重新遍历也会重复触发副作用。本章只验证<strong>同一条</strong>管道的一次消费没有重复读取输入块，不能推广为所有计算都只执行一次。</p>
+<p>在 <code>examples/python-language/</code> 运行：</p>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs sh">PYTHONPATH=src /usr/bin/python3.12 experiments/10_pipeline.py<br>PYTHONPATH=src /usr/bin/python3.12 -m unittest discover -s tests -v<br></code></pre></td></tr></table></figure>
+<p>演示与累计回归均以 0 退出，共执行 32 条测试。新增断言覆盖每块恰好读取一次、未过滤任务与原结果一致、无效批次大小未触发上游读取。<code>examples/python-language/evidence/10/20261007-pipeline/</code> 保留原始输出、命令、基线环境与断言。没有计时或内存样本，因而这里不宣称“批处理比单词逐个遍历更快”；这样的比较要留给 36。</p>
+<h3 id="预测题">预测题</h3>
+<p>把批次大小从 2 改为 3，第一次取批时最少需要读到哪块？<code>skip=&#123;&quot;skip&quot;&#125;</code> 对首批有何影响？</p>
+<p><strong>答案</strong>：第一块只有两个通过筛选的词，凑足第三项必须读第二块中的 <code>&quot;one&quot;</code>；因此取首批时两块都已读入。<code>&quot;skip&quot;</code> 被过滤，不占批次位置。这个改动是推导变式，实际记录测的是大小 2 的情况。</p>
+<h3 id="变更题">变更题</h3>
+<p>要求“批次大小非法时不读输入”，如果将参数检查移到生成器表达式内部，会引入什么新风险？</p>
+<p><strong>答案</strong>：错误可能推迟到开始消费时，甚至在某些改写中先触发了上游；需要用可记录读取次数的迭代器断言异常发生前计数仍是零。当前 <code>test_bad_batch_size_fails_before_reading_chunks</code> 检验的是入口立刻拒绝的实现，错误改动尚未落盘。</p>
+<p>接下来的装饰器要记录入口耗时，而不改变结果、异常和调用方看到的函数元信息。<a href="/python-language/">系列导航</a>只列真实章节。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://docs.python.org/3.12/library/itertools.html#itertools.batched">Python 3.12 <code>itertools.batched</code></a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/07/Python-10-%E6%83%B0%E6%80%A7%E7%AE%A1%E9%81%93%E5%9C%A8%E5%93%AA%E9%87%8C%E7%A7%AF%E7%B4%AF%E6%88%90%E6%9C%AC/">https://magicliang.github.io/2026/10/07/Python-10-%E6%83%B0%E6%80%A7%E7%AE%A1%E9%81%93%E5%9C%A8%E5%93%AA%E9%87%8C%E7%A7%AF%E7%B4%AF%E6%88%90%E6%9C%AC/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Python/">Python</a><a class="post-meta__tags" href="/tags/%E6%83%B0%E6%80%A7%E6%B1%82%E5%80%BC/">惰性求值</a><a class="post-meta__tags" href="/tags/itertools/">itertools</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-158.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/05/21/%E6%8A%BD%E8%B1%A1%E8%A7%A3%E9%87%8A-%E7%94%A8%E4%BF%9D%E5%AE%88%E8%BF%91%E4%BC%BC%E7%90%86%E8%A7%A3%E7%A8%8B%E5%BA%8F/" title="抽象解释：用保守近似理解程序"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/05/21/%E6%8A%BD%E8%B1%A1%E8%A7%A3%E9%87%8A-%E7%94%A8%E4%BF%9D%E5%AE%88%E8%BF%91%E4%BC%BC%E7%90%86%E8%A7%A3%E7%A8%8B%E5%BA%8F/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-21</div><div class="info-item-2">抽象解释：用保守近似理解程序</div></div><div class="info-2"><div class="info-item-1">停机问题说明，对任意程序做完备且正确的停机判断是不可能的。工程分析工具并没有因此失去意义。它们换了目标：不追求精确理解所有程序，而是用可计算的抽象信息给出有用结论。 抽象解释就是这个方向的代表。它把具体值集合映射到抽象域里，用保守规则模拟程序执行。只要抽象规则覆盖了所有可能的具体行为，分析结果就可以用于告警、优化或拒绝高风险程序。 本文用区间分析做一个最小模型：变量不再保存单个整数，而是保存可能取值范围。  从具体值到抽象值 具体执行关心单个值： 123x = 3y = 5z = x + y = 8 抽象执行关心值的集合。若只知道 x 在 0 到 10 之间，y 等于 5，就可以推出： 123x in [0, 10]y in [5, 5]z = x + y =&gt; z in [5, 15] 这个结果不精确。z 不一定等于区间里的每个数，但所有可能结果都被包含在 [5, 15] 里。保守性比精确性更重要：不能漏掉可能发生的值。 区间抽象域 区间可以用两个端点表示。 12345678910111213141516from dataclasses import dataclass@...</div></div></div></a><a class="pagination-related" href="/2026/05/20/AgentScope-%E5%85%A8%E6%99%AF%E5%AE%9E%E6%88%98-%E8%AE%BE%E8%AE%A1%E9%80%9F%E8%AF%BB%E4%B8%8E%E7%94%9F%E4%BA%A7%E7%BA%A7%E5%8D%81%E4%BA%8C%E5%B1%82%E8%A3%85%E9%85%8D/" title="AgentScope 全景实战：设计速读与生产级十二层装配"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/05/20/AgentScope-%E5%85%A8%E6%99%AF%E5%AE%9E%E6%88%98-%E8%AE%BE%E8%AE%A1%E9%80%9F%E8%AF%BB%E4%B8%8E%E7%94%9F%E4%BA%A7%E7%BA%A7%E5%8D%81%E4%BA%8C%E5%B1%82%E8%A3%85%E9%85%8D/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-20</div><div class="info-item-2">AgentScope 全景实战：设计速读与生产级十二层装配</div></div><div class="info-2"><div class="info-item-1">把 AgentScope 当成&quot;另一个 LangChain&quot;是上手时最常见的误区。AgentScope v1.x 在 2025 年中做过一次实质上不向后兼容的 API 重构——v0.x 的 actor-based 多机分布式被整体删除，新核心改为 async-ReAct 循环 + MsgHub 显式消息广播。它的设计取向与 LangChain / LangGraph 也不同：假设开发者从一个 ReActAgent 开始，逐层往外加东西——先有一个 agent 能跑，再共享 LLM 单例，再装工具，再装 MCP，再往上做多 agent 路由，最后接观测和部署。这种&quot;渐进式装配&quot;的次序不是教学方便，是它的实际工程姿态——每一层都能独立验证、独立失败、独立替换。 本文分两部分。第一部分是设计速读：把 AgentScope v1.x 的范式翻转、ReAct + MsgHub 核心抽象、与 LangGraph / CrewAI / MAF 的对位、A2A + MCP 协议化分布式、Trinity-RFT 训练集成讲清楚——理解了&quot;为什么&q...</div></div></div></a><a class="pagination-related" href="/2026/05/20/%E6%8C%87%E7%A7%B0%E8%AF%AD%E4%B9%89-%E6%8A%8A%E7%A8%8B%E5%BA%8F%E7%BF%BB%E8%AF%91%E6%88%90-Python-%E5%87%BD%E6%95%B0/" title="指称语义：把程序翻译成 Python 函数"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/05/20/%E6%8C%87%E7%A7%B0%E8%AF%AD%E4%B9%89-%E6%8A%8A%E7%A8%8B%E5%BA%8F%E7%BF%BB%E8%AF%91%E6%88%90-Python-%E5%87%BD%E6%95%B0/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-20</div><div class="info-item-2">指称语义：把程序翻译成 Python 函数</div></div><div class="info-2"><div class="info-item-1">前两篇用操作语义解释程序。大步语义直接给最终结果，小步语义展示每一步规约。第 2 章还有第三种视角：指称语义（denotational semantics）。 指称语义把程序映射到某个更基础的对象。在本文的小语言里，表达式会变成一个 Python 函数，语句也会变成一个 Python 函数。程序的含义从“机器怎样跑”转到“它等价于哪个函数”。 对 Java 程序员来说，可以先把它理解成： 12Function&lt;Environment, Value&gt;        // 表达式的含义Function&lt;Environment, Environment&gt;  // 语句的含义 本文继续沿用前面的 AST，用 Python 函数重写这套小语言的含义。  三种语义回答三类问题 同一段程序可以从三种角度解释。    语义 关心的问题 本系列里的实现     大步语义 运行完成后得到什么 递归解释器   小步语义 每一步怎样变化 规约机器   指称语义 程序等价于什么对象 函数翻译器    大步和小步都属于操作语义。它们会描述程序在某种抽象机器上怎样执行。指称语义换成另一...</div></div></div></a><a class="pagination-related" href="/2026/10/08/Python-38-%E4%BB%8E%E8%AF%AD%E8%A8%80%E8%A7%84%E5%88%99%E5%88%B0-CPython-%E8%83%BD%E6%8E%A8%E5%A4%9A%E8%BF%9C/" title="Python 38：从语言规则到 CPython 能推多远"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-146.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-08</div><div class="info-item-2">Python 38：从语言规则到 CPython 能推多远</div></div><div class="info-2"><div class="info-item-1">count_words 的运行结果是 &#123;&quot;one&quot;:2,&quot;two&quot;:1&#125;。dis 又显示 FOR_ITER、BINARY_OP 和调用相关指令。那么 BINARY_OP 是 Python 语言规范承诺的实现方式吗？不是：词频结果与对象、迭代协议属于可向语言规则求证的行为；字节码指令、解释器执行循环和 GIL 都是本次冻结的 CPython 构建需要另外核实的实现细节。00 的冻结记录给出 /usr/bin/python3.12、CPython 3.12.3、Ubuntu 补丁包版本 3.12.3-1ubuntu0.17，因此不能只查滚动的主分支源码。 本次重新按 00 的 .dsc 和两份归档 SHA-256 核对源包，使用 dpkg-source -x 解出 Ubuntu 补丁后的源码，并逐一比较 Python/ceval.c、Python/generated_cases.c.h、Python/ceval_gil.c、Include/internal/pycore_gil.h 与原始 v3.12.3 tar 的 SHA...</div></div></div></a><a class="pagination-related" href="/2026/05/20/%E8%87%AA%E5%B7%B1%E5%86%99%E4%B8%80%E4%B8%AA%E8%A7%A3%E9%87%8A%E5%99%A8-%E5%A4%A7%E6%AD%A5%E8%AF%AD%E4%B9%89%E4%B8%8E%E9%80%92%E5%BD%92%E6%B1%82%E5%80%BC/" title="自己写一个解释器：大步语义与递归求值"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/05/20/%E8%87%AA%E5%B7%B1%E5%86%99%E4%B8%80%E4%B8%AA%E8%A7%A3%E9%87%8A%E5%99%A8-%E5%A4%A7%E6%AD%A5%E8%AF%AD%E4%B9%89%E4%B8%8E%E9%80%92%E5%BD%92%E6%B1%82%E5%80%BC/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-20</div><div class="info-item-2">自己写一个解释器：大步语义与递归求值</div></div><div class="info-2"><div class="info-item-1">上一篇已经把字符串解析成 AST。程序结构稳定以后，下一步是给它一套求值规则。最直接的规则叫大步语义（big-step semantics）：给定一个表达式和环境，直接得到最终值；给定一个语句和环境，直接得到新的环境。 大步语义适合写成递归解释器。表达式节点递归求值，语句节点递归改变环境。它不会展示每一个中间状态，只关心完整运行后的结果。 本文会实现一个小语言。它支持数字、布尔值、变量、加法、乘法、小于、赋值、顺序执行、条件分支和 while 循环。  大步语义关心最终关系 大步语义可以先记成两条关系： 12expression + environment =&gt; valuestatement  + environment =&gt; new_environment 表达式会产生值，语句会改变环境。环境是变量名到值的映射。 例如： 1x + 1, &#123;x = 2&#125; =&gt; 3 赋值语句会得到一个新环境： 1x = x + 1, &#123;x = 2&#125; =&gt; &#123;x = 3&#125; 这套写法和 Java 程序员熟悉的递归下降解...</div></div></div></a><a class="pagination-related" href="/2026/10/07/Python-04-%E5%AD%97%E7%AC%A6%E4%B8%B2%E6%80%8E%E6%A0%B7%E5%8F%98%E6%88%90%E5%8F%AF%E9%9D%A0%E8%BE%93%E5%85%A5/" title="Python 04：字符串怎样变成可靠输入"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-2.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-07</div><div class="info-item-2">Python 04：字符串怎样变成可靠输入</div></div><div class="info-2"><div class="info-item-1">&quot;你好 世界&quot; 是五个 Python 字符，却编码成十三个 UTF-8 字节。如果限制的是接收端的字节数，却用 len(text) 检查，边界会放错位置；如果把错误字节悄悄替换成别的字符，词频结果即使“成功”，也不再对应原始输入。 tasklab 现在增加 submit_bytes，接收生成的 UTF-8 数据，仍转入同一个 submit → run → query 业务路径。前一章处理任务元数据的复制边界；这里处理数据进入应用前的编码与大小边界。  字节数不是字符数 Python 的 str 是文本序列，bytes 是字节序列；二者在应用边界处需要明确转换。官方 Unicode HOWTO解释了编码、解码以及错误策略。本实验固定 UTF-8；不会从一串任意字节“猜”原本的编码。  对实际输入 &quot;你好 世界&quot;，len(text) 为 5，len(text.encode(&quot;utf-8&quot;)) 为 13。submit_bytes 先要求输入是 bytes，再检查原始字节长度是否超过 1024，随后调用 raw_bytes.de...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%88%E7%9F%A5%E9%81%93%E8%BF%87%E6%BB%A4%E9%92%88%E5%AF%B9%E8%B0%81"><span class="toc-number">1.</span> <span class="toc-text">先知道过滤针对谁</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E8%AF%BB%E5%8F%96%E6%AC%A1%E6%95%B0%E6%A3%80%E9%AA%8C-%E6%8C%89%E9%9C%80"><span class="toc-number">2.</span> <span class="toc-text">用读取次数检验“按需”</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%A2%84%E6%B5%8B%E9%A2%98"><span class="toc-number">2.1.</span> <span class="toc-text">预测题</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%8F%98%E6%9B%B4%E9%A2%98"><span class="toc-number">2.2.</span> <span class="toc-text">变更题</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">3.</span> <span class="toc-text">参考资料</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

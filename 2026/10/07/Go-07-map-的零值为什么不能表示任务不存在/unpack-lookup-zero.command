@@ -1,0 +1,1 @@
+/tmp/go-language-07-unpack-rxElVh/taskstats --batch Go\|one\ two --lookup task\[0\]

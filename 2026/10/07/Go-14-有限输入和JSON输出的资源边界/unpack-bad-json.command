@@ -1,0 +1,1 @@
+sh -c printf\ %s\ \'\{\"text\":\'\ \|\ \"\$1\"\ --stdin\ --input-json sh /tmp/go-language-14-unpack-yksNGO/taskstats

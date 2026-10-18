@@ -1,0 +1,1 @@
+PGPORT=57745 GO_LANGUAGE_SERVE_DSN='host=127.0.0.1 port=57745 user=admin dbname=goe05live sslmode=disable' bash verification/E05.sh '/tmp/go-language-E05-reader.OYQYBb/taskstats' '/home/admin/workspace/my-blogs/source/_posts/2026-10-10-Go-E05-Web框架只替换哪一层'

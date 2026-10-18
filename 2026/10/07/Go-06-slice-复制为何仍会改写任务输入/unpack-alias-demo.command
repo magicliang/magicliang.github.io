@@ -1,0 +1,1 @@
+go run ./testdata/slice-append.go

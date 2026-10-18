@@ -1,0 +1,1 @@
+cp -a '/tmp/go-language-35-reader.I43pgB/go-language' '/tmp/go-language-35-reader.I43pgB/old-go-language' && cp '/tmp/go-language-35-reader.I43pgB/go-language/evidence/35/old-source.stdout' '/tmp/go-language-35-reader.I43pgB/old-go-language/stats/count.go'

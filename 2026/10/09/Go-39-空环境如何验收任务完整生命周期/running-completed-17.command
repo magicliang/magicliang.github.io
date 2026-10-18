@@ -1,0 +1,1 @@
+curl --globoff --max-time 15 --silent --show-error --output '/home/admin/workspace/my-blogs/source/_posts/2026-10-09-Go-39-空环境如何验收任务完整生命周期/running-completed-17.body' --write-out 'HTTP_STATUS=%{http_code}\n' 'http://127.0.0.1:39941/tasks/task%5B2%5D'

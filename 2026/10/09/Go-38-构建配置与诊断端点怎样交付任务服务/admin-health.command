@@ -1,0 +1,1 @@
+curl --silent --show-error --output '/home/admin/workspace/my-blogs/source/_posts/2026-10-09-Go-38-构建配置与诊断端点怎样交付任务服务/admin-health.body' --write-out 'HTTP_STATUS=%{http_code}\n' 'http://127.0.0.1:46251/debug/health'

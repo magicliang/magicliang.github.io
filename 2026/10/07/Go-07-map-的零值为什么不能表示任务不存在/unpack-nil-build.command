@@ -1,0 +1,1 @@
+go build -o /tmp/go-language-07-unpack-rxElVh/nilmap ./testdata/nil-map-write.go

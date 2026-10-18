@@ -1,0 +1,1 @@
+/tmp/go-language-11-unpack-bLDv44/taskstats --batch Go\|one\ two --lookup task\[missing\]

@@ -1,0 +1,1 @@
+/tmp/go-language-08-unpack-SxbBna/taskstats --text Go\ 写\ Go

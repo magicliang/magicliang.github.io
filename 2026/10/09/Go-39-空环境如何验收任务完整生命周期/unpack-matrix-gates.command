@@ -1,0 +1,1 @@
+go test -count=1 -v -run '^(TestHTTPMethodsValidationAndOverload|TestSQLHTTPRunningCancelWaitsForAnalysisExit|TestSQLConcurrentClaimAndTransactionRollback|TestSQLShutdownWaitsForWorkerBeforeTerminal|TestSQLProcessCrashAndRecovery|TestSQLHTTPPoolWaitDeadlineAndRecovery)$' .

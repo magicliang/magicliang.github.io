@@ -1,0 +1,699 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>Go 37：一个阻塞接收从源码到任务终态 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上篇按任务 ID 对齐了等待的事件与栈。仅凭 [chan receive] 四个字还不能回答：什么操作让接收方返回、返回时 ok 是多少、服务何时才可以宣布 worker 退出？这里选累计任务服务里一个阻塞接收，把公开语义、冻结版源码和正反两次受控实验接在一起。完整 源码证据包、SHA-256与独立复跑步骤附在同名素材目录。 公开契约先于调度实现 Go 1.27.1 随附语言规范的 Receive">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Go 37：一个阻塞接收从源码到任务终态">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/09/Go-37-%E4%B8%80%E4%B8%AA%E9%98%BB%E5%A1%9E%E6%8E%A5%E6%94%B6%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E4%BB%BB%E5%8A%A1%E7%BB%88%E6%80%81/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上篇按任务 ID 对齐了等待的事件与栈。仅凭 [chan receive] 四个字还不能回答：什么操作让接收方返回、返回时 ok 是多少、服务何时才可以宣布 worker 退出？这里选累计任务服务里一个阻塞接收，把公开语义、冻结版源码和正反两次受控实验接在一起。完整 源码证据包、SHA-256与独立复跑步骤附在同名素材目录。 公开契约先于调度实现 Go 1.27.1 随附语言规范的 Receive">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-146.png">
+<meta property="article:published_time" content="2026-10-09T15:55:00.000Z">
+<meta property="article:modified_time" content="2026-10-18T05:40:14.650Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Go">
+<meta property="article:tag" content="Go 任务服务">
+<meta property="article:tag" content="channel">
+<meta property="article:tag" content="源码">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-146.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "Go 37：一个阻塞接收从源码到任务终态",
+  "url": "https://magicliang.github.io/2026/10/09/Go-37-%E4%B8%80%E4%B8%AA%E9%98%BB%E5%A1%9E%E6%8E%A5%E6%94%B6%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E4%BB%BB%E5%8A%A1%E7%BB%88%E6%80%81/",
+  "image": "https://magicliang.github.io/img/wall-paper-146.png",
+  "datePublished": "2026-10-09T15:55:00.000Z",
+  "dateModified": "2026-10-18T05:40:14.650Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/09/Go-37-%E4%B8%80%E4%B8%AA%E9%98%BB%E5%A1%9E%E6%8E%A5%E6%94%B6%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E4%BB%BB%E5%8A%A1%E7%BB%88%E6%80%81/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: 'Go 37：一个阻塞接收从源码到任务终态',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1964</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1986</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">38</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-146.png);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">Go 37：一个阻塞接收从源码到任务终态</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">Go 37：一个阻塞接收从源码到任务终态</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-09T15:55:00.000Z" title="Created 2026-10-09 23:55:00">2026-10-09</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-18T05:40:14.650Z" title="Updated 2026-10-18 13:40:14">2026-10-18</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%B7%A5%E7%A8%8B%E5%AE%9E%E8%B7%B5/">工程实践</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">1.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>4mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-18 13:40:14&quot;}" hidden></div><p><a href="/2026/10/09/Go-36-trace%E4%B8%8E%E9%98%BB%E5%A1%9Eprofile%E6%80%8E%E6%A0%B7%E6%8B%86%E5%BC%80%E7%AD%89%E5%BE%85%E6%97%B6%E9%97%B4/">上篇</a>按任务 ID 对齐了等待的事件与栈。仅凭 <code>[chan receive]</code> 四个字还不能回答：什么操作让接收方返回、返回时 <code>ok</code> 是多少、服务何时才可以宣布 worker 退出？这里选<a href="/go-language/">累计任务服务</a>里一个阻塞接收，把公开语义、冻结版源码和正反两次受控实验接在一起。完整 <a href="./go-language-37.tar.gz">源码证据包</a>、<a href="./SHA256SUMS">SHA-256</a>与<a href="./RUN.md">独立复跑步骤</a>附在同名素材目录。</p>
+<h2 id="公开契约先于调度实现">公开契约先于调度实现</h2>
+<p>Go 1.27.1 随附语言规范的 <code>Receive_operator</code> 指出，接收表达式在没有可取值时会阻塞；从已经关闭并且排空的 channel 接收会立即返回元素类型零值。<code>Close</code> 章节与 <code>go doc builtin.close</code> 还规定了二值接收：关闭且排空后 <code>ok=false</code>。未关闭时与发送者配对接收一个值，<code>ok=true</code>。返回值先按冻结规范判定，再由测试确认；goroutine 栈用于识别阻塞点。</p>
+<p>新增加的 <code>TestChannelWakeAndWorkerExit</code> 将当前 HTTP handler 接收的 <code>task[0]</code> 停在分析器的无缓冲 <code>&lt;-release</code>；先查状态仍为 RUNNING，再让 <code>task[1]</code> 进入唯一队列槽，第三条必须返回 503 且 <code>task[2]</code> 不存在。测试真正拍到包含分析器的 <code>[chan receive]</code> 栈之后，发起服务 <code>Close</code>，但释放前不得宣称它已等待 worker 退出。测试既比较关闭 release channel，也比较向仍打开的 channel 发送一个值：</p>
+<table>
+<thead>
+<tr>
+<th>放行方法</th>
+<th>接收方返回的 <code>ok</code></th>
+<th><code>Close</code> 确认后两条终态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>close(release)</code></td>
+<td><code>false</code></td>
+<td><code>task[0] SUCCEEDED words=2</code>，<code>task[1] SUCCEEDED words=1</code></td>
+</tr>
+<tr>
+<td><code>release &lt;- struct{}{}</code></td>
+<td><code>true</code></td>
+<td><code>task[0] SUCCEEDED words=2</code>，<code>task[1] SUCCEEDED words=1</code></td>
+</tr>
+</tbody>
+</table>
+<p>关闭的是<strong>实验闸门</strong>而不是任务的取消 context；<code>ok=false</code> 只说明当前接收看到 channel 已关闭，不表示任务应该 CANCELED。任务的正常结果来自原 <code>AnalyzeContext</code> 和原任务存储的结果提交；<code>Close</code> 的返回需要 worker 真正退出。收到 POST 202 只说明已接受，不能替代这两个终态。</p>
+<h2 id="固定版源码中接收者怎样再次可运行">固定版源码中接收者怎样再次可运行</h2>
+<p>源码 tag <code>go1.27.1</code> 的镜像查询完整 SHA 是 <code>862c888e612ac346c7c4d99c9392bdfd265f33b0</code>。本轮另核对安装版 <code>src/runtime/chan.go</code> 的 SHA-256 为 <code>dbe8d02ebb1b554b28263c8f34747c0b6d796b3e7040a2f6a625c472e9ce9a42</code>、<code>src/runtime/proc.go</code> 为 <code>40d15ce858cf058cff92606001a29ee1689db88c121a2f0c283163a0d64a7375</code>；前者是 Git 标识，后两个是实际文件哈希。官方 Gitiles 与镜像 SHA 的独立交叉核验尚未完成，不写成已验证。</p>
+<p>调用链的入口在 <code>runtime/chan.go:chanrecv2→chanrecv</code>。未就绪时，<code>chanrecv</code> 将接收方挂入 <code>recvq</code> 并通过 <code>runtime/proc.go:gopark</code> 停放 G。当前版本的发送方走 <code>chansend→send</code>，把值交给等待中的接收方，将 <code>sudog.success</code> 置为 true 并调用 <code>goready</code>；关闭方 <code>closechan</code> 把 <code>closed</code> 置位，从接收队列取出等待者，将 <code>success</code> 置为 false，解锁后调用 <code>goready</code>。<code>proc.go:goready→ready</code> 将 G 从 <code>_Gwaiting</code> 改为 <code>_Grunnable</code> 并放到可运行队列；唤醒不等于立刻得到 CPU。被唤醒的 <code>chanrecv</code> 读取 <code>mysg.success</code>，返回给二值接收形式，接下来才会执行分析器剩余代码。</p>
+<p>这些文件、实际符号、行号和原始片段都在 <code>writing-plans/go-language/evidence/37/source-*</code>；它们解释<strong>这个已冻结实现</strong>为何符合观察到的 <code>ok</code>，不是让语言规范从此承诺 <code>goready</code> 的名字、run queue 结构或时间片。十轮正反复跑中，每次都要在解除闸门之前看到阻塞、之后看到两条 SUCCEEDED；只截图一行 <code>[chan receive]</code> 无法证明关闭流程。</p>
+<p>练习：① <code>close(release)</code> 后接收 <code>ok=false</code>，任务是否应标为 CANCELED？不应该；这个 release 是实验同步闸门，不是服务取消请求，更不是 worker 退出确认。② <code>goready</code> 被调用，能立即向 HTTP 客户端返回业务完成吗？不能，G 还要得到运行机会、分析器要返回并提交结果，服务等待协议还未结束。③ 若取消与正常完成竞争怎么办？回到此前任务状态提交点选择唯一终态，不能用本篇关闭闸门的两个测试冒称已覆盖所有交错。</p>
+<p>真实 PostgreSQL 16.15 的累计 SQL 回归、两包测试、race 的实际路径和旧 CLI 正反都在本次独立解包复跑中保留；本篇闸门实验本身没有进入 SQL，数据库提交也不代表外部副作用完成。race 无报告只覆盖执行路径，远程网络、其他平台、含 37 的全站构建与发布仍 <code>NOT_RUN</code>。下一篇从干净目录构建可交付程序，并限制诊断端点的监听范围。</p>
+<h3 id="参考资料">参考资料</h3>
+<ul>
+<li>Go 1.27.1 <a target="_blank" rel="noopener" href="https://go.dev/ref/spec#Receive_operator">语言规范：接收</a>及<a target="_blank" rel="noopener" href="https://go.dev/ref/spec#Close">关闭</a>；冻结版 <code>doc/go_spec.html</code> 片段与 <code>go doc builtin.close</code> 原文在 <code>writing-plans/go-language/evidence/37/</code>。</li>
+<li>Go 1.27.1 <a target="_blank" rel="noopener" href="https://go.dev/src/runtime/chan.go"><code>runtime/chan.go</code></a> 和 <a target="_blank" rel="noopener" href="https://go.dev/src/runtime/proc.go"><code>runtime/proc.go</code></a>，固定源码 SHA、文件哈希和符号见同一证据目录。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/09/Go-37-%E4%B8%80%E4%B8%AA%E9%98%BB%E5%A1%9E%E6%8E%A5%E6%94%B6%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E4%BB%BB%E5%8A%A1%E7%BB%88%E6%80%81/">https://magicliang.github.io/2026/10/09/Go-37-%E4%B8%80%E4%B8%AA%E9%98%BB%E5%A1%9E%E6%8E%A5%E6%94%B6%E4%BB%8E%E6%BA%90%E7%A0%81%E5%88%B0%E4%BB%BB%E5%8A%A1%E7%BB%88%E6%80%81/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Go/">Go</a><a class="post-meta__tags" href="/tags/Go-%E4%BB%BB%E5%8A%A1%E6%9C%8D%E5%8A%A1/">Go 任务服务</a><a class="post-meta__tags" href="/tags/channel/">channel</a><a class="post-meta__tags" href="/tags/%E6%BA%90%E7%A0%81/">源码</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-146.png" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/08/Go-21-%E6%9C%8D%E5%8A%A1%E5%85%B3%E9%97%AD%E6%80%8E%E6%A0%B7%E5%AE%8C%E6%88%90%E5%81%9C%E6%AD%A2%E6%8E%A5%E6%94%B6%E5%8F%96%E6%B6%88%E4%B8%8E%E7%AD%89%E5%BE%85/" title="Go 21：服务关闭怎样完成停止接收、取消与等待"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-6.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-08</div><div class="info-item-2">Go 21：服务关闭怎样完成停止接收、取消与等待</div></div><div class="info-2"><div class="info-item-1">上篇限制了同时执行和排队的数量。队列有了上限，另一个问题就无法回避：调用方准备退出时，多个提交者仍可能正在等待空槽。若一个 goroutine 关闭输入 channel，另一个 goroutine 恰好发送，关闭过程本身便可能 panic。Close、cancel、等待退出必须各有责任，本篇在同一个累计工程的原 worker 路径上补关闭协议。完整工程与实验包、SHA-256和解包复跑说明保存本章实际代码及正反证据。 能关闭 channel 的不应是任何一个提交者 Go 1.27.1 的语言规范 Send statements 明确：向已关闭的 channel 发送会触发运行时 panic。testdata/send-after-close.go 是单独构建的故意错误程序；本次直接执行二进制得到 panic: send on closed channel，退出 2。这不是生产执行器发生的故障，而是要排除的错误设计。只在发送处先检查一个 closed 布尔值也不够：从检查通过到真正发送之间，另一 goroutine 仍可把 channel 关闭。 原批处理只有一个生产者，由它关闭输...</div></div></div></a><a class="pagination-related" href="/2026/10/08/Go-25-database-sql%E5%A6%82%E4%BD%95%E7%AE%A1%E7%90%86%E8%BF%9E%E6%8E%A5%E4%B8%8E%E7%BB%93%E6%9E%9C%E9%9B%86/" title="Go 25：database&#x2F;sql 如何管理连接与结果集"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-169.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-08</div><div class="info-item-2">Go 25：database&#x2F;sql 如何管理连接与结果集</div></div><div class="info-2"><div class="info-item-1">上篇把出站 HTTP 的请求期限与任务取消分开。任务服务仍有一处更大的缺口：已接受任务只在进程内的 map 中，进程一停，按 ID 查询就失去依据。本篇在同一工程中添加真实 PostgreSQL 入口，从最早的一步——先保存待领取任务——检查 database/sql 管理连接和结果集的方式。完整工程及原始实验、SHA-256、独立解包运行说明与本篇一起交付。 sql.Open 返回了什么 先把一条提交的文字 Go 记录为 task[0]。若把 sql.Open(&quot;postgres&quot;, dsn) 没有报错理解成“数据库可用”，在服务真正需要提交时才会撞上连接错误。本版 Go 1.27.1 的 database/sql.Open 文档说 Open 可能只校验参数，不立刻建立连接，返回的 *sql.DB 是维护连接池的句柄，并非某一条固定连接。这里固定 PostgreSQL 16.15 与驱动 github.com/lib/pq v1.12.3；go.mod、go.sum 锁住实际模块版本与摘要，驱动使用 postgres 名称。没有把 PostgreSQL 服务...</div></div></div></a><a class="pagination-related" href="/2026/10/08/Go-16-channel%E7%9A%84%E5%8F%91%E9%80%81%E6%8E%A5%E6%94%B6%E4%B8%8E%E5%85%B3%E9%97%AD%E6%80%8E%E6%A0%B7%E6%9E%84%E6%88%90%E5%8D%8F%E8%AE%AE/" title="Go 16：channel 的发送、接收与关闭怎样构成协议"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-25.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-08</div><div class="info-item-2">Go 16：channel 的发送、接收与关闭怎样构成协议</div></div><div class="info-2"><div class="info-item-1">上篇让统计函数在 goroutine 中运行，但 CLI 还是启动一项、等一项。要把任务交给另一个持续读取任务的计算者，仅有“某项结束了”的 done 不够：谁能继续发送？谁宣布不会再发？接收者如何知道该退出？关闭错了 channel，程序可能 panic；不关闭，又可能永远等在接收处。这些问题需要一份双方能遵守的协议，不是画一条 chan 箭头就解决。 本章沿用同一个任务工程和旧的任务 ID、错误分类及 CLI 入口。queue.go 增加一个生产者、一个消费者和两条 channel；CLI 在校验及输入准备后把任务交给生产者，最终排空结果，再生成原有记录。没有为本章另起一个互不相关的服务。完整累计快照、SHA-256和解包命令可独立下载复跑；原始命令、退出码和双流另存 writing-plans/go-language/evidence/16/。 首先约定唯一关闭者 任务路径如下： 123456789CLI 的 tasks 切片        │        ▼生产者 ──发送──&gt; inputs（容量 1） ──接收──&gt; 消费者  │            ...</div></div></div></a><a class="pagination-related" href="/2026/10/07/Go-04-%E5%BE%AA%E7%8E%AF%E5%8F%98%E9%87%8F%E4%B8%BA%E4%BD%95%E5%BD%B1%E5%93%8D%E6%89%B9%E9%87%8F%E4%BB%BB%E5%8A%A1/" title="Go 04：循环变量为什么会影响批量任务"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-127.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-07</div><div class="info-item-2">Go 04：循环变量为什么会影响批量任务</div></div><div class="info-2"><div class="info-item-1">把 03 的单次文本统计改为顺序批量执行后，for 循环已经出现。假如为了延迟读取任务标签，先在循环里保存几个函数，等循环结束再调用：它们会各自读到对应标签，还是都读到最后一个？Go 1.27.1 下，答案取决于 range 后面写的是声明 :=，还是向预先存在的变量赋值 =。无需启动 goroutine，这个差异就能稳定复现。 本篇仍沿用系列唯一累计工程。--batch 'one two|Go 写 Go' 暂时把 | 用作教学输入分隔符，按顺序统计两项；--text 原入口保留。此时没有 worker、排队、任务 ID 或持久化。本篇源码与证据归档包含截至 04 的完整工程与各章原始实验，旧章的历史输出不随新代码改写。 批量输入怎样保持可判断的结果 两个 flag 只能选其一。代码用 FlagSet.Visit 判断调用者实际提供了哪些选项，而不只看 --batch 对应字符串是不是空：显式传 --batch '' 与根本没传是两种输入，都不能变成一次看似成功的单任务。选择批量模式后，以 strings.Split(*batch, &quot;|&quot;) 切出任务，在一个...</div></div></div></a><a class="pagination-related" href="/2026/10/10/Go-E07-workspace%E4%B8%8E%E5%A4%9Amodule%E8%83%BD%E5%90%A6%E9%9A%90%E8%97%8F%E4%BE%9D%E8%B5%96/" title="Go E07：workspace 与多 module 能否隐藏依赖"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-142.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-10</div><div class="info-item-2">Go E07：workspace 与多 module 能否隐藏依赖</div></div><div class="info-2"><div class="info-item-1">E06在同一个累计任务服务上比较了编译配置。若外部工具也要提交并查询任务，是否应该让它直接导入服务的 main 包？不能：服务包封装了执行器、SQL 和诊断端点，消费者只需要稳定的 HTTP 请求/响应契约。本篇从累计工程中拆出 client/：只实现 Submit、Lookup、Cancel 的薄客户端。它不接触任务状态机，更不会复制 worker。代码、原始双流和真实数据库实验见完整素材包、SHA-256及独立复跑说明。 一个成功的 workspace 构建证明不了依赖闭合 冻结 Go 1.27.1。go help work 规定 go.work 的 use 把列出的 module 当作工作区根模块，并允许工作区替换覆盖模块内的替换。累计工程的 go.work 列出原服务、client/ 和 consumer/；后者声明 require example.com/go-language-task/client v0.1.0，却没有独立的解析途径。GOWORK=auto 从 consumer/ 构建通过，只说明这三份源码在同一个目录树中能协同编译，不说明独立消费者能拿到这个版本。...</div></div></div></a><a class="pagination-related" href="/2026/10/07/Go-07-map-%E7%9A%84%E9%9B%B6%E5%80%BC%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E8%83%BD%E8%A1%A8%E7%A4%BA%E4%BB%BB%E5%8A%A1%E4%B8%8D%E5%AD%98%E5%9C%A8/" title="Go 07：map 的零值为什么不能表示任务不存在"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-139.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-07</div><div class="info-item-2">Go 07：map 的零值为什么不能表示任务不存在</div></div><div class="info-2"><div class="info-item-1">06 的批次按顺序保存在 slice 中；删除第一项并添加新项之后，调用者可按 task[0]、task[1] 看到当前批次的编号。如果另存一张 map[string]int 记录 ID 到切片位置的映射，positions[&quot;task[0]&quot;] 得到 0。查询不存在的 ID 也可能得到 0：仅靠一次索引无法说明第一项真的存在。 同一累计工程现在给 --batch 加入互斥的 --lookup ID 和 --list-ids。它只是一次 CLI 调用期间建立的索引，不保存跨进程的任务身份，也没有后台 worker。原 --text、--file、顺序 --batch 与 06 的增删用法仍有效。完整累计工程与原始结果和SHA256SUMS可独立下载复跑。 独立复跑步骤列出本章正反例、源码校验及运行命令。 第 0 项与缺失键的共同返回值 indexTasks 用 make(map[string]int, count) 初始化映射，遍历当前批次，为每个位置写入 task[0]、task[1] 等键；这里的 count 是容量提示，不是固定的最大可添加条数。查找时必...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AC%E5%BC%80%E5%A5%91%E7%BA%A6%E5%85%88%E4%BA%8E%E8%B0%83%E5%BA%A6%E5%AE%9E%E7%8E%B0"><span class="toc-number">1.</span> <span class="toc-text">公开契约先于调度实现</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%BA%E5%AE%9A%E7%89%88%E6%BA%90%E7%A0%81%E4%B8%AD%E6%8E%A5%E6%94%B6%E8%80%85%E6%80%8E%E6%A0%B7%E5%86%8D%E6%AC%A1%E5%8F%AF%E8%BF%90%E8%A1%8C"><span class="toc-number">2.</span> <span class="toc-text">固定版源码中接收者怎样再次可运行</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">2.1.</span> <span class="toc-text">参考资料</span></a></li></ol></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

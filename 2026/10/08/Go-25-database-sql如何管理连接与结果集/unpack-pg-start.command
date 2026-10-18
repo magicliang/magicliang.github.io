@@ -1,0 +1,1 @@
+/usr/lib/postgresql/16/bin/pg_ctl -D '/tmp/go-language-25-pg-reader.z6er52' -o '-h 127.0.0.1 -p 53607 -k /tmp/go-language-25-pg-reader.z6er52' -l '/tmp/go-language-25-pg-reader.z6er52/server.log' start

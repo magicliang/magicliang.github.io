@@ -1,0 +1,1 @@
+/tmp/go-language-06-unpack-pCYhEJ/taskstats --batch Go --drop-first

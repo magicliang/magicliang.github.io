@@ -1,0 +1,1 @@
+go test -count=1 -v ./testdata/slice-alias-bug_test.go

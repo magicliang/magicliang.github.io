@@ -1,0 +1,1 @@
+go test -count=40 -run 'TestSettingsOnceInitializesForConcurrentCallers|TestStoreRaceScenario|TestIndependentAtomicCountDoesNotPublishResult|TestCancelRequestWaitsForWorkerExit' -v .

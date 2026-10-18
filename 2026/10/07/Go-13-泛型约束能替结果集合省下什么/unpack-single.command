@@ -1,0 +1,1 @@
+/tmp/go-language-13-unpack-jfyCrS/taskstats --text Go\ 写\ Go

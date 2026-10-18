@@ -1,0 +1,1 @@
+go build -o /tmp/go-language-08-unpack-SxbBna/invalid ./testdata/nonaddressable-receiver.go

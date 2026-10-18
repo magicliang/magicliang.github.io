@@ -1,0 +1,1 @@
+/tmp/go-language-39-reader.Uk8zCV/taskstats serve --listen 127.0.0.1:0 --admin 127.0.0.1:0 --workers 1 --queue-capacity 1 --max-words 3 --sql-dsn host=127.0.0.1\ port=54089\ user=admin\ dbname=go39live\ sslmode=disable 

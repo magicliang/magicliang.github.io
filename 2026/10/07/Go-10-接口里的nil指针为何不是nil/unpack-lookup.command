@@ -1,0 +1,1 @@
+/tmp/go-language-10-unpack-EuFKv9/taskstats --batch Go\|one\ two --lookup task\[0\]

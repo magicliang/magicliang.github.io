@@ -1,0 +1,1 @@
+/tmp/go-language-06-unpack-pCYhEJ/taskstats --file /tmp/go-language-06-unpack-pCYhEJ/input.txt

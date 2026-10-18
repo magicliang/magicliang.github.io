@@ -1,0 +1,1 @@
+curl --globoff --max-time 15 --silent --show-error -H 'Content-Type: application/json' -d '{"text":"db lost"}' --output '/home/admin/workspace/my-blogs/source/_posts/2026-10-09-Go-39-空环境如何验收任务完整生命周期/rejected-db.body' --write-out 'HTTP_STATUS=%{http_code}\n' 'http://127.0.0.1:39941/tasks'

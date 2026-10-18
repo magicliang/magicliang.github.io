@@ -1,0 +1,1 @@
+psql -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 54089 -U admin -d go39live -Atc "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='go39live' AND pid<>pg_backend_pid() AND state='active' AND query LIKE '%UPDATE go_tasks SET%'"

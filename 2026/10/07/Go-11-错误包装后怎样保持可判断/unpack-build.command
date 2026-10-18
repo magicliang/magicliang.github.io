@@ -1,0 +1,1 @@
+go build -o /tmp/go-language-11-unpack-bLDv44/taskstats .

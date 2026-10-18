@@ -1,0 +1,1 @@
+go test -run '^$' -bench '^BenchmarkTask(AnalyzeContext|HTTPRead)$' -benchtime=1s -cpuprofile='/tmp/go-language-35-reader.I43pgB/cpu-35.pprof' -memprofile='/tmp/go-language-35-reader.I43pgB/heap-35.pprof' -memprofilerate=1024 .

@@ -1,0 +1,1 @@
+tar -xzf go-language-12.tar.gz -C /tmp/go-language-12-unpack-auE8tY

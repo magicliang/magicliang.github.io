@@ -1,0 +1,1318 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>Codex 架构全景：本地运行、云端长任务与多层 Loop | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="从公开源码与官方文档拆解 Codex 的组件、进程、协议、工具、状态和权限，解释本地、SSH Remote、托管 Cloud 的差别，以及 task、turn、模型工具循环和长期目标之间的关系。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Codex 架构全景：本地运行、云端长任务与多层 Loop">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/15/Codex-%E6%9E%B6%E6%9E%84%E5%85%A8%E6%99%AF-%E6%9C%AC%E5%9C%B0%E8%BF%90%E8%A1%8C-%E4%BA%91%E7%AB%AF%E9%95%BF%E4%BB%BB%E5%8A%A1%E4%B8%8E%E5%A4%9A%E5%B1%82-Loop/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="从公开源码与官方文档拆解 Codex 的组件、进程、协议、工具、状态和权限，解释本地、SSH Remote、托管 Cloud 的差别，以及 task、turn、模型工具循环和长期目标之间的关系。">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-ai-agent.svg">
+<meta property="article:published_time" content="2026-10-15T08:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-18T05:40:15.225Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="AI Agent">
+<meta property="article:tag" content="Agent Harness">
+<meta property="article:tag" content="Codex">
+<meta property="article:tag" content="系统架构">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-ai-agent.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "Codex 架构全景：本地运行、云端长任务与多层 Loop",
+  "url": "https://magicliang.github.io/2026/10/15/Codex-%E6%9E%B6%E6%9E%84%E5%85%A8%E6%99%AF-%E6%9C%AC%E5%9C%B0%E8%BF%90%E8%A1%8C-%E4%BA%91%E7%AB%AF%E9%95%BF%E4%BB%BB%E5%8A%A1%E4%B8%8E%E5%A4%9A%E5%B1%82-Loop/",
+  "image": "https://magicliang.github.io/img/cover-ai-agent.svg",
+  "datePublished": "2026-10-15T08:00:00.000Z",
+  "dateModified": "2026-10-18T05:40:15.225Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/15/Codex-%E6%9E%B6%E6%9E%84%E5%85%A8%E6%99%AF-%E6%9C%AC%E5%9C%B0%E8%BF%90%E8%A1%8C-%E4%BA%91%E7%AB%AF%E9%95%BF%E4%BB%BB%E5%8A%A1%E4%B8%8E%E5%A4%9A%E5%B1%82-Loop/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: 'Codex 架构全景：本地运行、云端长任务与多层 Loop',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1964</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1986</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">38</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-ai-agent.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">Codex 架构全景：本地运行、云端长任务与多层 Loop</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">Codex 架构全景：本地运行、云端长任务与多层 Loop</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-15T08:00:00.000Z" title="Created 2026-10-15 16:00:00">2026-10-15</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-18T05:40:15.225Z" title="Updated 2026-10-18 13:40:15">2026-10-18</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD/">人工智能</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">13k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>41mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-18 13:40:15&quot;}" hidden></div><p>Codex 的架构需要同时回答两个问题：一次编码请求怎样完成，以及请求结束以后，什么状态还能保留、谁会再次启动工作。前一个问题涉及模型、工具和 Harness；后一个问题涉及会话、目标、执行环境、调度和身份。</p>
+<p>“Codex 在本地运行”通常表示工作区和工具在本机，模型推理仍可以发生在 OpenAI 的服务器。“Desktop 连 Remote”通常表示客户端通过 SSH 控制远端 App Server；“Cloud 长期运行”则包含托管执行环境及其生命周期。这些模式可以共享执行框架，却承担着不同的运行责任。</p>
+<p>本文以 <strong>2026 年 10 月 15 日读取的官方产品文档</strong>和 <strong>Codex <code>rust-v0.162.1</code> 源码</strong>为基线。源码固定在 <a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d"><code>092d3acd6bec3e3a14bdc7e7a2810ab628ab759d</code></a>，提交日期为 2026 年 10 月 9 日；本地 <code>codex --version</code> 为 <code>codex-cli 0.162.1</code>。文中的拓扑是根据公开接口整理的解释模型，涉及托管 Cloud 的部分只描述公开契约。云端内部队列、数据库拓扑、VM checkpoint 算法和模型权重结构，没有足够公开证据可以展开。</p>
+<span id="more"></span>
+<h1 id="codex-这个名字覆盖了哪些东西">Codex 这个名字覆盖了哪些东西</h1>
+<p>Codex 既指产品，也出现在模型名称、命令行工具、SDK 和执行框架的讨论中。架构分析需要先确定对象。</p>
+<table>
+<thead>
+<tr>
+<th>对象</th>
+<th>实际职责</th>
+<th>不能由名字直接推导的性质</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模型与推理服务</td>
+<td>根据上下文生成文本、工具调用等响应</td>
+<td>工具一定在模型服务器执行、本机一定运行模型权重</td>
+</tr>
+<tr>
+<td>Harness / Core</td>
+<td>管理上下文、模型工具循环、权限、取消、记录和恢复</td>
+<td>自带完整云调度与永久在线服务</td>
+</tr>
+<tr>
+<td>App Server</td>
+<td>向客户端提供认证、thread、turn、事件和审批接口</td>
+<td>必须独立进程、等同 MCP、只是模型 API 代理</td>
+</tr>
+<tr>
+<td>客户端与 SDK</td>
+<td>提供交互入口，或以程序控制运行时</td>
+<td>各入口使用完全相同的工具、权限和产品功能</td>
+</tr>
+<tr>
+<td>执行与产品平台</td>
+<td>提供工作目录、进程、网络、身份和任务生命周期</td>
+<td>所有产品共用一种 VM、状态或调度策略</td>
+</tr>
+</tbody>
+</table>
+<p>CLI、核心 Harness、App Server 及部分 SDK 可以检查公开实现；桌面和 IDE 产品的完整实现、托管 Cloud 控制面并不能通过 CLI 仓库全部还原。官方还单独列出了 <code>codex-universal</code> 等开源项目。开源范围是组件范围，不能扩展成整个产品栈都已开源。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/open-source">开源组件说明</a></p>
+<p>站内的《<a href="/2026/08/24/OpenAI-Codex-Harness-%E6%BA%90%E7%A0%81%E8%A7%A3%E5%89%96-%E5%AE%83%E4%B8%8E-Codex-CLI-%E5%88%B0%E5%BA%95%E6%98%AF%E4%BB%80%E4%B9%88%E5%85%B3%E7%B3%BB/">OpenAI Codex Harness 源码解剖</a>》解释过 CLI 与 Harness 的关系。这里使用较新的源码快照：当前核心包装类型是 <code>CodexThread</code>，内部持有 <code>Session</code> 和 <code>SessionIo</code>，由 <code>ThreadManager</code> 管理。旧版本的类型名和调用路径不能直接当成当前实现。</p>
+<h1 id="先确定四个位置">先确定四个位置</h1>
+<p>理解一种运行模式，先定位控制、推理、执行和状态。</p>
+<table>
+<thead>
+<tr>
+<th>位置</th>
+<th>要问的问题</th>
+<th>典型内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>控制</td>
+<td>谁接受请求、安排工作、决定继续或等待？</td>
+<td>Desktop、App Server、goal 扩展、云端调度</td>
+</tr>
+<tr>
+<td>推理</td>
+<td>谁处理模型请求？</td>
+<td>OpenAI 推理服务、显式配置的本地模型服务</td>
+</tr>
+<tr>
+<td>执行</td>
+<td>谁真正读取文件、运行命令、访问服务？</td>
+<td>本机、SSH 主机、云任务 VM、MCP 服务</td>
+</tr>
+<tr>
+<td>状态</td>
+<td>历史、文件、目标和凭据分别存在哪里？</td>
+<td>本地会话文件与 SQLite、远端目录、云任务状态、身份服务</td>
+</tr>
+</tbody>
+</table>
+<p>这四个位置可以重合，也可以分离。Desktop 的窗口在本机，不代表命令在本机；工具在本机，不代表模型在本机；UI 经过云端 relay，也不代表工作区已经进入托管 Cloud。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/environments/modes">运行环境</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/remote-connections">远程连接</a></p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="components.svg" alt="Codex 组件及控制、推理、执行与状态边界"></p>
+<p>图中箭头表示职责之间的调用或数据关系，不表示每个框都部署为独立服务。尤其是 App Server，可以在客户端进程内运行。</p>
+<h1 id="从命令启动到-core：本地到底运行了什么">从命令启动到 Core：本地到底运行了什么</h1>
+<h2 id="一个-rust-发行物承载多个入口">一个 Rust 发行物承载多个入口</h2>
+<p><code>codex</code> 的顶层命令分发到交互 TUI、非交互 <code>exec</code>、独立 <code>app-server</code>、Cloud 客户端等入口。它们承担不同的输入输出方式，不应按命令名字推断执行地点。例如，<code>codex cloud</code> 是操作云任务的客户端入口，不能据此认为当前终端开始托管云任务。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/cli/src/main.rs">CLI 命令分发源码</a></p>
+<p>在这个源码版本中，TUI 的 <code>AppServerTarget</code> 有 <code>Embedded</code>、<code>LocalDaemon</code>、<code>Remote</code> 三种目标。Embedded 启动进程内 App Server；LocalDaemon 尝试连接本地 daemon，部分失败路径允许回退 Embedded；Remote 连接已有远端服务。因此，“CLI 直接调用 Core”和“CLI 总是另起 App Server 子进程”，都不足以概括当前启动路径。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/tui/src/lib.rs#L320-L345">目标类型</a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/tui/src/lib.rs#L553-L611">连接分支</a></p>
+<p>非交互 <code>codex exec</code> 也调用 <code>InProcessAppServerClient::start</code>。进程内客户端使用带类型的请求和事件通道，启动 App Server 后台 Tokio worker。外部 STDIO / WebSocket 边界使用 JSON 序列化；进程内热路径使用 typed channels，但响应仍保留 JSON-RPC result envelope，并未另造一套协议语义。服务抽象与操作系统进程边界在这里是两个独立选择。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/exec/src/lib.rs#L1022-L1029">exec 初始化</a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/app-server-client/README.md#L27-L43">进程内客户端设计</a></p>
+<h2 id="app-server-下面的对象关系">App Server 下面的对象关系</h2>
+<p><code>ThreadManager</code> 创建并保有内存中的 thread。创建过程组装认证、模型、执行环境、skills、plugins、MCP 和存储等依赖，再启动 <code>Session</code>。<code>CodexThread</code> 提供线程对象的外部操作面；<code>SessionIo</code> 保存提交操作的 sender、接收事件的 receiver，以及会话循环的终止 future。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/thread_manager.rs#L2320-L2368">ThreadManager</a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/codex_thread.rs#L208-L220">CodexThread</a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/session/mod.rs#L410-L425">SessionIo</a></p>
+<p>可以沿着下面的路径阅读一次普通执行：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs text">客户端 / SDK<br>  → App Server 请求处理<br>  → ThreadManager<br>  → CodexThread &#123; Session, SessionIo &#125;<br>  → submission_loop 接收操作<br>  → SessionTask / RegularTask<br>  → run_turn<br>  → 模型请求、响应事件、工具调用、后续模型请求<br></code></pre></td></tr></table></figure>
+<p>这里的“thread”是对话状态和执行控制对象，不能直接翻译成“一条操作系统线程”。Tokio task、子进程、终端会话和子 agent thread 是另外的对象。</p>
+<h2 id="本地执行与本地推理要分别配置">本地执行与本地推理要分别配置</h2>
+<p>普通本地模式可以在本机读代码、运行测试，再把必要的代码片段和工具结果发送给远端模型。截图等多模态输入也属于数据流的一部分。本地工作目录并不构成“代码绝不离开机器”的保证。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/enterprise/chatgpt-work-local-security">本地执行安全边界</a></p>
+<p>显式使用 OSS provider 是另一种拓扑：CLI 可以连接 Ollama 或 LM Studio 等本地模型服务。这时推理服务的位置改变，模型能力、工具协议兼容性和资源要求也要分别确认。安装 Codex CLI 本身不会把默认托管模型的权重下载到笔记本。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/config-file/config-advanced#oss-mode-local-providers">本地模型 provider 配置</a></p>
+<p>Desktop 的 Local 与 Worktree 模式仍属于本地执行。Worktree 提供独立 Git 工作目录，减少并行修改同一路径的冲突；它不提供独立操作系统，也不自动隔离网络、凭据和所有进程。</p>
+<h1 id="app-server-的协议架构">App Server 的协议架构</h1>
+<p>App Server 提供的是有状态 agent 协议。客户端需要跟踪 thread、turn、item、流式事件、审批请求及连接生命周期，不能只发送一次 prompt，等待一段文本。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/app-server">App Server 协议</a></p>
+<h2 id="传输与连接握手">传输与连接握手</h2>
+<p>默认传输是 STDIO：请求与事件按 JSONL 逐行传输。还支持 WebSocket，以及 Unix socket 上的 WebSocket/HTTP Upgrade 等方式。消息采用 JSON-RPC 2.0 的请求、响应和通知结构，但 wire message 省略 <code>jsonrpc</code> 字段。每个连接先完成 <code>initialize</code> 请求，再发送 <code>initialized</code> 通知，随后才进入业务调用。</p>
+<p><code>--listen</code> 决定客户端怎样连接 App Server；<code>--code-mode-host</code> 决定 App Server 怎样连接 Code Mode 执行宿主。这是两条不同方向的连接。同一 App Server 进程内的 threads 共享所选 Code Mode host 连接，并不意味着所有工具都被同一个参数迁移到了远端。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/app-server">App Server 传输与 Code Mode host</a></p>
+<p>当前文档仍将 App Server 命令及 WebSocket transport 标为实验性，并注明不支持 production workloads。用它研究、嵌入和构建原型，与获得托管 Cloud 的生产生命周期承诺，是不同层次的事情。</p>
+<h2 id="thread-turn-item">Thread、Turn、Item</h2>
+<table>
+<thead>
+<tr>
+<th>协议对象</th>
+<th>表示什么</th>
+<th>一个例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Thread</td>
+<td>可持续追加和恢复的对话及其状态</td>
+<td>围绕某个仓库持续处理问题的 chat</td>
+</tr>
+<tr>
+<td>Turn</td>
+<td>一次输入所启动的 agent 工作过程</td>
+<td>接到修复请求后读文件、改代码、测试、回答</td>
+</tr>
+<tr>
+<td>Item</td>
+<td>turn 中的输入、输出或操作记录</td>
+<td>用户消息、agent 消息、命令、文件修改、工具调用</td>
+</tr>
+</tbody>
+</table>
+<p>一个 turn 可以包含多次模型请求和多次工具执行。一个 thread 可以经历多个 turn。产品层的一项任务还可能涉及多个对话或子 agent；不能把所有界面上的 task 都当成一个固定的 thread ID。</p>
+<p>典型事件序列如下。工具和审批事件只是示意，实际类型以协议 schema 为准：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><code class="hljs text">client → initialize<br>client ← initialization result<br>client → initialized<br>client → thread/start 或 thread/resume<br>client ← thread<br>client → turn/start<br>client ← turn，status=inProgress<br>client ← turn/started<br>client ← item/started、输出增量、item/completed ...<br>client ← 审批或用户输入请求（若需要）<br>client → 对应请求的答复<br>client ← 后续 items ...<br>client ← turn/completed，status=completed / failed / interrupted<br></code></pre></td></tr></table></figure>
+<p><code>turn/start</code> 成功只表示工作获准开始。<code>turn/completed</code> 表示该 turn 达到协议终态，不能证明测试通过、PR 合并、线上流量正常，甚至不能单凭 <code>completed</code> 证明业务目标已经实现。验收证据需要来自相应工具、文件或外部系统。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="protocol-sequence.svg" alt="App Server 的连接握手、Turn 事件与双向审批时序"></p>
+<h2 id="steering-取消与双向请求">Steering、取消与双向请求</h2>
+<p><code>turn/steer</code> 向活动 turn 注入新输入，使用 <code>expectedTurnId</code> 防止输入落到错误的执行过程。它不会新建 turn，也不能借此随意改写活动 turn 的 cwd、模型或权限策略；没有活动 turn 时会失败。<code>turn/interrupt</code> 则请求中断当前执行。</p>
+<p>审批让协议具有双向性：服务端也可以发起请求，等待客户端答复。只实现“客户端请求、服务端响应”的单向 RPC 包装，会遗漏命令审批、文件操作审批和用户补充信息等状态。连接中断时，还要处理这些等待者的归属。</p>
+<p>历史读取、订阅和执行恢复也需要区分。读取已保存的 thread，不等于让它恢复执行；客户端收到某个 item 的增量，也应以后续完成事件确定最终状态。官方说明还包含无订阅、无活动一段时间后卸载 thread 的行为，这与任务永久驻留是不同概念。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/app-server">Thread 与 Turn 生命周期</a></p>
+<h1 id="task-loop-与-turn-loop：先消除同名歧义">Task Loop 与 Turn Loop：先消除同名歧义</h1>
+<p>“Task loop 是外层，turn loop 是内层”只能作为粗略解释。源码里的 task、产品里的 task、业务工作流里的 task，并不共享同一种生命周期。</p>
+<table>
+<thead>
+<tr>
+<th>用法</th>
+<th>负责的事情</th>
+<th>是否天然跨 turn</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>产品任务</td>
+<td>保存一次委托、环境、结果与继续工作的入口</td>
+<td>可以，具体由产品定义</td>
+</tr>
+<tr>
+<td>目标或工作流循环</td>
+<td>判断目标是否完成，安排下一轮执行或等待</td>
+<td>通常可以</td>
+</tr>
+<tr>
+<td><code>SessionTask</code></td>
+<td>驱动 Session turn 的具体执行工作流</td>
+<td>不能据名字推导；由具体实现决定</td>
+</tr>
+<tr>
+<td><code>run_turn</code> 内部循环</td>
+<td>组织模型、工具、输入与停止条件</td>
+<td>工作于 turn 执行范围内</td>
+</tr>
+<tr>
+<td>模型请求与响应流</td>
+<td>完成一次推理请求，处理响应事件</td>
+<td>单次请求本身不是完整 turn</td>
+</tr>
+</tbody>
+</table>
+<p>在本次固定快照的 Rust 源码中，没有检索到名为 <code>task_loop</code> 或 <code>turn_loop</code> 的精确标识符。可定位的机制是 <code>submission_loop</code>、<code>SessionTask</code>、<code>RegularTask::run</code>、<code>run_turn</code>，以及 goal 扩展的 continuation。文章或演讲使用前两个英文词时，必须补上所指层次。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="loops.svg" alt="Codex 会话、运行时任务、Turn 内循环与目标续跑的关系"></p>
+<p>图中的层级是职责层级。它不是说每层都有一个独立、永不返回的 <code>while</code> 函数，更不是一次函数调用就对应一个新协议 turn。</p>
+<h2 id="submission-loop：会话操作分发">submission_loop：会话操作分发</h2>
+<p><code>Session</code> 启动 <code>submission_loop</code>，等待并分发输入、取消、恢复、关闭等操作。会话可以存活并等待输入，此时模型完全不需要持续生成。服务在线、thread 已加载、turn 活跃、模型正在推理，是四种不同状态。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/session/mod.rs#L966-L984">循环启动</a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/session/handlers.rs#L439-L552">操作分发</a></p>
+<p>这层循环解决“运行时收到什么操作、如何改变执行状态”。它本身不负责证明某个长期业务目标完成，也不等于云调度器。</p>
+<h2 id="sessiontask：session-拥有的执行工作流">SessionTask：Session 拥有的执行工作流</h2>
+<p><code>SessionTask</code> 的注释明确说明：它驱动 Session turn，由 Session 拥有，在后台 Tokio task 中执行。当前 <code>TaskKind</code> 包含 <code>Regular</code>、<code>Review</code>、<code>Compact</code>。这些类型解释运行时如何区分普通工作、审查和压缩等工作流。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/tasks/mod.rs#L172-L204">SessionTask 契约</a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/state/turn.rs#L65-L83">TaskKind</a></p>
+<p><code>RegularTask::run</code> 自己还有一个外层循环。它调用 <code>run_turn</code>；遇到 terminal error 则结束；没有 pending input 则结束；如果仍有输入，就以空 initial input 再调用一次，并复用原来的 <code>TurnContext</code>。</p>
+<p>因此，同一个协议 turn 的执行过程，可以重新进入 <code>run_turn</code>。拿 <code>run_turn()</code> 的调用次数统计 turn 数量，会把函数实现细节误当成协议生命周期。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/tasks/regular.rs#L101-L124">RegularTask 的循环</a></p>
+<h2 id="run-turn：模型与工具往返">run_turn：模型与工具往返</h2>
+<p><code>run_turn</code> 的源码注释给出了基本机制：模型提出函数调用，运行时执行工具，再把结果用于下一次采样。实际循环还要处理 pending input、上下文管理、模型是否需要 follow-up，以及 Stop hook 是否允许结束。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/session/turn.rs#L149-L170">run_turn 定义与注释</a></p>
+<p>可以把下面的伪代码用作阅读辅助；它省略并发、错误、压缩和事件细节，不能代替实现：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">在当前 TurnContext 中：<br>    组织模型输入<br>    请求并消费模型响应<br>    执行响应要求的工具，记录结果<br>    有工具后续或待处理输入 → 继续模型请求<br>    Stop hook 要求继续 → 注入反馈，继续<br>    其余结束条件满足 → 结束当前执行<br></code></pre></td></tr></table></figure>
+<p>follow-up 判断包含 <code>model_needs_follow_up || has_pending_input</code>。模型已经输出一段可见文本，并不意味着 turn 立刻结束；Stop hook 拒绝结束时，还可以注入 continuation prompt，继续同一执行循环。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/session/turn.rs#L531-L573">后续请求条件</a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/session/turn.rs#L656-L704">Stop hook</a></p>
+<h2 id="一次修复请求怎样跨越这些层">一次修复请求怎样跨越这些层</h2>
+<p>假设用户提交“修复登录超时，并用回归测试证明”。一个 turn 中可能依次发生：模型要求读文件、工具返回代码；模型要求运行测试、工具返回失败；模型生成修改、工具更新文件；模型再次测试、工具返回结果；模型提交最终说明。这里包含多个模型请求、多个 items，但仍可能只有一个协议 turn。</p>
+<p>用户在执行期间补充“也检查 Windows”，如果通过 <code>turn/steer</code> 接入，可以仍处于该 turn。用户在结束后再发“继续验证集成环境”，则启动后续 turn。若设置了长期 goal，运行时也可以在空闲时自动启动新 turn。产品中的“修复登录超时”这项任务，可能覆盖上述整个过程。</p>
+<p>这给出三个不同的计数单位：任务按委托和产品状态计数，turn 按协议执行生命周期计数，模型调用按推理请求计数。它们不能互相代换，token 预算和耗时统计也需要注明口径。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="turn-timeline.svg" alt="同一产品任务中的模型请求、Turn 边界与 Goal 续跑时间线"></p>
+<h1 id="goal：跨-turn-的目标续跑">Goal：跨 turn 的目标续跑</h1>
+<p>当前 <code>/goal</code> 功能把目标及完成条件保存下来，支持继续引导、暂停、恢复和修改。它延长的是目标管理的生命周期；当前 sandbox 和 approval policy 仍然适用。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/long-running-work">Long-running work</a></p>
+<p>App Server 提供 <code>thread/goal/set</code>、<code>thread/goal/get</code> 和 <code>thread/goal/clear</code> 等接口。goal 状态包含 objective、status、token budget、tokens used 和 time used 等信息。设置新的 objective 与在同一个目标上继续工作，涉及不同的预算记账语义，应按接口契约处理。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/app-server">Goal 协议</a></p>
+<p>源码中的实现已分离到 <code>codex-rs/ext/goal</code>。<code>GoalRuntimeHandle::continue_if_idle</code> 会检查功能是否可用、是否有 continuation deferral、thread 是否仍可用、保存的 goal 是否处于 Active。满足条件后，通过 <code>start_turn_if_idle</code> 提交 continuation，并将 <code>turn_trigger</code> 标为 <code>goal</code>。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/ext/goal/src/runtime.rs#L425-L510">Goal runtime</a></p>
+<p>这与 Stop hook 的区别是可观察的：Stop hook 可以继续 turn 内循环；goal 的 idle continuation 则尝试启动新的 turn。两者都能产生“回答以后还在继续”的表象，却作用于不同生命周期。</p>
+<p>goal 也有停止和记账路径。源码区分 turn error、usage limit、execution unavailable、重复空响应等情况，并通过状态和锁协调外部修改与自动续跑。它不是一个无条件的 <code>while true</code>。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/ext/goal/src/runtime.rs#L276-L325">Goal 停止处理</a></p>
+<p>本地 goal 仍依赖运行时和工作区可用。官方建议长任务避免主机休眠，并在预计断网前暂停，再恢复执行。保存了目标，并不自动获得离线调度器、常驻云主机或无限资源。</p>
+<h1 id="模型连接-上下文与工具路由">模型连接、上下文与工具路由</h1>
+<h2 id="modelclient-与一次模型请求">ModelClient 与一次模型请求</h2>
+<p>源码把会话级 <code>ModelClient</code> 与 turn 级 <code>ModelClientSession</code> 分开。前者维护认证、provider、conversation 和连接回退等状态；后者服务于某个 turn，允许在该 turn 内发出多个 Responses 请求。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/client.rs">模型客户端设计注释</a></p>
+<p>连接层包含 WebSocket 缓存、路由状态、增量上下文关联和 HTTP 回退等机制。由此不能把“一个 turn”等同一条 HTTP 请求，也不能声称每一步都重新发送一份完全相同的纯文本历史。模型输入包含指令、消息、工具声明、工具结果及多模态内容；具体传输还受 provider 和版本影响。</p>
+<p>认证状态、模型选择和计费主体也属于运行架构。使用 ChatGPT 登录、API key 或组织管理的凭据，不能仅因接入同一 CLI 就视为同一种身份和配额。远端主机上的 Codex 还需要自己的可用认证；本机登录不等于给任意 SSH 主机自动授予全部凭据。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/codex/cli">CLI 使用与认证入口</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/remote-connections">远程连接</a></p>
+<h2 id="工具声明-选择与执行">工具声明、选择与执行</h2>
+<p>模型输出的是工具调用意图，Harness 根据工具名、call ID 和 payload 路由到实现。工具 registry 决定哪些工具可见，参数 schema 决定调用形状，执行器再处理结果、错误和事件。<code>ToolRouter</code> 维护 registry、可见 specs、Code Mode 名称映射等对象。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/tools/router.rs">ToolRouter</a></p>
+<p>当前仓库还把共享工具 schema、namespace、延迟发现、MCP 转换和 Code Mode 相关定义整理在 <code>codex-rs/tools</code>。该目录说明部分职责仍在迁移，Core 继续承担具体编排。讨论组件边界时，应该同时看类型定义和实际执行入口。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/tools/README.md">工具层设计说明</a></p>
+<p>普通命令工具还要经过审批、sandbox 选择、执行及必要的升级重试。<code>ToolOrchestrator</code> 的设计注释直接列出这条路径。工具调用成功返回，只证明该工具的结果；一个外部服务返回“已接受”，不等于它的下游副作用已经完成。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/tools/orchestrator.rs">ToolOrchestrator</a></p>
+<h2 id="code-mode-与-exec-server">Code Mode 与 exec-server</h2>
+<p>Code Mode 增加了通过代码组合工具调用的执行方式，公开仓库包含基于 V8 的 runtime 和会话实现。它处于工具编排层，不能解释为“模型生成 JavaScript 后就获得不受限制的系统权限”。最终调用仍落到宿主提供的能力与策略。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/code-mode-runtime/src/lib.rs">Code Mode runtime</a></p>
+<p><code>exec-server</code> 则是另一类更窄的服务：启动、控制子进程和 PTY，并提供文件系统相关 handler。它的协议与 App Server 不同。App Server 管 thread 和 turn，exec-server 管执行资源；不能把两个名字都翻译成“远程 Codex 服务”。</p>
+<p>公开 exec-server 设计还包含直接 WebSocket 与远端 registry/rendezvous 等连接路径。relay/forwarder 负责转发字节，不持久化、重放完整执行；目标执行端拥有进程及恢复状态。这里能确认执行位置可进一步拆开，却不能据此断言托管 Codex Cloud 就采用同一内部拓扑。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/exec-server/README.md">exec-server 设计说明</a></p>
+<h1 id="状态架构：上下文-历史-记忆和文件">状态架构：上下文、历史、记忆和文件</h1>
+<p>长期工作至少要区分四类状态。模型当前能看到的上下文，只是其中一类。</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>主要用途</th>
+<th>恢复时需要防止的误解</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>对话与执行历史</td>
+<td>记录输入、items、turn 和相关事件</td>
+<td>能恢复历史，不代表活跃进程仍在</td>
+</tr>
+<tr>
+<td>上下文与压缩结果</td>
+<td>在有限窗口中保留当前推理所需信息</td>
+<td>压缩会选择和重写信息，不是无限完整记忆</td>
+</tr>
+<tr>
+<td>工作区与执行状态</td>
+<td>保存文件、未提交修改、依赖、进程与终端</td>
+<td>文件、进程、连接可以有不同寿命</td>
+</tr>
+<tr>
+<td>目标、记忆与产品元数据</td>
+<td>支持跨 turn 目标、偏好和检索</td>
+<td>持久化文本不等于更新模型权重</td>
+</tr>
+</tbody>
+</table>
+<h2 id="threadstore-rollout-与-sqlite">ThreadStore、Rollout 与 SQLite</h2>
+<p>当前快照使用 <code>ThreadStore</code> 作为 thread 存储边界，提供本地和内存实现，也允许仓库之外存在其他实现。活动会话优先通过 <code>LiveThread</code> 持久化：应用相应策略、追加规范历史，再显式提交 metadata patch。<code>ThreadManager</code> 统一路由已加载与冷 thread 的元数据修改，Core 不需要假设底层一定是本地文件。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/thread-store/README.md#L3-L30">Thread Store 设计说明</a></p>
+<p><code>LocalThreadStore</code> 才进一步使用 rollout JSONL 保存历史，并在 SQLite 可用时维护可查询的元数据。<code>RolloutRecorder</code> 是本地 writer；活动 thread-store append 的元数据更新由上层明确提交，不再由 writer 根据历史内容自行推断。这条边界让“会话怎么运行”与“状态由谁存储”可以独立变化。</p>
+<p>公开实现包含 rollout 记录器和状态数据库。rollout 模块负责会话记录的持久化与发现，记录器将事件写入 JSONL；state 模块使用 SQLite 保存和查询结构化状态，部分 thread metadata 与 rollout 对应，并提供 backfill 等机制。goal、队列等新增状态也有自己的表和语义。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/rollout/src/lib.rs">rollout 模块</a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/rollout/src/recorder.rs">记录器</a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/state/src/lib.rs">state 模块</a></p>
+<p>不能用“所有状态都在 JSONL”或“SQLite 是全部真相”概括这一组合。具体对象的拥有者、写入时机和恢复路径需要逐项确认。线程历史、Git 修改、云 VM state 和外部服务数据，也不在同一个事务中提交。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="state-storage.svg" alt="Codex 的活动状态、ThreadStore、本地存储与外部状态边界"></p>
+<h2 id="compaction-管理推理窗口">Compaction 管理推理窗口</h2>
+<p>上下文窗口有限，长 turn 和长 thread 都需要控制输入规模。压缩把既有内容整理成继续推理可用的表示；它会影响后续判断，但不会让原始外部系统状态自动变成最新。文件可能被其他进程修改，测试环境可能变化，旧结论需要重新读取对应证据。</p>
+<p><code>Compact</code> 是当前源码中的任务类型之一，配置和模型还可能影响压缩方式。压缩、恢复、记忆维护是相邻机制，不能用“记住了”把它们合成一种能力。</p>
+<h2 id="memories-是独立的维护流程">Memories 是独立的维护流程</h2>
+<p>公开 <code>codex-rs/memories</code> 描述了一个可启用、依赖持久状态的两阶段机制。第一阶段从符合条件、已经空闲的交互会话 rollout 中提取 <code>raw_memory</code>、<code>rollout_summary</code> 等内容，使用有 lease 的任务与并发上限；生成内容会经过秘密信息处理并写入状态。第二阶段选择材料，生成或同步记忆文件，再由受限的内部 consolidation agent 整理。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/memories/README.md">Memories 设计说明</a></p>
+<p>第二阶段还使用记忆目录的 Git baseline 检测变化、清理过期内容，并在成功后更新 baseline。这里发生的是外部状态提取、筛选和重新注入，不是在线训练模型。该机制有功能开关和会话条件，不能写成所有 Codex 入口默认拥有同一套永久记忆。</p>
+<h2 id="trace-与可观测性">Trace 与可观测性</h2>
+<p><code>rollout-trace</code> 提供可选本地诊断：记录原始事件与 payload，再离线还原 thread、turn、推理调用、工具、Code Mode cells、终端和压缩等节点与关系。这种记录适合解释“为什么继续了三次”“时间花在哪个工具上”，比只保存最终聊天文本更接近实际执行图。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/rollout-trace/README.md">Rollout trace 说明</a></p>
+<p>该功能说明它是本地诊断记录，不能当作全部都会上传的遥测。记录可能包含 prompt 和工具结果，使用、保存和共享时需要按内容处理。</p>
+<h1 id="权限-身份与扩展分别约束什么">权限、身份与扩展分别约束什么</h1>
+<h2 id="sandbox-与审批的边界">Sandbox 与审批的边界</h2>
+<p>Sandbox 决定工具在技术上能够访问什么；approval policy 决定何时需要人工或策略授权；auto-review 对符合条件的动作进行自动审批判断；安全监测还可以在执行过程中暂停活动。它们承担不同职责，不能互相替代。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/agent-approvals-security">Agent approvals and security</a></p>
+<p>典型文件权限模式包括只读、工作区可写和更宽的访问，也可以使用命名 permission profile。即使工作区可写，<code>.git</code>、<code>.agents</code>、<code>.codex</code>、<code>.aws</code> 等敏感路径仍可能受到额外保护。实际能否写入，要以当次生效的 profile、平台和组织要求为准。</p>
+<p>当前官方文档列出的实现包括 macOS Seatbelt、Linux 的 bubblewrap 与 seccomp、Windows 的 MXC 及兼容路径；WSL2 使用 Linux 执行环境。早期资料中关于 Linux 单一隔离后端的描述，需要结合版本更新。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/agent-approvals-security">平台隔离机制</a></p>
+<p>网络也分通道。本地 shell 的网络关闭，并不必然关闭托管网页搜索或远端 MCP 服务的访问；MCP 服务自身的凭据和权限也不由一个本地目录白名单完整决定。需要分别追踪命令执行、模型服务、网页工具和 connector 的调用路径。</p>
+<h2 id="config-与-agents-md">Config 与 AGENTS.md</h2>
+<p>个人配置、profile、项目配置、命令行覆盖和组织管理要求共同决定运行行为。当前配置文档还区分默认配置与强制要求：一个默认值可以被更高优先级配置覆盖，强制约束则不能靠普通项目配置解除。未信任项目不会直接加载其项目配置、hooks 和规则。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/config-file/config-basic">配置基础</a></p>
+<p><code>AGENTS.md</code> 是提供给 agent 的指令来源。当前发现规则从全局指令和项目路径逐层组合，每层优先选择 override 等候选文件，并受默认读取大小限制；它不是递归读取仓库所有同名文件。进入某个子目录的工作范围，还可能受到该层指令影响。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/agent-configuration/agents-md">AGENTS.md 规则</a></p>
+<p>文件里的“只读”“允许联网”属于指令内容。文件系统与网络能力由运行时策略约束。把角色文件命名为 reviewer，不能自动建立只读 sandbox；在仓库里写“允许全部操作”，也不会绕过宿主权限。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="security-boundaries.svg" alt="指令、审批、身份与 Sandbox 对工具执行的不同约束"></p>
+<h2 id="skills-plugins-mcp-apps-与-hooks">Skills、Plugins、MCP、Apps 与 Hooks</h2>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>装入什么</th>
+<th>应当检查的边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Skill</td>
+<td>工作流说明、脚本、参考资料</td>
+<td>先发现摘要，再按需读取正文；不等于模型微调</td>
+</tr>
+<tr>
+<td>Plugin</td>
+<td>skills、MCP、hooks 等能力的分发组合</td>
+<td>安装、启用、认证和使用授权是不同动作</td>
+</tr>
+<tr>
+<td>MCP / App connector</td>
+<td>外部服务提供的工具与数据</td>
+<td>连接方式、凭据主体、服务端权限、数据可见性</td>
+</tr>
+<tr>
+<td>Hook</td>
+<td>生命周期事件触发的确定性程序或反馈</td>
+<td>信任、运行地点、超时和对执行的影响</td>
+</tr>
+</tbody>
+</table>
+<p>Skills 使用渐进式加载，避免每次把所有操作手册塞进上下文。MCP 支持 STDIO 子进程和 Streamable HTTP 等连接；其服务可能在本机，也可能在其他系统。工具可见，不等于目标服务已经授权当前用户访问全部数据。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/skills-and-plugins">Skills 与 plugins</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/extend/mcp">MCP 工具接入</a></p>
+<p>Hooks 可覆盖 Session、Turn 周边、工具前后、压缩、Stop、Interrupt 和子 agent 生命周期等事件。它们能在关键位置运行检查或返回继续工作的反馈。当前文档还要求处理 hook 信任；匹配的 hooks 可能并发执行，不能依赖一个未声明的串行短路顺序。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/hooks">Hooks</a></p>
+<p>Hook 的运行位置也取决于编排模式。启用相应企业策略时，Work Cloud local access 与 dots 使用云端协调器上的管理员远程 MCP hooks；本地配置、插件中的 command hooks 不会因为工具在本机执行就自动生效。某些 <code>PreToolUse</code> 回调错误、超时或畸形响应会使 hook 失败，却不阻止工具执行。因此，hook 检查不能一概当作操作系统级强制隔离。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/hooks">云端编排的 hooks 边界</a></p>
+<p>还有一个版本变化：当前官方文档说明 <code>codex mcp-server</code> 和独立 <code>codex-mcp-server</code> 已移除。Codex 仍能消费 MCP 工具，但把 Codex 自身作为服务嵌入时，应区分 App Server 协议与旧 MCP server 路线。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/mcp-server">MCP server 迁移说明</a></p>
+<h1 id="多-agent：多个执行上下文如何协作">多 agent：多个执行上下文如何协作</h1>
+<p>子 agent 拥有独立对话和工作上下文，父 agent 可以分派任务、等待结果和发送后续输入。创建时可以提供或继承初始上下文；后续每一步不会自动共享成一个全局聊天缓冲区。角色配置还能指定模型和行为，但不能仅靠 prompt 获得超出宿主边界的权限。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/agent-configuration/subagents">Subagents</a></p>
+<p>多 agent 有两种经常被混淆的并行：多个模型或 agent 同时工作，以及单个 agent 并发调用工具。前者涉及独立上下文、任务归属和结果整合；后者主要涉及工具依赖、并发限制和事件顺序。一个父 turn 可以等待多个子 agent，而子 agent 又有自己的 turns，时间结构并不是一条简单的串行链。</p>
+<p>独立上下文不等于独立文件系统。在共享 checkout 上，两个 agent 可以修改同一文件、影响同一个测试进程或覆盖彼此结果。Worktree 能隔离工作目录，却仍需要分配文件归属、集成修改并验证最终组合。只有明确配置的执行环境隔离，才能进一步隔离系统资源。</p>
+<p>父 agent 需要为委派设置可检查的目标、范围和完成证据。子 agent 的“完成”消息属于协作结果，不能代替父级集成后的构建、测试或产品验收。并行提高吞吐的前提，是子任务能够独立执行、结果能够被整合。</p>
+<h1 id="六种运行模式放在一起比较">六种运行模式放在一起比较</h1>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="deployment.svg" alt="Codex 本地、SSH、Remote Control、托管 Cloud 与混合执行拓扑"></p>
+<p>以下表格描述产品支持的运行边界。默认模型推理可以在远端发生，因此“执行地点”特指工具和工作区的主要位置。</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>交互入口</th>
+<th>Harness / 执行位置</th>
+<th>状态和依赖由谁维护</th>
+<th>客户端离线意味着什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CLI、IDE、本地 Desktop</td>
+<td>终端、编辑器、App</td>
+<td>本机或所连接开发环境</td>
+<td>用户与本地运行时</td>
+<td>需要区分 UI 退出、运行时退出和主机休眠</td>
+</tr>
+<tr>
+<td>Desktop Worktree</td>
+<td>Desktop</td>
+<td>本机的独立 Git 工作目录</td>
+<td>用户与本地运行时</td>
+<td>Worktree 本身不提供后台在线保证</td>
+</tr>
+<tr>
+<td>Desktop → SSH</td>
+<td>本机 Desktop</td>
+<td>用户的 SSH 主机</td>
+<td>用户维护主机、Codex、仓库与认证</td>
+<td>不能推导任意断线后所有进程继续</td>
+</tr>
+<tr>
+<td>Remote Control</td>
+<td>手机或另一台 Desktop</td>
+<td>被配对主机，可继续连接 SSH</td>
+<td>被控主机及其连接环境</td>
+<td>主机须醒着、在线、App 运行</td>
+</tr>
+<tr>
+<td>Codex Cloud</td>
+<td>Web、Mobile、Desktop 等</td>
+<td>托管的每任务 workspace / VM</td>
+<td>平台管理基础设施，用户配置 environment</td>
+<td>明确支持用户电脑睡眠后继续</td>
+</tr>
+<tr>
+<td>Work Cloud + local access</td>
+<td>云端协调入口</td>
+<td>授权本地执行，也可在规定边界使用云容器</td>
+<td>云任务与已连接电脑分别承担状态</td>
+<td>部分既有任务可在新 turn 边界转云执行</td>
+</tr>
+</tbody>
+</table>
+<p><a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/environments/modes">运行模式</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/remote-connections">Remote connections</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/cloud">Cloud</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/enterprise/cloud-local-access">Cloud local access</a></p>
+<h2 id="desktop-ssh：远端-app-server">Desktop → SSH：远端 App Server</h2>
+<p>Desktop 读取 <code>~/.ssh/config</code> 中可用的具体 host aliases，通过 OpenSSH 连接。远端需要安装并认证 Codex，远端 login shell 的 <code>PATH</code> 能找到 <code>codex</code>。App 通过 SSH 启动、管理远端 App Server，项目命令和文件访问发生在远端主机。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/remote-connections">SSH 连接机制</a></p>
+<p>这一模式适合已有的远程开发机：代码、依赖、私网和凭据已经在那里，Desktop 提供交互面。用户仍负责主机可用性、磁盘、系统升级、SSH、远端配置及项目环境。</p>
+<p>远端服务器一直开机，只满足主机可用性的一部分。App Server 如何被启动、transport 消失时怎样清理、子进程受谁监督、是否保存未处理输入，都影响断连后的行为。官方没有给出覆盖全部 SSH 断线场景的存活保证，不能写成“关掉 Desktop 也一定一直运行”。</p>
+<h2 id="remote-control：远程控制一台仍在运行的电脑">Remote Control：远程控制一台仍在运行的电脑</h2>
+<p>手机或另一台 Desktop 可以经安全 relay 连接已配对的主机。主机继续提供工作目录、凭据、skills、MCP 及其他本地能力。relay 解决连接可达性，任务计算并没有因此自动进入托管 Cloud。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/remote-connections">Remote Control 条件</a></p>
+<p>该主机需要保持醒着、联网、登录且 App 运行。放一台常开电脑可以改善这条路径的可用性，但生命周期仍由用户维护；手机退出不等于主机退出，主机睡眠则会影响远程访问。</p>
+<h2 id="host-handoff：迁移聊天与-git-状态">Host handoff：迁移聊天与 Git 状态</h2>
+<p>host handoff 可以在本机与具有匹配项目的远端主机之间转交 chat 及其 Git 状态。活动 response 会先被中断，再进行转交。它不是迁移正在运行的操作系统进程，也不是把所有内存、终端和网络连接热迁移到新机器；当前该 handoff 路径也不支持将目标设为 Codex Cloud。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/remote-connections#hand-off-a-chat-between-hosts">Host handoff</a></p>
+<h1 id="当前-codex-cloud：environment-与-task-vm">当前 Codex Cloud：Environment 与 Task VM</h1>
+<p>新版 Codex Cloud 把可复用的环境准备状态与每次任务分开。Environment 规定仓库、依赖、工具、网络和服务访问；Task 从准备好的起点开始，在自己的 workspace / VM 中工作。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/environments/cloud-environments">Cloud environments</a></p>
+<h2 id="准备-保存与发布">准备、保存与发布</h2>
+<p>创建或修改 environment 时，Codex 可以检查仓库、安装工具和依赖，并验证准备结果。保存配置与发布 filesystem 不是同一个动作：发布后的准备状态，才构成新任务使用的环境起点。</p>
+<p>任务 A 的文件修改，不会直接覆盖共享 environment，也不会自动成为任务 B 的初始目录。需要改变后续任务的起点，就编辑、验证并重新发布 environment。已有任务则保有自己的 saved files，包括未提交修改和在任务中安装的工具。</p>
+<p>这可以解释两个看似矛盾的行为：新任务保持隔离，同一个任务又能继续已有工作。隔离作用于任务之间，恢复作用于同一任务的生命周期。</p>
+<h2 id="电脑睡眠后还能工作-靠的是托管执行">电脑睡眠后还能工作，靠的是托管执行</h2>
+<p>官方明确说明，Cloud 任务可以在用户电脑睡眠后继续；同一个任务可以从其他入口重开。此时工具执行不依赖用户笔记本上的进程，执行基础设施由平台管理。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/cloud">Codex Cloud</a></p>
+<p>当前文档还给出 saved VM state 的恢复窗口：默认情况下，以最近一次 start turn 或 resume task 为时间锚，最多七天可恢复。这里描述的是已保存 VM 状态的恢复期限，不能解释为一个模型连续推理七天、一条 shell 命令运行七天，或任务永久保留。重要成果仍需要提交或保存到适当的持久位置。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/environments/cloud-environments">任务状态保留</a></p>
+<p>公开文档没有给出内部 scheduler 的队列设计、VM 暂停机制、每个进程的 checkpoint 颗粒度或无期限运行 SLA。能够确认的，是用户可见的任务独立性与恢复契约。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="cloud-lifecycle.svg" alt="Codex Cloud 的环境发布、任务独立性与状态恢复窗口"></p>
+<h2 id="网络-身份与-secrets">网络、身份与 secrets</h2>
+<p>当前 Cloud environment 可以配置网络 allowlist、包管理相关预设或更宽的访问。允许目标域名，只解决“能否连到那里”；服务仍可能要求 OAuth、云身份、数据库凭据或其他认证。</p>
+<p>普通 environment variables 会向需要读取原始值的程序提供变量。Network secrets 则采用 placeholder 与代理替换机制：程序使用占位值，代理在符合配置的 HTTPS 请求中注入实际凭据。当前支持范围涉及 HTTPS 443 与允许域名；不能把这种 secret 当成程序能直接读出的原始环境变量。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/environments/cloud-environments">Cloud 网络与凭据</a></p>
+<p>私网连接当前支持 Tailscale，访问同时受环境网络规则与 Tailscale 访问规则约束。OIDC 短期云凭据目前面向 Enterprise 按申请开放。共享 environment 的使用权限，不自动授予查看其他用户任务、修改 environment 或访问所有关联服务的权限。</p>
+<h2 id="本地能力不会自动复制过去">本地能力不会自动复制过去</h2>
+<p>本地文件、浏览器登录态、VPN、长期运行的进程和个人 skills，不会因为创建 Cloud 任务就全部复制。仓库中的 skills 可以随项目提供；需要的服务访问则要在 Cloud environment 中配置。</p>
+<p>截至本文取证日，Cloud environments 尚不支持 Computer Use、browser use、GitLab 与 self-hosted GitHub Enterprise Server。选择执行地点前，需要按实际依赖核对这些能力。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/environments/cloud-environments#current-limitations">Cloud 限制</a></p>
+<h1 id="legacy-cloud-需要单独解释">Legacy Cloud 需要单独解释</h1>
+<p>官方仍保留明确标记为 Legacy 的 Cloud 文档，覆盖 Code Review、Linear 和 GitHub integrations 等路径。它描述 container checkout、setup、maintenance、agent 执行与产出 diff 的流程。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/environments/cloud-environment">Codex Cloud Legacy</a></p>
+<table>
+<thead>
+<tr>
+<th>方面</th>
+<th>Legacy 文档描述</th>
+<th>新版 Cloud 文档描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>环境起点</td>
+<td>Container image、checkout、setup / maintenance</td>
+<td>准备并发布的 environment filesystem</td>
+</tr>
+<tr>
+<td>隔离对象</td>
+<td>某次执行的 container</td>
+<td>每个 task 的 workspace / VM</td>
+</tr>
+<tr>
+<td>缓存或恢复</td>
+<td>Container cache 最多 12 小时</td>
+<td>Saved VM state 默认最多七天可恢复</td>
+</tr>
+<tr>
+<td>Secrets</td>
+<td>Setup 阶段提供，agent 阶段移除</td>
+<td>Environment variables 与 network secrets 分开</td>
+</tr>
+<tr>
+<td>网络</td>
+<td>Setup 与 agent 阶段分别处理</td>
+<td>Environment 网络、服务访问与身份配置</td>
+</tr>
+</tbody>
+</table>
+<p>Legacy 的 setup script 在独立 Bash session 中运行，临时 <code>export</code> 不会自动变成 agent 阶段环境。其 <code>universal</code> image 与最多 12 小时 container cache 也有明确适用范围。把这组规则与新版 VM、published environment、network secrets 拼在一起，会得到一个官方从未描述过的混合系统。</p>
+<p>两个时间数字也不能比较成“新版任务比旧版多运行十四倍”：12 小时描述缓存，七天描述 saved state 恢复窗口，计量对象不同。</p>
+<h1 id="云端长期运行-到底包含哪些机制">云端长期运行，到底包含哪些机制</h1>
+<p>“长期”至少有三种需求：一次工作持续较久，停止以后可以继续，以及隔一段时间或收到事件后再次启动。它们分别需要执行时间、状态恢复和触发机制。</p>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>主要解决什么</th>
+<th>还依赖什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>长 turn / 长工具执行</td>
+<td>当前这一轮持续工作</td>
+<td>运行时、连接、工具和预算</td>
+</tr>
+<tr>
+<td>持久 goal</td>
+<td>跨 turn 保存目标并续跑</td>
+<td>活跃 runtime、目标状态、权限和资源</td>
+</tr>
+<tr>
+<td>可恢复云任务</td>
+<td>客户端离开后保存并继续已有任务</td>
+<td>平台的 workspace 与恢复契约</td>
+</tr>
+<tr>
+<td>定时或事件任务</td>
+<td>没有新用户输入时再次启动工作</td>
+<td>Scheduler、触发源、身份和可用环境</td>
+</tr>
+<tr>
+<td>上层持续协调</td>
+<td>跨任务追踪、委派、等待和通知</td>
+<td>更长寿命的产品状态与授权管理</td>
+</tr>
+</tbody>
+</table>
+<p>给 <code>codex exec</code> 外面包一个无限循环，只实现了某种重试或续跑策略。它没有自动补齐任务去重、可恢复输入、身份更新、环境供给、结果通知和外部副作用管理。</p>
+<h2 id="desktop-的定时任务">Desktop 的定时任务</h2>
+<p>Desktop scheduled tasks 可以在本地项目目录或 worktree 中运行。它们需要电脑开机、App 运行和项目路径可用。Standalone 运行会创建新的 chat；绑定到 chat 的调度可以复用已有上下文。具体调度能力包括间隔和日周计划等。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/automations">Scheduled tasks</a></p>
+<p>把这种调度设置成每天一次，不会让一台睡眠的电脑具备持续执行能力。它解决“何时开始”，本地环境仍负责“能否执行”。</p>
+<h2 id="web-mobile-的云端定时与事件任务">Web / Mobile 的云端定时与事件任务</h2>
+<p>当前 Web 和 Mobile 的 scheduled tasks 可以在云端使用上传上下文、connected tools、skills 和 plugins。它们不持有用户本机文件夹或 worktree；长期需要的信息应放入任务指令、项目、上传文件或可访问的数据源。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/automations">云端 scheduled tasks</a></p>
+<p>当前文档还包含 eligible plans 的 event triggers，例如 Gmail 新消息、所选 Slack channel 的新消息和 GitHub PR 活动。这类事件触发目前只在 Web / Mobile，不能据此说 Desktop、CLI、IDE 都有同一功能。邻近事件可能合并为一次 run，连接了 app 也不等于已经创建监控。</p>
+<p>一个 scheduled task 可以配置多个事件触发器，但不能同时混合事件触发与时间计划。触发配置定义的是何时创建 run；一个 run 如何选择上下文、工具和执行环境，则是后续的运行职责。</p>
+<p>因此，旧结论“Codex automations 都在本地跑”已经不足以描述当前产品；反过来，也不能把全部云端 scheduled tasks 都写成同一种仓库 VM。上下文来源、工具集合和执行环境，要看具体任务入口。</p>
+<h2 id="team-tasks-与持续协调产品">Team Tasks 与持续协调产品</h2>
+<p>Team Tasks 使用团队 service account 及配置的 app connections，在云端接受定时或事件触发。它不自动继承创建者的个人记忆、custom instructions 和聊天历史。任务能否在创建者离开后继续，还取决于连接身份是否仍有效。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/enterprise/teams">Team Tasks</a></p>
+<p>暂停 Team Task 会阻止未来的定时和事件运行；暂停或删除任务，不能作为中断正在执行 run 的可靠手段。调度状态与活跃执行状态要分别处理。</p>
+<p>dots 等上层产品还可以保存持续目标，等待、唤醒并委派本地或 Cloud 编码任务。子任务有自己的 conversation，不会自动获得上层全部聊天内容；选择另一台电脑也不等于迁移已有任务。这属于跨任务协调层，不能全部归入开源 CLI 的 <code>run_turn</code>。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/dots/tasks-and-memory">Tasks and memory</a></p>
+<p>站内《<a href="/2026/10/02/Personal-Agents-%E6%9E%B6%E6%9E%84%E6%BC%94%E8%BF%9B-dots-Codex-Cloud-%E4%B8%8E-QoderWake/">Personal Agents 的架构演进</a>》讨论了这类长期产品实体。Codex Harness 可以成为其中的执行器，长期身份、触发和跨任务责任则需要额外的产品机制。</p>
+<h1 id="work-cloud-与本地-executor：两个位置分开以后">Work Cloud 与本地 executor：两个位置分开以后</h1>
+<p>Work Cloud 使用 Codex task-execution harness，但工具、权限和企业管理控制并不完全相同。开启 local computer access 后，符合条件的新 Work 任务可以由云端协调，连接电脑执行本地步骤。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/enterprise/chatgpt-work-cloud-security">Work Cloud security</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/enterprise/cloud-local-access">Cloud local access</a></p>
+<p>Work Cloud 在 VM-backed sandbox 中运行，可以跨任务复用执行环境，也可以替换环境并保留符合条件的状态。它不保证每个任务都新建一个 container；前文 Codex Cloud 的每任务 workspace 契约，不能直接套用于 Work Cloud。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/enterprise/chatgpt-work-cloud-security#where-cloud-tasks-run">Work Cloud 执行环境</a></p>
+<p>这个模式给出了一个明确的迁移边界：对符合条件的既有任务，如果在新 turn 开始时发现电脑不可用，可以继续到 cloud container；不能在 turn 中途自动切换。转云以后，也不能访问离线电脑里的文件和工具。</p>
+<p>开启 sync 之前的既有任务不会因此全部改用新模式，本地 enterprise requirements 也不能直接当成 cloud container 的策略。官方还明确说明，这一功能不改变 Codex mobile host connection 的行为。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/enterprise/cloud-local-access">本地与云执行边界</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/remote-connections">Codex Remote</a></p>
+<p>这与 Desktop SSH 的区别不在“都能连电脑”，而在控制责任：SSH 把交互面接到远端 runtime；Work Cloud local access 允许云端协调任务使用本地资源，并在产品规定的 turn 边界选择其他执行位置。两者的离线行为不能互相套用。</p>
+<h1 id="断线-重启和恢复：需要逐层验收">断线、重启和恢复：需要逐层验收</h1>
+<p>“可以 resume”仍然没有说明恢复了什么。至少要分别检查历史、输入、执行和副作用。</p>
+<table>
+<thead>
+<tr>
+<th>恢复对象</th>
+<th>能恢复的典型内容</th>
+<th>不能自动保证的内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Thread 历史</td>
+<td>已持久化的消息、items 和状态</td>
+<td>所有尚未落盘的增量与待处理输入</td>
+</tr>
+<tr>
+<td>工作区</td>
+<td>已保存文件、Git 修改、任务 filesystem</td>
+<td>原来的 PID、网络连接和内存</td>
+</tr>
+<tr>
+<td>活动执行</td>
+<td>在支持的路径重新建立运行状态</td>
+<td>任意工具在任意断点无损续跑</td>
+</tr>
+<tr>
+<td>外部副作用</td>
+<td>通过业务系统查询已发生结果</td>
+<td>自动 exactly-once、撤回已发送消息或已写数据库</td>
+</tr>
+</tbody>
+</table>
+<p>App Server 的 <code>thread/resume</code> 让已保存 thread 继续。<code>thread/revert</code> 删除指定 turn 及之后的历史，不撤销文件写入和外部系统动作；旧的 <code>thread/rollback</code> 已被移除。把历史回退当成仓库回滚，会直接造成判断错误。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/app-server">恢复与 revert 协议</a></p>
+<p>公开源码中的 turn suspension 也说明恢复边界很具体：当前路径只支持 Regular task，并检查 live descendants；它会 flush 后取消执行，为另一个 worker 使用原 turn ID 恢复保留条件。但 pending accepted input 和 interactive waiters 属于进程内状态，不能凭这条路径自动持久化重放。<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/session/turn_suspension.rs#L13-L46">挂起约束</a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/session/turn_suspension.rs#L69-L98">进程内状态限制</a></p>
+<p>由这些边界可以得到一个工程推论：自行把 Codex 接入长期工作流时，需要在应用层保存目标、触发事件和外部操作 ID，恢复后先查询现实状态，再决定是否重试。对于创建 PR、发送通知、提交订单或写数据库等动作，应利用目标系统的幂等机制；不能从一次模型回答或会话日志推出恰好执行一次。</p>
+<p>取消也要区分层次。中断 turn、杀掉终端进程、暂停 goal、取消未来 schedule、删除任务，是不同操作。已经发生的外部副作用不会因为其中某个状态改成 paused 就自动撤销。</p>
+<p><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="recovery-layers.svg" alt="Thread 历史、工作区、进程和外部副作用的分层恢复边界"></p>
+<h1 id="自己嵌入-codex-应该选择哪个接口">自己嵌入 Codex，应该选择哪个接口</h1>
+<h2 id="非交互命令与-sdk">非交互命令与 SDK</h2>
+<p><code>codex exec</code> 适合围绕一次非交互执行组织脚本。程序需要可靠处理机器可读事件、退出状态和输出文件，不能只按终端中的最后一句话判断是否成功。要修改工作区，仍需显式配置适用的 sandbox 与权限。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/codex/cli">CLI</a></p>
+<p>当前 TypeScript SDK 包装本地 CLI 执行路径；在所核查版本中，它通过子进程及 JSONL 事件驱动 <code>codex exec</code>，提供运行、流式消费和恢复 thread 等接口。当前官方还提供稳定 Python SDK，经 JSON-RPC 控制本地 App Server，并绑定 Codex runtime 依赖。因此，“SDK 就是远端 Cloud Job REST API”不符合这些实现。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/codex-sdk">SDK 文档</a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/sdk/typescript/src/exec.ts#L94-L95">TypeScript SDK 执行入口</a></p>
+<h2 id="rich-client-与自建常驻服务">Rich client 与自建常驻服务</h2>
+<p>需要聊天历史、流式 UI、审批、多个 thread 和中断控制，可以研究 App Server。客户端应使用当前生成的 schema，并把初始化、请求 ID、反向请求、订阅和重连状态纳入设计。<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/app-server">App Server</a></p>
+<p>自建常驻服务还要额外承担进程监督、任务排队、持久输入、凭据更新、环境隔离、资源预算和结果验收。这些是服务集成责任。App Server 已提供某些状态与生命周期接口，并不意味着用户只需公开一个端口，就拥有与托管 Cloud 相同的服务。</p>
+<p>下面的命令只用于核对本机版本和可用参数，不会创建任务或修改仓库：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs bash">codex --version<br>codex --<span class="hljs-built_in">help</span><br>codex <span class="hljs-built_in">exec</span> --<span class="hljs-built_in">help</span><br>codex app-server --<span class="hljs-built_in">help</span><br></code></pre></td></tr></table></figure>
+<p>在本文环境中，四条命令均已执行，版本为 <code>0.162.1</code>。App Server 监听若用于远程实验，应按官方要求保护传输与认证；不要将可操作工作区的接口直接暴露到公共网络。</p>
+<h1 id="选择运行方式时-检查任务真正需要什么">选择运行方式时，检查任务真正需要什么</h1>
+<table>
+<thead>
+<tr>
+<th>需求</th>
+<th>对应的架构选择</th>
+<th>最先验证的条件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>直接使用本机代码、工具与登录态</td>
+<td>Local / Worktree</td>
+<td>本地权限、工作区隔离、主机在线</td>
+</tr>
+<tr>
+<td>使用已准备好的远程开发机</td>
+<td>Desktop → SSH</td>
+<td>远端 Codex、认证、PATH、SSH 和依赖</td>
+</tr>
+<tr>
+<td>手机查看并控制同一台电脑的工作</td>
+<td>Remote Control</td>
+<td>被控主机醒着、在线、App 运行</td>
+</tr>
+<tr>
+<td>电脑睡眠后仍执行独立编码任务</td>
+<td>Codex Cloud</td>
+<td>Environment、仓库和服务访问是否齐备</td>
+</tr>
+<tr>
+<td>跨多轮推进、按时间或事件再次启动</td>
+<td>Goal + 对应调度或上层协调</td>
+<td>目标状态、触发器、身份、执行地点与验收证据</td>
+</tr>
+</tbody>
+</table>
+<p>设计自有 agent 系统时，Codex 的公开结构还能提供几条可复用的经验。协议对象可以跨进程边界，服务抽象不必固定成独立进程；持久 goal 与 turn 执行分开后，目标管理可以跨越多轮；执行宿主与交互入口分离后，SSH、relay 和混合执行才有清楚的定位；将历史恢复与副作用恢复分开，可以避免把聊天记录误当成业务事务日志。</p>
+<p>这些经验能用于其他 Harness，但具体恢复保证仍需要对应实现证明。任务可继续、模型还在回答、命令执行成功和业务目标验收通过，是四种不同结论。</p>
+<h1 id="公开组件的源码导航">公开组件的源码导航</h1>
+<p>下表固定到同一 SHA，便于沿实际对象关系继续阅读。目录存在说明公开实现覆盖这项职责，不代表所有产品入口均已启用同一功能。</p>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>路径</th>
+<th>阅读重点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>入口与客户端</td>
+<td><a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/cli"><code>cli</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/tui"><code>tui</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/exec"><code>exec</code></a></td>
+<td>命令分发、交互与非交互路径</td>
+</tr>
+<tr>
+<td>服务与协议</td>
+<td><a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/app-server"><code>app-server</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/app-server-client"><code>app-server-client</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/app-server-protocol"><code>app-server-protocol</code></a></td>
+<td>传输、生命周期、请求和事件</td>
+</tr>
+<tr>
+<td>会话与执行循环</td>
+<td><a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/session"><code>core/src/session</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/tasks"><code>core/src/tasks</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/ext/goal"><code>ext/goal</code></a></td>
+<td>操作分发、turn 内工作、跨 turn 目标</td>
+</tr>
+<tr>
+<td>工具与宿主</td>
+<td><a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/tools"><code>core/src/tools</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/tools"><code>tools</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/code-mode-runtime"><code>code-mode-runtime</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/exec-server"><code>exec-server</code></a></td>
+<td>路由、schema、代码编排与执行资源</td>
+</tr>
+<tr>
+<td>状态与诊断</td>
+<td><a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/thread-store"><code>thread-store</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/rollout"><code>rollout</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/state"><code>state</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/memories"><code>memories</code></a>、<a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/rollout-trace"><code>rollout-trace</code></a></td>
+<td>存储抽象、历史、元数据、记忆维护与执行图</td>
+</tr>
+</tbody>
+</table>
+<h1 id="参考资料与验证范围">参考资料与验证范围</h1>
+<p>产品文档读取日期为 2026 年 10 月 15 日。官方文档索引当时由原 <code>developers.openai.com/codex/llms.txt</code> 指向 <code>learn.chatgpt.com</code> 下的文档。引用以这些具体页面和固定版本源码为依据，产品可用性仍受计划、组织策略与后续更新影响。</p>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>一手资料</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>核心协议与本地入口</td>
+<td><a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/app-server">App Server</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/codex/cli">CLI</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/codex-sdk">SDK</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/open-source">开源范围</a></td>
+</tr>
+<tr>
+<td>部署与执行环境</td>
+<td><a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/environments/modes">运行模式</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/remote-connections">Remote</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/cloud">Cloud</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/environments/cloud-environments">新版环境</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/environments/cloud-environment">Legacy 环境</a></td>
+</tr>
+<tr>
+<td>长期工作与混合模式</td>
+<td><a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/long-running-work">Long-running work</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/automations">Automations</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/enterprise/cloud-local-access">Cloud local access</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/enterprise/chatgpt-work-cloud-security">Work Cloud security</a></td>
+</tr>
+<tr>
+<td>权限、扩展与协作</td>
+<td><a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/agent-approvals-security">安全与审批</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/config-file/config-basic">配置</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/agent-configuration/agents-md">AGENTS.md</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/skills-and-plugins">Skills 与 plugins</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/hooks">Hooks</a>、<a target="_blank" rel="noopener" href="https://learn.chatgpt.com/docs/agent-configuration/subagents">Subagents</a></td>
+</tr>
+<tr>
+<td>源码基线</td>
+<td><a target="_blank" rel="noopener" href="https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d">Codex <code>092d3acd</code></a>，对应 <code>rust-v0.162.1</code>；各关键结论在正文中附具体文件链接</td>
+</tr>
+</tbody>
+</table>
+<p>本文完成了官方文档与固定源码的交叉阅读，并核对本地 CLI 版本和帮助参数；没有执行托管 Cloud 长时任务、SSH 断线、Desktop 退出、VM 重启恢复或跨主机迁移实验。涉及恢复期限和离线能力的结论属于公开产品契约，不作为端到端实测结果。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/15/Codex-%E6%9E%B6%E6%9E%84%E5%85%A8%E6%99%AF-%E6%9C%AC%E5%9C%B0%E8%BF%90%E8%A1%8C-%E4%BA%91%E7%AB%AF%E9%95%BF%E4%BB%BB%E5%8A%A1%E4%B8%8E%E5%A4%9A%E5%B1%82-Loop/">https://magicliang.github.io/2026/10/15/Codex-%E6%9E%B6%E6%9E%84%E5%85%A8%E6%99%AF-%E6%9C%AC%E5%9C%B0%E8%BF%90%E8%A1%8C-%E4%BA%91%E7%AB%AF%E9%95%BF%E4%BB%BB%E5%8A%A1%E4%B8%8E%E5%A4%9A%E5%B1%82-Loop/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a><a class="post-meta__tags" href="/tags/AI-Agent/">AI Agent</a><a class="post-meta__tags" href="/tags/Codex/">Codex</a><a class="post-meta__tags" href="/tags/Agent-Harness/">Agent Harness</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-ai-agent.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/02/Personal-Agents-%E6%9E%B6%E6%9E%84%E6%BC%94%E8%BF%9B-dots-Codex-Cloud-%E4%B8%8E-QoderWake/" title="Personal Agents 的架构演进：dots、Codex Cloud 与 QoderWake"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-ai-agent.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">Personal Agents 的架构演进：dots、Codex Cloud 与 QoderWake</div></div><div class="info-2"><div class="info-item-1">把 personal agent 理解成“云端放一个独立 runtime，再接一个强模型”，抓住了它的执行基础。这个组合却还不能说明：聊天结束后，哪个组件保存目标；隔几天谁再次启动工作；一次任务积累的经验如何进入下一次任务；获得过的信息能否用于另一个群聊。 这些问题决定了 personal agent 能否持续承担一个人的工作。服务器、模型和工具已经存在，新增的系统责任主要落在跨任务的状态、触发、记忆维护和授权管理上。 截至 2026 年 10 月 2 日，OpenAI 对 dots 的公开定义是由 GPT-6 Astra 驱动、拥有云端电脑的个人 agent。dot 本身使用 Astra，也能创建 Codex 云任务。因此，“委派给 Astra”和“委派给 Codex”需要分开：前者通常是在说模型推理，后者才是启动另一个任务执行环境。dots 发布公告、dot 入门文档 本文依据公开文档和论文分析架构，没有实测这些产品的长期运行、通知送达、重启恢复或学习效果。产品文档确认的是功能约定；下面的架构图是解释这些约定的工程抽象，不能视为厂商内部部署拓扑。  personal agen...</div></div></div></a><a class="pagination-related" href="/2026/05/13/Goal-Ralph-Loop-%E4%B8%8E-SDD-Sidecar/" title="Goal 模式深度研究：从 Ralph Loop 到 Codex Runtime、Claude Judge 与 SDD Sidecar"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/05/13/Goal-Ralph-Loop-%E4%B8%8E-SDD-Sidecar/cover.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-13</div><div class="info-item-2">Goal 模式深度研究：从 Ralph Loop 到 Codex Runtime、Claude Judge 与 SDD Sidecar</div></div><div class="info-2"><div class="info-item-1"> 调研截至：2026-05-20。本文从 patleeman 的 Codex /goal PR 解析和 36氪 / 新智元关于 Ralph Loop 产品化的报道出发，交叉核对 OpenAI Codex、Claude Code、Hermes、Anthropic Ralph Loop、OpenCode / Oh My OpenCode、Oh My ClaudeCode、自进化 Agent 相关论文与公开资料，并对一个内部 all-in-one SDD skill 做了脱敏分析。脱敏约定：不写本地路径、组织名称、平台名称、具体适配器名和领域字段；下文用 sdd-all 指代这类内部 SDD overlay。  Goal 模式不应再被理解为 Codex 的单点能力。更准确的判断是：AI 编程工具正在把 Ralph Loop 这类外部循环，收敛成一类更正式的闭环交付控制协议。  先把 Ralph 循环的一句话定义放最前面 Ralph 循环 = 外层循环 + 稳定锚点提示词 + 外置完成判定器 + 外部可恢复进度态。 四件套缺任意一件，Ralph 都会塌成别的东西。展开来说：    部件 ...</div></div></div></a><a class="pagination-related" href="/2026/08/24/OpenAI-Codex-Harness-%E6%BA%90%E7%A0%81%E8%A7%A3%E5%89%96-%E5%AE%83%E4%B8%8E-Codex-CLI-%E5%88%B0%E5%BA%95%E6%98%AF%E4%BB%80%E4%B9%88%E5%85%B3%E7%B3%BB/" title="OpenAI Codex Harness 源码解剖：它与 Codex CLI 到底是什么关系"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/08/24/OpenAI-Codex-Harness-%E6%BA%90%E7%A0%81%E8%A7%A3%E5%89%96-%E5%AE%83%E4%B8%8E-Codex-CLI-%E5%88%B0%E5%BA%95%E6%98%AF%E4%BB%80%E4%B9%88%E5%85%B3%E7%B3%BB/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-24</div><div class="info-item-2">OpenAI Codex Harness 源码解剖：它与 Codex CLI 到底是什么关系</div></div><div class="info-2"><div class="info-item-1">OpenAI 最近开始频繁使用一个容易引起误解的词：Codex harness。 它不是一个需要单独安装的新产品，也不是 Codex CLI 改了名字。OpenAI 给出的最小定义是：harness 是围绕模型运行的执行系统，负责保存会话状态、组织工具循环、执行命令、施加 sandbox 与 approval 策略，并把过程事件交给上层界面。Codex CLI 则是这套系统最早、最直接的终端产品形态，同时也是它的发行入口和源码宿主。 因此，两者最准确的关系不是“同一个东西”，也不是“前端和后端”这么简单，而是：  Codex CLI 包含并暴露 Codex harness；harness 可以脱离 TUI，被 codex exec、App Server、SDK 和其他 Codex 客户端复用。  这个判断可以同时解释几个看似矛盾的事实：为什么 OpenAI 会说 harness “通过 Codex CLI 暴露”，又说它驱动 Codex App、IDE 与 Web；为什么开源仓库叫 openai/codex，官方文档却称其中一部分为 Codex Core；为什么 TypeScri...</div></div></div></a><a class="pagination-related" href="/2026/05/20/Harness-Engineering-%E9%95%BF%E7%A8%8B-Agent-%E7%9A%84%E5%B7%A5%E7%A8%8B%E5%8C%96%E5%BA%95%E5%BA%A7/" title="Harness Engineering：长程 Agent 的工程化底座"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-ai-agent.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-05-20</div><div class="info-item-2">Harness Engineering：长程 Agent 的工程化底座</div></div><div class="info-2"><div class="info-item-1">微信公众号文章《Harness Engineering：让AI Agent长程运行的秘密武器》抓住了一个很重要的行业拐点：Agent 讨论正在从“模型有多强”转向“系统怎么让模型可靠工作”。这个判断是对的，但如果只把 Harness Engineering 理解成“给 Agent 做记忆和交接班”，还是太窄。 更准确的定义是：Harness Engineering 是围绕模型构建一套可执行的工作环境、状态系统、工具边界、验证机制和反馈循环，让 Agent 能跨越单个上下文窗口，持续推进真实任务，并在失败时留下可恢复的证据。 这不是 Prompt Engineering 的升级版，也不是 Context Engineering 的别名。Prompt 解决一次请求怎么说，Context 解决一次请求里放什么，Harness 解决的是任务生命周期怎么被系统托住。  一、为什么 2026 年突然轮到 Harness OpenAI 在 2026 年 2 月发布的 Harness Engineering 文章里披露了一个内部实验：团队从空 Git 仓库开始，用 Codex 构建并发布一个内部...</div></div></div></a><a class="pagination-related" href="/2026/04/30/openai-symphony-%E6%B7%B1%E5%BA%A6%E7%A0%94%E7%A9%B6/" title="OpenAI Symphony 深度研究，一次从「监督 Agent」到「管理工作」的编排改造"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-ai-agent.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-04-30</div><div class="info-item-2">OpenAI Symphony 深度研究，一次从「监督 Agent」到「管理工作」的编排改造</div></div><div class="info-2"><div class="info-item-1">2026 年 3 月初，OpenAI 在 GitHub 上公开了 openai/symphony 仓库。这个仓库很容易被误读成「一份 SPEC 加一点示例代码」，因为根目录 README 把第一个选项写成了「让你喜欢的 coding agent 按 SPEC.md 自己实现一版」。但真正打开目录看，仓库里有三块东西：根目录的 SPEC.md，一套可以构建和运行的 elixir/ 参考实现，以及 .codex/、.github/media/ 这类围绕 Codex workflow、演示视频和工程素材组织起来的配套内容。elixir/README.md 里的启动命令不是伪代码，而是完整的本地构建链路：mise exec -- mix setup、mise exec -- mix build，最后用 ./bin/symphony ./WORKFLOW.md 启动服务 [Symphony Elixir README]。 所以 Symphony 首先不是一篇规范文档，而是一个被拆成两层发布的工程项目：SPEC.md 说明什么叫 Symphony，elixir/ 证明这套东西能作为一个长驻服...</div></div></div></a><a class="pagination-related" href="/2022/01/07/%E5%A6%82%E4%BD%95%E5%86%99%E5%A4%8D%E6%9D%82%E4%B8%9A%E5%8A%A1%E7%B3%BB%E7%BB%9F/" title="如何写复杂业务系统"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2022/01/07/%E5%A6%82%E4%BD%95%E5%86%99%E5%A4%8D%E6%9D%82%E4%B8%9A%E5%8A%A1%E7%B3%BB%E7%BB%9F/clean-architecture.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2022-01-07</div><div class="info-item-2">如何写复杂业务系统</div></div><div class="info-2"><div class="info-item-1">引言 本文只是一家之言。 本文是一系列文章的缩略版本（完整版只写了个开头），尽量只讲具体的东西，如果有东西太干了，没有具体的“体感”，是作者的责任。 不喜欢看纯理论分析的可以跳到单一系统层次和模块设计（大多数人可能更加关注这一节，其实前面的部分更重要）。 几个很干的原则  解决复杂问题要用高级思维，不要用低级思维。 蚂蚁/ebay 等若干家企业架构师四大原则 - 听过的可以往下跳： 分治（其他所有原则都是从分治里衍生的） 分层 抽象 演化 solid 5 原则很重要很重要 -很多人读过，很多人可能没有读过，温故知新很重要。 注重过程质量，拿到结果质量。  业务系统为什么难写？ 纯粹的业务驱动：技术的输入和决策完全来源于业务同事，甚至只受业务摆布的团队，架构容易混乱  业务又不懂架构、业务又不懂功能点罗列的合理性，业务只会往技术团队身上扔需求。 怎么把需求和实现分门别类是技术自己的事情。 但技术人员如果一直都很忙，没有自己的空闲时间或者对设计洁癖的坚持，慢慢地就会养成“把需求翻译成代码，然后往老的系统里面扔”（混乱根源 1）的坏习惯- 问题：翻译只是普通的低级思维，不能解决很复杂...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#codex-%E8%BF%99%E4%B8%AA%E5%90%8D%E5%AD%97%E8%A6%86%E7%9B%96%E4%BA%86%E5%93%AA%E4%BA%9B%E4%B8%9C%E8%A5%BF"><span class="toc-number">1.</span> <span class="toc-text">Codex 这个名字覆盖了哪些东西</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%85%88%E7%A1%AE%E5%AE%9A%E5%9B%9B%E4%B8%AA%E4%BD%8D%E7%BD%AE"><span class="toc-number">2.</span> <span class="toc-text">先确定四个位置</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E4%BB%8E%E5%91%BD%E4%BB%A4%E5%90%AF%E5%8A%A8%E5%88%B0-core%EF%BC%9A%E6%9C%AC%E5%9C%B0%E5%88%B0%E5%BA%95%E8%BF%90%E8%A1%8C%E4%BA%86%E4%BB%80%E4%B9%88"><span class="toc-number">3.</span> <span class="toc-text">从命令启动到 Core：本地到底运行了什么</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E4%B8%AA-rust-%E5%8F%91%E8%A1%8C%E7%89%A9%E6%89%BF%E8%BD%BD%E5%A4%9A%E4%B8%AA%E5%85%A5%E5%8F%A3"><span class="toc-number">3.1.</span> <span class="toc-text">一个 Rust 发行物承载多个入口</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#app-server-%E4%B8%8B%E9%9D%A2%E7%9A%84%E5%AF%B9%E8%B1%A1%E5%85%B3%E7%B3%BB"><span class="toc-number">3.2.</span> <span class="toc-text">App Server 下面的对象关系</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%AC%E5%9C%B0%E6%89%A7%E8%A1%8C%E4%B8%8E%E6%9C%AC%E5%9C%B0%E6%8E%A8%E7%90%86%E8%A6%81%E5%88%86%E5%88%AB%E9%85%8D%E7%BD%AE"><span class="toc-number">3.3.</span> <span class="toc-text">本地执行与本地推理要分别配置</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link" href="#app-server-%E7%9A%84%E5%8D%8F%E8%AE%AE%E6%9E%B6%E6%9E%84"><span class="toc-number">4.</span> <span class="toc-text">App Server 的协议架构</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BC%A0%E8%BE%93%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%8F%A1%E6%89%8B"><span class="toc-number">4.1.</span> <span class="toc-text">传输与连接握手</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#thread-turn-item"><span class="toc-number">4.2.</span> <span class="toc-text">Thread、Turn、Item</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#steering-%E5%8F%96%E6%B6%88%E4%B8%8E%E5%8F%8C%E5%90%91%E8%AF%B7%E6%B1%82"><span class="toc-number">4.3.</span> <span class="toc-text">Steering、取消与双向请求</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link" href="#task-loop-%E4%B8%8E-turn-loop%EF%BC%9A%E5%85%88%E6%B6%88%E9%99%A4%E5%90%8C%E5%90%8D%E6%AD%A7%E4%B9%89"><span class="toc-number">5.</span> <span class="toc-text">Task Loop 与 Turn Loop：先消除同名歧义</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#submission-loop%EF%BC%9A%E4%BC%9A%E8%AF%9D%E6%93%8D%E4%BD%9C%E5%88%86%E5%8F%91"><span class="toc-number">5.1.</span> <span class="toc-text">submission_loop：会话操作分发</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#sessiontask%EF%BC%9Asession-%E6%8B%A5%E6%9C%89%E7%9A%84%E6%89%A7%E8%A1%8C%E5%B7%A5%E4%BD%9C%E6%B5%81"><span class="toc-number">5.2.</span> <span class="toc-text">SessionTask：Session 拥有的执行工作流</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#run-turn%EF%BC%9A%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%B7%A5%E5%85%B7%E5%BE%80%E8%BF%94"><span class="toc-number">5.3.</span> <span class="toc-text">run_turn：模型与工具往返</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E6%AC%A1%E4%BF%AE%E5%A4%8D%E8%AF%B7%E6%B1%82%E6%80%8E%E6%A0%B7%E8%B7%A8%E8%B6%8A%E8%BF%99%E4%BA%9B%E5%B1%82"><span class="toc-number">5.4.</span> <span class="toc-text">一次修复请求怎样跨越这些层</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link" href="#goal%EF%BC%9A%E8%B7%A8-turn-%E7%9A%84%E7%9B%AE%E6%A0%87%E7%BB%AD%E8%B7%91"><span class="toc-number">6.</span> <span class="toc-text">Goal：跨 turn 的目标续跑</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E6%A8%A1%E5%9E%8B%E8%BF%9E%E6%8E%A5-%E4%B8%8A%E4%B8%8B%E6%96%87%E4%B8%8E%E5%B7%A5%E5%85%B7%E8%B7%AF%E7%94%B1"><span class="toc-number">7.</span> <span class="toc-text">模型连接、上下文与工具路由</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#modelclient-%E4%B8%8E%E4%B8%80%E6%AC%A1%E6%A8%A1%E5%9E%8B%E8%AF%B7%E6%B1%82"><span class="toc-number">7.1.</span> <span class="toc-text">ModelClient 与一次模型请求</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B7%A5%E5%85%B7%E5%A3%B0%E6%98%8E-%E9%80%89%E6%8B%A9%E4%B8%8E%E6%89%A7%E8%A1%8C"><span class="toc-number">7.2.</span> <span class="toc-text">工具声明、选择与执行</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#code-mode-%E4%B8%8E-exec-server"><span class="toc-number">7.3.</span> <span class="toc-text">Code Mode 与 exec-server</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E7%8A%B6%E6%80%81%E6%9E%B6%E6%9E%84%EF%BC%9A%E4%B8%8A%E4%B8%8B%E6%96%87-%E5%8E%86%E5%8F%B2-%E8%AE%B0%E5%BF%86%E5%92%8C%E6%96%87%E4%BB%B6"><span class="toc-number">8.</span> <span class="toc-text">状态架构：上下文、历史、记忆和文件</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#threadstore-rollout-%E4%B8%8E-sqlite"><span class="toc-number">8.1.</span> <span class="toc-text">ThreadStore、Rollout 与 SQLite</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#compaction-%E7%AE%A1%E7%90%86%E6%8E%A8%E7%90%86%E7%AA%97%E5%8F%A3"><span class="toc-number">8.2.</span> <span class="toc-text">Compaction 管理推理窗口</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#memories-%E6%98%AF%E7%8B%AC%E7%AB%8B%E7%9A%84%E7%BB%B4%E6%8A%A4%E6%B5%81%E7%A8%8B"><span class="toc-number">8.3.</span> <span class="toc-text">Memories 是独立的维护流程</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#trace-%E4%B8%8E%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7"><span class="toc-number">8.4.</span> <span class="toc-text">Trace 与可观测性</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E6%9D%83%E9%99%90-%E8%BA%AB%E4%BB%BD%E4%B8%8E%E6%89%A9%E5%B1%95%E5%88%86%E5%88%AB%E7%BA%A6%E6%9D%9F%E4%BB%80%E4%B9%88"><span class="toc-number">9.</span> <span class="toc-text">权限、身份与扩展分别约束什么</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#sandbox-%E4%B8%8E%E5%AE%A1%E6%89%B9%E7%9A%84%E8%BE%B9%E7%95%8C"><span class="toc-number">9.1.</span> <span class="toc-text">Sandbox 与审批的边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#config-%E4%B8%8E-agents-md"><span class="toc-number">9.2.</span> <span class="toc-text">Config 与 AGENTS.md</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#skills-plugins-mcp-apps-%E4%B8%8E-hooks"><span class="toc-number">9.3.</span> <span class="toc-text">Skills、Plugins、MCP、Apps 与 Hooks</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%A4%9A-agent%EF%BC%9A%E5%A4%9A%E4%B8%AA%E6%89%A7%E8%A1%8C%E4%B8%8A%E4%B8%8B%E6%96%87%E5%A6%82%E4%BD%95%E5%8D%8F%E4%BD%9C"><span class="toc-number">10.</span> <span class="toc-text">多 agent：多个执行上下文如何协作</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%85%AD%E7%A7%8D%E8%BF%90%E8%A1%8C%E6%A8%A1%E5%BC%8F%E6%94%BE%E5%9C%A8%E4%B8%80%E8%B5%B7%E6%AF%94%E8%BE%83"><span class="toc-number">11.</span> <span class="toc-text">六种运行模式放在一起比较</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#desktop-ssh%EF%BC%9A%E8%BF%9C%E7%AB%AF-app-server"><span class="toc-number">11.1.</span> <span class="toc-text">Desktop → SSH：远端 App Server</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#remote-control%EF%BC%9A%E8%BF%9C%E7%A8%8B%E6%8E%A7%E5%88%B6%E4%B8%80%E5%8F%B0%E4%BB%8D%E5%9C%A8%E8%BF%90%E8%A1%8C%E7%9A%84%E7%94%B5%E8%84%91"><span class="toc-number">11.2.</span> <span class="toc-text">Remote Control：远程控制一台仍在运行的电脑</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#host-handoff%EF%BC%9A%E8%BF%81%E7%A7%BB%E8%81%8A%E5%A4%A9%E4%B8%8E-git-%E7%8A%B6%E6%80%81"><span class="toc-number">11.3.</span> <span class="toc-text">Host handoff：迁移聊天与 Git 状态</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%BD%93%E5%89%8D-codex-cloud%EF%BC%9Aenvironment-%E4%B8%8E-task-vm"><span class="toc-number">12.</span> <span class="toc-text">当前 Codex Cloud：Environment 与 Task VM</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%87%86%E5%A4%87-%E4%BF%9D%E5%AD%98%E4%B8%8E%E5%8F%91%E5%B8%83"><span class="toc-number">12.1.</span> <span class="toc-text">准备、保存与发布</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%B5%E8%84%91%E7%9D%A1%E7%9C%A0%E5%90%8E%E8%BF%98%E8%83%BD%E5%B7%A5%E4%BD%9C-%E9%9D%A0%E7%9A%84%E6%98%AF%E6%89%98%E7%AE%A1%E6%89%A7%E8%A1%8C"><span class="toc-number">12.2.</span> <span class="toc-text">电脑睡眠后还能工作，靠的是托管执行</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BD%91%E7%BB%9C-%E8%BA%AB%E4%BB%BD%E4%B8%8E-secrets"><span class="toc-number">12.3.</span> <span class="toc-text">网络、身份与 secrets</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%AC%E5%9C%B0%E8%83%BD%E5%8A%9B%E4%B8%8D%E4%BC%9A%E8%87%AA%E5%8A%A8%E5%A4%8D%E5%88%B6%E8%BF%87%E5%8E%BB"><span class="toc-number">12.4.</span> <span class="toc-text">本地能力不会自动复制过去</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link" href="#legacy-cloud-%E9%9C%80%E8%A6%81%E5%8D%95%E7%8B%AC%E8%A7%A3%E9%87%8A"><span class="toc-number">13.</span> <span class="toc-text">Legacy Cloud 需要单独解释</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E4%BA%91%E7%AB%AF%E9%95%BF%E6%9C%9F%E8%BF%90%E8%A1%8C-%E5%88%B0%E5%BA%95%E5%8C%85%E5%90%AB%E5%93%AA%E4%BA%9B%E6%9C%BA%E5%88%B6"><span class="toc-number">14.</span> <span class="toc-text">云端长期运行，到底包含哪些机制</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#desktop-%E7%9A%84%E5%AE%9A%E6%97%B6%E4%BB%BB%E5%8A%A1"><span class="toc-number">14.1.</span> <span class="toc-text">Desktop 的定时任务</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#web-mobile-%E7%9A%84%E4%BA%91%E7%AB%AF%E5%AE%9A%E6%97%B6%E4%B8%8E%E4%BA%8B%E4%BB%B6%E4%BB%BB%E5%8A%A1"><span class="toc-number">14.2.</span> <span class="toc-text">Web &#x2F; Mobile 的云端定时与事件任务</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#team-tasks-%E4%B8%8E%E6%8C%81%E7%BB%AD%E5%8D%8F%E8%B0%83%E4%BA%A7%E5%93%81"><span class="toc-number">14.3.</span> <span class="toc-text">Team Tasks 与持续协调产品</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link" href="#work-cloud-%E4%B8%8E%E6%9C%AC%E5%9C%B0-executor%EF%BC%9A%E4%B8%A4%E4%B8%AA%E4%BD%8D%E7%BD%AE%E5%88%86%E5%BC%80%E4%BB%A5%E5%90%8E"><span class="toc-number">15.</span> <span class="toc-text">Work Cloud 与本地 executor：两个位置分开以后</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E6%96%AD%E7%BA%BF-%E9%87%8D%E5%90%AF%E5%92%8C%E6%81%A2%E5%A4%8D%EF%BC%9A%E9%9C%80%E8%A6%81%E9%80%90%E5%B1%82%E9%AA%8C%E6%94%B6"><span class="toc-number">16.</span> <span class="toc-text">断线、重启和恢复：需要逐层验收</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E8%87%AA%E5%B7%B1%E5%B5%8C%E5%85%A5-codex-%E5%BA%94%E8%AF%A5%E9%80%89%E6%8B%A9%E5%93%AA%E4%B8%AA%E6%8E%A5%E5%8F%A3"><span class="toc-number">17.</span> <span class="toc-text">自己嵌入 Codex，应该选择哪个接口</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%9E%E4%BA%A4%E4%BA%92%E5%91%BD%E4%BB%A4%E4%B8%8E-sdk"><span class="toc-number">17.1.</span> <span class="toc-text">非交互命令与 SDK</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#rich-client-%E4%B8%8E%E8%87%AA%E5%BB%BA%E5%B8%B8%E9%A9%BB%E6%9C%8D%E5%8A%A1"><span class="toc-number">17.2.</span> <span class="toc-text">Rich client 与自建常驻服务</span></a></li></ol></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E9%80%89%E6%8B%A9%E8%BF%90%E8%A1%8C%E6%96%B9%E5%BC%8F%E6%97%B6-%E6%A3%80%E6%9F%A5%E4%BB%BB%E5%8A%A1%E7%9C%9F%E6%AD%A3%E9%9C%80%E8%A6%81%E4%BB%80%E4%B9%88"><span class="toc-number">18.</span> <span class="toc-text">选择运行方式时，检查任务真正需要什么</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%85%AC%E5%BC%80%E7%BB%84%E4%BB%B6%E7%9A%84%E6%BA%90%E7%A0%81%E5%AF%BC%E8%88%AA"><span class="toc-number">19.</span> <span class="toc-text">公开组件的源码导航</span></a></li><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99%E4%B8%8E%E9%AA%8C%E8%AF%81%E8%8C%83%E5%9B%B4"><span class="toc-number">20.</span> <span class="toc-text">参考资料与验证范围</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

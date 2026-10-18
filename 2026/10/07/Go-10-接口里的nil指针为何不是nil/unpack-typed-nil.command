@@ -1,0 +1,1 @@
+go run ./testdata/typed-nil.go

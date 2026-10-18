@@ -1,0 +1,1 @@
+/tmp/go-language-14-unpack-yksNGO/taskstats --text Go\ 写\ Go

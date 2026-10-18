@@ -1,0 +1,1 @@
+PGDATA='/tmp/go-language-39-pg.g35jmm' PGPORT=54089 GO_LANGUAGE_SERVE_DSN='host=127.0.0.1 port=54089 user=admin dbname=go39live sslmode=disable' bash verification/39.sh '/tmp/go-language-39-reader.Uk8zCV/taskstats' '/home/admin/workspace/my-blogs/source/_posts/2026-10-09-Go-39-空环境如何验收任务完整生命周期'

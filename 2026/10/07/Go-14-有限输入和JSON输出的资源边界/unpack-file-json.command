@@ -1,0 +1,1 @@
+/tmp/go-language-14-unpack-yksNGO/taskstats --file /tmp/go-language-14-unpack-yksNGO/task.json --input-json --json

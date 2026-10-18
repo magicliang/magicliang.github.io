@@ -1,0 +1,1 @@
+/tmp/go-language-08-unpack-SxbBna/taskstats --batch Go\|one\ two --lookup task\[0\]

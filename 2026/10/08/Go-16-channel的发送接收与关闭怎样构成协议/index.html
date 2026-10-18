@@ -1,0 +1,684 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>Go 16：channel 的发送、接收与关闭怎样构成协议 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="上篇让统计函数在 goroutine 中运行，但 CLI 还是启动一项、等一项。要把任务交给另一个持续读取任务的计算者，仅有“某项结束了”的 done 不够：谁能继续发送？谁宣布不会再发？接收者如何知道该退出？关闭错了 channel，程序可能 panic；不关闭，又可能永远等在接收处。这些问题需要一份双方能遵守的协议，不是画一条 chan 箭头就解决。 本章沿用同一个任务工程和旧的任务 ID、错">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Go 16：channel 的发送、接收与关闭怎样构成协议">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/08/Go-16-channel%E7%9A%84%E5%8F%91%E9%80%81%E6%8E%A5%E6%94%B6%E4%B8%8E%E5%85%B3%E9%97%AD%E6%80%8E%E6%A0%B7%E6%9E%84%E6%88%90%E5%8D%8F%E8%AE%AE/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="上篇让统计函数在 goroutine 中运行，但 CLI 还是启动一项、等一项。要把任务交给另一个持续读取任务的计算者，仅有“某项结束了”的 done 不够：谁能继续发送？谁宣布不会再发？接收者如何知道该退出？关闭错了 channel，程序可能 panic；不关闭，又可能永远等在接收处。这些问题需要一份双方能遵守的协议，不是画一条 chan 箭头就解决。 本章沿用同一个任务工程和旧的任务 ID、错">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-25.jpg">
+<meta property="article:published_time" content="2026-10-07T20:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-18T05:40:14.521Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Go">
+<meta property="article:tag" content="Go 任务服务">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-25.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "Go 16：channel 的发送、接收与关闭怎样构成协议",
+  "url": "https://magicliang.github.io/2026/10/08/Go-16-channel%E7%9A%84%E5%8F%91%E9%80%81%E6%8E%A5%E6%94%B6%E4%B8%8E%E5%85%B3%E9%97%AD%E6%80%8E%E6%A0%B7%E6%9E%84%E6%88%90%E5%8D%8F%E8%AE%AE/",
+  "image": "https://magicliang.github.io/img/wall-paper-25.jpg",
+  "datePublished": "2026-10-07T20:00:00.000Z",
+  "dateModified": "2026-10-18T05:40:14.521Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/08/Go-16-channel%E7%9A%84%E5%8F%91%E9%80%81%E6%8E%A5%E6%94%B6%E4%B8%8E%E5%85%B3%E9%97%AD%E6%80%8E%E6%A0%B7%E6%9E%84%E6%88%90%E5%8D%8F%E8%AE%AE/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: 'Go 16：channel 的发送、接收与关闭怎样构成协议',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">1964</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">1986</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">38</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-25.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">Go 16：channel 的发送、接收与关闭怎样构成协议</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">Go 16：channel 的发送、接收与关闭怎样构成协议</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-07T20:00:00.000Z" title="Created 2026-10-08 04:00:00">2026-10-08</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-18T05:40:14.521Z" title="Updated 2026-10-18 13:40:14">2026-10-18</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%B7%A5%E7%A8%8B%E5%AE%9E%E8%B7%B5/">工程实践</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">2.3k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>7mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-18 13:40:14&quot;}" hidden></div><p><a href="/2026/10/08/Go-15-%E5%90%AF%E5%8A%A8goroutine%E5%90%8E%E8%B0%81%E7%AD%89%E5%BE%85%E5%AE%83%E7%BB%93%E6%9D%9F/">上篇</a>让统计函数在 goroutine 中运行，但 CLI 还是启动一项、等一项。要把任务交给另一个持续读取任务的计算者，仅有“某项结束了”的 <code>done</code> 不够：谁能继续发送？谁宣布不会再发？接收者如何知道该退出？关闭错了 channel，程序可能 panic；不关闭，又可能永远等在接收处。这些问题需要一份双方能遵守的协议，不是画一条 <code>chan</code> 箭头就解决。</p>
+<p>本章沿用<a href="/go-language/">同一个任务工程</a>和旧的任务 ID、错误分类及 CLI 入口。<code>queue.go</code> 增加一个生产者、一个消费者和两条 channel；CLI 在校验及输入准备后把任务交给生产者，最终排空结果，再生成原有记录。没有为本章另起一个互不相关的服务。<a href="./go-language-16.tar.gz">完整累计快照</a>、<a href="./SHA256SUMS">SHA-256</a>和<a href="./RUN.md">解包命令</a>可独立下载复跑；原始命令、退出码和双流另存 <code>writing-plans/go-language/evidence/16/</code>。</p>
+<h2 id="首先约定唯一关闭者">首先约定唯一关闭者</h2>
+<p>任务路径如下：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs text">CLI 的 tasks 切片<br>        │<br>        ▼<br>生产者 ──发送──&gt; inputs（容量 1） ──接收──&gt; 消费者<br>  │                                             │<br>  └──发送完毕后 close(inputs)                  ├──逐项调用 15 的受控统计<br>                                                └──发送──&gt; outputs（无缓冲）<br>                                                             │<br>                                             消费者关闭 outputs 后，CLI 排空并返回<br></code></pre></td></tr></table></figure>
+<p>生产者是唯一向 <code>inputs</code> 发送的 goroutine，也是唯一关闭它的 goroutine。消费者通过 <code>for task := range inputs</code> 收到任务；生产者发送结束后关闭输入，消费者将已经在缓冲区里的最后一项收完，循环才结束。消费者是 <code>outputs</code> 的唯一发送者，也是它的唯一关闭者。CLI 只负责 <code>for result := range outputs</code> 排空，不会为了“让它快点结束”擅自关闭别人正在写的输入或输出 channel。<code>defer close</code> 放在各自唯一发送者的函数内，不能把这一写法不加分析地推广到多个生产者。</p>
+<p>这是关闭所有权，而不是“谁最方便就关”。Go 语言规范对关闭后的接收有明确定义：已经送入的值先被接走，此后接收立刻返回元素类型零值；两值接收的 <code>ok</code> 为 false。<code>range</code> 利用这个结束信号退出。关闭也不是清空缓冲区；若把 <code>inputs</code> 关在仍有发送者运行的时候，稍后的发送会 panic。<code>testdata/send-after-close.go</code> 单独编译、运行后，stderr 为 <code>panic: send on closed channel</code>，直接运行的二进制退出 2；这个反例没有混入正常 CLI，也不靠吞掉 panic 假装成功。</p>
+<h2 id="什么叫-空-满-nil-已关闭">什么叫“空”“满”“nil”“已关闭”</h2>
+<p>本版 Go 语言规范的 Send statements 与 Receive operator 分别约定等待条件。<code>queue_test.go</code> 不使用 <code>Sleep</code> 猜测阻塞，而用容量为 1 的通道和带 <code>default</code> 的 <code>select</code> 检查某个操作<strong>在检查时</strong>是否可执行。空的、尚未关闭的 channel 上没有值，接收不可立即进行；塞入 7 以后缓冲区已满，下一次发送不可立即进行。这只是本地瞬时可执行性，不代表可以对将来的调度先后做保证。</p>
+<p><code>nil</code> 的含义又不同：一个 <code>var disabled chan int</code> 没有指向已创建通道，在测试的 <code>select</code> 中发送和接收两条路径都不会准备好，进入 <code>default</code>。普通代码若直接在 nil channel 上收/发，则会一直阻塞，不能把它当作“空但是有人马上能填”的队列。某些状态机可用 nil 暂时禁用一条 <code>select</code> 分支，但本章并没有设计可取消的等待；到下一章才会给阻塞发送与接收加入取消协议。</p>
+<p>最后关闭仍含 7 的通道：第一次接收到 <code>7, true</code>，第二次接收到 <code>0, false</code>。两个 <code>0</code> 的语义可能不同：如果生产者合法发送了整数零，两值接收会是 <code>0, true</code>；如果是排空后的关闭，才是 <code>0, false</code>。测试的日志按先后记下 <code>empty: receive is not ready</code>、<code>full: send is not ready</code>、<code>nil: neither send nor receive is ready</code> 和 <code>closed: first value=7 ok=true; drained value=0 ok=false</code>。四者不能只用“没拿到任务”笼统概括，尤其不能写 <code>if value==0</code> 就认为生产者已退出。</p>
+<h2 id="排空之后再处理最早的错误">排空之后再处理最早的错误</h2>
+<p><code>processTasksUsing</code> 从现有 <code>[]string</code> 送入带原始位置的任务值，计算者仍调用上篇 <code>analyzeTaskAsyncUsing</code> 并等待其完成。一个持续运行的消费者按输入接收顺序发送结果；<code>outputs</code> 是无缓冲通道，所以若 CLI 不接收，消费者会停在发送处，生产者也可能因容量 1 而被反压。这是明确的握手，不是“关闭输入后所有任务瞬时完成”。CLI 将收到的结果按原位置放入切片，直到 <code>outputs</code> 被关闭才返回该切片，随后按位置依次选择错误或生成记录。当前只有一个消费者，不能借输出顺序声称以后增加多个 worker 仍天然有序；位置字段留出了以后对乱序结果重排的依据。</p>
+<p>为什么碰到错误不马上返回？假设输入是 <code>Go|</code>，后一项被判空；如果接收者在看到这个错误时直接退出，而生产者还在发送、消费者还在 <code>outputs &lt;- ...</code>，两边都可能卡住。现在先把已接受的输入逐项处理并排空结果，之后才复用 CLI 原有的错误分类与 stdout 暂存：<code>--batch 'Go|'</code> 的二进制 stdout 空、stderr 为 <code>usage: taskstats: text must not be empty</code>，退出 2。<code>--batch 'Go|one two' --lookup 'task[missing]'</code> 的 stderr 则为 <code>task not found: task[missing]</code>，也是退出 2，但不是同一种错误。当前策略的代价是批次中前项失败后，后续任务仍会计算；下一篇的取消应明确决定是停止排队、请求已开始的工作退出，还是继续排空，不能只关一个 channel 就假定工作已停。</p>
+<p>空任务切片也要走通关闭路径。<code>TestQueueEmptyInputTerminates</code> 直接以 nil 切片调用队列函数，生产者不发送、关闭输入，消费者发现输入已结束、关闭输出，CLI 收到空结果并返回。这不是 CLI 接受空文本：<code>--batch ''</code> 经业务校验仍报 <code>text must not be empty</code>。这里的空是队列内部的零项，文本空白是任务输入无效，两者验收目的不同。</p>
+<p><code>TestQueueDrainsBeforeReturning</code> 用闸门挡住第一项统计。测试已经收到 <code>started</code> 时，消费者尚未产生该项的结果，调用队列的函数不应返回；打开闸门后断言三项结果按位置到达，最后一项是 <code>ErrInvalidInput</code>。两包 <code>go test -count=1 -v ./...</code> 退出 0，闸门、空队列与四种 channel 状态重跑 30 次退出 0。编译后的 <code>--batch 'Go|one two'</code> 仍输出两行 <code>task[0] words=1 bytes=2 runes=2</code>、<code>task[1] words=2 bytes=7 runes=7</code>，退出 0；<code>--json</code>、批次增删和查询也保存了对应的双流与退出码。这些实测只证明覆盖到的路径，没有运行 race detector，不能据此宣称所有并发路径都安全。</p>
+<p>容量为 1 只是 <code>inputs</code> 通道里暂存的任务值数量上限：<code>--batch</code> 已经先拆成完整 <code>[]string</code>，结果也被全部保留到输出前。它不是整个程序的内存预算，不是 20 章的有界 worker pool，更不是满队列时明确拒绝提交的契约。这里生产者可能阻塞等待消费者推进，没有截止时间或取消出口。<code>outputs</code> 的关闭证实消费者执行到尾声；但取消请求、工作确实退出、HTTP 请求已经返回、任务作为后台工作仍在运行，各自需要独立证据，不能互相冒充。</p>
+<p>练习：若把 <code>close(inputs)</code> 移到 CLI 的输出循环里，且消费者还可能向 <code>inputs</code> 发送，能否因为已经收到第一项结果就安全关闭？答案：不能。收到一个输出只确认相应的通信发生，不保证其他发送者全部结束；向已关闭 channel 发送将 panic。必须先撤掉其他发送者或等待它们确认退出，由确认所有权的一方关闭。更简单的本章设计是从一开始限定唯一生产者持有关闭责任，而 CLI 只接收。</p>
+<p>本章仍仅有同一进程的一位消费者与可控测试数据。HTTP、SQL、请求取消、数据库提交及外部副作用均 <code>NOT_RUN</code>；未对未来的 HTTP 应答与任务完成作同一承诺。当前实测 Go 1.27.1/Linux amd64、<code>GOMAXPROCS=2</code>、<code>CGO_ENABLED=0</code>；全站构建、race 检测、其他平台及发布未验收。工具链源码 tag <code>go1.27.1</code> 与镜像 SHA <code>862c888e612ac346c7c4d99c9392bdfd265f33b0</code> 沿用系列基线，官方 Gitiles 交叉验证仍 <code>NOT_RUN</code>；本章引用规范/内存模型而非 runtime 源码。下一篇在阻塞发送、接收和分段计算处引入 context，并把“发出取消请求”与“收到退出确认”拆开验证。</p>
+<h3 id="参考资料">参考资料</h3>
+<ul>
+<li><a target="_blank" rel="noopener" href="https://go.dev/ref/spec#Channel_types">Go 语言规范：Channel types</a>、<a target="_blank" rel="noopener" href="https://go.dev/ref/spec#Send_statements">Send statements</a>、<a target="_blank" rel="noopener" href="https://go.dev/ref/spec#Receive_operator">Receive operator</a>、<a target="_blank" rel="noopener" href="https://go.dev/ref/spec#Close">Close</a>。本版文档对应 <code>doc/go_spec.html:1688</code>、<code>:6106</code>、<code>:5346</code>、<code>:7548</code>。</li>
+<li><a target="_blank" rel="noopener" href="https://go.dev/ref/mem#chan">Go 内存模型：Channel communication</a>。固定版本摘录、实际命令和观察边界见 <code>writing-plans/go-language/research/16.md</code> 与 <code>writing-plans/go-language/evidence/16/</code>。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/08/Go-16-channel%E7%9A%84%E5%8F%91%E9%80%81%E6%8E%A5%E6%94%B6%E4%B8%8E%E5%85%B3%E9%97%AD%E6%80%8E%E6%A0%B7%E6%9E%84%E6%88%90%E5%8D%8F%E8%AE%AE/">https://magicliang.github.io/2026/10/08/Go-16-channel%E7%9A%84%E5%8F%91%E9%80%81%E6%8E%A5%E6%94%B6%E4%B8%8E%E5%85%B3%E9%97%AD%E6%80%8E%E6%A0%B7%E6%9E%84%E6%88%90%E5%8D%8F%E8%AE%AE/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Go/">Go</a><a class="post-meta__tags" href="/tags/Go-%E4%BB%BB%E5%8A%A1%E6%9C%8D%E5%8A%A1/">Go 任务服务</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-25.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/09/Go-28-%E8%BF%9B%E7%A8%8B%E9%87%8D%E5%90%AF%E5%90%8E%E4%BB%BB%E5%8A%A1%E8%AE%B0%E5%BD%95%E8%83%BD%E8%AF%B4%E6%98%8E%E4%BB%80%E4%B9%88/" title="Go 28：进程重启后任务记录能说明什么"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-14.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-09</div><div class="info-item-2">Go 28：进程重启后任务记录能说明什么</div></div><div class="info-2"><div class="info-item-1">上篇给 HTTP 路径上的数据库等待设置期限，仍没有处理进程突然消失的情况。SQL 里留下 RUNNING，只能说明某次领取已提交；进程死后，它不可能自己变成终态。QUEUED 留着原文，倒是可以由后续启动的 worker 再领取。本篇继续修改同一个任务服务，区分这两行的恢复动作。完整累计工程、SHA-256和独立解包步骤可复跑真实子进程实验。 先看进程死时数据库实际保存了什么 测试在隔离的 PostgreSQL 16.15 上启动一个独立 Go 子进程，提供原有 POST /tasks、GET /tasks/{id}，worker 数为 1，排队槽位为 1。连续提交 task[0] 和 task[1] 都得到 HTTP 202。第一个 worker 已把 task[0] 从 QUEUED 条件更新为 RUNNING，并进入故意不退出的分析器；第二个仍是 QUEUED。父进程查到这两行后调用 os.Process.Kill，Wait 确认子进程被信号终止。它没有机会执行 service.Close，不能把正常关闭时的等待语义套到这里。 杀死进程后再次从数据库查询，task[0] ...</div></div></div></a><a class="pagination-related" href="/2026/10/10/Go-E05-Web%E6%A1%86%E6%9E%B6%E5%8F%AA%E6%9B%BF%E6%8D%A2%E5%93%AA%E4%B8%80%E5%B1%82/" title="Go E05：Web 框架只替换哪一层"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-168.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-10</div><div class="info-item-2">Go E05：Web 框架只替换哪一层</div></div><div class="info-2"><div class="info-item-1">E04通过 gRPC 适配原服务。本篇仍在同一个任务服务里做另一项局部替换：给 HTTP 应用端口换路由适配器，不复制任务提交、SQL 领取或 worker。选定 Go 1.27.1 和 github.com/go-chi/chi/v5 v5.3.2，具体依赖及 chi 源码 SHA 随完整实验包交付；另有SHA-256和独立复跑方法。 路由框架不替业务提交状态 taskstats serve 新增 --http-adapter stdlib|chi，缺省仍为原标准库 ServeMux。chi 路由器把 POST /tasks 交给原 taskHTTPService.create，GET /tasks/{id} 与 POST /tasks/{id}/cancel 只把框架取到的 ID 填回 PathValue 再交给原 lookup/cancelTask。因此 JSON/字段限制、队列容量、SQL 写入与终态仲裁还是前 39 章那一份服务。--http-adapter unknown 在监听前退出 2；单独的管理 listener 不随 HTTP 适配器一起放出诊断路由。 把两个...</div></div></div></a><a class="pagination-related" href="/2026/10/09/Go-35-profile%E5%A6%82%E4%BD%95%E5%AE%9A%E4%BD%8D%E7%83%AD%E7%82%B9%E8%80%8C%E4%B8%8D%E6%9B%BF%E4%BB%A3%E6%B5%8B%E9%87%8F/" title="Go 35：profile 如何定位热点而不替代测量"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-119.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-09</div><div class="info-item-2">Go 35：profile 如何定位热点而不替代测量</div></div><div class="info-2"><div class="info-item-1">上篇看到等待中的 worker 并不等于正在消耗 CPU。要找实际计算热点，先选负载，再采样；profile 给出下一步该改哪里的线索，改动是否有收益则要回到多轮基准与业务断言。本篇仍使用同一任务服务的 AnalyzeContext 和已完成任务 HTTP GET。工程包、SHA-256及独立复跑步骤带完整原始 profile。 一组 profile 必须注明两种负载 新增的 BenchmarkTaskAnalyzeContext 在计时循环外固定 strings.Repeat(&quot;Go one two 你好 &quot;, 128)，每轮实际运行当前 worker 使用的 stats.AnalyzeContext，校对词数、字节和 rune 数以及错误返回；原有 BenchmarkTaskHTTPRead 则查已完成任务，检查 200/终态/词数。两者都在 profile 采样的进程里跑，但不是同一个业务路径。未开 profile 的五轮基线、原始 -cpuprofile 和 -memprofile 文件，以及 go tool pprof -top 原文分别存于 wri...</div></div></div></a><a class="pagination-related" href="/2026/10/08/Go-19-WaitGroup-Once%E4%B8%8Eatomic%E5%90%84%E8%B4%9F%E8%B4%A3%E4%BB%80%E4%B9%88/" title="Go 19：WaitGroup、Once 与 atomic 各负责什么"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-44.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-08</div><div class="info-item-2">Go 19：WaitGroup、Once 与 atomic 各负责什么</div></div><div class="info-2"><div class="info-item-1">上篇用一把 Mutex 保护任务记录的状态、结果和取消请求。现在服务还有三件性质不同的事：要等生产者和消费者整组退出，要保证同一份配置只初始化一次，还想从另一条路径读取“已有多少任务到达终态”。把这三件事都压到同一个原语上，往往会丢掉真正需要的约束。本章继续扩展同一个累计任务工程：生产者/消费者用 WaitGroup，配置用 Once，独立终态数用 atomic；记录的多字段提交仍由 Mutex 决定。完整工程及实验包与SHA-256可独立解包复跑。 独立复跑步骤列出本章正反例、源码校验及运行命令。 等整组退出，不等于请求整组停下 第 17 篇在队列里分别建了 producerDone 和 workerDone。本章让同一个队列在启动两个 goroutine 之前执行 workers.Add(2)，生产者和消费者各自 defer workers.Done()；调用方排空 outputs 后再 workers.Wait()，确保两者都完成自己的尾部工作。子统计 goroutine 仍由先前的单项 done 握手确认完成：WaitGroup 负责哪两个成员，应写在工程边界里，不能把没...</div></div></div></a><a class="pagination-related" href="/2026/10/08/Go-15-%E5%90%AF%E5%8A%A8goroutine%E5%90%8E%E8%B0%81%E7%AD%89%E5%BE%85%E5%AE%83%E7%BB%93%E6%9D%9F/" title="Go 15：启动 goroutine 后谁等待它结束"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-104.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-08</div><div class="info-item-2">Go 15：启动 goroutine 后谁等待它结束</div></div><div class="info-2"><div class="info-item-1">原来的顺序 CLI读取文本后，统计、生成任务记录、输出结果依次发生。把 analyzeTask 前面加上 go，看似只改一个关键字，却把调用方原本拥有的“等统计结束”这项责任删掉了：go analyzeTask(...) 不会把两个返回值交回当前函数，也不会等统计结束。于是问题不只是如何启动计算，而是怎样知道可以安全地写出 SUCCEEDED。 本章仍修改同一累计工程的 CLI：每项任务的统计交给一个 goroutine，调用者显式等待该项工作发出完成信号，然后继续沿用先前的错误判断和记录逻辑。完整累计工程和 SHA-256 校验附在正文素材目录；正文所述的实际实验命令、双流和退出码在 writing-plans/go-language/evidence/15/。这里没有把每个编号做成独立项目。 独立复跑步骤列出本章正反例、源码校验及运行命令。 启动信号不足以发布结果 先看独立反例 testdata/async-without-wait.go。计算者启动后关闭 started，随后卡在 &lt;-release。主流程观察到 started，却没有放行计算者；此时查看 done，...</div></div></div></a><a class="pagination-related" href="/2026/10/09/Go-30-fuzz%E8%83%BD%E5%8F%91%E7%8E%B0%E5%93%AA%E4%BA%9B%E8%BE%93%E5%85%A5%E5%81%87%E8%AE%BE/" title="Go 30：fuzz 能发现哪些输入假设"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-160.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-09</div><div class="info-item-2">Go 30：fuzz 能发现哪些输入假设</div></div><div class="info-2"><div class="info-item-1">上篇用两份固定输入分别验收函数、HTTP 和真实数据库。固定输入清楚，但没遍历异常 JSON 或状态操作的交错次序。本篇沿用同一个任务服务写两个 Go fuzz 目标，检验有限的输入不变量；累计工程包、SHA-256和独立复跑步骤附原始日志。 HTTP 接收之后必须有一个可解释的结果 FuzzHTTPTaskSubmission 的种子包括合法的 {&quot;text&quot;:&quot;Go&quot;}、UTF-8 文本、空白、text 类型错误、未知字段、两个相邻 JSON 对象和超过 64 KiB 的 JSON。每一轮拿 httptest.ResponseRecorder 调原有 POST /tasks handler，而非复制一套解析器。服务关闭要等待自己的 worker；若响应为 202，测试要求分配一个任务 ID，并在退出后读到 SUCCEEDED 或 FAILED。若返回 400/413，必须没有分配 ID 或留下记录。这使“报错时仍有后台任务”成为会导致 fuzz 失败的反例。 种子的坏输入也有明确预期：空白文本和类型不符不会当成已接受，拼接两个 JSON...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%A6%96%E5%85%88%E7%BA%A6%E5%AE%9A%E5%94%AF%E4%B8%80%E5%85%B3%E9%97%AD%E8%80%85"><span class="toc-number">1.</span> <span class="toc-text">首先约定唯一关闭者</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BB%80%E4%B9%88%E5%8F%AB-%E7%A9%BA-%E6%BB%A1-nil-%E5%B7%B2%E5%85%B3%E9%97%AD"><span class="toc-number">2.</span> <span class="toc-text">什么叫“空”“满”“nil”“已关闭”</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%8E%92%E7%A9%BA%E4%B9%8B%E5%90%8E%E5%86%8D%E5%A4%84%E7%90%86%E6%9C%80%E6%97%A9%E7%9A%84%E9%94%99%E8%AF%AF"><span class="toc-number">3.</span> <span class="toc-text">排空之后再处理最早的错误</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">3.1.</span> <span class="toc-text">参考资料</span></a></li></ol></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

@@ -1,0 +1,1 @@
+go build -o /tmp/go-language-12-unpack-auE8tY/taskstats .

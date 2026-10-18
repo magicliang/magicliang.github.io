@@ -1,0 +1,1 @@
+python3 -c 'import socket,sys; [ (lambda s,a: (s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1),s.bind(("127.0.0.1",int(a.rsplit(":",1)[1]))),s.close()))(socket.socket(),address) for address in sys.argv[1:] ]; print("ports released")' '127.0.0.1:38893' '127.0.0.1:46251'

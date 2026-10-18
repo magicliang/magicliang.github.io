@@ -1,0 +1,1 @@
+go build -o /tmp/go-language-13-unpack-jfyCrS/invalid-op ./testdata/invalid-type-operation.go

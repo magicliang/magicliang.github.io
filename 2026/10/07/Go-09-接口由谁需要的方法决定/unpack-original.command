@@ -1,0 +1,1 @@
+/tmp/go-language-09-unpack-0Eoex0/taskstats --text Go\ 写\ Go

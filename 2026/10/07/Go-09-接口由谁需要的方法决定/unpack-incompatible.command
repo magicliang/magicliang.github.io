@@ -1,0 +1,1 @@
+go build -o /tmp/go-language-09-unpack-0Eoex0/invalid ./testdata/interface-value-error.go

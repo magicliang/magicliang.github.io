@@ -1,0 +1,1 @@
+sh -c head\ -c\ 65537\ /dev/zero\ \|\ \"\$1\"\ --stdin sh /tmp/go-language-14-unpack-yksNGO/taskstats
