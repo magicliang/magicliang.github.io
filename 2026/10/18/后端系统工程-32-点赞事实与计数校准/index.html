@@ -1,0 +1,964 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>后端系统工程 32：点赞事实与计数校准 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="点赞数是派生数据。真相源是“谁赞了哪个条目”这组事实，计数只是对事实的汇总；为了让读取不必每次 count(*)，计数被单独存放、异步更新。破坏两者一致的路径有五条：用户重复点击，赞与取消交错，事件被重复投递，消费者在提交与确认之间崩溃，以及修复用的批量重算与在线增量同时改同一行。前三条会把计数推高或拉低；消费者崩溃会让已生效的事件被再投一次；批量重算若与在线增量直接冲突，修复本身就会制造新的偏差">
+<meta property="og:type" content="article">
+<meta property="og:title" content="后端系统工程 32：点赞事实与计数校准">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-32-%E7%82%B9%E8%B5%9E%E4%BA%8B%E5%AE%9E%E4%B8%8E%E8%AE%A1%E6%95%B0%E6%A0%A1%E5%87%86/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="点赞数是派生数据。真相源是“谁赞了哪个条目”这组事实，计数只是对事实的汇总；为了让读取不必每次 count(*)，计数被单独存放、异步更新。破坏两者一致的路径有五条：用户重复点击，赞与取消交错，事件被重复投递，消费者在提交与确认之间崩溃，以及修复用的批量重算与在线增量同时改同一行。前三条会把计数推高或拉低；消费者崩溃会让已生效的事件被再投一次；批量重算若与在线增量直接冲突，修复本身就会制造新的偏差">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-153.png">
+<meta property="article:published_time" content="2026-10-18T02:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T08:33:36.098Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Outbox">
+<meta property="article:tag" content="PostgreSQL">
+<meta property="article:tag" content="后端系统工程">
+<meta property="article:tag" content="批量重算">
+<meta property="article:tag" content="派生计数">
+<meta property="article:tag" content="点赞">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-153.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "后端系统工程 32：点赞事实与计数校准",
+  "url": "https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-32-%E7%82%B9%E8%B5%9E%E4%BA%8B%E5%AE%9E%E4%B8%8E%E8%AE%A1%E6%95%B0%E6%A0%A1%E5%87%86/",
+  "image": "https://magicliang.github.io/img/wall-paper-153.png",
+  "datePublished": "2026-10-18T02:00:00.000Z",
+  "dateModified": "2026-10-22T08:33:36.098Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-32-%E7%82%B9%E8%B5%9E%E4%BA%8B%E5%AE%9E%E4%B8%8E%E8%AE%A1%E6%95%B0%E6%A0%A1%E5%87%86/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '后端系统工程 32：点赞事实与计数校准',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2016</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2094</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-153.png);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">后端系统工程 32：点赞事实与计数校准</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">后端系统工程 32：点赞事实与计数校准</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-18T02:00:00.000Z" title="Created 2026-10-18 10:00:00">2026-10-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-22T08:33:36.098Z" title="Updated 2026-10-22 16:33:36">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">6.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>21mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-22 16:33:36&quot;}" hidden></div><p>点赞数是派生数据。真相源是“谁赞了哪个条目”这组事实，计数只是对事实的汇总；为了让读取不必每次 <code>count(*)</code>，计数被单独存放、异步更新。破坏两者一致的路径有五条：用户重复点击，赞与取消交错，事件被重复投递，消费者在提交与确认之间崩溃，以及修复用的批量重算与在线增量同时改同一行。前三条会把计数推高或拉低；消费者崩溃会让已生效的事件被再投一次；批量重算若与在线增量直接冲突，修复本身就会制造新的偏差。</p>
+<p>本章代码在 <code>examples/social</code> 的 <code>social.like</code> 包，全部用例跑在真实 PostgreSQL 16.15 上，包括独立 JVM 的 <code>kill -9</code> 与数据库 immediate 停机。验收目标：点赞/取消交错与事件重复之后，计数与事实记录一致；计数允许落后于事实，落后多少有明确定义，并且在任何时刻都能算出误差上界。</p>
+<h2 id="需求与范围">需求与范围</h2>
+<p>操作有三个：点赞、取消点赞、读取条目的点赞数。业务不变量写成可以用 SQL 检查的形式：</p>
+<ol>
+<li>每个 (user, item) 至多一行事实，<code>liked</code> 表示当前是否已赞，<code>version</code> 每次状态变化加一。</li>
+<li>每次状态变化恰好写一条 Outbox 事件，与事实变化在同一事务；事件的 <code>delta</code> 是 +1 或 −1，由事务内读到的旧状态决定。状态不变的请求不写事件。</li>
+<li>事件带全局序号，序号没有空洞，序号顺序等于提交顺序。</li>
+<li>每条事件对计数恰好生效一次：要么被消费者加进计数（APPLIED），要么已经包含在重算基线里（COVERED）。</li>
+<li>任意一致快照中，计数加上尚未处理、且序号大于基线的事件增量之和，等于事实数；排空事件后，计数等于事实数。</li>
+</ol>
+<p>排除项：多种表情回应、反作弊、条目删除、缓存、跨库分片、外部消息组件。本章的“投递”由测试线程或子进程直接读 <code>like_outbox</code> 表完成，重投的事件由测试代码按固定种子挑选，不验证任何中间件的确认语义。热点条目的分片计数行只做讨论，没有实现。</p>
+<h2 id="教学规模假设">教学规模假设</h2>
+<p>以下是教学假设，不对应任何实际产品，也没有测量：条目 10⁷ 个，点赞数呈重尾分布，少数条目有 10⁵ 量级的赞；读取点赞数的次数远多于点赞写入。在这个假设下，读路径必须是主键点查一行计数，不能对事实表做 <code>count(*)</code>；写路径上，同一热点条目在短时间内会收到大量并发点赞。</p>
+<p>实验规模远小于此：至多 6 个条目、60 个用户、每轮至多 2400 个请求，只用来检查不变量。</p>
+<h2 id="接口与返回语义">接口与返回语义</h2>
+<p>表 32-1：点赞接口</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>CHANGED</th>
+<th>NOOP</th>
+<th>REJECTED</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>like(u, i)</td>
+<td>未赞→已赞，版本加一，写 delta=+1 事件</td>
+<td>已是已赞</td>
+<td>条目不存在（外键 23503）</td>
+</tr>
+<tr>
+<td>unlike(u, i)</td>
+<td>已赞→未赞，版本加一，写 delta=−1 事件</td>
+<td>本来未赞</td>
+<td>—</td>
+</tr>
+<tr>
+<td>readCount(i, allowedLag)</td>
+<td>返回 n、lag、本条目未处理事件数、stale 标记</td>
+<td>—</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>点赞与取消都是“设成目标状态”的语义，重复请求得到 NOOP，客户端超时后重发是安全的。32-B 中重复点赞返回 <code>NOOP(liked,v1,already liked)</code>，Outbox 行数仍为 1；对从未赞过的条目取消返回 <code>NOOP(unliked,v0,not liked)</code>。</p>
+<h2 id="数据模型">数据模型</h2>
+<p><code>like_fact</code> 以 (user_id, item_id) 为主键，<code>item_id</code> 外键引用 <code>item</code>。<code>like_outbox</code> 以 <code>seq</code> 为主键，另有 <code>UNIQUE (user_id, item_id, version)</code>，同一对的同一个版本不可能写出两条事件。派生侧有三张表：<code>like_count(item_id, n, base_seq)</code>，<code>processed_event(seq, how)</code> 记录每条已处理事件是 APPLIED 还是 COVERED，<code>counter_watermark</code> 记录连续水位，即最大的 w 使序号 1…w 全部已处理。</p>
+<p>全局序号没有用 PostgreSQL 序列。PostgreSQL 16 文档 9.17 节说明，<code>nextval</code> 取得的值在事务中止后不回收，中止或崩溃都会留下空洞，序列不能提供无空洞编号。另外，序列在 <code>nextval</code> 时分配，先拿到小号的事务可能后提交，所以分配顺序也不等于提交顺序（这是本章的推断，第 34 篇的 NC4 实测到了这种情形）。本章改用单行计数：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">UPDATE</span> like_seq <span class="hljs-keyword">SET</span> <span class="hljs-keyword">last</span> <span class="hljs-operator">=</span> <span class="hljs-keyword">last</span> <span class="hljs-operator">+</span> <span class="hljs-number">1</span> <span class="hljs-keyword">WHERE</span> id <span class="hljs-operator">=</span> <span class="hljs-number">1</span> RETURNING <span class="hljs-keyword">last</span><br></code></pre></td></tr></table></figure>
+<p>这条语句给计数行加行锁并持有到事务结束（13.3.2 节），下一个点赞事务要等前一个提交或回滚后才能拿到序号。回滚会把加一一起撤销，所以没有空洞；拿到序号 k 的事务提交之前，没有事务能拿到 k+1，所以序号顺序就是提交顺序。代价是所有点赞写入在这一行上串行化，这和第 30 篇关系事件的做法相同，是教学实现为了得到连续水位而接受的限制。</p>
+<p><code>delta</code> 写死在事件里有一个直接后果：增量满足交换律，消费者以任何顺序应用同一组事件，和都相同。乱序因此不需要版本比较，威胁只剩重复。乱序期间 n 可能暂时为负或偏离事实，误差仍受本条目未处理事件数约束；对外展示时可以夹紧到 0，或在 stale 时附带误差上界。本章的 <code>readCount</code> 没有做夹紧。这一点与第 30 篇的关系投影不同，那里事件携带的是目标状态，覆盖顺序会影响结果，必须比较版本。</p>
+<h2 id="状态机">状态机</h2>
+<p>事实行在第一次请求时以“未赞、版本 0”的占位行出现，占位不写事件。之后只有两个状态之间的迁移。</p>
+<p>图 32-1：互动事实的状态与拒绝路径（32-B、32-C 验证）</p>
+<pre><code class="hljs mermaid">stateDiagram-v2
+    [*] --&gt; Unliked: 首次请求插入占位行 v0（不写事件）
+    [*] --&gt; [*]: 条目不存在 → REJECTED（23503，无任何行）
+    Unliked --&gt; Liked: like，版本+1，写 delta=+1
+    Liked --&gt; Unliked: unlike，版本+1，写 delta=−1
+    Liked --&gt; Liked: like → NOOP，不写事件
+    Unliked --&gt; Unliked: unlike → NOOP，不写事件</code></pre>
+<p>每条事件在派生侧的处理结果由两项检查决定：<code>processed_event</code> 主键是否已存在，事件序号是否不大于该条目的 <code>base_seq</code>。</p>
+<p>图 32-2：一条事件被投递时的处理分支（32-E、32-H、32-K 验证）</p>
+<pre><code class="hljs mermaid">flowchart TD
+    D[投递事件 e] --&gt; L[锁水位行，再锁 like_count 行]
+    L --&gt; B&#123;e.seq ≤ base_seq?&#125;
+    B -- 是 --&gt; C1&#123;processed_event 插入成功?&#125;
+    C1 -- 是 --&gt; COV[COVERED：只登记，不加增量]
+    C1 -- 否 --&gt; DUP[dup：不变]
+    B -- 否 --&gt; C2&#123;processed_event 插入成功?&#125;
+    C2 -- 是 --&gt; APP[APPLIED：n += delta]
+    C2 -- 否 --&gt; DUP
+    COV --&gt; W[推进连续水位，提交]
+    APP --&gt; W
+    DUP --&gt; W</code></pre>
+<h2 id="正常路径">正常路径</h2>
+<p>写事务的步骤是：插入占位行（<code>ON CONFLICT DO NOTHING</code>），<code>SELECT ... FOR UPDATE</code> 锁住事实行并读出旧状态，比较目标状态，不同才改状态、加版本、取序号、写 Outbox。锁顺序固定为事实行 → <code>like_seq</code>。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs java">Db.update(cx, <span class="hljs-string">&quot;INSERT INTO like_fact(user_id, item_id, liked, version) VALUES (?, ?, false, 0) &quot;</span> +<br>              <span class="hljs-string">&quot;ON CONFLICT DO NOTHING&quot;</span>, user, item);<br><span class="hljs-comment">// SELECT liked, version FROM like_fact WHERE user_id = ? AND item_id = ? FOR UPDATE</span><br><span class="hljs-keyword">if</span> (liked == want) <span class="hljs-keyword">return</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Result</span>(Outcome.NOOP, liked, ver, <span class="hljs-number">0</span>, want ? <span class="hljs-string">&quot;already liked&quot;</span> : <span class="hljs-string">&quot;not liked&quot;</span>);<br><span class="hljs-type">long</span> <span class="hljs-variable">v</span> <span class="hljs-operator">=</span> ver + <span class="hljs-number">1</span>;<br>Db.update(cx, <span class="hljs-string">&quot;UPDATE like_fact SET liked = ?, version = ? WHERE user_id = ? AND item_id = ?&quot;</span>, want, v, user, item);<br><span class="hljs-type">long</span> <span class="hljs-variable">seq</span> <span class="hljs-operator">=</span> Db.queryLong(cx, <span class="hljs-string">&quot;UPDATE like_seq SET last = last + 1 WHERE id = 1 RETURNING last&quot;</span>);<br>Db.update(cx, <span class="hljs-string">&quot;INSERT INTO like_outbox(seq, user_id, item_id, delta, version) VALUES (?, ?, ?, ?, ?)&quot;</span>,<br>        seq, user, item, want ? <span class="hljs-number">1</span> : -<span class="hljs-number">1</span>, v);<br></code></pre></td></tr></table></figure>
+<p>16 个线程同时对同一对点赞时，后到者先在占位行的 <code>INSERT ... ON CONFLICT</code> 上等待先到者结束，随后的 <code>FOR UPDATE</code> 锁住并读到更新后的行（Read Committed，13.2.1 节），于是看到“已赞”并返回 NOOP。32-C 的输出是 <code>CHANGED=1 NOOP=15</code>，只有 1 条事件。8 个线程在另一对上随机交错 320 次赞/取消后，CHANGED 次数、事件数、事实版本三者相等（本次为 146），增量和等于当前是否已赞。</p>
+<p>消费者一批事件一个事务：先 <code>FOR UPDATE</code> 锁水位行，使消费者之间串行；再按条目逐条锁计数行、登记 <code>processed_event</code>、加增量；最后推进连续水位。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs java">&#125; <span class="hljs-keyword">else</span> &#123;<br>    <span class="hljs-type">int</span> <span class="hljs-variable">fresh</span> <span class="hljs-operator">=</span> Db.update(cx, <span class="hljs-string">&quot;INSERT INTO processed_event(seq, how) VALUES (?, &#x27;APPLIED&#x27;) ON CONFLICT DO NOTHING&quot;</span>, e.seq());<br>    <span class="hljs-keyword">if</span> (fresh == <span class="hljs-number">1</span>) &#123;<br>        Db.update(cx, <span class="hljs-string">&quot;UPDATE like_count SET n = n + ? WHERE item_id = ?&quot;</span>, e.delta(), e.item());<br>        s.applied++;<br>    &#125; <span class="hljs-keyword">else</span> &#123;<br>        s.dup++;<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>去重的保证来自 <code>processed_event</code> 的主键与计数更新同在一个事务：主键插入成功和增量生效要么一起提交，要么一起回滚。成立条件是二者共享事务；观察位置是 <code>Audit.readSide</code> 中的 <code>exact_violations</code>；失败边界是把计数更新和去重登记拆进两个事务，或者把去重记录放在数据库之外，此时崩溃会留下“已登记未加”或“已加未登记”。</p>
+<h2 id="滞后的定义与读侧误差">滞后的定义与读侧误差</h2>
+<p>本章把滞后定义为：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">lag = like_seq.last − counter_watermark.applied_upto<br></code></pre></td></tr></table></figure>
+<p>两个量在同一条 SQL 里读出，所以来自同一快照。<code>last</code> 是已提交的最大事件序号（序号顺序等于提交顺序，快照里看到的 <code>last</code> 之前的事件都已提交），<code>applied_upto</code> 是连续已处理前缀的末尾。未处理的事件全部在 (applied_upto, last] 区间内，因此“未处理事件数 ≤ lag”。lag 是条数，不是时间；换算成时间需要知道写入速率，本章不做这种换算。</p>
+<p>读接口 <code>Audit.readCount</code> 同时返回 n、lag 和本条目未处理事件数，并按调用方给出的允许滞后标记 stale。允许滞后取 16 条是教学设定。32-D 先写入 30 个赞（item-lab-01 上 20 个），不消费，再消费前 20 条：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">note no consumer yet: item-lab-01 n=0 lag=30 pendingForItem=20 stale=true truth=20<br>note after 20 events: applied=20 covered=0 dup=0 watermark=20 | item-lab-01 n=14 lag=10 pendingForItem=6 stale=false | ...<br>note drained: item-lab-01 n=20 lag=0 pendingForItem=0 stale=false<br></code></pre></td></tr></table></figure>
+<p>误差有两层界。条目级：|n − 事实数| ≤ 本条目未处理事件数（上例 |14 − 20| = 6）。更强的是一条恒等式：n 加上“未处理且序号大于 <code>base_seq</code>”的事件增量之和，恰好等于事实数。<code>Audit.readSide</code> 用一条 SQL 在同一快照里对所有条目检查这两条，输出 <code>exact_violations</code> 与 <code>bound_violations</code>。成立条件：事实与事件同事务提交，计数与去重登记同事务提交，序号无空洞且按提交顺序分配。失败边界：若改用序列分配序号，快照中可能缺少一个较小序号的事件而包含较大的，<code>last</code> 就不再说明“之前的都已提交”，lag 的含义和恒等式都会失效。</p>
+<h2 id="方案比较">方案比较</h2>
+<p>表 32-2：计数维护方式</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>计数何时正确</th>
+<th>重复请求</th>
+<th>重复投递</th>
+<th>热点条目</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 请求路径直接加减，不查事实</td>
+<td>从不保证</td>
+<td>多加</td>
+<td>不涉及</td>
+<td>计数行每请求一锁</td>
+</tr>
+<tr>
+<td>B 事实与计数同事务更新</td>
+<td>提交即正确</td>
+<td>由事实比较吸收</td>
+<td>不涉及</td>
+<td>热点计数行在每个点赞事务里持锁到提交</td>
+</tr>
+<tr>
+<td>C 事实 + Outbox，异步去重消费（本章）</td>
+<td>排空后正确，之前有界</td>
+<td>由事实比较吸收</td>
+<td>由 processed_event 吸收</td>
+<td>计数行只被消费者锁；写路径仍经过全局序号行</td>
+</tr>
+<tr>
+<td>D 只做定期 <code>count(*)</code> 重算</td>
+<td>重算瞬间正确</td>
+<td>由事实吸收</td>
+<td>不涉及</td>
+<td>每次重算扫描热点条目的全部赞</td>
+</tr>
+</tbody>
+</table>
+<p>方案 B 最简单，代价是热点条目的计数行锁进入用户请求路径。方案 C 把这把锁移到消费者，但本实现的写路径仍要经过 <code>like_seq</code> 这一行，串行点没有消失，只是从“每条目一个”变成“全局一个”。若要去掉它，可以改为每条目独立序号与每条目水位，滞后的定义也随之变成每条目一个量；本章没有实现。</p>
+<p>热点条目常见的做法是把一行计数拆成 (item, shard) 多行，写时按某个规则选一行，读时求和。在本章的设计里，分片会影响重算安装：<code>base_seq</code> 必须对同一条目的全部分片一次写定，安装事务要按固定顺序锁住所有分片行，否则一部分分片用新基线、一部分用旧基线，COVERED 判断会出错。社交图存储把关联计数作为一等查询的设计可参见 TAO（USENIX ATC 2013）；本环境只取得该文的会议摘要页，未据此论述其实现。</p>
+<h2 id="负向对照一：请求路径直接加一">负向对照一：请求路径直接加一</h2>
+<p>32-F 把同一组 400 个请求交给 8 个线程，其中 136 个请求被客户端重发一次，模拟响应丢失后的重试。事实入口一侧，重发和重复点击全部变成 NOOP（本次 347 个），排空后 4 个条目计数都等于事实数。负向对照 <code>setNaive</code> 每个请求直接按方向加减计数，不读旧状态：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">note naive: items with drift=4 of 4, sum |naive − facts|=60<br>note   item-lab-02 naive=0 facts=19<br>note   item-lab-03 naive=-12 facts=15<br></code></pre></td></tr></table></figure>
+<p>偏差有两个来源：重发的点赞或取消各多加减一次，对未赞过的条目取消也会减一次，计数甚至变成负数。保证来自写事务里“读旧状态、比较、再决定增量”这一步，与有没有事务无关；<code>setNaive</code> 同样运行在事务里。</p>
+<h2 id="负向对照二：消费者不去重">负向对照二：消费者不去重</h2>
+<p>32-G 先写出 243 条事件，让 3 个竞争消费者都从当前水位拉取。拉取发生在加锁之前，批次会重叠；之后再重投 29 条旧事件。去重消费者得到 <code>applied=243</code>，其余投递全部记为 dup，计数一致。清空派生侧，用 <code>dedup(false)</code> 的消费者重放同一批事件：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">note no-dedup consumers: applied=758 covered=0 dup=0 watermark=243 (applications=758 for 243 events)<br>note   item-lab-01 count=38 facts=12<br></code></pre></td></tr></table></figure>
+<p>758 次应用对应 243 条事件，4 个条目全部偏离。偏离之后用批量重算校准：重算把四个条目分别从 38、63、44、53 改回 12、19、14、18，此后再来 50 个请求，由去重消费者增量维护，排空后仍一致。重算因此承担两个角色：修复派生侧已经发生的错误，以及给在线增量提供新的基线。</p>
+<h2 id="批量重算与在线增量">批量重算与在线增量</h2>
+<p>直接用快照里的 <code>count(*)</code> 覆盖计数，会与在线消费者冲突。快照之前提交、但消费者尚未应用的事件，其效果已在快照里，消费者之后再加一次就重复；快照之后提交、消费者已经应用的事件，其效果不在快照里，覆盖就把它丢了。</p>
+<p>本章的重算分两步。第一步在一个 Repeatable Read 事务里读出 <code>S = like_seq.last</code> 与每个条目的事实数 C(S)；RR 事务内所有语句看到同一快照（13.2.2 节），而序号顺序等于提交顺序，所以这个快照恰好包含序号 1…S 的全部事件效果。第二步逐条目开短事务，锁计数行，写入基线：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-type">long</span> <span class="hljs-variable">after</span> <span class="hljs-operator">=</span> Db.queryLong(cx,<br>        <span class="hljs-string">&quot;SELECT coalesce(sum(o.delta), 0) FROM processed_event p JOIN like_outbox o USING (seq) &quot;</span> +<br>        <span class="hljs-string">&quot;WHERE o.item_id = ? AND p.seq &gt; ? AND p.how = &#x27;APPLIED&#x27;&quot;</span>, item, snap.seq());<br><span class="hljs-type">long</span> <span class="hljs-variable">n</span> <span class="hljs-operator">=</span> snap.counts().getOrDefault(item, <span class="hljs-number">0L</span>) + after;<br>Db.update(cx, <span class="hljs-string">&quot;UPDATE like_count SET n = ?, base_seq = ? WHERE item_id = ?&quot;</span>, n, snap.seq(), item);<br></code></pre></td></tr></table></figure>
+<p>消费者遇到 <code>seq ≤ base_seq</code> 的事件只登记 COVERED，不加增量。若该条目已有 <code>base_seq ≥ S</code>，说明更新的重算已安装，本次跳过。</p>
+<p>32-H 构造了确定的交错，时间线如下（单条目 item-lab-01）：</p>
+<p>表 32-3：重算与在线增量的交错（32-H）</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>动作</th>
+<th>按基线安装</th>
+<th>直接覆盖</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>写入事件 1…6，消费者应用 1…3</td>
+<td>n=3</td>
+<td>n=3</td>
+</tr>
+<tr>
+<td>2</td>
+<td>重算快照：S=6，C(S)=6</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr>
+<td>3</td>
+<td>写入事件 7、8，消费者先应用 7</td>
+<td>n=4</td>
+<td>n=4</td>
+</tr>
+<tr>
+<td>4</td>
+<td>安装</td>
+<td>n=6+1=7，base_seq=6</td>
+<td>n=6</td>
+</tr>
+<tr>
+<td>5</td>
+<td>消费者应用 4、5、6、8</td>
+<td>4…6 COVERED，8 APPLIED，n=8</td>
+<td>全部 APPLIED，n=10</td>
+</tr>
+<tr>
+<td>6</td>
+<td>事实数</td>
+<td>8</td>
+<td>8</td>
+</tr>
+</tbody>
+</table>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">note naive overwrite: ... item-lab-01:overwritten(n 4-&gt;6, base_seq=0, appliedAfterBase=0); applied&#123;4,5,6,8&#125; applied=4 ... n=10 truth=8<br>note naive: double-counted &#123;4,5,6&#125;=+3, lost &#123;7&#125;=-1, error=2<br></code></pre></td></tr></table></figure>
+<p>按基线安装之后再重投 1…8，8 次全部记为 dup，n 保持 8。</p>
+<p>第二步与消费者争的是同一行计数。32-I 让消费者在提交前停住，此时它持有 item-lab-01 计数行的锁；重算安装在 <code>pg_locks</code> 中出现一条 <code>granted = false</code> 的等待（54.12 节）。放行消费者后，安装的 <code>FOR UPDATE</code> 拿到锁，随后的求和语句看到消费者刚提交的事件 5，安装值为 4+1=5，之后事件 1…4 全部记为 COVERED。保证来自两处：安装与消费者都先锁计数行再读 <code>processed_event</code>；Read Committed 下锁等待之后的新语句看到最新已提交数据。失败边界：安装若改在 RR 事务里执行，等锁之后的 <code>FOR UPDATE</code> 会因计数行已被消费者更新而报 40001（13.2.2 节），需要整体重试；真正会漏计的写法是先在锁外读出 <code>processed_event</code> 的求和，再去锁计数行写入。</p>
+<h2 id="全部并发">全部并发</h2>
+<p>32-J 让 8 个写线程各发 300 个请求（item-lab-01 占一半流量），同时运行 3 个竞争消费者、1 个随机重投旧事件的线程、1 个每 100 毫秒做一次全量重算的线程，以及 1 个采样线程，每次采样执行 <code>Audit.readSide</code>。本次运行：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">note requests=2400 CHANGED=1202 events=1202 rebuild rounds=9 redelivered=280<br>note consumers+redeliver: applied=79 covered=1123 dup=2265 watermark=1202 covered rows=1123<br>note sampler (values vary by run): samples=91 max lag=634 max |n-truth|=16<br></code></pre></td></tr></table></figure>
+<p>91 次采样中，恒等式、条目误差界、“未处理数 ≤ lag”三项违反数都是 0；每条事件恰好一次 APPLIED 或 COVERED（79 + 1123 = 1202）；排空后计数等于事实数。这一轮消费者落后较多，大部分事件在被消费前已经被某次重算的快照覆盖，所以 COVERED 远多于 APPLIED；比例与最大 lag 随调度变化，不是性能数据。采样是抽查，不能覆盖所有中间状态。</p>
+<h2 id="崩溃与恢复">崩溃与恢复</h2>
+<p>32-K 用独立 JVM 运行消费者 <code>ConsumerProc</code>，投递位点存放在本地文件里，只在数据库提交之后才写入，用来代表外部传输的消费位点。第一次让子进程在第 2 批（序号 26…50）的事务内停住，然后 <code>kill -9</code>：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">note child1| PAUSED_IN_TX batch=2 seq=26..50<br>note child1 backend state idle in transaction = 1<br>note kill -9 child1 exit=137 backendStillListed=0 watermark=25 processed=25 offsetFile=25<br></code></pre></td></tr></table></figure>
+<p>客户端进程消失后，服务端在下一次读 socket 时发现连接断开（<code>client_connection_check_interval</code> 默认关闭，20.3.1 节），会话结束，打开的事务回滚（55.2.9 节）。水位停在 25，第 2 批的登记一条也没有留下。第二次让子进程提交第 2 批（51…75）之后、写位点文件之前被杀：数据库水位是 75，位点文件仍是 50。第三次正常启动，从 50 开始重投，51…75 共 25 条全部记为 dup，最终 <code>applied=45 dup=25 watermark=120</code>，计数一致。这个“已提交、未确认”的窗口在任何把确认放在业务提交之后的传输里都存在，去重只能在业务事务内部完成。</p>
+<p>32-L 在 6 个写线程和 1 个消费者运行时执行 <code>pg.sh restart-immediate</code>。immediate 模式直接中止全部服务进程，下次启动进入崩溃恢复（pg_ctl 参考页）。7 个线程全部以 08006 结束。恢复后：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">note acked CHANGED before crash=344; threads ended by SQLException=7 states=[08006, consumer:08006]<br>note after recovery write-side: last_seq=344 outbox_rows=344 version_mismatch_pairs=0 delta_sum_mismatch_items=0<br>note after recovery read-side:  last_seq=344 watermark=180 lag=164 unprocessed=164 count_mismatch_items=3 max_abs_err=3 exact_violations=0 bound_violations=0<br></code></pre></td></tr></table></figure>
+<p>已经向调用方确认的 344 个 CHANGED 都能在 Outbox 中按序号和版本找到；序号无空洞，每对的版本等于事件数，每个条目的增量和等于事实数，说明事实与事件同进同退。计数此时落后 164 条，3 个条目不一致，但恒等式成立，排空后计数等于事实数。这一项依赖 <code>fsync=on</code>、<code>synchronous_commit=on</code>（均为默认值）与 WAL 先于数据页落盘（30.3 节），单机单实例，不涉及复制。本次 Outbox 行数恰好等于已确认数；用例只断言前者不小于后者，因为停机可能发生在提交已持久化、确认尚未送达之间，这样的请求在调用方看来是结果未知。按表 32-1 的语义重发同一目标状态，若期间没有其他变化，会得到 NOOP。</p>
+<p>线程结束时看到的是 08006 这个原始错误（共用的 <code>social.common.Tx</code> 把回滚时的后续异常附为 suppressed，不覆盖原始错误，修改记录见 <code>evidence/32/LIMITS.md</code>）。</p>
+<p>恢复流程按下面的顺序检查：</p>
+<ol>
+<li>消费者重启后从自己的位点或数据库水位重新拉取，重复部分由 <code>processed_event</code> 吸收，不需要人工判断哪些已经生效。</li>
+<li>用 <code>Audit.writeSide</code> 检查写侧：<code>last_seq = outbox_rows</code>、版本不符的对数为 0、增量和不符的条目数为 0。写侧不一致说明有绕过写入口的修改，重算不能修复，要先查事实表。</li>
+<li>用 <code>Audit.readSide</code> 检查读侧恒等式。恒等式违反（例如 32-G 的不去重消费者）说明派生侧被写错，运行 <code>Rebuild.rebuildAll</code> 重新安装基线，再让消费者继续。</li>
+<li>排空后 <code>lag = 0</code> 且计数不符条目数为 0，恢复结束。</li>
+</ol>
+<h2 id="证据与限制">证据与限制</h2>
+<p>运行入口是 <code>examples/social/run.sh 32</code>。约定端口 55432 在本机被一个与本批无关的集群占用，<code>run.sh</code> 改用 55532，并写进 <code>env.txt</code>。脚本启动 b3-32 集群，重建 <code>social32</code> 库，编译运行 <code>social.like.Ch32Main</code>，输出写入 <code>evidence/32/output.txt</code>，最后停止集群。本次运行汇总为 <code>SUMMARY passed=128 failed=0</code>，退出码 0，40001/40P01 重试次数为 0。复跑时可加 <code>LAB_BUILD=/tmp/batch3-build-32</code>，与第 30、31 篇的编译目录分开。</p>
+<p>表 32-4：用例与保证的对应</p>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th>类别</th>
+<th>检查的保证</th>
+<th>观察位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>32-A、32-B</td>
+<td>真实组件</td>
+<td>正常路径；NOOP、外键拒绝、中止不留痕、序号无空洞</td>
+<td>like_fact、like_outbox、like_seq</td>
+</tr>
+<tr>
+<td>32-C</td>
+<td>真实组件，真实线程</td>
+<td>同一对并发只一条事件；版本 = 事件数</td>
+<td>CHANGED 计数、version</td>
+</tr>
+<tr>
+<td>32-D</td>
+<td>真实组件</td>
+<td>lag 定义、stale 标记、误差界</td>
+<td>Audit.readCount、readSide</td>
+</tr>
+<tr>
+<td>32-E</td>
+<td>真实组件，确定投递序列</td>
+<td>重复与乱序投递后一致</td>
+<td>applied、dup、恒等式</td>
+</tr>
+<tr>
+<td>32-F、32-G</td>
+<td>真实组件，负向对照</td>
+<td>直接加减偏离；不去重偏离；重算校准</td>
+<td>naiveDrift、readSide</td>
+</tr>
+<tr>
+<td>32-H、32-I</td>
+<td>真实组件，确定交错</td>
+<td>重算基线与在线增量不重不漏；直接覆盖的负向对照；锁等待</td>
+<td>n、COVERED、pg_locks</td>
+</tr>
+<tr>
+<td>32-J</td>
+<td>真实组件，真实线程</td>
+<td>全部并发下采样恒等式成立</td>
+<td>Audit.readSide</td>
+</tr>
+<tr>
+<td>32-K</td>
+<td>多进程，kill -9</td>
+<td>事务内被杀回滚；提交后被杀重投被去重</td>
+<td>水位、位点文件、dup</td>
+</tr>
+<tr>
+<td>32-L</td>
+<td>多进程，immediate 停机</td>
+<td>已确认事件持久；事实与事件同进同退</td>
+<td>writeSide、readSide</td>
+</tr>
+</tbody>
+</table>
+<p>限制写在 <code>evidence/32/LIMITS.md</code>，要点如下。规模至多 6 个条目、2400 个请求，计数只对这份输入成立，不报告任何耗时或吞吐。全局序号行与水位行是两处串行点，没有测量其容量。没有实现分片计数行。读接口统计未处理事件数要扫描 Outbox，只适合教学规模。Outbox 与 <code>processed_event</code> 不清理，没有验证保留期之后的去重边界。投递与重投由测试代码完成，位点文件是本地替身。32-F、32-G、32-J、32-L 中的具体数值随调度变化，断言只检查不变量。</p>
+<h2 id="本批导航">本批导航</h2>
+<ul>
+<li>上一篇：<a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-31-Feed%E7%9A%84%E6%89%87%E5%87%BA%E6%88%90%E6%9C%AC%E4%B8%8E%E7%83%AD%E7%82%B9/" title="后端系统工程 31：Feed 的扇出成本与热点">31 Feed 的扇出成本与热点</a></li>
+<li>下一篇：<a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-33-%E9%80%9A%E7%9F%A5%E6%B8%A0%E9%81%93%E7%9A%84%E7%BB%93%E6%9E%9C%E6%9C%AA%E7%9F%A5/" title="后端系统工程 33：通知渠道的结果未知">33 通知渠道的结果未知</a></li>
+<li>本批索引：仓库 <code>batch-3/INDEX.md</code>（阅读顺序与运行入口），<code>batch-3/STATUS.md</code>、<code>batch-3/SOURCES.md</code></li>
+<li>运行入口：<code>batch-3/examples/social/run.sh</code>，证据目录：<code>batch-3/evidence/32/</code></li>
+<li>本篇工程与证据快照：<a href="./backend-systems-32.tar.gz">backend-systems-32.tar.gz</a>（SHA-256 见同目录 <code>backend-systems-32.tar.gz.sha256</code>）。正文中的 <code>examples/</code>、<code>evidence/</code>、<code>SOURCES.md</code> 路径都相对仓库的 <code>batch-3/</code> 目录，与快照包内布局一致。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-32-%E7%82%B9%E8%B5%9E%E4%BA%8B%E5%AE%9E%E4%B8%8E%E8%AE%A1%E6%95%B0%E6%A0%A1%E5%87%86/">https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-32-%E7%82%B9%E8%B5%9E%E4%BA%8B%E5%AE%9E%E4%B8%8E%E8%AE%A1%E6%95%B0%E6%A0%A1%E5%87%86/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/PostgreSQL/">PostgreSQL</a><a class="post-meta__tags" href="/tags/Outbox/">Outbox</a><a class="post-meta__tags" href="/tags/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B/">后端系统工程</a><a class="post-meta__tags" href="/tags/%E7%82%B9%E8%B5%9E/">点赞</a><a class="post-meta__tags" href="/tags/%E6%B4%BE%E7%94%9F%E8%AE%A1%E6%95%B0/">派生计数</a><a class="post-meta__tags" href="/tags/%E6%89%B9%E9%87%8F%E9%87%8D%E7%AE%97/">批量重算</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-153.png" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-25-%E7%BC%93%E5%AD%98%E6%97%A7%E5%80%BC%E5%9B%9E%E5%A1%AB%E4%B8%8E%E5%A4%B1%E6%95%88%E4%BF%AE%E5%A4%8D/" title="后端系统工程 25：缓存旧值回填与失效修复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-117.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 25：缓存旧值回填与失效修复</div></div><div class="info-2"><div class="info-item-1">Cache Aside 的写法很短：读时先查缓存，未命中就读数据库再回填；写时先提交数据库，再删除缓存。这段代码里有一个读者与写者交错的窗口：读者读到旧行之后、回填之前，写者提交了新版本并删掉了缓存，读者随后把旧行写回去。此后缓存里的旧值没有任何人负责清除，只能等 TTL。另一个窗口出现在写者自身：数据库已经提交，删除缓存的那条命令还没发出，进程就退出了。 本篇的验收目标是：数据更新与慢读回填交错之后，旧值可以被拒绝、被检测、被修复；旧值最多存活多久（新鲜度窗口）要写成由哪些量组成的上界，并指出哪些条件下不存在上界。全部数据为合成数据，商品标识形如 sku-lab-05。 需求与范围 服务管理一组商品描述，数据库是唯一真相源，每行有一个单调递增的 version。缓存只是加速副本，允许短暂落后，但不允许“无限期落后”。具体要求：  读路径：命中直接返回；未命中读库并回填。 写路径：只改数据库，然后让缓存失效；不允许写者直接把新值写进缓存（避免写者之间的乱序覆盖成为第二个问题）。 写者在提交后任意时刻崩溃，旧值最终被清除，且不依赖 TTL。 失效命令可能重复、乱序到达，重复和乱序不...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-29-%E8%AE%A2%E5%8D%95%E6%94%AF%E4%BB%98%E6%A8%A1%E6%8B%9F%E4%B8%8E%E5%BA%93%E5%AD%98%E8%A1%A5%E5%81%BF/" title="后端系统工程 29：订单、支付模拟与库存补偿"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-15.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 29：订单、支付模拟与库存补偿</div></div><div class="info-2"><div class="info-item-1">上一篇把名额收进了一张预留表：预留有效期内名额归该用户，到期由释放任务归还。本篇在它上面加一层订单和一个假支付渠道，处理三件预留层回答不了的事：调用渠道超时，钱到底扣了没有；渠道的回调重复、乱序、迟到时，订单状态会不会被改坏；支付成功的消息到达时，预留已经过期并被别人买走，这笔钱怎么办。代码在 examples/flash-sale/src/lab/flash/order，库存层原样复用第 28 篇的 lab.flash.reserve.Inventory，没有改动。全部金额是模拟积分，订单固定 1990 分，SKU 为 sku-lab-01，用户为 user-0042 这类编号，渠道替身只监听本机端口。 需求与范围 需求写成可以逐条断言的形式：  订单状态只能沿状态机迁移；任何迁移都以“当前状态等于前置状态”为条件，不满足即拒绝，不覆盖。 渠道调用没有拿到确定应答时，订单不得判为失败，也不得归还库存；结果必须通过查询或关单收敛。 同一笔支付的成功通知无论到达几次、以什么顺序到达，最多造成一次状态迁移、一次库存确认和一条下游事件。 成功通知到达时若预留已被释放：能重新占到名额就确...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-23-%E5%88%86%E7%89%87%E6%89%A9%E5%AE%B9%E6%97%B6%E7%9A%84%E6%95%B0%E6%8D%AE%E4%BA%A4%E6%8E%A5/" title="后端系统工程 23：分片扩容时的数据交接"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-27.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 23：分片扩容时的数据交接</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 22 非分片键查询与全局分页 ｜ 本篇 23 ｜ 下一篇 24 在线变更的数据兼容 两个分片扩到三个，需要把一部分数据从旧分片搬到新分片，同时写入不停。这件事拆开看有三个难点。复制需要时间，复制期间源端还在变化，复制完的副本一出来就是旧的。路由表改了之后，已经拿着旧路由的写入方不会立刻知道，它们的写会继续打到源端。写入方遇到超时会重试，一次请求可能在源端提交了、重试却落到目标端。任何一处处理不当，结果都是某些已经告诉调用方“成功”的写，在迁移完成后不见了，或者已经删除的行又回来了。 本篇实现按桶迁移：版本化路由、快照复制、按事务水位追赶、冻结栅栏、按键与版本校验、切流。三个独立的写入进程在迁移全程持续写入、删除与重试，迁移结束后逐键核对“所有已确认写”。代码在 examples/23-shard-rebalance/，输出在 evidence/23/output.txt。 需求与不变量 数据是合成的键值记录 items(item_id, bucket, val, row_version)，写操作有三种：创建（值为 0，版本 1）、增量（val += delta，...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-38-%E6%95%B0%E6%8D%AE%E5%A4%87%E4%BB%BD%E6%81%A2%E5%A4%8D%E4%B8%8E%E5%9C%B0%E5%9F%9F%E5%88%87%E6%8D%A2/" title="后端系统工程 38：数据备份、恢复与地域切换——恢复演练要检查数据，不只检查进程"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-95.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 38：数据备份、恢复与地域切换——恢复演练要检查数据，不只检查进程</div></div><div class="info-2"><div class="info-item-1"> 本文属于《后端系统工程：从接口契约到故障恢复》系列。文中提到的演练工程、测试与实验证据位于博客源码仓库的 batch-4/ 目录（examples/、evidence/ 等子目录）；业务数据均为合成数据。  “备份成功”是一条日志，“能恢复到指定时刻且数据正确”才是一项能力。两者之间隔着几个容易略过的问题：恢复点到底落在哪里，归档的 WAL 是否完整，恢复出来的实例里账是否平，角色和权限是否还在，切换之后旧主库会不会继续接受写入。 本篇在一台机器上启动多个隔离的 PostgreSQL 16 实例，实际执行基础备份、WAL 归档、按命名还原点的时间点恢复（PITR）、计划内切换和注入复制中断的非计划切换，每一步都用 SQL 检查数据本身。所有演练证明的是脚本与步骤在单机上可执行、检查项能发现错误；它们不证明跨地域网络、存储、DNS 或权限体系的行为。  1. 需求、目标与不变量 被保护的数据是一个合成的双边记账库：account(id, balance) 有 200 个账户，entry(request_id, account_id, amount, batch) 记录每笔转账的借...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-30-%E5%85%B3%E6%B3%A8%E5%85%B3%E7%B3%BB%E4%B8%8E%E5%8F%AF%E6%92%A4%E9%94%80%E8%AE%A2%E9%98%85/" title="后端系统工程 30：关注关系与可撤销订阅"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-150.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 30：关注关系与可撤销订阅</div></div><div class="info-2"><div class="info-item-1">关注关系看起来只是一张两列的表，难点在于它同时是一种授权。用户 A 关注私密账号 B 并获批后，A 就能读 B 的“仅粉丝可见”内容；B 拉黑 A 之后，这项授权必须收回，而且收回之后 B 新发的内容不能再被 A 看到。关系表之外通常还有粉丝列表、粉丝计数、下一篇要讲的 Feed 收件箱等派生视图，它们靠消费关系事件异步更新。重复点击关注、关注与取消交错、事件乱序和重复投递、消费者丢失进度，都会让派生视图与真相源出现差距；差距一旦落在权限上，就是越权读取。 本章的工程放在 examples/social 的 social.rel 包中，全部用例跑在真实 PostgreSQL 16.15 事务上。验收目标有两条：重复关注、取消与事件乱序不会让已经取消的关系“复活”；内容入口与派生视图在权限判断上给出一致的结论，或者明确声明二者允许相差的窗口。 需求与范围 操作只有六个：关注、取消关注、私密账号审批（同意或拒绝）、拉黑、解除拉黑、发布带可见性的内容。可见性分三档：PUBLIC 任何未被拉黑的人可读，FOLLOWERS 只有有效粉丝可读，SELF 只有作者本人可读。 业务不变量写成可以...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-26-%E7%A7%9F%E7%BA%A6%E4%BA%92%E6%96%A5%E4%B8%8E%E8%B5%84%E6%BA%90%E7%AB%AF%E6%A0%85%E6%A0%8F/" title="后端系统工程 26：租约互斥与资源端栅栏"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-14.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 26：租约互斥与资源端栅栏</div></div><div class="info-2"><div class="info-item-1">一个每日报表作业部署了多个实例，同一时刻只应有一个实例往报表输出库写结果。常见做法是在数据库里放一张租约表：谁抢到租约谁干活，租约到期没有续上就让给别人。这套做法能减少重复执行，但它本身不能阻止一种写入：实例 A 拿到租约、做完写前检查，然后整个进程停住；租约在停顿期间过期，实例 B 接手并写完；A 恢复后把手里那份已经过时的结果写了进去。A 自己无法察觉停顿，因为它恢复后执行的下一条指令就是“发出写请求”。 本篇的验收条件只有一条：暂停的旧持有者恢复后，无法写入受保护资源。实现上，租约在获取时原子地发出一个单调递增的 fencing token，受保护资源在写入的同一个原子操作里比较 token，拒绝比自己见过的最大值更小的请求。另外用同一时间线说明：资源端如果不检查 token，这个保证就不存在，再完善的租约也补不上。 需求、不变量与排除项 场景是合成的：报表作业 report-job 每天生成作用域 daily-report 下的若干分片（summary、detail），写入报表输出库。持有者标识形如 holder-a。 需要成立的不变量有三条：  I1，按数据库时钟，同一...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9C%80%E6%B1%82%E4%B8%8E%E8%8C%83%E5%9B%B4"><span class="toc-number">1.</span> <span class="toc-text">需求与范围</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%99%E5%AD%A6%E8%A7%84%E6%A8%A1%E5%81%87%E8%AE%BE"><span class="toc-number">2.</span> <span class="toc-text">教学规模假设</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%8E%A5%E5%8F%A3%E4%B8%8E%E8%BF%94%E5%9B%9E%E8%AF%AD%E4%B9%89"><span class="toc-number">3.</span> <span class="toc-text">接口与返回语义</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%B0%E6%8D%AE%E6%A8%A1%E5%9E%8B"><span class="toc-number">4.</span> <span class="toc-text">数据模型</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%8A%B6%E6%80%81%E6%9C%BA"><span class="toc-number">5.</span> <span class="toc-text">状态机</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%AD%A3%E5%B8%B8%E8%B7%AF%E5%BE%84"><span class="toc-number">6.</span> <span class="toc-text">正常路径</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%BB%9E%E5%90%8E%E7%9A%84%E5%AE%9A%E4%B9%89%E4%B8%8E%E8%AF%BB%E4%BE%A7%E8%AF%AF%E5%B7%AE"><span class="toc-number">7.</span> <span class="toc-text">滞后的定义与读侧误差</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%96%B9%E6%A1%88%E6%AF%94%E8%BE%83"><span class="toc-number">8.</span> <span class="toc-text">方案比较</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%B4%9F%E5%90%91%E5%AF%B9%E7%85%A7%E4%B8%80%EF%BC%9A%E8%AF%B7%E6%B1%82%E8%B7%AF%E5%BE%84%E7%9B%B4%E6%8E%A5%E5%8A%A0%E4%B8%80"><span class="toc-number">9.</span> <span class="toc-text">负向对照一：请求路径直接加一</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%B4%9F%E5%90%91%E5%AF%B9%E7%85%A7%E4%BA%8C%EF%BC%9A%E6%B6%88%E8%B4%B9%E8%80%85%E4%B8%8D%E5%8E%BB%E9%87%8D"><span class="toc-number">10.</span> <span class="toc-text">负向对照二：消费者不去重</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%89%B9%E9%87%8F%E9%87%8D%E7%AE%97%E4%B8%8E%E5%9C%A8%E7%BA%BF%E5%A2%9E%E9%87%8F"><span class="toc-number">11.</span> <span class="toc-text">批量重算与在线增量</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%A8%E9%83%A8%E5%B9%B6%E5%8F%91"><span class="toc-number">12.</span> <span class="toc-text">全部并发</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B4%A9%E6%BA%83%E4%B8%8E%E6%81%A2%E5%A4%8D"><span class="toc-number">13.</span> <span class="toc-text">崩溃与恢复</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%AF%81%E6%8D%AE%E4%B8%8E%E9%99%90%E5%88%B6"><span class="toc-number">14.</span> <span class="toc-text">证据与限制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%AC%E6%89%B9%E5%AF%BC%E8%88%AA"><span class="toc-number">15.</span> <span class="toc-text">本批导航</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

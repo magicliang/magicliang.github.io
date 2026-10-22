@@ -1,0 +1,886 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>后端系统工程 17：从持久日志构建最小消息队列 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="系列导航：上一篇 16 服务发现中的旧地址 ｜ 本篇 17 ｜ 下一篇 18 消息队列接入与积压恢复 生产者收到一句“发送成功”，这句话到底承诺了什么？消息可能只是进了 broker 的内存队列，可能已经交给操作系统但还停在页缓存里，也可能已经被 fsync 刷到设备。三种状态在正常运行时看不出差别，进程崩溃、掉电或者磁盘出错时才会分开。消费端也有同样的问题：消费者读到了消息、处理了消息、提交了进">
+<meta property="og:type" content="article">
+<meta property="og:title" content="后端系统工程 17：从持久日志构建最小消息队列">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-17-%E4%BB%8E%E6%8C%81%E4%B9%85%E6%97%A5%E5%BF%97%E6%9E%84%E5%BB%BA%E6%9C%80%E5%B0%8F%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="系列导航：上一篇 16 服务发现中的旧地址 ｜ 本篇 17 ｜ 下一篇 18 消息队列接入与积压恢复 生产者收到一句“发送成功”，这句话到底承诺了什么？消息可能只是进了 broker 的内存队列，可能已经交给操作系统但还停在页缓存里，也可能已经被 fsync 刷到设备。三种状态在正常运行时看不出差别，进程崩溃、掉电或者磁盘出错时才会分开。消费端也有同样的问题：消费者读到了消息、处理了消息、提交了进">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-148.jpg">
+<meta property="article:published_time" content="2026-10-18T13:10:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T08:33:36.094Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="fsync">
+<meta property="article:tag" content="后端系统工程">
+<meta property="article:tag" content="崩溃恢复">
+<meta property="article:tag" content="消息队列">
+<meta property="article:tag" content="追加日志">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-148.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "后端系统工程 17：从持久日志构建最小消息队列",
+  "url": "https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-17-%E4%BB%8E%E6%8C%81%E4%B9%85%E6%97%A5%E5%BF%97%E6%9E%84%E5%BB%BA%E6%9C%80%E5%B0%8F%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/",
+  "image": "https://magicliang.github.io/img/wall-paper-148.jpg",
+  "datePublished": "2026-10-18T13:10:00.000Z",
+  "dateModified": "2026-10-22T08:33:36.094Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-17-%E4%BB%8E%E6%8C%81%E4%B9%85%E6%97%A5%E5%BF%97%E6%9E%84%E5%BB%BA%E6%9C%80%E5%B0%8F%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '后端系统工程 17：从持久日志构建最小消息队列',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2016</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2094</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-148.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">后端系统工程 17：从持久日志构建最小消息队列</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">后端系统工程 17：从持久日志构建最小消息队列</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-18T13:10:00.000Z" title="Created 2026-10-18 21:10:00">2026-10-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-22T08:33:36.094Z" title="Updated 2026-10-22 16:33:36">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">5.5k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>18mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-22 16:33:36&quot;}" hidden></div><p>系列导航：上一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-16-%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0%E4%B8%AD%E7%9A%84%E6%97%A7%E5%9C%B0%E5%9D%80/" title="后端系统工程 16：服务发现中的旧地址">16 服务发现中的旧地址</a> ｜ 本篇 17 ｜ 下一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-18-%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97%E6%8E%A5%E5%85%A5%E4%B8%8E%E7%A7%AF%E5%8E%8B%E6%81%A2%E5%A4%8D/" title="后端系统工程 18：消息队列接入与积压恢复">18 消息队列接入与积压恢复</a></p>
+<p>生产者收到一句“发送成功”，这句话到底承诺了什么？消息可能只是进了 broker 的内存队列，可能已经交给操作系统但还停在页缓存里，也可能已经被 <code>fsync</code> 刷到设备。三种状态在正常运行时看不出差别，进程崩溃、掉电或者磁盘出错时才会分开。消费端也有同样的问题：消费者读到了消息、处理了消息、提交了进度，这三件事的先后顺序决定了重启后丢消息还是重复处理。</p>
+<p>本篇用一个单机日志队列把这些位置逐一拆开：分段追加日志、带长度与 CRC32C 的记录格式、启动时的恢复扫描、broker 管理的消费组进度，以及“确认—落盘—消费确认”三条彼此独立的线。代码在 <code>examples/17-log-queue/</code>，全部输出在 <code>evidence/17/output.txt</code>。</p>
+<p>先划清边界：这是教学用的单机实现，没有复制，没有共识，没有多副本确认，也没有分区与再均衡。它最多只能说明“一块本地磁盘上的一个进程”在进程崩溃后能保住什么；单机磁盘损坏时数据就丢了，任何关于集群持久性的结论都不能从这里推出。</p>
+<h2 id="需求与保证">需求与保证</h2>
+<p>broker 只提供四个操作：发布、拉取、确认、查询状态。协议是一行一个请求的 TCP 文本协议，载荷是第 17、18 两章共用的合成订单事件（<code>data/orders-events.jsonl</code>，固定种子生成 3000 条，字段只有测试值）。</p>
+<p>发布时，生产者指定要等待的确认级别：</p>
+<table>
+<thead>
+<tr>
+<th>级别</th>
+<th>broker 回复时的状态</th>
+<th>进程崩溃后</th>
+<th>掉电后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ACCEPTED</code></td>
+<td>已分配偏移，进入内存队列</td>
+<td>可能不存在，偏移可能被重新分配</td>
+<td>可能不存在</td>
+</tr>
+<tr>
+<td><code>WRITTEN</code></td>
+<td><code>FileChannel.write</code> 已返回，数据在页缓存</td>
+<td>通常仍在（页缓存属于内核）</td>
+<td>可能不存在</td>
+</tr>
+<tr>
+<td><code>DURABLE</code></td>
+<td><code>FileChannel.force</code> 已返回</td>
+<td>存在</td>
+<td>取决于设备是否如实执行刷新</td>
+</tr>
+</tbody>
+</table>
+<p>表中“进程崩溃后”一列由本章实验观察，“掉电后”一列来自文档，本机没有验证（见后文 NOT_RUN 一节）。</p>
+<p>broker 对外承诺的不变量只有下面几条：</p>
+<ul>
+<li>收到 <code>DURABLE</code> 回复的偏移，在进程崩溃并重启后存在，且内容与发布时一致。</li>
+<li>偏移从 0 开始连续，一经 <code>DURABLE</code> 确认就不再改变归属。</li>
+<li>消费者只能读到已经 force 的记录，即 durable 水位以下的记录。</li>
+<li>消费组的已提交偏移只有在持久化之后才回复 <code>ACKED</code>；未确认部分在连接断开后从已提交偏移重投，语义是至少一次。</li>
+<li>日志中间出现损坏时 broker 拒绝启动，不静默跳过任何记录。</li>
+</ul>
+<p>broker 不承诺生产端去重（没有生产者编号与序号），也不承诺一个消费组可以并行消费：同一组同时只允许一个活动连接，第二个连接得到 <code>ERR GROUP_BUSY</code>。</p>
+<p>规模假设是教学取值：单条载荷不超过 64 KiB，内存受理队列 1024 条，段文件默认 1 MiB，单个消费组单个消费者。这些数字只决定拒绝条件，不对应任何生产环境。</p>
+<h2 id="三条确认线">三条确认线</h2>
+<p>“受理”“落盘”“消费确认”是三件事，分别属于不同的持久状态。图 17-1 按时间画出一次 <code>DURABLE</code> 发布与一次消费，标出每个回复发生的位置和崩溃时各自的结果。</p>
+<p>图 17-1：DURABLE 发布与消费确认的时序（已实现并经注入验证）</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant P as 生产者
+    participant B as broker 连接线程
+    participant W as 写线程
+    participant D as 段文件
+    participant C as 消费者
+    P-&gt;&gt;B: PUB DURABLE payload
+    B-&gt;&gt;B: 分配偏移 n，入内存队列（ACCEPTED 在此回复）
+    B-&gt;&gt;W: Pending(n)
+    W-&gt;&gt;D: write（WRITTEN 在此回复）
+    Note over W,D: 注入点 written：此时崩溃，客户端无回复，记录仍在页缓存
+    W-&gt;&gt;D: force（一批只一次）
+    Note over W,D: 注入点 forced：此时崩溃，记录已落盘，客户端无回复
+    W--&gt;&gt;B: durable 水位推进到 n+1
+    B--&gt;&gt;P: OK n DURABLE
+    Note over P,B: 客户端 30s 读超时或连接断开 = 结果未知，只能重试
+    C-&gt;&gt;B: FETCH g 10 500（只读水位以下）
+    B--&gt;&gt;C: MSG n payload
+    C-&gt;&gt;C: 施加副作用
+    C-&gt;&gt;B: ACK g n
+    B-&gt;&gt;B: 写 g.offset.tmp → force → rename → fsync 目录
+    B--&gt;&gt;C: ACKED n+1</code></pre>
+<p>生产者丢失回复时无法区分“写线程还没写”与“已经落盘只是回复没到”，因此它只能重试，重试又可能产生重复记录。<code>crash_forced_before_reply_dup</code> 观察到了这种重复：force 之后、回复之前停机，生产者重试后同一个 <code>message_id=evt-000011</code> 出现在偏移 <code>[10, 11]</code>。偏移去重挡不住这种重复，消费端需要按业务标识去重，第 18 章再处理这个问题。</p>
+<p><code>ACCEPTED</code> 的偏移更不稳定。<code>accepted_offset_not_stable</code> 在受理后、写入前注入停机：生产者已经收到 <code>OK 5 ACCEPTED</code>，重启后偏移 5 被分配给另一条消息（<code>evt-000201</code>），原载荷在日志中不存在。把 <code>ACCEPTED</code> 的偏移写进下游数据库当作引用，就会指向一条别的消息。</p>
+<h2 id="记录格式与持久状态">记录格式与持久状态</h2>
+<p>每条记录由 16 字节头和载荷组成：长度 <code>u32</code>、CRC32C <code>u32</code>、偏移 <code>u64</code>。CRC 覆盖长度、偏移和载荷，因此长度字段或偏移字段被改动也能检测出来。CRC32C 由 JDK 的 <code>java.util.zip.CRC32C</code> 计算；PostgreSQL 的 WAL 采用同一类校验，每条记录都有 CRC-32C，并在崩溃恢复时检查（<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/wal-reliability.html">PostgreSQL 16 §30.1</a>）。</p>
+<p>图 17-2：broker 的状态归属与持久化位置</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs text">           内存（进程退出即失去）                           磁盘（&lt;dir&gt;/）<br>┌──────────────────────────────────────┐    ┌──────────────────────────────────────────────┐<br>│ nextSeq        下一个待分配偏移        │    │ log/00000000000000000000.log  段 0            │<br>│ queue[1024]    ACCEPTED 的待写记录     │──▶ │ log/00000000000000000123.log  段 1（文件名=   │<br>│ durable 水位   force 已覆盖的偏移上界   │    │                               首条记录偏移）  │<br>│ 偏移→位置索引   启动时由扫描重建         │    │   每条：len | crc32c | offset | payload       │<br>│ 连接游标        每连接、每组的投递位置    │    │ groups/&lt;g&gt;.offset             已提交偏移       │<br>└──────────────────────────────────────┘    │ groups/&lt;g&gt;.offset.tmp         仅在写入途中存在 │<br>       写线程独占写；读者只读水位以下            └──────────────────────────────────────────────┘<br></code></pre></td></tr></table></figure>
+<p>内存索引没有持久化，启动扫描时按顺序读取每条记录重建，代价与日志大小成正比。这是“单文件 vs 分段+索引”取舍里的折中：分段让滚动、删除旧数据、定位文件都只涉及文件名；持久化的稀疏索引能让启动不必读完全部数据，但索引自身也会在崩溃时写坏，需要校验或可重建。教学实现选择每次重建，代价是启动时间随日志线性增长，<code>boundary_segments_and_rejects</code> 用 4096 字节的段验证了跨 4 个段文件读回 100 条记录。</p>
+<p>段滚动时先 force 旧段，再创建新段并对目录调用 fsync。Linux 的 fsync 手册说明，对文件 fsync 不保证包含它的目录项也已落盘，需要对目录的文件描述符再做一次（<a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man2/fsync.2.html">fsync(2)</a>）。在 Java 里，以只读方式打开目录得到的 <code>FileChannel</code> 在 Linux 上可以调用 <code>force</code>。这一步在本机无法通过故障注入证伪，因为进程崩溃不会丢掉目录项；它的依据只有手册。</p>
+<h2 id="写线程与组提交">写线程与组提交</h2>
+<p>所有写入由一个写线程完成。它从内存队列一次取出最多 256 条，逐条 write，再整批 force 一次，然后统一回复 <code>DURABLE</code>。下面是 <code>src/Broker.java</code> 中组提交部分的主干（省略了注入点）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-type">Pending</span> <span class="hljs-variable">first</span> <span class="hljs-operator">=</span> queue.take();<br>batch.clear(); batch.add(first); queue.drainTo(batch, <span class="hljs-number">255</span>);<br><span class="hljs-keyword">for</span> (Pending p : batch) &#123;<br>    log.maybeRoll();<br>    log.append(p.offset, LogStore.encode(p.offset, p.payload));<br>    <span class="hljs-keyword">if</span> (p.level == Level.WRITTEN) p.done.complete(<span class="hljs-literal">null</span>);<br>&#125;<br><span class="hljs-type">long</span> <span class="hljs-variable">last</span> <span class="hljs-operator">=</span> batch.get(batch.size() - <span class="hljs-number">1</span>).offset;<br>doForce(last + <span class="hljs-number">1</span>);                                <span class="hljs-comment">// 一批只 force 一次，并推进 durable 水位</span><br><span class="hljs-keyword">for</span> (Pending p : batch) <span class="hljs-keyword">if</span> (p.level == Level.DURABLE) p.done.complete(<span class="hljs-literal">null</span>);<br></code></pre></td></tr></table></figure>
+<p><code>FileChannel.force</code> 的 Javadoc 只对本地存储设备作保证：方法返回时，自通道创建或上次调用以来的修改都已写入该设备；文件不在本地设备上时没有这种保证（<a target="_blank" rel="noopener" href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/channels/FileChannel.html">Java SE 21 FileChannel</a>）。实现用的是 <code>force(false)</code>，只要求文件内容，文件长度等元数据是否一并刷新由操作系统决定，Javadoc 明确写着这一点未规定。</p>
+<p>写线程遇到 IO 异常时直接停机，不再受理。fsync 失败之后，页缓存里哪些数据被丢弃、哪些仍标记为脏，取决于内核版本与文件系统；在这种状态下继续 force 并回复成功，可能把已丢失的数据报告为持久。停机后重新扫描磁盘，是本实现能给出的最保守处理。</p>
+<p>逐条 force 与组提交的对比结果如下，两组都是 4 个并发生产者、共 400 条 <code>DURABLE</code> 发布，之后 kill -9 并重启校验：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>force 次数</th>
+<th>每次 force 平均</th>
+<th>总耗时</th>
+<th>kill -9 后已确认偏移</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>组提交（<code>normal_group_commit</code>）</td>
+<td>228</td>
+<td>271µs</td>
+<td>186ms</td>
+<td>400/400 存在且一致</td>
+</tr>
+<tr>
+<td>逐条 force（<code>compare_force_each</code>）</td>
+<td>400</td>
+<td>210µs</td>
+<td>156ms</td>
+<td>400/400 存在且一致</td>
+</tr>
+</tbody>
+</table>
+<p>稳定的结论只有 force 次数：组提交把 400 次降到 228 次，批次大小取决于线程调度，每次运行都不同。耗时一列不能拿来比较两种方案，本机一次 force 只要零点几毫秒，这个量级下的差异落在噪声里；这块存储可能有带掉电保护的缓存，也可能没有如实执行刷新，本机无法区分。组提交的收益在刷新代价高的设备上才会显现，代价是同一批里先到的请求要等最后一条写完才得到回复。Kafka 的设计文档走的是另一条路：数据写入文件系统但不一定刷盘，持久性靠副本重新同步，理由是每次写都 fsync 会让性能下降两到三个数量级（<a target="_blank" rel="noopener" href="https://kafka.apache.org/39/design/design/">Kafka 3.9 Design</a>）。那条路以复制为前提，单机日志不能照搬。</p>
+<h2 id="恢复扫描：截断尾部-拒绝中间损坏">恢复扫描：截断尾部，拒绝中间损坏</h2>
+<p>启动时，<code>LogStore.open</code> 按文件名顺序扫描每个段，逐条检查四件事：头部是否完整、长度是否在 1…65536 之内、载荷是否装得下、CRC 与偏移连续性是否成立。难点在于遇到第一条无效记录之后怎么办。</p>
+<p>写入中途崩溃只会损坏最后一段的尾部：追加日志只在末尾写，残缺记录之后不会再有有效记录。中间损坏不一样，它之后还有完整的记录，其中可能有已经回复过 <code>DURABLE</code> 的偏移。判断方法是从无效位置的下一个字节开始，逐字节寻找任意一条 CRC 有效的记录：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-type">long</span> <span class="hljs-variable">later</span> <span class="hljs-operator">=</span> last ? findValidAfter(ch, pos + <span class="hljs-number">1</span>, fileSize) : -<span class="hljs-number">2</span>;<br><span class="hljs-keyword">if</span> (!last || later &gt;= <span class="hljs-number">0</span>) &#123;                 <span class="hljs-comment">// 非最后一段，或其后仍有有效记录：中间损坏</span><br>    r.status = <span class="hljs-string">&quot;CORRUPT&quot;</span>; ...<br>    closeAll(); <span class="hljs-keyword">return</span> r;                  <span class="hljs-comment">// Broker 输出 REFUSE_START，退出码 3，不改文件</span><br>&#125;<br>r.status = <span class="hljs-string">&quot;TRUNCATED_TAIL&quot;</span>; ...           <span class="hljs-comment">// 残缺尾部：截断并报告</span><br><span class="hljs-keyword">if</span> (repair) &#123; ch.truncate(pos); ch.force(<span class="hljs-literal">true</span>); &#125;<br></code></pre></td></tr></table></figure>
+<p>图 17-3：恢复扫描对一条无效记录的判定（前置条件与拒绝路径）</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs text">读到位置 pos 的记录<br>  │ 头部完整？长度合法？载荷装得下？CRC 相符？偏移 = 期望值？<br>  ├─ 全部是 ──────────────▶ 记入索引，pos 前进，期望偏移 +1<br>  └─ 任一否<br>       ├─ 不在最后一段 ─────────────────────────▶ CORRUPT：拒绝启动（exit 3），不修改文件<br>       └─ 在最后一段<br>            ├─ pos 之后能找到 CRC 有效的记录 ──────▶ CORRUPT：拒绝启动（exit 3），不修改文件<br>            └─ 找不到 ───────────────────────────▶ TRUNCATED_TAIL：截断到 pos、force、报告字节数与偏移<br></code></pre></td></tr></table></figure>
+<p>“逐字节寻找”这一步专门对付长度字段损坏。若中间某条记录的长度被改成 60000，朴素的扫描会认为它“载荷装不下”，再把它当作残缺尾部截断，后面的 20 条有效记录随之消失。<code>mid_corruption_refused</code> 的第二部分构造了这个场景：恢复扫描在位置 4648 遇到 <code>short-payload</code>，又在 4806 找到有效记录，于是判定 <code>CORRUPT</code> 并以退出码 3 拒绝启动。第一部分翻转了第 20 条载荷里的一个字节，得到 <code>reason=crc-mismatch ... expectedOffset=20 validRecordAt=3244</code>，文件大小没有变化。</p>
+<p>遇到中间损坏时可以拒绝启动，也可以把坏记录挪到隔离区后继续服务。本实现选拒绝启动。坏记录所在的偏移可能已经被确认为 <code>DURABLE</code>，自动跳过会让偏移序列出现空洞，消费者无法区分“这个偏移从未存在”与“这个偏移被跳过了”；而隔离需要额外的元数据格式、修复工具和运维流程，教学实现不承担这部分。拒绝启动牺牲的是可用性，换来的是不会把损坏悄悄交给消费者。</p>
+<p>这条规则也有盲区。如果恰好是最后一条记录的载荷被翻转，它之后没有任何有效记录，扫描无法区分“写到一半”和“写完后被损坏”，会按残缺尾部截断。若这条记录已经被确认为 <code>DURABLE</code>，截断就丢了一条已确认的数据。要消除这个盲区，需要额外持久化 durable 水位，或依赖副本比对。PostgreSQL 面对的是同一类问题：文档指出掉电可能让一次写入只完成部分 512 字节扇区，它在修改数据页之前先把整页镜像写入 WAL，恢复时用镜像修复这些 partially-written pages，WAL 记录本身则靠 CRC-32C 判断内容是否正确（<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/wal-reliability.html">PostgreSQL 16 §30.1</a>）。</p>
+<h2 id="消费进度与重投">消费进度与重投</h2>
+<p>消费组进度由 broker 管理，存成一个十进制文本文件。更新步骤是：写 <code>g.offset.tmp</code>，force，用 <code>ATOMIC_MOVE</code> rename 成 <code>g.offset</code>，再 fsync <code>groups/</code> 目录，最后回复 <code>ACKED</code>。rename 替换已存在目标时是原子的，其他进程不会看到目标文件缺失的时刻（<a target="_blank" rel="noopener" href="https://man7.org/linux/man-pages/man2/rename.2.html">rename(2)</a>）。</p>
+<p><code>group_offset_crash_points</code> 在两个位置注入停机。rename 之前停机，重启时删除残留的 <code>.tmp</code>（<code>GROUP_TMP_REMOVED file=g.offset.tmp</code>），进度仍是上一次的 20，消费者从 20 重新读取；rename 之后、目录 fsync 与回复之前停机，进度已经是 40，尽管客户端没有收到 <code>ACKED</code>。后一种情况对消费者无害：它以为没提交，重新确认时 broker 发现值不大于已提交值，不回退。</p>
+<p>消费者的副作用写入 PostgreSQL 库 <code>b2_17</code> 的 <code>applied</code> 表，偏移是主键，<code>insert ... on conflict (log_offset) do nothing</code> 让重复投递不产生第二行。<code>consumer_redelivery_dedup_by_offset</code> 让消费者每 10 条确认一次，在处理完第 25 条（偏移 24）后停机，此时已提交的是 20：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CONSUMER_HALT seen=25 lastOffset=24 (applied, not acked)<br>CONSUMER_DONE firstOffset=20 seen=40 applied=35 skippedDuplicates=5 | rows=60 distinctOffsets=60<br></code></pre></td></tr></table></figure>
+<p>重启后从 20 开始重投，偏移 20 到 24 被跳过，最终 60 行对应 60 个偏移。负向对照 <code>negative_consumer_without_dedup</code> 去掉主键约束，同样的崩溃留下 65 行，偏移 20 到 24 的副作用各施加了两次。这种顺序在 Kafka 设计文档里称为“先处理、后保存位置”，对应至少一次（<a target="_blank" rel="noopener" href="https://kafka.apache.org/39/design/design/">Kafka 3.9 Design</a>）。</p>
+<p>进度由谁保存是另一项取舍。broker 管理进度，消费者实现简单，broker 能据此决定重投起点，但进度与副作用分处两个存储，中间的窗口只能靠去重弥补。消费者自管偏移，把偏移和副作用写进同一个数据库事务，就能让二者一起成功或一起失败，代价是 broker 不知道消费到哪里，换消费者或排查积压时要去读消费者的库。本实验的 <code>applied</code> 表其实已经具备自管偏移的条件，只是没有用它来决定拉取起点。</p>
+<h2 id="进程崩溃不等于掉电">进程崩溃不等于掉电</h2>
+<p><code>kill -9</code> 和 <code>Runtime.halt</code> 只结束进程，内核里的页缓存不受影响。<code>crash_written_before_force</code> 在 write 之后、force 之前停机，客户端没有收到回复，重启后偏移 10 的记录仍然存在（<code>offset10PresentAfterRestart=true</code>），恢复扫描结果是 <code>status=OK records=11</code>。同样的道理，<code>kill9_durable_acked_survive</code> 在发布途中 kill -9，3298 个已确认偏移全部找回，这个结果对 <code>WRITTEN</code> 级别同样成立，所以它不能区分 force 有没有起作用。</p>
+<p>真正区分 <code>WRITTEN</code> 与 <code>DURABLE</code> 的是掉电或内核崩溃。Linux 手册说明 fsync 会把文件在内核中修改过的数据传到设备，包括写穿或刷新磁盘缓存；PostgreSQL 文档补充，控制器和磁盘的写回缓存是易失的，有些 SSD 默认不执行刷新命令，可靠性最终取决于整条存储链路。本机是 docker 容器，没有 <code>dmsetup</code>，也没有可加载的内核模块，无法用 dm-flakey 或 dm-log-writes 丢弃未刷新的写入，也无法给虚拟机强制断电，因此 <code>power_loss_unforced_data</code> 记为 NOT_RUN。</p>
+<p>为了让“确认早于持久化”这个错误能被观察到，<code>negative_early_durable_ack</code> 用了一个标明为模型的注入：<code>--sim-power-loss</code> 在停机前把活动段截回最近一次 force 时的长度，模拟页缓存丢失。错误实现 <code>--ack early</code> 在 write 之后先回复 <code>DURABLE</code> 再 force，在回复之后、force 之前停机：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">model=simulated-page-cache-loss early: acked=16 missingAcked=1 ... offset15Acked=true<br>                                 | correct: acked=15 missingAcked=0 ... offset15Acked=false<br></code></pre></td></tr></table></figure>
+<p>错误实现丢了 1 个已确认偏移；正确实现在 write 之后、force 之前做相同的注入，偏移 15 从未被确认，已确认偏移没有丢失。这个对照说明的是确认顺序带来的窗口，不能当作掉电实验的结果。</p>
+<h2 id="只校验长度的恢复">只校验长度的恢复</h2>
+<p>另一个负向对照是去掉 CRC 检查的恢复（<code>--recovery length-only</code>）：只要头部完整、长度装得下就算有效。注入点 <code>extend</code> 写入记录头后，在记录末尾写一个字节，使文件长度覆盖整条记录、载荷部分是全零空洞。这个注入构造的是“长度已经覆盖整条记录、内容却是零”的字节形状；真实掉电能否留下这种形状取决于文件系统的日志模式，本机没有验证。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">crcRecovery: RECOVERY status=TRUNCATED_TAIL ... truncatedBytes=157 truncatedAtOffset=20 reason=crc-mismatch<br>lengthOnly: records=21 offset20Payload=141xNUL deliveredToConsumer=true (expectBug)<br></code></pre></td></tr></table></figure>
+<p>带 CRC 的恢复截断了 157 字节；只看长度的恢复接受了偏移 20，把 141 个 NUL 字节交给消费者。对中间翻转的那份日志，它照常启动，<code>mismatched=1</code>：一个已确认偏移的内容被静默改变。</p>
+<h2 id="用例与证据">用例与证据</h2>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th>类型</th>
+<th>观察值（摘自 evidence/17/output.txt）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>normal_group_commit</code> / <code>compare_force_each</code></td>
+<td>正常 / 方案对比</td>
+<td>400/400 已确认偏移在 kill -9 后存在且一致；force 228 次 vs 400 次</td>
+</tr>
+<tr>
+<td><code>boundary_segments_and_rejects</code></td>
+<td>边界</td>
+<td>4 个段文件；超长载荷 <code>ERR TOO_LARGE</code>；空拉取 300ms 后返回 0 条；越界确认 <code>ERR NOT_DELIVERED</code>；同组第二连接 <code>ERR GROUP_BUSY</code></td>
+</tr>
+<tr>
+<td><code>kill9_durable_acked_survive</code></td>
+<td>崩溃恢复</td>
+<td>3298 个已确认偏移，缺失 0、内容不符 0</td>
+</tr>
+<tr>
+<td><code>crash_partial_write_truncated</code></td>
+<td>崩溃恢复</td>
+<td><code>TRUNCATED_TAIL</code> 79 字节，偏移 30 起截断，0…29 完整</td>
+</tr>
+<tr>
+<td><code>crash_written_before_force</code></td>
+<td>崩溃恢复</td>
+<td>客户端无回复，记录仍在（进程崩溃不丢页缓存）</td>
+</tr>
+<tr>
+<td><code>crash_forced_before_reply_dup</code></td>
+<td>结果未知</td>
+<td>重试后同一事件位于偏移 10 与 11</td>
+</tr>
+<tr>
+<td><code>accepted_offset_not_stable</code></td>
+<td>确认分级</td>
+<td><code>OK 5 ACCEPTED</code> 后停机，偏移 5 重新分配</td>
+</tr>
+<tr>
+<td><code>mid_corruption_refused</code></td>
+<td>损坏</td>
+<td>字节翻转与长度损坏均 <code>CORRUPT</code>、退出码 3、文件不变</td>
+</tr>
+<tr>
+<td><code>negative_lengthonly_accepts_tail</code> / <code>_flip</code></td>
+<td>负向对照</td>
+<td>全零记录与被改内容交给消费者</td>
+</tr>
+<tr>
+<td><code>negative_early_durable_ack</code></td>
+<td>负向对照（模型）</td>
+<td>早确认丢 1 个已确认偏移，正确实现丢 0 个</td>
+</tr>
+<tr>
+<td><code>consumer_redelivery_dedup_by_offset</code> / 无去重对照</td>
+<td>重投</td>
+<td>从 20 重投，去重跳过 5 条；无去重 65 行</td>
+</tr>
+<tr>
+<td><code>group_offset_crash_points</code></td>
+<td>崩溃恢复</td>
+<td>rename 前停机进度为 20，rename 后停机进度为 40</td>
+</tr>
+<tr>
+<td><code>power_loss_unforced_data</code></td>
+<td>掉电</td>
+<td>NOT_RUN，需要虚拟机断电或 dm-flakey</td>
+</tr>
+</tbody>
+</table>
+<p>运行入口是 <code>examples/17-log-queue/run.sh</code>，环境在 <code>evidence/17/env.txt</code>（OpenJDK 21.0.12.1、PostgreSQL 16.15、4 核、ext4 上的 docker 容器），每个 broker 与消费者进程的输出在 <code>evidence/17/logs/</code>。证明范围与时序敏感点见 <code>evidence/17/LIMITS.md</code>。</p>
+<h2 id="结论边界">结论边界</h2>
+<p>实验支持的结论限于单机、单进程崩溃：收到 <code>DURABLE</code> 的偏移在 kill -9 与各个注入点之后存在且内容一致；写到一半的尾部被检测、截断并报告；中间损坏导致拒绝启动，而不是被跳过；消费者在副作用与确认之间崩溃会被重投，按偏移去重可以吸收这部分重复。<code>ACCEPTED</code>、<code>WRITTEN</code>、<code>DURABLE</code> 三个确认点和消费确认，各自对应不同的持久状态，不能互相替代。</p>
+<p>实验不支持以下结论：掉电或内核崩溃下 <code>DURABLE</code> 是否成立（NOT_RUN），目录 fsync 是否必要（没有能丢目录项的环境），以及任何吞吐与延迟判断。此外，这个队列没有副本：Kafka 的承诺以“至少一个同步副本存活”为前提（<a target="_blank" rel="noopener" href="https://kafka.apache.org/39/design/design/">Kafka 3.9 Design</a>），本实现连这个前提都没有，单机日志实验得出的任何数字都不能用来推断集群持久性。</p>
+<p>下一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-18-%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97%E6%8E%A5%E5%85%A5%E4%B8%8E%E7%A7%AF%E5%8E%8B%E6%81%A2%E5%A4%8D/" title="后端系统工程 18：消息队列接入与积压恢复">18 消息队列接入与积压恢复</a> 换成真实的 RabbitMQ 节点，用同一份订单事件检验客户端一侧的契约：publisher confirms 在什么时候回来，消费确认丢失时副作用怎样只发生一次，毒消息怎样隔离，积压时预取怎样限制未确认数量。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-17-%E4%BB%8E%E6%8C%81%E4%B9%85%E6%97%A5%E5%BF%97%E6%9E%84%E5%BB%BA%E6%9C%80%E5%B0%8F%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-17-%E4%BB%8E%E6%8C%81%E4%B9%85%E6%97%A5%E5%BF%97%E6%9E%84%E5%BB%BA%E6%9C%80%E5%B0%8F%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><a class="post-meta__tags" href="/tags/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B/">后端系统工程</a><a class="post-meta__tags" href="/tags/%E8%BF%BD%E5%8A%A0%E6%97%A5%E5%BF%97/">追加日志</a><a class="post-meta__tags" href="/tags/fsync/">fsync</a><a class="post-meta__tags" href="/tags/%E5%B4%A9%E6%BA%83%E6%81%A2%E5%A4%8D/">崩溃恢复</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-148.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E04-%E6%B6%88%E6%81%AF%E9%80%9A%E9%81%93%E6%9B%BF%E6%8D%A2%E4%B8%8E%E8%BF%81%E7%A7%BB/" title="后端系统工程 E04：消息通道替换与迁移——迟到事件与回退边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-20.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 E04：消息通道替换与迁移——迟到事件与回退边界</div></div><div class="info-2"><div class="info-item-1"> 本文属于《后端系统工程：从接口契约到故障恢复》系列。文中提到的演练工程、测试与实验证据位于博客源码仓库的 batch-4/ 目录（examples/、evidence/ 等子目录）；业务数据均为合成数据。  替换一条在用的消息通道，比如把自建队列换成托管服务，或者在两个集群之间搬迁，不能靠“周五晚上停写、切换、周一观察”。切换的那一刻，旧通道里还有在途事件，新通道刚开始接收的事件可能比旧通道里的同一事件先到；切换之后，旧通道还会因为长尾延迟吐出几条早该到达的事件。迁移方案要回答四个问题：怎样证明新通道可以接手，切换时同一事件来自两条通道怎么办，切换后旧通道迟到的事件怎么办，以及到什么时候为止还能无损地退回去。 本篇用离散事件模型实现一个四阶段迁移控制器，在同一条合成事件流上注入延迟、重复、丢失和写入失败，验证副作用恰好一次，并用负向对照说明去重窗口和补漏期为什么不能随意缩短。  1. 需求与不变量 事件流是合成的业务通知事件：200 个业务键，每秒 50 个事件，每个事件带全局唯一的 eid、所属 key、在 key 内单调递增的 version 和一个随机载荷。消费者对每个事...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-18-%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97%E6%8E%A5%E5%85%A5%E4%B8%8E%E7%A7%AF%E5%8E%8B%E6%81%A2%E5%A4%8D/" title="后端系统工程 18：消息队列接入与积压恢复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-149.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 18：消息队列接入与积压恢复</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 17 从持久日志构建最小消息队列 ｜ 本篇 18 ｜ 下一篇 19 延迟任务的领取与取消 上一篇把“受理”“落盘”“消费确认”拆成了三条线，用一个自制的单机日志逐一观察。换成成熟的消息中间件之后，这三条线依然存在，只是分别落到了客户端协议里：publisher confirm 说明 broker 接下了消息，消费确认把消息的所有权交给消费者，两者之间还隔着队列、重投和消费者自己的数据库事务。中间件不会替应用决定先提交还是先确认，也不会替应用判断一条消息是不是已经处理过。 本篇用真实的 RabbitMQ 3.12.1 节点和 PostgreSQL 16 检验接入方的契约：生产确认与不可路由消息、提交后再确认与去重表、毒消息的有限次重试和隔离、积压时的有界预取。输入是与第 17 章共用的 3000 条合成订单事件，代码在 examples/18-rabbitmq-consumer/，输出在 evidence/18/output.txt。 实验只有一个 RabbitMQ 节点。它能说明单个 broker 进程重启或被 kill -9 之后，已确认的持久消息还在不在；它...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-35-%E6%96%87%E4%BB%B6%E4%B8%8A%E4%BC%A0%E4%B8%8E%E5%BC%82%E6%AD%A5%E5%A4%84%E7%90%86/" title="后端系统工程 35：文件上传与异步处理"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-151.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 35：文件上传与异步处理</div></div><div class="info-2"><div class="info-item-1">一次文件上传跨越两个互不共享事务的存储：字节落在文件系统或对象存储里，文件名、归属、处理进度落在数据库里。两边各自可以做到原子，合起来却没有一次提交能同时覆盖它们。于是有三种残局必须单独处理：字节写完了、元数据没提交，字节成了没人认领的孤儿；后台处理任务因为租约过期被执行了两次，发布动作也跟着做了两次；处理还没结束，读取接口已经把文件交了出去。示例实现基于 Java 21、PostgreSQL 16 和一个本地目录替身，覆盖从分块上传到发布读取的完整链路，三种残局分别用崩溃、重复执行和提前读取的实验构造出来。 需求与范围 操作有七个：创建上传会话、上传分块、完成上传、提交元数据、中止会话、读取文件，以及后台的处理与回收。客户端在创建会话时声明分块数、总字节数和整体 SHA-256，分块可以乱序、可以重传。 业务不变量：  F1 字节不丢、不错。任何进入内容地址 blobs/sha256/&lt;hex&gt; 的文件，其内容的 SHA-256 等于 &lt;hex&gt;；任何被 file_object 引用的 blob 在回收后仍然存在。 F2 孤儿可回收。字节已经写入但元数据...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-25-%E7%BC%93%E5%AD%98%E6%97%A7%E5%80%BC%E5%9B%9E%E5%A1%AB%E4%B8%8E%E5%A4%B1%E6%95%88%E4%BF%AE%E5%A4%8D/" title="后端系统工程 25：缓存旧值回填与失效修复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-117.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 25：缓存旧值回填与失效修复</div></div><div class="info-2"><div class="info-item-1">Cache Aside 的写法很短：读时先查缓存，未命中就读数据库再回填；写时先提交数据库，再删除缓存。这段代码里有一个读者与写者交错的窗口：读者读到旧行之后、回填之前，写者提交了新版本并删掉了缓存，读者随后把旧行写回去。此后缓存里的旧值没有任何人负责清除，只能等 TTL。另一个窗口出现在写者自身：数据库已经提交，删除缓存的那条命令还没发出，进程就退出了。 本篇的验收目标是：数据更新与慢读回填交错之后，旧值可以被拒绝、被检测、被修复；旧值最多存活多久（新鲜度窗口）要写成由哪些量组成的上界，并指出哪些条件下不存在上界。全部数据为合成数据，商品标识形如 sku-lab-05。 需求与范围 服务管理一组商品描述，数据库是唯一真相源，每行有一个单调递增的 version。缓存只是加速副本，允许短暂落后，但不允许“无限期落后”。具体要求：  读路径：命中直接返回；未命中读库并回填。 写路径：只改数据库，然后让缓存失效；不允许写者直接把新值写进缓存（避免写者之间的乱序覆盖成为第二个问题）。 写者在提交后任意时刻崩溃，旧值最终被清除，且不依赖 TTL。 失效命令可能重复、乱序到达，重复和乱序不...</div></div></div></a><a class="pagination-related" href="/2021/07/07/%E5%A6%82%E4%BD%95%E5%86%99%E4%B8%80%E4%B8%AA%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/" title="如何写一个消息队列"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2021-07-07</div><div class="info-item-2">如何写一个消息队列</div></div><div class="info-2"><div class="info-item-1">重平衡问题 标准的重平衡算法是 kafka 的重平衡算法。 可以覆写的重平衡算法 默认生产者行为 每个机房的生产者优先生产到本机房的 broker。 默认策略 同机房集群—&gt;同地域跨机房集群—&gt;跨地域集群 同机房集群优先 向同机房的全部集群发送消息。 某些 mq 的实现不能向全部集群发送消息，会按照一个负载均衡列表按顺序选择集群，控制这个负载均衡列表实际上就能控制负载均衡策略。 同地域集群优先 优先向同地域内的全部集群发送消息。 某些 mq 的实现不能向全部集群发送消息，会按照一个负载均衡列表按顺序选择集群，控制这个负载均衡列表实际上就能控制负载均衡策略。 全部集群 不区分服务端集群的机房信息，向全部集群发送消息。 默认消费者行为 所有消费者都可以参与所有集群的消费。 指定分配 不要轻易指定这个策略。 这个策略有它的危险性：指定 partition 消费，服务端将不对该消费组的 partition 进行分配，完全交给客户端负责，如果客户端死掉，可能出现 partition 无人消费的情况。 12345678910111213141516171819202122// 创...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E05-%E5%B9%82%E7%AD%89%E5%AF%BC%E5%87%BA%E4%B8%8E%E6%96%AD%E7%82%B9%E7%BB%AD%E4%BC%A0/" title="后端系统工程 E05：幂等导出与断点续传——同一个请求，同一份字节"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-24.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 E05：幂等导出与断点续传——同一个请求，同一份字节</div></div><div class="info-2"><div class="info-item-1"> 本文属于《后端系统工程：从接口契约到故障恢复》系列。文中提到的演练工程、测试与实验证据位于博客源码仓库的 batch-4/ 目录（examples/、evidence/ 等子目录）；业务数据均为合成数据。  “导出我的聊天记录”看起来只是一次查询加一次下载，实际包含几个各自独立的问题。用户点了两次按钮，是一个任务还是两个；导出期间又有新消息、有人退群、有消息被撤回，文件里该有什么；导出跑到一半进程被杀，重跑出来的文件和不中断时是否一致；下载到 80% 断网，能否从断点继续，断点之后的字节是否属于同一个文件；下载链接被转发出去，别人能不能用。 本篇用 SQLite 和一个真实监听本机端口的 HTTP 服务实现这条链路，每个问题对应一组用例。全部数据为合成数据。  1. 需求与不变量  X1 同一用户、同一幂等键、同一请求体只产生一个导出任务；同键不同请求体被拒绝。 X2 导出内容由创建时刻的数据快照和权限快照决定，之后的写入、撤回、成员变化不改变结果。 X3 任务可以在任意分片处中断并重跑；重跑得到的产物与不中断时逐字节相同，已完成且校验通过的分片不重写。 X4 下载支持断点续传...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9C%80%E6%B1%82%E4%B8%8E%E4%BF%9D%E8%AF%81"><span class="toc-number">1.</span> <span class="toc-text">需求与保证</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E6%9D%A1%E7%A1%AE%E8%AE%A4%E7%BA%BF"><span class="toc-number">2.</span> <span class="toc-text">三条确认线</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%AE%B0%E5%BD%95%E6%A0%BC%E5%BC%8F%E4%B8%8E%E6%8C%81%E4%B9%85%E7%8A%B6%E6%80%81"><span class="toc-number">3.</span> <span class="toc-text">记录格式与持久状态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%86%99%E7%BA%BF%E7%A8%8B%E4%B8%8E%E7%BB%84%E6%8F%90%E4%BA%A4"><span class="toc-number">4.</span> <span class="toc-text">写线程与组提交</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%81%A2%E5%A4%8D%E6%89%AB%E6%8F%8F%EF%BC%9A%E6%88%AA%E6%96%AD%E5%B0%BE%E9%83%A8-%E6%8B%92%E7%BB%9D%E4%B8%AD%E9%97%B4%E6%8D%9F%E5%9D%8F"><span class="toc-number">5.</span> <span class="toc-text">恢复扫描：截断尾部，拒绝中间损坏</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%B6%88%E8%B4%B9%E8%BF%9B%E5%BA%A6%E4%B8%8E%E9%87%8D%E6%8A%95"><span class="toc-number">6.</span> <span class="toc-text">消费进度与重投</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%BF%9B%E7%A8%8B%E5%B4%A9%E6%BA%83%E4%B8%8D%E7%AD%89%E4%BA%8E%E6%8E%89%E7%94%B5"><span class="toc-number">7.</span> <span class="toc-text">进程崩溃不等于掉电</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%AA%E6%A0%A1%E9%AA%8C%E9%95%BF%E5%BA%A6%E7%9A%84%E6%81%A2%E5%A4%8D"><span class="toc-number">8.</span> <span class="toc-text">只校验长度的恢复</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E4%BE%8B%E4%B8%8E%E8%AF%81%E6%8D%AE"><span class="toc-number">9.</span> <span class="toc-text">用例与证据</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%93%E8%AE%BA%E8%BE%B9%E7%95%8C"><span class="toc-number">10.</span> <span class="toc-text">结论边界</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

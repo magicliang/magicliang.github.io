@@ -1,0 +1,952 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>后端系统工程 24：在线变更的数据兼容 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="在线修改表结构时，系统里同时存在一份正在变化的表定义和至少两个版本的应用代码。旧代码按旧列读写，新代码按新列读写，后台回填任务又在补写历史行。三方都在提交事务，任何一方都可能把另一方刚写下的值改掉。DDL 本身还要拿表锁，一条看起来只改元数据的 ALTER TABLE 也可能让整张表的普通查询排队。 本篇用一张合成工单表，把“整数优先级”迁成“文本优先级”，并在迁移后期引入一个旧格式表达不了的新取">
+<meta property="og:type" content="article">
+<meta property="og:title" content="后端系统工程 24：在线变更的数据兼容">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-24-%E5%9C%A8%E7%BA%BF%E5%8F%98%E6%9B%B4%E7%9A%84%E6%95%B0%E6%8D%AE%E5%85%BC%E5%AE%B9/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="在线修改表结构时，系统里同时存在一份正在变化的表定义和至少两个版本的应用代码。旧代码按旧列读写，新代码按新列读写，后台回填任务又在补写历史行。三方都在提交事务，任何一方都可能把另一方刚写下的值改掉。DDL 本身还要拿表锁，一条看起来只改元数据的 ALTER TABLE 也可能让整张表的普通查询排队。 本篇用一张合成工单表，把“整数优先级”迁成“文本优先级”，并在迁移后期引入一个旧格式表达不了的新取">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-171.jpg">
+<meta property="article:published_time" content="2026-10-18T02:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T08:33:36.095Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="PostgreSQL">
+<meta property="article:tag" content="Schema 变更">
+<meta property="article:tag" content="兼容性">
+<meta property="article:tag" content="后端系统工程">
+<meta property="article:tag" content="回填">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-171.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "后端系统工程 24：在线变更的数据兼容",
+  "url": "https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-24-%E5%9C%A8%E7%BA%BF%E5%8F%98%E6%9B%B4%E7%9A%84%E6%95%B0%E6%8D%AE%E5%85%BC%E5%AE%B9/",
+  "image": "https://magicliang.github.io/img/wall-paper-171.jpg",
+  "datePublished": "2026-10-18T02:00:00.000Z",
+  "dateModified": "2026-10-22T08:33:36.095Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-24-%E5%9C%A8%E7%BA%BF%E5%8F%98%E6%9B%B4%E7%9A%84%E6%95%B0%E6%8D%AE%E5%85%BC%E5%AE%B9/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '后端系统工程 24：在线变更的数据兼容',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2016</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2094</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-171.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">后端系统工程 24：在线变更的数据兼容</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">后端系统工程 24：在线变更的数据兼容</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-18T02:00:00.000Z" title="Created 2026-10-18 10:00:00">2026-10-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-22T08:33:36.095Z" title="Updated 2026-10-22 16:33:36">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">6.7k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>23mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-22 16:33:36&quot;}" hidden></div><p>在线修改表结构时，系统里同时存在一份正在变化的表定义和至少两个版本的应用代码。旧代码按旧列读写，新代码按新列读写，后台回填任务又在补写历史行。三方都在提交事务，任何一方都可能把另一方刚写下的值改掉。DDL 本身还要拿表锁，一条看起来只改元数据的 <code>ALTER TABLE</code> 也可能让整张表的普通查询排队。</p>
+<p>本篇用一张合成工单表，把“整数优先级”迁成“文本优先级”，并在迁移后期引入一个旧格式表达不了的新取值。要回答的问题有三个：回填期间新写入的值怎样不被覆盖；旧代码还在只写旧列时，新列怎样不落后；从哪一步开始，回退到旧代码就会丢语义，系统怎样拒绝一次假装无损的回退。实验结论都在本地 PostgreSQL 16.15 上用真实事务、真实线程和独立进程验证，证据在 <code>evidence/24/</code>；只引用文档、没有实验的论断在文中单独标出。</p>
+<h2 id="需求-不变量与范围">需求、不变量与范围</h2>
+<p>合成表 <code>ticket</code> 有主键 <code>id</code>、标题 <code>title</code> 和整数列 <code>priority</code>，取值 1、2、3。目标结构用文本列 <code>priority_level</code> 表示优先级，取值 <code>low</code>、<code>normal</code>、<code>high</code>，迁移后期再允许 <code>urgent</code>。映射固定为 1↔low、2↔normal、3↔high；<code>urgent</code> 没有对应整数，只能退化成 3。</p>
+<p>迁移期间必须成立的不变量如下。</p>
+<ul>
+<li>I1：回填不改写任何已经由业务写入新值的行。观察位置是逐行核对：每行 <code>priority_level</code> 等于该行最后一次已提交业务写入所期望的值。</li>
+<li>I2：在越过不可逆点之前，旧列与新列表达同一个优先级。观察位置是校验查询 <code>COUNT_MISMATCH</code>（新列非空且不等于 <code>lvl_of(priority)</code> 的行数，另排除 urgent 与 3 的组合，越过不可逆点后这是合法映射）与 <code>COUNT_NULL</code>（新列为空的行数），两者都应为 0。</li>
+<li>I3：一旦存在旧格式无法表达的值，回退守卫拒绝回退到旧代码，并报告无法表达的行数；收缩之后不存在数据库内的回退路径。</li>
+</ul>
+<p>范围之外的内容：多副本与逻辑复制下的 DDL 传播、分区表、外部 schema 迁移工具、跨服务的数据契约。实验规模是教学假设：主用例 3000 行种子数据、4 个写线程，崩溃用例 4000 行、3 个写线程。实验不报告吞吐、延迟或 DDL 耗时，输出中的写入次数每次运行不同，只用来说明并发写确实发生过。</p>
+<h2 id="三个应用版本的读写契约">三个应用版本的读写契约</h2>
+<p>迁移期间同时存在三种代码，每种只认识自己那一部分结构。</p>
+<p>表 24-1：各版本读写的列</p>
+<table>
+<thead>
+<tr>
+<th>版本</th>
+<th>读</th>
+<th>写</th>
+<th>认识 urgent</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>v1（旧）</td>
+<td><code>priority</code></td>
+<td>只写 <code>priority</code></td>
+<td>否</td>
+</tr>
+<tr>
+<td>v2（双写）</td>
+<td>切读前读 <code>priority</code>，切读后读 <code>priority_level</code></td>
+<td>同一条 UPDATE 写两列</td>
+<td>否，传入 urgent 直接抛异常</td>
+</tr>
+<tr>
+<td>v3（只写新列）</td>
+<td><code>priority_level</code></td>
+<td>只写 <code>priority_level</code></td>
+<td>越过不可逆点之后</td>
+</tr>
+</tbody>
+</table>
+<p>v2 的双写在一条语句里完成，所以两列要么同时更新，要么都不更新。v1 不知道新列存在，v3 不再维护旧列。两边各缺一半，缺口交给数据库内的兼容触发器补齐。</p>
+<h2 id="数据模型：新列-约束与兼容触发器">数据模型：新列、约束与兼容触发器</h2>
+<p>扩张阶段只加一个可空的新列和两条 CHECK：<code>level_domain</code> 限定取值集合，<code>no_urgent_before_cutover</code> 在越过不可逆点之前拒绝 <code>urgent</code>。把 <code>urgent</code> 的禁止条件做成数据库约束，而不只是应用里的判断，是为了让“能否撤回越过动作”也由数据库检查决定，后文的守卫依赖这一点。</p>
+<p>这两条 CHECK 与加列写在同一条 ALTER TABLE 里，没有带 NOT VALID，PostgreSQL 会在持有 AccessExclusiveLock 期间扫描全表以校验既有行（DEBUG1 下可见 <code>verifying table</code>）。新列此时全为 NULL，CHECK 对 NULL 为真，扫描不会失败，但持锁时间随表大小增长。P4 为 NOT NULL 专门采用 NOT VALID 加 VALIDATE，同样的写法也适用于这里：两条 CHECK 加 NOT VALID，到 P4 一并 VALIDATE，语义不变。本章实现保留了带扫描的写法，表规模只有几千行，没有测量扫描时长。</p>
+<p>兼容触发器按“本条语句改了哪一列”推导另一列：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><code class="hljs sql">IF TG_OP <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;INSERT&#x27;</span> <span class="hljs-keyword">THEN</span><br>  IF NEW.priority_level <span class="hljs-keyword">IS</span> <span class="hljs-keyword">NULL</span> <span class="hljs-keyword">AND</span> NEW.priority <span class="hljs-keyword">IS</span> <span class="hljs-keyword">NOT NULL</span> <span class="hljs-keyword">THEN</span><br>    NEW.priority_level :<span class="hljs-operator">=</span> lvl_of(NEW.priority);<br>  ELSIF NEW.priority <span class="hljs-keyword">IS</span> <span class="hljs-keyword">NULL</span> <span class="hljs-keyword">AND</span> NEW.priority_level <span class="hljs-keyword">IS</span> <span class="hljs-keyword">NOT NULL</span> <span class="hljs-keyword">THEN</span><br>    NEW.priority :<span class="hljs-operator">=</span> int_of(NEW.priority_level);<br>  <span class="hljs-keyword">END</span> IF;<br><span class="hljs-keyword">ELSE</span><br>  IF NEW.priority <span class="hljs-keyword">IS</span> <span class="hljs-keyword">DISTINCT</span> <span class="hljs-keyword">FROM</span> OLD.priority<br>     <span class="hljs-keyword">AND</span> NEW.priority_level <span class="hljs-keyword">IS</span> <span class="hljs-keyword">NOT</span> <span class="hljs-keyword">DISTINCT</span> <span class="hljs-keyword">FROM</span> OLD.priority_level <span class="hljs-keyword">THEN</span><br>    NEW.priority_level :<span class="hljs-operator">=</span> lvl_of(NEW.priority);<br>  ELSIF NEW.priority_level <span class="hljs-keyword">IS</span> <span class="hljs-keyword">DISTINCT</span> <span class="hljs-keyword">FROM</span> OLD.priority_level<br>     <span class="hljs-keyword">AND</span> NEW.priority <span class="hljs-keyword">IS</span> <span class="hljs-keyword">NOT</span> <span class="hljs-keyword">DISTINCT</span> <span class="hljs-keyword">FROM</span> OLD.priority <span class="hljs-keyword">THEN</span><br>    NEW.priority :<span class="hljs-operator">=</span> int_of(NEW.priority_level);<br>  <span class="hljs-keyword">END</span> IF;<br><span class="hljs-keyword">END</span> IF;<br><span class="hljs-keyword">RETURN</span> <span class="hljs-keyword">NEW</span>;<br></code></pre></td></tr></table></figure>
+<p>这是 <code>BEFORE INSERT OR UPDATE ... FOR EACH ROW</code> 触发器。PostgreSQL 16 文档 43.10.1 说明，BEFORE 行级触发器返回修改过的 <code>NEW</code>，写入的就是修改后的行。v1 只改 <code>priority</code>，触发器补新列；v3 只改 <code>priority_level</code>，触发器补旧列；v2 两列都改，触发器不动。触发器不处理“本条语句没碰优先级”的情况，因此扩张之前就存在、此后没被业务改过的行，新列一直为空，这部分由回填负责。</p>
+<p>另有两张辅助表：<code>migration_state</code> 是单行表，记录当前阶段与越过不可逆点的时间 <code>no_return_at</code>；<code>backfill_progress</code> 记录回填作业的断点 <code>last_id</code>、上界 <code>max_id</code>、已提交批次数与改写行数。</p>
+<h2 id="阶段状态机与每一步能否回退">阶段状态机与每一步能否回退</h2>
+<p>图 24-1：迁移阶段、推进条件与回退边界（各条件由 S1、S3、S10 用例验证）</p>
+<pre><code class="hljs mermaid">stateDiagram-v2
+    P0: P0 基线（只有 priority）
+    P1: P1 扩张（加列+约束+触发器，同一事务）
+    P2: P2 双写（部署 v2）
+    P3: P3 分批回填
+    P4: P4 校验（NOT VALID→VALIDATE→SET NOT NULL）
+    P5: P5 切读（v2 读新列）
+    P6: P6 停写旧列（v3）
+    NR: 已越过不可逆点（允许 urgent）
+    P7: P7 收缩（删触发器与旧列）
+    P0 --&gt; P1: lock_timeout 内拿到锁，否则 55P03 回滚重试
+    P1 --&gt; P2
+    P2 --&gt; P3
+    P3 --&gt; P4: COUNT_NULL=0 且 COUNT_MISMATCH=0
+    P4 --&gt; P5
+    P5 --&gt; P6
+    P6 --&gt; NR: DROP CONSTRAINT no_urgent_before_cutover
+    NR --&gt; P6: 重新加约束，校验扫描通过（无 urgent 行）
+    NR --&gt; NR: 重新加约束遇到 urgent 行，23514，保持已越过
+    NR --&gt; P7: DROP TRIGGER + DROP COLUMN priority
+    P6 --&gt; P0: 守卫放行（未越过，旧列完整且一致）
+    NR --&gt; NR: 回退请求，守卫拒绝（报告 urgent 行数）
+    P7 --&gt; P7: 回退请求，守卫拒绝；v1 查询 42703</code></pre>
+<p>表 24-2：各阶段的表锁、两类代码的行为与回退方式</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>动作与表锁</th>
+<th>v1</th>
+<th>新代码</th>
+<th>回退</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P1 扩张</td>
+<td>ADD COLUMN、ADD CONSTRAINT、CREATE TRIGGER，同一事务；AccessExclusiveLock，持有到提交；CHECK 不带 NOT VALID，持锁期间扫描全表</td>
+<td>读写旧列，触发器补新列</td>
+<td>未部署</td>
+<td>删除触发器与新列，无数据损失</td>
+</tr>
+<tr>
+<td>P2 双写</td>
+<td>部署 v2，无 DDL</td>
+<td>同上</td>
+<td>读旧列，写两列</td>
+<td>下线 v2；旧列完整</td>
+</tr>
+<tr>
+<td>P3 回填</td>
+<td>分批条件 UPDATE，只有行锁</td>
+<td>同上</td>
+<td>同上</td>
+<td>停止回填即可</td>
+</tr>
+<tr>
+<td>P4 校验</td>
+<td>ADD CHECK NOT VALID（短暂 AccessExclusiveLock）→ VALIDATE（ShareUpdateExclusiveLock）→ SET NOT NULL（AccessExclusiveLock，免扫描）</td>
+<td>写入经触发器补齐，不违反 NOT NULL</td>
+<td>同上</td>
+<td>DROP NOT NULL / DROP CONSTRAINT</td>
+</tr>
+<tr>
+<td>P5 切读</td>
+<td>应用配置切换</td>
+<td>同上</td>
+<td>读新列</td>
+<td>切回读旧列；两列一致</td>
+</tr>
+<tr>
+<td>P6 停写旧列</td>
+<td>部署 v3</td>
+<td>应已下线；若仍在，经触发器仍兼容</td>
+<td>只写新列，触发器推导旧列</td>
+<td>守卫检查后可回退</td>
+</tr>
+<tr>
+<td>越过不可逆点</td>
+<td>DROP CONSTRAINT；AccessExclusiveLock</td>
+<td>把 urgent 读成 3</td>
+<td>可写 urgent</td>
+<td>无 urgent 行时可撤回，有则不可</td>
+</tr>
+<tr>
+<td>P7 收缩</td>
+<td>DROP TRIGGER、DROP COLUMN；AccessExclusiveLock</td>
+<td>查询失败 42703</td>
+<td>只用新列</td>
+<td>无（只能从备份恢复，本章不覆盖）</td>
+</tr>
+</tbody>
+</table>
+<p>P1 把加列和建触发器放在同一事务，是为了不留下“列已存在、触发器尚未建立”的窗口；在那个窗口里 v1 改过的行，新列会保持空值或旧值。P4 的 NOT NULL 有一个隐含前提：v1 插入时总是给出 <code>priority</code>。如果旧代码会插入 <code>priority</code> 为空的行，触发器推不出新列，P4 之后这类插入会以 23502 失败。</p>
+<h2 id="正常路径：并发写入下走完七个阶段">正常路径：并发写入下走完七个阶段</h2>
+<p>S1 用 3000 行种子数据，启动两个 v1 写线程，再在 P2 加入两个 v2 写线程。每个线程独占 <code>id % 4</code> 相同的行，所以同一行的写入顺序就是该线程的程序顺序，线程据此记下每行最后一次已提交写入的期望值，结束后逐行核对。线程还会插入新行，ID 从 100000 起。</p>
+<p>回填用键集分页：每批的上界取断点之后第 250 行的主键。v1 在扩张之前插入的行 ID 从 100000 起，主键在 3000 与 100000 之间是空洞；按 <code>last_id + 250</code> 的固定步长切区间，会在空洞上提交大量不改任何行的批次。</p>
+<p>S1 的关键输出：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs text">ok   P4 校验：新列无空值 (expected=0, actual=0)<br>ok   P4 校验：新旧列逐行一致 (expected=0, actual=0)<br>ok   每行新列等于该行最后一次已提交业务写入（回填未覆盖新值） (expected=0, actual=0)<br>ok   SET NOT NULL 由已验证 CHECK 证明，未扫描全表<br>ok   切读：抽样 429 行按旧列与按新列读出相同结果 (expected=0, actual=0)<br>ok   不可逆点之前：回退到 v1 的守卫放行（old column authoritative-compatible）<br>ok   收缩后 v1 读取旧列失败（undefined_column） (expected=42703, actual=42703)<br></code></pre></td></tr></table></figure>
+<p>输出中还有一行 <code>note writes ...</code>，记录本次运行 v1、v2 的写入次数与回填批次数，这些计数每次运行都不同，只说明并发写确实发生过。逐行核对之所以必要，是因为两列一致并不能说明值是对的，S8 会给出一个两列一致但值已被覆盖的例子。</p>
+<h2 id="ddl-本身的锁与扫描">DDL 本身的锁与扫描</h2>
+<p>迁移脚本里的每条 DDL 都要单独判断两件事：拿什么锁，是否扫描或重写整表。PostgreSQL 16 文档对 ALTER TABLE 的说明是：除非另有注明，各子形式都取 ACCESS EXCLUSIVE；多个子命令合在一条语句里时，取其中最严格的锁。</p>
+<h3 id="锁队列：一条排队的-alter-挡住后来的-select">锁队列：一条排队的 ALTER 挡住后来的 SELECT</h3>
+<p>图 24-2：长事务、排队的 DDL 与后来的普通查询（S2 观察到的锁状态）</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant A as 长事务 A
+    participant DB as ticket 表锁
+    participant B as ALTER TABLE（B）
+    participant C as 普通 SELECT（C）
+    A-&gt;&gt;DB: BEGIN; SELECT（AccessShareLock，granted）
+    B-&gt;&gt;DB: 请求 AccessExclusiveLock
+    DB--&gt;&gt;B: granted=false，pg_blocking_pids(B)=&#123;A&#125;
+    C-&gt;&gt;DB: 请求 AccessShareLock
+    DB--&gt;&gt;C: granted=false，pg_blocking_pids(C)=&#123;B&#125;
+    A-&gt;&gt;DB: COMMIT
+    DB--&gt;&gt;B: 授予，ALTER 完成
+    DB--&gt;&gt;C: 授予，SELECT 返回 100</code></pre>
+<p>S2 中，A 只执行了一次 <code>SELECT count(*)</code> 就停在事务里，持有 AccessShareLock。B 的 ALTER TABLE 等待 AccessExclusiveLock。随后到达的 C 只是普通查询，它请求的 AccessShareLock 与 A 持有的锁并不冲突，却仍被挂起。<code>pg_locks</code> 视图不暴露等待队列中的先后关系，文档建议用 <code>pg_blocking_pids()</code>；该函数把“排在前面、等待冲突锁”的进程也算作阻塞者（soft block）。输出中 C 的阻塞者正是 B：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">ok   ALTER 被长事务阻塞（hard block） (expected=[long-reader], actual=[long-reader])<br>ok   pg_blocking_pids 显示 SELECT 被排队中的 ALTER 阻塞（soft block），而不是被长事务直接阻塞 (expected=[ddl], actual=[ddl])<br></code></pre></td></tr></table></figure>
+<p>阻塞者以会话的 application_name 显示：<code>long-reader</code> 是长事务 A，<code>ddl</code> 是 B。这一现象的成立条件是：存在一个持有任意表锁且不结束的事务，DDL 需要与之冲突的锁，并且没有设置超时。文档 13.3.4 节写明，只要没有检测到死锁，等锁的事务会无限等待。</p>
+<h3 id="lock-timeout：拿不到锁就退出队列">lock_timeout：拿不到锁就退出队列</h3>
+<p>S3 在同样的长事务下，让 DDL 会话设置 <code>lock_timeout = '300ms'</code>。ALTER 在超时后以 SQLSTATE 55P03（lock_not_available）失败，退出等待队列；之后 C 的 SELECT 在长事务仍处于 <code>idle in transaction</code> 时就返回了。迁移脚本把 DDL 包在 <code>withLockRetry</code> 中：事务内 <code>SET LOCAL lock_timeout</code>，遇到 55P03 就回滚、退避后重试，其他错误直接抛出。用例在第二次失败后提交长事务，输出为 <code>[1:55P03, 2:55P03]</code>，第 3 次成功。</p>
+<p>这里的保证只有一条：任何一次排队最多挡住后续查询 lock_timeout 那么久。lock_timeout 只限制排队时长；拿到锁之后，持锁期间的扫描（例如 P1 的 CHECK 校验）同样阻塞后续查询。如果长事务一直不结束，重试会耗尽次数，DDL 无法完成，此时要处理的是那个长事务。</p>
+<h3 id="add-column：不带默认值或带非易变默认值时不重写表">ADD COLUMN：不带默认值或带非易变默认值时不重写表</h3>
+<p>文档 ALTER TABLE 的 Notes 写明：带非易变 DEFAULT 加列时，默认值在语句执行时求值并存入元数据，既有行读取时使用它；不带 DEFAULT 时为 NULL；两种情况都不重写表。易变默认值则需要重写整表及其索引。S4 用两个观察点核对：<code>pg_class.relfilenode</code> 是否变化，以及 <code>client_min_messages = debug1</code> 时服务端是否发出 <code>rewriting table</code> 消息。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">ok   无默认值：relfilenode 不变<br>ok   常量默认值记录在 pg_attribute.atthasmissing/attmissingval (expected=true, actual=true)<br>ok   易变默认值 clock_timestamp()：出现 rewriting table 消息<br>ok   易变默认值：relfilenode 改变（表被重写）<br></code></pre></td></tr></table></figure>
+<p>不重写表不等于不拿锁。同一用例在事务内查询 <code>pg_locks</code>，ADD COLUMN 持有 AccessExclusiveLock 直到提交，所以它同样会陷入上一节的锁队列。</p>
+<h3 id="check-not-valid-validate-与免扫描的-set-not-null">CHECK NOT VALID、VALIDATE 与免扫描的 SET NOT NULL</h3>
+<p>直接 <code>SET NOT NULL</code> 要扫描全表，并在整个扫描期间持有 AccessExclusiveLock。PostgreSQL 12 起，如果已有一个有效的 CHECK 能证明该列没有 NULL，扫描可以跳过。迁移中的做法是三步：先 <code>ADD CONSTRAINT level_nn CHECK (priority_level IS NOT NULL) NOT VALID</code>，它不检查既有行，加约束的 AccessExclusiveLock 只持有很短时间；再 <code>VALIDATE CONSTRAINT</code>，它扫描既有行，但文档说明只取 SHARE UPDATE EXCLUSIVE；最后 <code>SET NOT NULL</code>。</p>
+<p>S5、S6 分别验证这三步。S5 的边界用例中，约束标为 NOT VALID 之后，更新一条尚未修复的旧行，哪怕只改别的列，也会因整行不满足 CHECK 而以 23514 失败。因此这条约束只能在回填完成之后再加，否则 v1 对未回填行只改其他列（例如标题）的更新会开始报 23514；v1 改优先级时，触发器先补上新列，不受影响。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs text">ok   边界：更新一条尚未修复的旧行的其他列，也因该行违反约束而失败 (expected=23514, actual=23514)<br>ok   VALIDATE 事务持有 ShareUpdateExclusiveLock (expected=[ShareUpdateExclusiveLock], actual=[ShareUpdateExclusiveLock])<br>ok   VALIDATE 未提交期间，另一会话的 UPDATE 不被阻塞 (expected=1, actual=1)<br>ok   已验证 CHECK：出现“existing constraints ... sufficient to prove”<br>ok   已验证 CHECK：没有 verifying table（未扫描）<br>ok   负向对照：只有 NOT VALID 的 CHECK 时仍扫描全表（verifying table）<br></code></pre></td></tr></table></figure>
+<p>负向对照说明，免扫描的前提是约束已验证（<code>pg_constraint.convalidated = true</code>），NOT VALID 的约束不算数。判断依据是服务端 DEBUG1 消息，消息文本可以在 16.15 的服务端二进制中找到；<code>tablecmds.c</code> 源码在本环境无法访问，本文没有引用源码中的控制流。SET NOT NULL 自身仍取 AccessExclusiveLock，免扫描只缩短持锁时间，排队问题仍然要靠 lock_timeout 解决。</p>
+<h3 id="create-index-concurrently-失败后的-invalid-索引">CREATE INDEX CONCURRENTLY 失败后的 INVALID 索引</h3>
+<p>本次迁移不需要新索引，但切读之后按新列查询通常需要。文档说明，并发建索引先在目录里登记一个 invalid 索引，再分两个事务扫描表；扫描中出现死锁或唯一冲突时命令失败，索引留在目录里，查询会忽略它，写入却仍要维护它。S7 用一个重复值让唯一索引构建失败：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs text">ok   重复值导致 CIC 失败（unique_violation） (expected=23505, actual=23505)<br>ok   失败后索引仍在目录中，pg_index.indisvalid=false (expected=false, actual=false)<br>ok   INVALID 索引不被查询使用<br>ok   negative control exposes: 用 IF NOT EXISTS 重试“成功”返回，但索引仍是 INVALID<br>ok   边界：CIC 不能在事务块内执行（active_sql_transaction） (expected=25001, actual=25001)<br>ok   恢复：DROP INDEX CONCURRENTLY、修复重复值、重建后 indisvalid=true (expected=true, actual=true)<br></code></pre></td></tr></table></figure>
+<p>第四行是一个容易写进迁移脚本的错误：为了让脚本可重入而写 <code>CREATE INDEX CONCURRENTLY IF NOT EXISTS</code>，失败后重跑只收到一条 NOTICE，命令正常返回，索引依旧无效。文档对 IF NOT EXISTS 的说明是，不保证已有索引与将要创建的索引一致。所以脚本完成的判据应该是查询 <code>pg_index.indisvalid</code>，命令有没有报错不能作为判据。</p>
+<h2 id="回填写法的比较">回填写法的比较</h2>
+<p>表 24-3：回填写回方式与验证结果</p>
+<table>
+<thead>
+<tr>
+<th>写法</th>
+<th>能否保住并发写入的新值</th>
+<th>证据</th>
+<th>失败边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>应用侧读旧值、计算、无条件 <code>UPDATE ... WHERE id = ?</code></td>
+<td>不能</td>
+<td>S8 负向对照，high 被改回 low</td>
+<td>读与写之间任何一次业务写都会丢</td>
+</tr>
+<tr>
+<td>应用侧读—算—写，写回时加 <code>AND priority_level IS NULL</code></td>
+<td>能</td>
+<td>S8，10 行中跳过 1 行</td>
+<td>只适用于“新列非空即已写过”的语义；若新代码会写 NULL，判据失效</td>
+</tr>
+<tr>
+<td>数据库内单语句 <code>SET priority_level = lvl_of(priority) WHERE ... AND priority_level IS NULL</code></td>
+<td>能</td>
+<td>S8 真实行锁交错；S1、S11 并发写</td>
+<td>依赖 READ COMMITTED 的重新求值；REPEATABLE READ 下按文档 13.2.2 会报序列化失败，需整批重试（未实验）</td>
+</tr>
+<tr>
+<td>数据库内单语句重算，不加 IS NULL</td>
+<td>碰巧能，直到出现 urgent</td>
+<td>S8 负向对照，urgent 被改为 high</td>
+<td>新值只要不能从旧列推导出来就会被覆盖</td>
+</tr>
+<tr>
+<td>版本列比较</td>
+<td>未实验（NOT_RUN）</td>
+<td>—</td>
+<td>要求包括 v1 在内的所有写入者都递增版本，v1 做不到，仍需触发器</td>
+</tr>
+</tbody>
+</table>
+<p>选用第三种。它的保证来自 PostgreSQL 16 文档 13.2.1 描述的行为：READ COMMITTED 下，UPDATE 找到的目标行若已被并发事务修改，会等待对方结束；对方提交后，在新版本的行上重新计算 WHERE 条件，不满足就跳过该行。S8 直接观察到了这个过程：业务事务未提交时，回填会话在 <code>transactionid:ShareLock</code> 上等待，<code>pg_blocking_pids</code> 指向业务会话；业务提交后，回填批次改写 9 行，跳过了已写入 high 的那一行。</p>
+<h2 id="关键实现">关键实现</h2>
+<p>回填的一个批次就是一个事务，事务内依次锁断点行、条件更新本批、推进断点：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-type">long</span> <span class="hljs-variable">hi</span> <span class="hljs-operator">=</span> Db.queryLong(c, <span class="hljs-string">&quot;&quot;&quot;</span><br><span class="hljs-string">    SELECT coalesce(max(id), ?) FROM (</span><br><span class="hljs-string">      SELECT id FROM ticket WHERE id &gt; ? AND id &lt;= ? ORDER BY id LIMIT ?) s&quot;&quot;&quot;</span>, max, last, max, batch);<br><span class="hljs-type">int</span> <span class="hljs-variable">n</span> <span class="hljs-operator">=</span> Db.update(c, <span class="hljs-string">&quot;&quot;&quot;</span><br><span class="hljs-string">    UPDATE ticket SET priority_level = lvl_of(priority)</span><br><span class="hljs-string">    WHERE id &gt; ? AND id &lt;= ? AND priority_level IS NULL&quot;&quot;&quot;</span>, last, hi);<br><span class="hljs-keyword">if</span> (inTx != <span class="hljs-literal">null</span>) inTx.run();<br>Db.update(c, <span class="hljs-string">&quot;&quot;&quot;</span><br><span class="hljs-string">    UPDATE backfill_progress SET last_id = ?, batches = batches + 1, rows_updated = rows_updated + ?</span><br><span class="hljs-string">    WHERE job = ?&quot;&quot;&quot;</span>, hi, n, job);<br>c.commit();<br></code></pre></td></tr></table></figure>
+<p>断点与数据在同一事务里提交，所以“数据已改、断点没推进”和“断点推进了、数据没改”都不会出现。<code>max_id</code> 在作业创建时取新列仍为空的最大主键，扩张之后插入的行已经由新代码或触发器填好新列。<code>inTx</code> 钩子只在崩溃实验中使用，让进程停在提交之前。</p>
+<p>越过与撤回不可逆点都在持有 <code>migration_state</code> 行锁的事务里完成。撤回时重新加约束：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs java">Db.exec(tx, <span class="hljs-string">&quot;SELECT 1 FROM migration_state FOR UPDATE&quot;</span>);<br>Db.exec(tx, <span class="hljs-string">&quot;ALTER TABLE ticket ADD CONSTRAINT no_urgent_before_cutover CHECK (priority_level &lt;&gt; &#x27;urgent&#x27;)&quot;</span>);<br>Db.update(tx, <span class="hljs-string">&quot;UPDATE migration_state SET no_return_at = NULL, phase = &#x27;P6-new-only&#x27;&quot;</span>);<br></code></pre></td></tr></table></figure>
+<p>不带 NOT VALID 的 ADD CONSTRAINT 会扫描全表。只要还有一行 <code>urgent</code>，语句就以 23514 失败，整个事务回滚，状态保持“已越过”。能否撤回由这次扫描判定，操作者的判断不参与。回退守卫 <code>rollbackToV1</code> 在同一行锁下读取阶段：已收缩则拒绝；已越过则拒绝并统计 urgent 行数；否则要求旧列无空值且 <code>COUNT_MISMATCH = 0</code> 才放行。</p>
+<h2 id="故障反例">故障反例</h2>
+<h3 id="回填读到旧值-新代码先写入了新值">回填读到旧值，新代码先写入了新值</h3>
+<p>图 24-3：应用侧无条件写回的覆盖时间线（S8 确定性交错）</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant BF as 回填（应用侧）
+    participant DB as ticket id=3
+    participant V2 as v2 业务写
+    BF-&gt;&gt;DB: SELECT id, priority WHERE priority_level IS NULL
+    DB--&gt;&gt;BF: id=3, priority=1
+    V2-&gt;&gt;DB: UPDATE priority_level=&#x27;high&#x27;, priority=3（提交）
+    BF-&gt;&gt;DB: UPDATE priority_level=&#x27;low&#x27; WHERE id=3（无条件）
+    Note over DB: 触发器见新列被改、旧列未改，把 priority 推导为 1
+    Note over DB: 结果 low/1，两列一致，high 丢失</code></pre>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">ok   negative control exposes: 读—算—无条件写回把新写入的 high 覆盖为 low<br>ok   negative control exposes: 被覆盖后新旧两列仍一致（mismatch=0），列间比对查不出这次丢失<br></code></pre></td></tr></table></figure>
+<p>第二条暴露了校验的盲区：兼容触发器把被覆盖的新列同步回旧列，两列重新一致，P4 的列间校验会顺利通过。列间比对只能发现“两列不一致”，发现不了“两列一致地错了”。I1 的观察位置因此是逐行期望值，校验查询只负责 I2。</p>
+<h3 id="旧代码仍在运行-只写旧列">旧代码仍在运行，只写旧列</h3>
+<p>S9 的负向对照只加列、不建触发器，回填完成后让 v1 改一行优先级、插入一行：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">ok   negative control exposes: v1 更新后新列仍是旧值（mismatch=1）<br>ok   negative control exposes: v1 新插入的行新列为空（null=1）<br></code></pre></td></tr></table></figure>
+<p>这两行在切读之后都会被读错。加上兼容触发器后，同样的操作得到 mismatch=0、null=0，v1 插入的 <code>priority=2</code> 被补为 <code>normal</code>，v3 只写新列 <code>low</code> 后 v1 读到 <code>priority=1</code>。触发器的保证只覆盖走 SQL 写入路径、且触发器处于启用状态的写入；禁用触发器的批量导入不在保证之内。S8 为了构造“扩张之前就存在的行”，就是先禁用触发器再灌数。</p>
+<h3 id="新取值让回退失去意义">新取值让回退失去意义</h3>
+<p>S10 先确认越过之前数据库拒绝 <code>urgent</code>（23514），守卫放行回退。越过之后、还没有写入 urgent 时，守卫已经拒绝回退，但撤回越过动作可以成功。写入一行 urgent 之后，撤回失败：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">ok   存在 urgent 行时撤回失败：重新加约束的校验扫描发现违规 (expected=23514, actual=23514)<br>ok   守卫拒绝回退，报告 1 行旧格式无法表达<br>ok   negative control exposes: v1 把 urgent 读成 priority=3（high），语义已丢失<br>ok   negative control exposes: v1 改优先级再改回 3 后，新列变为 high，urgent 永久丢失<br></code></pre></td></tr></table></figure>
+<p>后两行是绕过守卫、直接让 v1 上线的结果。v1 读到的 3 与真正的 high 无法区分；用户在 v1 界面把优先级改成 2 再改回 3，触发器按旧列推导出 high，urgent 就从数据库中消失了。这个点之后，“回滚”只剩两条路：继续向前修复，或者从越过之前的备份恢复并承担其后写入的损失。本章没有实现后者，也不把它当作无损回退。</p>
+<h3 id="回填进程在批次中途被杀">回填进程在批次中途被杀</h3>
+<p>S11 让独立 JVM 回填进程每批在 UPDATE 之后、提交之前停顿 1 秒，同时运行 v1、v2、v3 三个写线程。父进程读到 <code>IN_TX batch=4</code> 时，确认数据库里该会话处于 <code>idle in transaction</code>，然后执行 <code>kill -9</code>：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">note worker exit=137 last_id at kill=600<br>ok   服务端清理了被杀进程的会话 (expected=0, actual=0)<br>ok   断点未前进：被中断批次整体回滚 (expected=600, actual=600)<br>ok   重启的回填进程正常结束 (expected=0, actual=0)<br>ok   每行等于最后一次已提交业务写入 (expected=0, actual=0)<br></code></pre></td></tr></table></figure>
+<p>客户端进程消失后，服务端会话随连接关闭而结束，未提交的第 4 批整体回滚。重启的进程从断点 600 继续，条件更新使重做的批次不会改写这段时间内业务写过的行。断点前进与数据改写在同一事务里，是续跑正确的前提。如果把断点写到另一个事务或外部文件，崩溃窗口里就会出现断点与数据不一致。</p>
+<h2 id="恢复流程">恢复流程</h2>
+<ul>
+<li>DDL 拿不到锁：55P03 回滚后退避重试；重试耗尽时用 <code>pg_blocking_pids</code> 找出持锁的长事务，处理该事务，不要去掉 lock_timeout 后直接重跑。</li>
+<li>回填中断：直接重启同一作业，断点在 <code>backfill_progress</code>，条件更新使重复执行无害。完成判据是 <code>last_id = max_id</code>、<code>COUNT_NULL = 0</code>、<code>COUNT_MISMATCH = 0</code>。</li>
+<li>VALIDATE 失败：约束保持 NOT VALID，新写入仍受约束；修复违规行后再次 VALIDATE。</li>
+<li>并发建索引失败：按 <code>indisvalid = false</code> 找出残留索引，<code>DROP INDEX CONCURRENTLY</code>，修复数据后重建，以 <code>indisvalid = true</code> 作为完成判据。</li>
+<li>越过不可逆点之后需要回退：先尝试 <code>uncross</code>，它能成功就说明没有 urgent 行；失败则只能向前修复。收缩之后数据库内没有回退路径。</li>
+</ul>
+<h2 id="证据与限制">证据与限制</h2>
+<p>全部用例由 <code>examples/schema-change/run.sh</code> 一条命令运行，最近一次运行输出 <code>SUMMARY passed=96 failed=0</code>，退出码 0。S1–S10 属于真实组件实验，S11 属于多进程集成。以 <code>negative control exposes</code> 开头的负向对照共 8 处，另有 S6 的 NOT VALID 对照，每一处都真实观察到了错误结果。</p>
+<p>这些实验不证明以下内容：多副本或逻辑复制环境下 DDL 与触发器的行为；REPEATABLE READ、SERIALIZABLE 下回填与业务写的交错（文档 13.2.2 描述为序列化失败，本章未实验）；更大表上 VALIDATE、重写和并发建索引的耗时；数据库服务端崩溃（本章只杀客户端进程）；真实滚动发布，三版本代码由同一 JVM 内的不同类模拟。“新旧代码并存时最多相差一个版本”的约束来自 F1 在线异步 schema 变更论文（Rae 等，PVLDB 6(11), 2013）：论文用 delete-only、write-only 等中间状态和 schema 租约保证同一时刻最多两个相邻版本在用，回填任务跳过回填开始后被用户事务更新过的行。本文借用了这些概念，没有实现租约与写栅栏，三版本共存的顺序由实验脚本控制。逐条边界见 <code>evidence/24/LIMITS.md</code>，来源见 <code>SOURCES.md</code> 的第 24 篇一节。</p>
+<h2 id="本批导航">本批导航</h2>
+<ul>
+<li>上一篇：<a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-23-%E5%88%86%E7%89%87%E6%89%A9%E5%AE%B9%E6%97%B6%E7%9A%84%E6%95%B0%E6%8D%AE%E4%BA%A4%E6%8E%A5/" title="后端系统工程 23：分片扩容时的数据交接">23 分片扩容时的数据交接</a></li>
+<li>下一篇：<a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-25-%E7%BC%93%E5%AD%98%E6%97%A7%E5%80%BC%E5%9B%9E%E5%A1%AB%E4%B8%8E%E5%A4%B1%E6%95%88%E4%BF%AE%E5%A4%8D/" title="后端系统工程 25：缓存旧值回填与失效修复">25 缓存旧值回填与失效修复</a></li>
+<li>本批索引：仓库 <code>batch-3/INDEX.md</code>（阅读顺序与运行入口），<code>batch-3/STATUS.md</code>、<code>batch-3/SOURCES.md</code></li>
+<li>运行入口：<code>batch-3/examples/schema-change/run.sh</code></li>
+<li>证据目录：<code>batch-3/evidence/24/</code></li>
+<li>本篇工程与证据快照：<a href="./backend-systems-24.tar.gz">backend-systems-24.tar.gz</a>（SHA-256 见同目录 <code>backend-systems-24.tar.gz.sha256</code>）。正文中的 <code>examples/</code>、<code>evidence/</code>、<code>SOURCES.md</code> 路径都相对仓库的 <code>batch-3/</code> 目录，与快照包内布局一致。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-24-%E5%9C%A8%E7%BA%BF%E5%8F%98%E6%9B%B4%E7%9A%84%E6%95%B0%E6%8D%AE%E5%85%BC%E5%AE%B9/">https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-24-%E5%9C%A8%E7%BA%BF%E5%8F%98%E6%9B%B4%E7%9A%84%E6%95%B0%E6%8D%AE%E5%85%BC%E5%AE%B9/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/PostgreSQL/">PostgreSQL</a><a class="post-meta__tags" href="/tags/%E5%85%BC%E5%AE%B9%E6%80%A7/">兼容性</a><a class="post-meta__tags" href="/tags/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B/">后端系统工程</a><a class="post-meta__tags" href="/tags/Schema-%E5%8F%98%E6%9B%B4/">Schema 变更</a><a class="post-meta__tags" href="/tags/%E5%9B%9E%E5%A1%AB/">回填</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-171.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-27-%E6%B5%8B%E8%AF%95%E8%B4%A6%E6%88%B7%E7%9A%84%E4%BD%99%E9%A2%9D%E4%B8%8E%E8%B4%A6%E6%9C%AC/" title="后端系统工程 27：测试账户的余额与账本"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-166.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 27：测试账户的余额与账本</div></div><div class="info-2"><div class="info-item-1">一个积分账户只要支持“扣减”，就会同时面对三类问题：多个请求同时扣同一个账户时会不会扣成负数；客户端超时后重发时会不会扣两次；余额列被某段代码改错以后，能不能从别的记录里算出正确值。本篇用一个测试账户服务回答这三个问题。账户、金额与请求都是合成数据，金额单位是“模拟积分”，不对应任何真实货币或支付渠道。 验收目标有三条，每条都落到具体的检查语句和用例编号上：  并发扣减不透支。 超时重试不重复扣款。 余额与流水守恒，余额可以从流水重算。  需求与范围 服务管理一组测试账户，每个账户有一个整数余额。业务方通过 HTTP 发起扣减，例如兑换一件测试奖品花掉 30 积分；运营脚本通过内部调用发放积分。不支持撤销、冻结、部分退款与多币种，也不处理跨库转账。 本章约定的业务不变量：    编号 不变量 检查位置     I1 普通账户余额不小于 0 account.balance_non_negative 约束；UPDATE ... WHERE 条件   I2 同一客户端、同一幂等键至多产生一笔交易 idem_request 主键、ledger_txn 唯一约束   I3 每笔交易的分录之...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-29-%E8%AE%A2%E5%8D%95%E6%94%AF%E4%BB%98%E6%A8%A1%E6%8B%9F%E4%B8%8E%E5%BA%93%E5%AD%98%E8%A1%A5%E5%81%BF/" title="后端系统工程 29：订单、支付模拟与库存补偿"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-15.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 29：订单、支付模拟与库存补偿</div></div><div class="info-2"><div class="info-item-1">上一篇把名额收进了一张预留表：预留有效期内名额归该用户，到期由释放任务归还。本篇在它上面加一层订单和一个假支付渠道，处理三件预留层回答不了的事：调用渠道超时，钱到底扣了没有；渠道的回调重复、乱序、迟到时，订单状态会不会被改坏；支付成功的消息到达时，预留已经过期并被别人买走，这笔钱怎么办。代码在 examples/flash-sale/src/lab/flash/order，库存层原样复用第 28 篇的 lab.flash.reserve.Inventory，没有改动。全部金额是模拟积分，订单固定 1990 分，SKU 为 sku-lab-01，用户为 user-0042 这类编号，渠道替身只监听本机端口。 需求与范围 需求写成可以逐条断言的形式：  订单状态只能沿状态机迁移；任何迁移都以“当前状态等于前置状态”为条件，不满足即拒绝，不覆盖。 渠道调用没有拿到确定应答时，订单不得判为失败，也不得归还库存；结果必须通过查询或关单收敛。 同一笔支付的成功通知无论到达几次、以什么顺序到达，最多造成一次状态迁移、一次库存确认和一条下游事件。 成功通知到达时若预留已被释放：能重新占到名额就确...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-25-%E7%BC%93%E5%AD%98%E6%97%A7%E5%80%BC%E5%9B%9E%E5%A1%AB%E4%B8%8E%E5%A4%B1%E6%95%88%E4%BF%AE%E5%A4%8D/" title="后端系统工程 25：缓存旧值回填与失效修复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-117.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 25：缓存旧值回填与失效修复</div></div><div class="info-2"><div class="info-item-1">Cache Aside 的写法很短：读时先查缓存，未命中就读数据库再回填；写时先提交数据库，再删除缓存。这段代码里有一个读者与写者交错的窗口：读者读到旧行之后、回填之前，写者提交了新版本并删掉了缓存，读者随后把旧行写回去。此后缓存里的旧值没有任何人负责清除，只能等 TTL。另一个窗口出现在写者自身：数据库已经提交，删除缓存的那条命令还没发出，进程就退出了。 本篇的验收目标是：数据更新与慢读回填交错之后，旧值可以被拒绝、被检测、被修复；旧值最多存活多久（新鲜度窗口）要写成由哪些量组成的上界，并指出哪些条件下不存在上界。全部数据为合成数据，商品标识形如 sku-lab-05。 需求与范围 服务管理一组商品描述，数据库是唯一真相源，每行有一个单调递增的 version。缓存只是加速副本，允许短暂落后，但不允许“无限期落后”。具体要求：  读路径：命中直接返回；未命中读库并回填。 写路径：只改数据库，然后让缓存失效；不允许写者直接把新值写进缓存（避免写者之间的乱序覆盖成为第二个问题）。 写者在提交后任意时刻崩溃，旧值最终被清除，且不依赖 TTL。 失效命令可能重复、乱序到达，重复和乱序不...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-20-%E5%8F%91%E5%8F%B7%E6%9C%8D%E5%8A%A1%E7%9A%84%E5%94%AF%E4%B8%80%E6%80%A7%E4%B8%8E%E5%A4%B1%E8%B4%A5%E6%A8%A1%E5%BC%8F/" title="后端系统工程 20：发号服务的唯一性与失败模式"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-77.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 20：发号服务的唯一性与失败模式</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 19 延迟任务的领取与取消 ｜ 本篇 20 ｜ 下一篇 21 有限能力的数据库路由代理 “生成一个唯一 ID”这句话省略了三个限定：在多大范围内唯一，在哪些故障之后仍然唯一，除了唯一还要求什么。一张订单表的主键只需在该表内不重复；跨系统传递的标识要在所有系统中不重复；作为分片键或排序键时，还会被要求大致按时间递增。不同方案对这些问题的回答不同，它们的失败模式也不同：数据库号段在进程崩溃后留下空洞，时间型标识在时钟回退时可能重复，节点号方案在两个进程误用同一节点号时必然重复。 本篇实现一个基于 PostgreSQL 的号段发号器，作为主方案验证并发取号、进程重启、数据库故障下的唯一性；再实现 UUIDv4、UUIDv7 和 Snowflake 式 64 位标识作为契约对照，用受控时钟测试时钟回退，用真实多进程测试节点号冲突。代码在 examples/20-id-service/，输出在 evidence/20/output.txt。 需求契约 号段服务的使用方只调用一个操作：为某个业务标签取下一个号。服务承诺：  同一业务标签下发出的号全局唯一，这一点在发号进程崩...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-18-%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97%E6%8E%A5%E5%85%A5%E4%B8%8E%E7%A7%AF%E5%8E%8B%E6%81%A2%E5%A4%8D/" title="后端系统工程 18：消息队列接入与积压恢复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-149.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 18：消息队列接入与积压恢复</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 17 从持久日志构建最小消息队列 ｜ 本篇 18 ｜ 下一篇 19 延迟任务的领取与取消 上一篇把“受理”“落盘”“消费确认”拆成了三条线，用一个自制的单机日志逐一观察。换成成熟的消息中间件之后，这三条线依然存在，只是分别落到了客户端协议里：publisher confirm 说明 broker 接下了消息，消费确认把消息的所有权交给消费者，两者之间还隔着队列、重投和消费者自己的数据库事务。中间件不会替应用决定先提交还是先确认，也不会替应用判断一条消息是不是已经处理过。 本篇用真实的 RabbitMQ 3.12.1 节点和 PostgreSQL 16 检验接入方的契约：生产确认与不可路由消息、提交后再确认与去重表、毒消息的有限次重试和隔离、积压时的有界预取。输入是与第 17 章共用的 3000 条合成订单事件，代码在 examples/18-rabbitmq-consumer/，输出在 evidence/18/output.txt。 实验只有一个 RabbitMQ 节点。它能说明单个 broker 进程重启或被 kill -9 之后，已确认的持久消息还在不在；它...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-26-%E7%A7%9F%E7%BA%A6%E4%BA%92%E6%96%A5%E4%B8%8E%E8%B5%84%E6%BA%90%E7%AB%AF%E6%A0%85%E6%A0%8F/" title="后端系统工程 26：租约互斥与资源端栅栏"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-14.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 26：租约互斥与资源端栅栏</div></div><div class="info-2"><div class="info-item-1">一个每日报表作业部署了多个实例，同一时刻只应有一个实例往报表输出库写结果。常见做法是在数据库里放一张租约表：谁抢到租约谁干活，租约到期没有续上就让给别人。这套做法能减少重复执行，但它本身不能阻止一种写入：实例 A 拿到租约、做完写前检查，然后整个进程停住；租约在停顿期间过期，实例 B 接手并写完；A 恢复后把手里那份已经过时的结果写了进去。A 自己无法察觉停顿，因为它恢复后执行的下一条指令就是“发出写请求”。 本篇的验收条件只有一条：暂停的旧持有者恢复后，无法写入受保护资源。实现上，租约在获取时原子地发出一个单调递增的 fencing token，受保护资源在写入的同一个原子操作里比较 token，拒绝比自己见过的最大值更小的请求。另外用同一时间线说明：资源端如果不检查 token，这个保证就不存在，再完善的租约也补不上。 需求、不变量与排除项 场景是合成的：报表作业 report-job 每天生成作用域 daily-report 下的若干分片（summary、detail），写入报表输出库。持有者标识形如 holder-a。 需要成立的不变量有三条：  I1，按数据库时钟，同一...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9C%80%E6%B1%82-%E4%B8%8D%E5%8F%98%E9%87%8F%E4%B8%8E%E8%8C%83%E5%9B%B4"><span class="toc-number">1.</span> <span class="toc-text">需求、不变量与范围</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E4%B8%AA%E5%BA%94%E7%94%A8%E7%89%88%E6%9C%AC%E7%9A%84%E8%AF%BB%E5%86%99%E5%A5%91%E7%BA%A6"><span class="toc-number">2.</span> <span class="toc-text">三个应用版本的读写契约</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%B0%E6%8D%AE%E6%A8%A1%E5%9E%8B%EF%BC%9A%E6%96%B0%E5%88%97-%E7%BA%A6%E6%9D%9F%E4%B8%8E%E5%85%BC%E5%AE%B9%E8%A7%A6%E5%8F%91%E5%99%A8"><span class="toc-number">3.</span> <span class="toc-text">数据模型：新列、约束与兼容触发器</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5%E7%8A%B6%E6%80%81%E6%9C%BA%E4%B8%8E%E6%AF%8F%E4%B8%80%E6%AD%A5%E8%83%BD%E5%90%A6%E5%9B%9E%E9%80%80"><span class="toc-number">4.</span> <span class="toc-text">阶段状态机与每一步能否回退</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%AD%A3%E5%B8%B8%E8%B7%AF%E5%BE%84%EF%BC%9A%E5%B9%B6%E5%8F%91%E5%86%99%E5%85%A5%E4%B8%8B%E8%B5%B0%E5%AE%8C%E4%B8%83%E4%B8%AA%E9%98%B6%E6%AE%B5"><span class="toc-number">5.</span> <span class="toc-text">正常路径：并发写入下走完七个阶段</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#ddl-%E6%9C%AC%E8%BA%AB%E7%9A%84%E9%94%81%E4%B8%8E%E6%89%AB%E6%8F%8F"><span class="toc-number">6.</span> <span class="toc-text">DDL 本身的锁与扫描</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%94%81%E9%98%9F%E5%88%97%EF%BC%9A%E4%B8%80%E6%9D%A1%E6%8E%92%E9%98%9F%E7%9A%84-alter-%E6%8C%A1%E4%BD%8F%E5%90%8E%E6%9D%A5%E7%9A%84-select"><span class="toc-number">6.1.</span> <span class="toc-text">锁队列：一条排队的 ALTER 挡住后来的 SELECT</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#lock-timeout%EF%BC%9A%E6%8B%BF%E4%B8%8D%E5%88%B0%E9%94%81%E5%B0%B1%E9%80%80%E5%87%BA%E9%98%9F%E5%88%97"><span class="toc-number">6.2.</span> <span class="toc-text">lock_timeout：拿不到锁就退出队列</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#add-column%EF%BC%9A%E4%B8%8D%E5%B8%A6%E9%BB%98%E8%AE%A4%E5%80%BC%E6%88%96%E5%B8%A6%E9%9D%9E%E6%98%93%E5%8F%98%E9%BB%98%E8%AE%A4%E5%80%BC%E6%97%B6%E4%B8%8D%E9%87%8D%E5%86%99%E8%A1%A8"><span class="toc-number">6.3.</span> <span class="toc-text">ADD COLUMN：不带默认值或带非易变默认值时不重写表</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#check-not-valid-validate-%E4%B8%8E%E5%85%8D%E6%89%AB%E6%8F%8F%E7%9A%84-set-not-null"><span class="toc-number">6.4.</span> <span class="toc-text">CHECK NOT VALID、VALIDATE 与免扫描的 SET NOT NULL</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#create-index-concurrently-%E5%A4%B1%E8%B4%A5%E5%90%8E%E7%9A%84-invalid-%E7%B4%A2%E5%BC%95"><span class="toc-number">6.5.</span> <span class="toc-text">CREATE INDEX CONCURRENTLY 失败后的 INVALID 索引</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9E%E5%A1%AB%E5%86%99%E6%B3%95%E7%9A%84%E6%AF%94%E8%BE%83"><span class="toc-number">7.</span> <span class="toc-text">回填写法的比较</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%B3%E9%94%AE%E5%AE%9E%E7%8E%B0"><span class="toc-number">8.</span> <span class="toc-text">关键实现</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%85%E9%9A%9C%E5%8F%8D%E4%BE%8B"><span class="toc-number">9.</span> <span class="toc-text">故障反例</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9B%9E%E5%A1%AB%E8%AF%BB%E5%88%B0%E6%97%A7%E5%80%BC-%E6%96%B0%E4%BB%A3%E7%A0%81%E5%85%88%E5%86%99%E5%85%A5%E4%BA%86%E6%96%B0%E5%80%BC"><span class="toc-number">9.1.</span> <span class="toc-text">回填读到旧值，新代码先写入了新值</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%97%A7%E4%BB%A3%E7%A0%81%E4%BB%8D%E5%9C%A8%E8%BF%90%E8%A1%8C-%E5%8F%AA%E5%86%99%E6%97%A7%E5%88%97"><span class="toc-number">9.2.</span> <span class="toc-text">旧代码仍在运行，只写旧列</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%96%B0%E5%8F%96%E5%80%BC%E8%AE%A9%E5%9B%9E%E9%80%80%E5%A4%B1%E5%8E%BB%E6%84%8F%E4%B9%89"><span class="toc-number">9.3.</span> <span class="toc-text">新取值让回退失去意义</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9B%9E%E5%A1%AB%E8%BF%9B%E7%A8%8B%E5%9C%A8%E6%89%B9%E6%AC%A1%E4%B8%AD%E9%80%94%E8%A2%AB%E6%9D%80"><span class="toc-number">9.4.</span> <span class="toc-text">回填进程在批次中途被杀</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%81%A2%E5%A4%8D%E6%B5%81%E7%A8%8B"><span class="toc-number">10.</span> <span class="toc-text">恢复流程</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%AF%81%E6%8D%AE%E4%B8%8E%E9%99%90%E5%88%B6"><span class="toc-number">11.</span> <span class="toc-text">证据与限制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%AC%E6%89%B9%E5%AF%BC%E8%88%AA"><span class="toc-number">12.</span> <span class="toc-text">本批导航</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

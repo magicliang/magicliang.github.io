@@ -1,0 +1,854 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>后端系统工程 16：服务发现中的旧地址 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="系列导航：上一篇 15 配置发布与客户端收敛 ｜ 本篇 16 ｜ 下一篇 17 从持久日志构建最小消息队列 服务发现的地址集总是落后于事实。一个提供者进程被暂停、被杀死，或者与注册中心断开，注册中心要等租约过期才删除它的地址；删除事件再经过 watch 流到达消费者，消费者才停止向它发请求。这段时间里，消费者手里的地址已经指向一个不能服务的进程。服务发现做不到“没有旧地址”，能做的是把旧地址的存活">
+<meta property="og:type" content="article">
+<meta property="og:title" content="后端系统工程 16：服务发现中的旧地址">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-16-%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0%E4%B8%AD%E7%9A%84%E6%97%A7%E5%9C%B0%E5%9D%80/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="系列导航：上一篇 15 配置发布与客户端收敛 ｜ 本篇 16 ｜ 下一篇 17 从持久日志构建最小消息队列 服务发现的地址集总是落后于事实。一个提供者进程被暂停、被杀死，或者与注册中心断开，注册中心要等租约过期才删除它的地址；删除事件再经过 watch 流到达消费者，消费者才停止向它发请求。这段时间里，消费者手里的地址已经指向一个不能服务的进程。服务发现做不到“没有旧地址”，能做的是把旧地址的存活">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-126.jpg">
+<meta property="article:published_time" content="2026-10-18T13:30:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T08:33:36.094Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="etcd">
+<meta property="article:tag" content="watch">
+<meta property="article:tag" content="后端系统工程">
+<meta property="article:tag" content="故障注入">
+<meta property="article:tag" content="服务发现">
+<meta property="article:tag" content="租约">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-126.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "后端系统工程 16：服务发现中的旧地址",
+  "url": "https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-16-%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0%E4%B8%AD%E7%9A%84%E6%97%A7%E5%9C%B0%E5%9D%80/",
+  "image": "https://magicliang.github.io/img/wall-paper-126.jpg",
+  "datePublished": "2026-10-18T13:30:00.000Z",
+  "dateModified": "2026-10-22T08:33:36.094Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-16-%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0%E4%B8%AD%E7%9A%84%E6%97%A7%E5%9C%B0%E5%9D%80/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '后端系统工程 16：服务发现中的旧地址',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2016</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2094</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-126.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">后端系统工程 16：服务发现中的旧地址</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">后端系统工程 16：服务发现中的旧地址</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-18T13:30:00.000Z" title="Created 2026-10-18 21:30:00">2026-10-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-22T08:33:36.094Z" title="Updated 2026-10-22 16:33:36">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">5k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>17mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-22 16:33:36&quot;}" hidden></div><p>系列导航：上一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-15-%E9%85%8D%E7%BD%AE%E5%8F%91%E5%B8%83%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E6%94%B6%E6%95%9B/" title="后端系统工程 15：配置发布与客户端收敛">15 配置发布与客户端收敛</a> ｜ 本篇 16 ｜ 下一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-17-%E4%BB%8E%E6%8C%81%E4%B9%85%E6%97%A5%E5%BF%97%E6%9E%84%E5%BB%BA%E6%9C%80%E5%B0%8F%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/" title="后端系统工程 17：从持久日志构建最小消息队列">17 从持久日志构建最小消息队列</a></p>
+<p>服务发现的地址集总是落后于事实。一个提供者进程被暂停、被杀死，或者与注册中心断开，注册中心要等租约过期才删除它的地址；删除事件再经过 watch 流到达消费者，消费者才停止向它发请求。这段时间里，消费者手里的地址已经指向一个不能服务的进程。服务发现做不到“没有旧地址”，能做的是把旧地址的存活时间算清楚，并给这段时间准备失败预算。</p>
+<p>本篇用真实 etcd 3.4 实例、真实提供者进程和真实消费者进程测量这个窗口：提供者被 <code>SIGSTOP</code>（进程在，续租停）、被 <code>kill -9</code>、被优雅终止时，旧地址各存活多久；同一窗口内，带本地剔除与重试的消费者和不带的消费者各有多少次失败。另外测试三件和“不漏事件”有关的事：watch 断线后按 revision 续订、历史被压缩后全量重新同步、etcd 自身重启。负向对照两个：断线后从“现在”开始 watch 的消费者，以及恢复后不检查租约的提供者。代码在 <code>examples/16-service-discovery/</code>，输出在 <code>evidence/16/output.txt</code>。</p>
+<h2 id="需求与不变量">需求与不变量</h2>
+<p>提供者启动时注册地址，运行期间保持注册，退出或失联后地址被移除。消费者维护一份地址集，并用它调用提供者。要求如下：</p>
+<ul>
+<li>注册中心里的每个地址都绑定一个租约，租约过期或撤销时地址被删除，删除不依赖提供者配合。</li>
+<li>消费者的地址集等于“某个 revision 时刻的全量快照 + 之后按 revision 顺序到达的全部事件”。断线、重启、压缩都不能让它跳过事件而不自知。</li>
+<li>提供者从暂停中恢复后，必须能发现自己的注册已经消失，并重新注册。</li>
+<li>旧地址窗口内的失败尽量由消费者本地吸收，不全部暴露给上层调用方。</li>
+</ul>
+<p>教学参数：租约 TTL 3s，续租间隔 1s；消费者每 50ms 发起一次逻辑调用，单次尝试超时 300ms，失败地址本地剔除 2s，最多在另一个地址上重试 1 次。生产系统的 TTL 通常更长，窗口按比例放大；这里取小值只为缩短实验时间。</p>
+<h2 id="组件与状态">组件与状态</h2>
+<p>图 16-1：状态归属与持久化位置</p>
+<pre><code class="hljs mermaid">flowchart LR
+    subgraph E[&quot;etcd 3.4.30 单成员（127.0.0.1:47160，数据 /tmp/b2-etcd-16）&quot;]
+        K[(&quot;/svc/demo/&amp;lt;name&amp;gt; → &#123;addr, lease&#125;&lt;br/&gt;绑定租约 TTL=3s&quot;)]
+        LS[(租约表)]
+    end
+    P[&quot;provider.py（每个一进程）&lt;br/&gt;内存：当前租约 ID&lt;br/&gt;HTTP GET /hello&quot;] --&gt;|grant / put / 每 1s keepalive / SIGTERM 时 revoke| E
+    C[&quot;consumer.py&lt;br/&gt;内存：地址集、last_revision、剔除表&quot;] --&gt;|启动：range 前缀，记 revision| E
+    C --&gt;|watch start_revision = last_revision+1| E
+    C --&gt;|HTTP/1.1 长连接调用| P</code></pre>
+<p>Python 标准库没有 gRPC，所有调用都经 etcd 的 gRPC-gateway 走 JSON。etcd 3.4 的网关路径是 <code>/v3/*</code>（同时保留 <code>/v3beta/*</code>），key 和 value 是字节数组，在 JSON 中要 base64 编码（<a target="_blank" rel="noopener" href="https://etcd.io/docs/v3.4/dev-guide/api_grpc_gateway/">etcd v3.4 gRPC gateway</a>）。int64 字段以字符串出现，零值字段直接省略。省略零值这一点在续租时很重要：对一个已不存在的租约调用 <code>/v3/lease/keepalive</code>，网关返回的结果里没有 <code>TTL</code> 字段，<code>etcdgw.keepalive</code> 把它读成 0，提供者据此判断租约已经丢失。</p>
+<p>消费者先 range 再 watch。range 返回的响应头带有读取时刻的 revision，watch 从 revision+1 开始。etcd 文档对 <code>start_revision</code> 的说明是：起点包含在内；不填时从 watch 创建响应头的 revision 之后开始（<a target="_blank" rel="noopener" href="https://etcd.io/docs/v3.4/learning/api/">etcd v3.4 API</a>）。填与不填的差别正是第一个负向对照要暴露的问题。</p>
+<h2 id="旧地址窗口">旧地址窗口</h2>
+<p>租约在 TTL 内没有收到续租就过期，过期时删除所有绑定的 key，每个 key 产生一个 delete 事件（同一文档）。从提供者失去服务能力到消费者删除地址，窗口由四项组成：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">旧地址窗口 = (TTL − 故障时刻距上次成功续租的时间)   租约剩余寿命<br>           + 过期检测与删除提交的延迟                 etcd 内部<br>           + watch 投递延迟                           健康集群约 10ms<br>           + 消费者应用事件的时间                     本实验可忽略<br></code></pre></td></tr></table></figure>
+<p>watch 延迟一项，etcd 文档的说法是：KV 调用立即生效，watch 的返回有无上界的延迟；健康集群中事件大约在 10ms 后出现，但不健康的集群里事件可能永远不到（<a target="_blank" rel="noopener" href="https://etcd.io/docs/v3.4/learning/api_guarantees/">etcd v3.4 API 保证</a>）。第一项最大接近 TTL，最小约为 TTL 减去续租间隔。</p>
+<p><code>sigstop_stale_window</code> 对提供者 p1 做 3 轮 <code>SIGSTOP</code>，三个消费者同时观察：A 带剔除与重试，B 两者都不带，C 是后面要用的负向对照，此时行为与 A 相同。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE sigstop_stale_window  PASS ttl=3s keepalive_interval=1.0s A=eject+retry1 B=no-eject<br>  [r0 since_last_keepalive_ms=243 window_ms=A:3221,B:3221,C:3221 A:attempt_fail=2,caller_fail=0 B:attempt_fail=7,caller_fail=7 errors=[&#x27;timeout&#x27;]]<br>  [r1 since_last_keepalive_ms=298 window_ms=A:3193,B:3193,C:3193 A:attempt_fail=2,caller_fail=0 B:attempt_fail=7,caller_fail=7 errors=[&#x27;timeout&#x27;]]<br>  [r2 since_last_keepalive_ms=599 window_ms=A:2893,B:2892,C:2893 A:attempt_fail=2,caller_fail=0 B:attempt_fail=6,caller_fail=6 errors=[&#x27;timeout&#x27;]]<br></code></pre></td></tr></table></figure>
+<p>（原输出是一行，这里按轮次折行。）按上式拆分，三轮的租约剩余寿命分别是 2757、2702、2401ms，实测窗口比它多出 464、491、494ms。这部分包含过期检测、删除提交与 watch 投递，实验没有把它再细分；<code>kill -9</code> 那一次多出 218ms，说明它不是固定值，而在零到半秒之间变化。三个消费者看到删除的时刻相差不超过 2ms，watch 投递本身在这里不是主要成本。</p>
+<p>被暂停的进程不会拒绝连接。内核仍然替它完成 TCP 握手，请求写进缓冲区后没有任何回应，调用方只能等到超时，所以错误类型全是 <code>timeout</code>。B 在每轮窗口内对 p1 有 6–7 次调用失败，每次都直接落到上层；A 只尝试失败 2 次：第一次超时后把 p1 剔除 2s，并在另一个地址上重试成功，2s 后剔除到期再试一次又失败，此后注册中心的删除已经到达。</p>
+<p><code>kill -9</code> 时情形不同：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE kill9_stale_window  PASS stop_after_last_keepalive_ms=395 stale_window_ms=A:2823,B:2823 A:attempt_fail=2,caller_fail=0,errors=[&#x27;refused&#x27;, &#x27;reset&#x27;] B:attempt_fail=19,caller_fail=19,errors=[&#x27;refused&#x27;, &#x27;reset&#x27;]<br></code></pre></td></tr></table></figure>
+<p>进程已经不在，长连接被内核重置，新连接被拒绝，每次失败只花一个往返时间。B 在同样长的窗口内失败 19 次，比暂停时多出两倍有余，原因是失败得快，单位时间内的尝试次数多。“进程崩溃”和“进程卡住”对注册中心是同一件事，都要等租约过期；对调用方则是两种代价，一种是快速失败、次数多，另一种是每次都占满超时时间。</p>
+<p>优雅退出是唯一不需要等待的情况。提供者收到 <code>SIGTERM</code> 时先撤销租约：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE graceful_stop_revokes_lease  PASS revoked=True removal_ms=A:3,B:3<br></code></pre></td></tr></table></figure>
+<p>撤销后 3ms 内删除到达消费者。部署系统停止实例时若先发 <code>SIGTERM</code>、留出撤销与排空的时间，旧地址窗口就从 TTL 量级降到毫秒量级。TTL 只是兜底，用来覆盖进程来不及做任何事的情况。</p>
+<h2 id="本地剔除与注册中心删除">本地剔除与注册中心删除</h2>
+<p>图 16-2：一次逻辑调用在旧地址窗口内的处理（A 的策略）</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant U as 上层调用方
+    participant C as 消费者 A
+    participant P1 as p1（SIGSTOP）
+    participant P2 as p2
+    participant E as etcd
+    U-&gt;&gt;C: 调用 /hello（幂等）
+    C-&gt;&gt;P1: 尝试 1：连接成功（内核握手），等待响应
+    Note over C,P1: 300ms 超时，attempt_fail
+    C-&gt;&gt;C: 剔除 p1 两秒
+    C-&gt;&gt;P2: 尝试 2（重试上限 1）
+    P2--&gt;&gt;C: 200
+    C--&gt;&gt;U: 成功（多花约 300ms）
+    Note over E: 租约到期，删除 key
+    E--&gt;&gt;C: watch DELETE 事件，地址集移除 p1
+    Note over C: 剔除只在本进程有效；删除对所有订阅者生效</code></pre>
+<p>本地剔除依据的是消费者自己观察到的失败，速度快，作用范围只有这一个进程，判断也可能出错：一次网络抖动就可能把健康地址剔除两秒。注册中心删除依据的是租约，速度慢，但对所有订阅者一致，而且只有提供者自己（或撤销操作）能阻止它发生。两者应该并存：剔除用来在租约过期前降低失败率，删除保证地址最终从所有消费者处消失。剔除不应写回注册中心，否则一个网络位置不好的消费者就能把健康实例从全体消费者那里摘掉。</p>
+<p>重试只对幂等操作安全。实验中的 <code>/hello</code> 是只读请求；对写操作，超时意味着结果未知，第 13 篇已经讨论过这类请求不能自动重试。有了重试，失败预算也要换一种算法：A 把窗口内的失败从 6–7 次降到 0 次调用方可见失败，代价是这些调用多花一个尝试超时，并给其他提供者带来额外请求。窗口内的重试流量大约等于“旧地址份额 × 调用速率”。旧地址占多数时，比如一次发布中大部分实例同时暂停，重试会把剩下的实例压垮；这时应限制重试比例，本实现没有做这层预算。</p>
+<h2 id="恢复后的租约检查">恢复后的租约检查</h2>
+<p><code>SIGSTOP</code> 结束后，提供者的续租线程醒来，下一次续租得到的是“租约不存在”：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE sigcont_detects_lease_loss  PASS [r0 lease_lost_after_cont_ms=4 keepalive_gap_s=3.969 lease_changed=True readded_ms=A:10] [r1 lease_lost_after_cont_ms=4 keepalive_gap_s=3.996 lease_changed=True readded_ms=A:11] [r2 lease_lost_after_cont_ms=10 keepalive_gap_s=4.002 lease_changed=True readded_ms=A:14]<br></code></pre></td></tr></table></figure>
+<p>恢复后 4–10ms 内发现租约丢失，用新租约重新注册，消费者在 10–14ms 内重新加入该地址。<code>time.sleep</code> 依据单调时钟，进程暂停期间时钟照常前进，所以恢复后续租线程立即醒来，不会再睡满一个间隔。</p>
+<p>负向对照的提供者只会对旧租约 ID 反复续租：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE negative_no_reregister  PASS expectInvisible removed=True lease_lost_events_in_4s=4 in_registry=False in_A_set=False http_alive=True<br></code></pre></td></tr></table></figure>
+<p>它的 HTTP 服务完全正常，4s 内续租失败 4 次，地址既不在注册中心，也不在任何消费者的地址集里。实例在运行、日志在刷，却收不到任何流量。这类故障很难从实例本身的健康检查中发现，因为实例本身确实是健康的。</p>
+<h2 id="不漏事件：revision-续订与压缩">不漏事件：revision 续订与压缩</h2>
+<p>watch 的保证是：事件按 revision 有序，不重复，在可用历史窗口内不会丢掉中间的一段；断开的 watch 可以从断开前最后收到的 revision 之后重建，前提是该 revision 仍在历史窗口内（<a target="_blank" rel="noopener" href="https://etcd.io/docs/v3.4/learning/api_guarantees/">etcd v3.4 API 保证</a>）。消费者 A 记录最后处理的 revision，续订时从它加 1 开始；C 是负向对照，续订时不带 <code>start_revision</code>，也不重新 range。</p>
+<p>实验让 A 和 C 主动断开 watch（<code>SIGUSR1</code> 关闭 watch 套接字，模拟一次网络中断），断开期间优雅停止 p3（产生删除）、启动 p5（产生新增），然后恢复：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE watch_resume_from_revision  PASS last_revision=16 resumed_at=17 registry_rev=18 registry=[&#x27;127.0.0.1:47162&#x27;, &#x27;127.0.0.1:47163&#x27;, &#x27;127.0.0.1:47166&#x27;] A_set=[&#x27;127.0.0.1:47162&#x27;, &#x27;127.0.0.1:47163&#x27;, &#x27;127.0.0.1:47166&#x27;]<br>CASE negative_resume_from_now    PASS expectStale C_set=[&#x27;127.0.0.1:47162&#x27;, &#x27;127.0.0.1:47163&#x27;, &#x27;127.0.0.1:47164&#x27;] keeps_deleted_p3=True sees_new_p5=False C_attempt_fail_to_p3_since_disconnect=3 C_set_6s_after_resume_still_has_p3=True<br></code></pre></td></tr></table></figure>
+<p>A 从 17 续订，收到 revision 17 的删除和 18 的新增，地址集与注册中心一致。C 的 watch 从“现在”开始，这两个事件都发生在它的起点之前，于是它保留着已经删除的 p3（47164），看不到新加入的 p5（47166）。恢复 6s 后 p3 仍在 C 的地址集里，期间 C 对 p3 失败 3 次，次数被 2s 剔除限制住了。这种旧地址没有租约兜底：p3 的 key 已经删除，以后不会再有它的删除事件，C 只能靠本地剔除反复探测它，直到进程重启。旧地址窗口不再由 TTL 决定，而是无限长。</p>
+<p>续订的前提是历史还在。etcd 会压缩旧 revision 以控制存储，从已压缩的 revision 创建 watch 时，响应带回可用的最小 revision（<code>compact_revision</code>），watcher 被取消，用同一个起点重建也会失败（<a target="_blank" rel="noopener" href="https://etcd.io/docs/v3.4/learning/api/">etcd v3.4 API</a>）。实验在 A 断开期间做两次变更，然后手工压缩到当前 revision：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE compaction_forces_resync  PASS last_revision=18 compacted_to=20 requested=19 compact_revision=20 resync_added=[&#x27;127.0.0.1:47167&#x27;] resync_removed=[&#x27;127.0.0.1:47166&#x27;] A_set=[&#x27;127.0.0.1:47162&#x27;, &#x27;127.0.0.1:47163&#x27;, &#x27;127.0.0.1:47167&#x27;] registry=[&#x27;127.0.0.1:47162&#x27;, &#x27;127.0.0.1:47163&#x27;, &#x27;127.0.0.1:47167&#x27;]<br></code></pre></td></tr></table></figure>
+<p>A 请求从 19 续订，网关返回 <code>canceled:true, compact_revision:&quot;20&quot;</code>。A 丢弃增量路径，重新 range 全量，用快照替换地址集，补上新增的 p6、移除已删除的 p5，再从新 revision 加 1 继续 watch。全量同步时不能在旧集合上合并，必须整体替换：被压缩掉的那段历史里，可能有删除事件已经无从得知。</p>
+<p>图 16-3：消费者订阅状态机</p>
+<pre><code class="hljs mermaid">stateDiagram-v2
+    [*] --&gt; Syncing: 启动
+    Syncing --&gt; Watching: range 成功，last_rev = 响应头 revision
+    Watching --&gt; Watching: 事件到达，last_rev = max(mod_revision)
+    Watching --&gt; Broken: 流结束 / 套接字错误 / etcd 不可达
+    Broken --&gt; Watching: 重建 watch(start = last_rev + 1)，0.5s 退避
+    Watching --&gt; Syncing: canceled 且带 compact_revision（起点已压缩）
+    note right of Broken
+      负向对照：不带 start_revision 重建
+      → 断线期间的事件永久丢失
+    end note</code></pre>
+<h2 id="注册中心自身重启">注册中心自身重启</h2>
+<p>最后一个用例用 <code>kill -9</code> 停掉 etcd，5s 后重启。5s 比 TTL 长：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE etcd_restart_recovery  PASS etcd_down_s=5.0 A_ok_calls_while_down=100 A_caller_fail_while_down=0 providers=&#123;&#x27;p1&#x27;: &#x27;keepalive_resumed&#x27;, &#x27;p2&#x27;: &#x27;keepalive_resumed&#x27;, &#x27;p6&#x27;: &#x27;keepalive_resumed&#x27;&#125; watch_reopened_at=[21] ...<br></code></pre></td></tr></table></figure>
+<p>注册中心不可用期间，A 用内存里的地址集完成 100 次调用，没有失败。数据面并不依赖注册中心实时在线；如果消费者在注册中心不可达时清空地址集，一次注册中心故障就会扩大成全部调用失败。etcd 恢复后，三个提供者的续租都在原租约上恢复成功，没有出现 <code>lease_lost</code>，A 从 revision 21 续订，A、B 的地址集与注册中心一致。停机时间超过 TTL 而租约没有过期，这是本地 3.4.30 单成员实例上的观察结果。v3.4 的用户文档没有说明重启或换主时租约如何计时；较新版本的源码接口注释提到，新晋升的 leader 会为全部租约重新计算 TTL（<a target="_blank" rel="noopener" href="https://pkg.go.dev/go.etcd.io/etcd/server/v3/lease">etcd server/v3/lease，v3.7.2</a>）。3.4 的源码没有核对，多成员集群换主的情形也没有实验，这一条不能当作 3.4 的承诺来用。</p>
+<h2 id="三种方案的旧地址窗口">三种方案的旧地址窗口</h2>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>旧地址窗口的组成</th>
+<th>失败暴露方式</th>
+<th>不在本实验中</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>租约 + watch 推送（本实现）</td>
+<td>租约剩余寿命（≤ TTL）+ 过期检测（实测 0.22–0.49s）+ watch 投递；优雅退出时只有撤销与投递（实测 3ms）</td>
+<td>窗口内调用失败；断线不带 revision 续订时窗口无限</td>
+<td>多成员集群、分区</td>
+</tr>
+<tr>
+<td>客户端主动健康探测</td>
+<td>探测间隔 × 连续失败阈值 + 探测超时</td>
+<td>每个客户端独立判断，结论可能不一致；探测流量随“客户端 × 实例”增长</td>
+<td>未实验</td>
+</tr>
+<tr>
+<td>DNS + TTL 缓存</td>
+<td>记录 TTL + 各级缓存的剩余寿命 + 应用自身的解析缓存</td>
+<td>无删除通知，只能等缓存过期</td>
+<td>未实验</td>
+</tr>
+</tbody>
+</table>
+<p>DNS 的 TTL 是记录可以被缓存的最长时间，0 表示只用于当前事务、不得缓存，取值范围是 0 到 2³¹−1 秒（<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc1035.txt">RFC 1035 §3.2.1</a>、<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc2181.txt">RFC 2181 §8</a>）。TTL 只规定上限，解析器提前丢弃缓存是允许的；但上游没有任何机制通知下游“这条记录已失效”，所以旧地址窗口的上界是逐级缓存剩余寿命之和，而应用进程里的解析缓存往往不受 DNS TTL 约束。主动探测的窗口可以做得很短，代价是探测流量和判断不一致。租约方案的长处是删除事件集中产生、所有订阅者看到同一个 revision 序列，短处是窗口下限由 TTL 决定，而 TTL 不能小于续租间隔加上一次网络抖动。</p>
+<p>实践中这几种方案往往叠加使用：租约负责成员资格，本地剔除负责窗口内的失败，优雅退出负责把计划内下线的窗口压到毫秒级。</p>
+<h2 id="用例与证据">用例与证据</h2>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th>类型</th>
+<th>观察值（evidence/16/output.txt）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>normal_register_and_watch</code></td>
+<td>正常</td>
+<td>3 个地址，A 对每个地址都调用成功，0 次调用方失败</td>
+</tr>
+<tr>
+<td><code>graceful_stop_revokes_lease</code></td>
+<td>正常</td>
+<td>撤销后 3ms 删除到达</td>
+</tr>
+<tr>
+<td><code>sigstop_stale_window</code></td>
+<td>故障</td>
+<td>窗口 2892–3221ms；B 失败 6–7 次，A 为 0</td>
+</tr>
+<tr>
+<td><code>sigcont_detects_lease_loss</code></td>
+<td>恢复</td>
+<td>4–10ms 发现丢失，新租约重新注册</td>
+</tr>
+<tr>
+<td><code>negative_no_reregister</code></td>
+<td>负向对照</td>
+<td>服务正常但不可见</td>
+</tr>
+<tr>
+<td><code>kill9_stale_window</code></td>
+<td>故障</td>
+<td>窗口 2823ms；B 失败 19 次，A 为 0</td>
+</tr>
+<tr>
+<td><code>watch_resume_from_revision</code></td>
+<td>恢复</td>
+<td>从 17 续订，地址集一致</td>
+</tr>
+<tr>
+<td><code>negative_resume_from_now</code></td>
+<td>负向对照</td>
+<td>保留已删除的 p3，看不到 p5</td>
+</tr>
+<tr>
+<td><code>compaction_forces_resync</code></td>
+<td>边界</td>
+<td><code>compact_revision=20</code>，全量同步后一致</td>
+</tr>
+<tr>
+<td><code>etcd_restart_recovery</code></td>
+<td>恢复</td>
+<td>停机期间 100 次成功调用；恢复后一致</td>
+</tr>
+</tbody>
+</table>
+<p>环境：etcd 3.4.30（单成员独立实例）、Python 3.12.3，4 核（<code>evidence/16/env.txt</code>）。各进程的事件日志在 <code>evidence/16/*.log</code>，证据边界写在 <code>evidence/16/LIMITS.md</code>。这台机器的临时端口范围是 32768–61000，覆盖了实验使用的 4716x 端口。首次试跑时，消费者短连接留下的客户端 TIME_WAIT 占住了一个提供者端口，导致绑定失败；消费者改用 HTTP/1.1 长连接后，最终运行中没有再出现这个问题。</p>
+<h2 id="结论边界">结论边界</h2>
+<p>实验支持的结论：在 TTL 3s、续租间隔 1s 的设置下，暂停或崩溃的提供者在 2.8–3.3s 后被所有消费者删除，窗口可以用“租约剩余寿命 + 半秒以内的检测与投递”估算；优雅退出把窗口降到毫秒级；本地剔除加一次重试，能把窗口内的调用方可见失败降到 0，代价是延迟和额外流量；提供者恢复后必须检查租约并重新注册；消费者续订必须带 revision，起点被压缩时必须全量替换。</p>
+<p>没有证明的部分：多成员 etcd 集群、leader 切换与网络分区下的租约和 watch 行为；etcd 重启后租约不过期是否是 3.4 的保证；DNS 与主动探测两种方案的实测窗口。watch 断开是消费者主动关闭套接字模拟的，没有覆盖真实中间设备丢包和半开连接。</p>
+<p>第 15、16 两篇处理的都是“状态从一个权威位置复制到许多客户端”，客户端只保存派生副本。下一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-17-%E4%BB%8E%E6%8C%81%E4%B9%85%E6%97%A5%E5%BF%97%E6%9E%84%E5%BB%BA%E6%9C%80%E5%B0%8F%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/" title="后端系统工程 17：从持久日志构建最小消息队列">17 从持久日志构建最小消息队列</a> 换一个方向：由系统自己保存持久日志，确认、落盘和消费进度各自对应日志中的哪个位置。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-16-%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0%E4%B8%AD%E7%9A%84%E6%97%A7%E5%9C%B0%E5%9D%80/">https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-16-%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0%E4%B8%AD%E7%9A%84%E6%97%A7%E5%9C%B0%E5%9D%80/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/etcd/">etcd</a><a class="post-meta__tags" href="/tags/%E6%95%85%E9%9A%9C%E6%B3%A8%E5%85%A5/">故障注入</a><a class="post-meta__tags" href="/tags/%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0/">服务发现</a><a class="post-meta__tags" href="/tags/%E7%A7%9F%E7%BA%A6/">租约</a><a class="post-meta__tags" href="/tags/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B/">后端系统工程</a><a class="post-meta__tags" href="/tags/watch/">watch</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-126.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-26-%E7%A7%9F%E7%BA%A6%E4%BA%92%E6%96%A5%E4%B8%8E%E8%B5%84%E6%BA%90%E7%AB%AF%E6%A0%85%E6%A0%8F/" title="后端系统工程 26：租约互斥与资源端栅栏"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-14.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 26：租约互斥与资源端栅栏</div></div><div class="info-2"><div class="info-item-1">一个每日报表作业部署了多个实例，同一时刻只应有一个实例往报表输出库写结果。常见做法是在数据库里放一张租约表：谁抢到租约谁干活，租约到期没有续上就让给别人。这套做法能减少重复执行，但它本身不能阻止一种写入：实例 A 拿到租约、做完写前检查，然后整个进程停住；租约在停顿期间过期，实例 B 接手并写完；A 恢复后把手里那份已经过时的结果写了进去。A 自己无法察觉停顿，因为它恢复后执行的下一条指令就是“发出写请求”。 本篇的验收条件只有一条：暂停的旧持有者恢复后，无法写入受保护资源。实现上，租约在获取时原子地发出一个单调递增的 fencing token，受保护资源在写入的同一个原子操作里比较 token，拒绝比自己见过的最大值更小的请求。另外用同一时间线说明：资源端如果不检查 token，这个保证就不存在，再完善的租约也补不上。 需求、不变量与排除项 场景是合成的：报表作业 report-job 每天生成作用域 daily-report 下的若干分片（summary、detail），写入报表输出库。持有者标识形如 holder-a。 需要成立的不变量有三条：  I1，按数据库时钟，同一...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-19-%E5%BB%B6%E8%BF%9F%E4%BB%BB%E5%8A%A1%E7%9A%84%E9%A2%86%E5%8F%96%E4%B8%8E%E5%8F%96%E6%B6%88/" title="后端系统工程 19：延迟任务的领取与取消"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-102.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 19：延迟任务的领取与取消</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 18 消息队列接入与积压恢复 ｜ 本篇 19 ｜ 下一篇 20 发号服务的唯一性与失败模式 “三十分钟后关闭未支付的预约”“两小时后提醒参会者”，这类需求都可以写成一句话：到了某个时刻之后，执行一次某个动作。真正实现起来，这句话里的“到了”“执行”和“一次”都要重新定义。到期时刻由谁的时钟判断？多个执行者同时扫描时，谁拿到任务？执行者拿到任务后被杀死或被暂停，任务何时由别人接手？原执行者恢复后又提交结果，系统听谁的？取消请求与到期同时到达，返回给调用方的“已取消”究竟保证了什么？ 本篇用 PostgreSQL 保存任务，多个独立 JVM 进程担任执行者，用真实的 kill -9 和 SIGSTOP 制造执行者失联，逐一回答这些问题。结论先写在契约里：系统允许同一任务有多次执行尝试，“一次”只落在副作用上，并且要靠唯一约束或幂等键来保证。代码在 examples/19-delayed-tasks/，输出在 evidence/19/output.txt。 需求契约 调用方可以做两件事：安排一个任务（类型、载荷、延迟、最大尝试次数），以及取消一个任务。执行者可以做四件...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E01-%E5%9C%A8%E7%BA%BF%E7%8A%B6%E6%80%81%E4%B8%8E%E5%88%86%E5%B1%82%E5%BF%83%E8%B7%B3/" title="后端系统工程 E01：在线状态与分层心跳——一个带误差上界的观察结果"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-41.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 E01：在线状态与分层心跳——一个带误差上界的观察结果</div></div><div class="info-2"><div class="info-item-1"> 本文属于《后端系统工程：从接口契约到故障恢复》系列。文中提到的演练工程、测试与实验证据位于博客源码仓库的 batch-4/ 目录（examples/、evidence/ 等子目录）；业务数据均为合成数据。  “在线”看起来是一个布尔值，实际上是服务端对远端设备的一次推断。设备离开的方式不止一种：主动关闭连接、进入隧道导致连接半开、所在的接入网关整机宕掉。每一种方式被服务端察觉的路径不同，耗时也不同。服务端能承诺的不是“状态永远正确”，而是“从设备事实上离开，到对外发布离线，最多经过多久”。 本篇用受控时钟实现三层心跳：连接层探测、网关到存储的租约续期、用户级视图的去抖发布，并为每种离开方式推导和测量误差上界。隐私粒度作为同一视图的另一个维度一起处理。  1. 需求与规模假设  用户可以有多台设备；任一设备在线，用户即在线。 订阅者只看到被允许的粒度：精确（在线/离线 + 分钟级最近在线）、粗略（在线/最近/很久以前）、隐藏（未知）；非联系人与被拉黑者什么都看不到。 每种离开方式都有可计算的“发现离线”上界；正常心跳偶尔丢一次，不应导致误报离线。 设备换网关重连时，旧连接迟到的下...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-38-%E6%95%B0%E6%8D%AE%E5%A4%87%E4%BB%BD%E6%81%A2%E5%A4%8D%E4%B8%8E%E5%9C%B0%E5%9F%9F%E5%88%87%E6%8D%A2/" title="后端系统工程 38：数据备份、恢复与地域切换——恢复演练要检查数据，不只检查进程"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-95.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 38：数据备份、恢复与地域切换——恢复演练要检查数据，不只检查进程</div></div><div class="info-2"><div class="info-item-1"> 本文属于《后端系统工程：从接口契约到故障恢复》系列。文中提到的演练工程、测试与实验证据位于博客源码仓库的 batch-4/ 目录（examples/、evidence/ 等子目录）；业务数据均为合成数据。  “备份成功”是一条日志，“能恢复到指定时刻且数据正确”才是一项能力。两者之间隔着几个容易略过的问题：恢复点到底落在哪里，归档的 WAL 是否完整，恢复出来的实例里账是否平，角色和权限是否还在，切换之后旧主库会不会继续接受写入。 本篇在一台机器上启动多个隔离的 PostgreSQL 16 实例，实际执行基础备份、WAL 归档、按命名还原点的时间点恢复（PITR）、计划内切换和注入复制中断的非计划切换，每一步都用 SQL 检查数据本身。所有演练证明的是脚本与步骤在单机上可执行、检查项能发现错误；它们不证明跨地域网络、存储、DNS 或权限体系的行为。  1. 需求、目标与不变量 被保护的数据是一个合成的双边记账库：account(id, balance) 有 200 个账户，entry(request_id, account_id, amount, batch) 记录每笔转账的借...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-24-%E5%9C%A8%E7%BA%BF%E5%8F%98%E6%9B%B4%E7%9A%84%E6%95%B0%E6%8D%AE%E5%85%BC%E5%AE%B9/" title="后端系统工程 24：在线变更的数据兼容"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-171.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 24：在线变更的数据兼容</div></div><div class="info-2"><div class="info-item-1">在线修改表结构时，系统里同时存在一份正在变化的表定义和至少两个版本的应用代码。旧代码按旧列读写，新代码按新列读写，后台回填任务又在补写历史行。三方都在提交事务，任何一方都可能把另一方刚写下的值改掉。DDL 本身还要拿表锁，一条看起来只改元数据的 ALTER TABLE 也可能让整张表的普通查询排队。 本篇用一张合成工单表，把“整数优先级”迁成“文本优先级”，并在迁移后期引入一个旧格式表达不了的新取值。要回答的问题有三个：回填期间新写入的值怎样不被覆盖；旧代码还在只写旧列时，新列怎样不落后；从哪一步开始，回退到旧代码就会丢语义，系统怎样拒绝一次假装无损的回退。实验结论都在本地 PostgreSQL 16.15 上用真实事务、真实线程和独立进程验证，证据在 evidence/24/；只引用文档、没有实验的论断在文中单独标出。 需求、不变量与范围 合成表 ticket 有主键 id、标题 title 和整数列 priority，取值 1、2、3。目标结构用文本列 priority_level 表示优先级，取值 low、normal、high，迁移后期再允许 urgent。映射固定为 1...</div></div></div></a><a class="pagination-related" href="/2026/10/01/%E6%9C%8D%E5%8A%A1%E7%BD%91%E6%A0%BC-08-%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0DNS%E4%B8%8E%E7%AB%AF%E7%82%B9%E6%9B%B4%E6%96%B0/" title="服务网格 08：服务发现、DNS 与端点更新"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/01/%E6%9C%8D%E5%8A%A1%E7%BD%91%E6%A0%BC-08-%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0DNS%E4%B8%8E%E7%AB%AF%E7%82%B9%E6%9B%B4%E6%96%B0/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-01</div><div class="info-item-2">服务网格 08：服务发现、DNS 与端点更新</div></div><div class="info-2"><div class="info-item-1">DNS 回答没变，为什么请求的后端变了 第 02 篇区分 Service ClusterIP 与 Pod 端点；第 07 篇又增加了代理配置更新。现在让 inventory-v1 下线并增加 inventory-v2：DNS 仍可能答复同一个 Service 入口，而候选端点和代理路由的上游集合发生变化。若应用保留旧连接，某些请求继续打到旧实例；不能用一次 nslookup 的结果解释全部流量。  图中标了两条控制/发现线和一条业务连接线：应用查询 Service DNS；Kubernetes EndpointSlice 描述当前后端；网格控制面可能将相应服务发现变化下发给代理；实际 TCP 连接建立后又有独立生命周期。Istiod 不是业务请求转发节点。 三种“地址”不要混用 应用地址是 inventory 这个主机名加业务端口。普通 ClusterIP Service 的 DNS 回答通常指向稳定虚拟 IP，而不是此次选中的 Pod。EndpointSlice 存放候选后端地址及条件，节点 Service 数据面依据这些资源选择新连接的目标；网格的 Envoy 也可能拥有经控...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9C%80%E6%B1%82%E4%B8%8E%E4%B8%8D%E5%8F%98%E9%87%8F"><span class="toc-number">1.</span> <span class="toc-text">需求与不变量</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%84%E4%BB%B6%E4%B8%8E%E7%8A%B6%E6%80%81"><span class="toc-number">2.</span> <span class="toc-text">组件与状态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%97%A7%E5%9C%B0%E5%9D%80%E7%AA%97%E5%8F%A3"><span class="toc-number">3.</span> <span class="toc-text">旧地址窗口</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%AC%E5%9C%B0%E5%89%94%E9%99%A4%E4%B8%8E%E6%B3%A8%E5%86%8C%E4%B8%AD%E5%BF%83%E5%88%A0%E9%99%A4"><span class="toc-number">4.</span> <span class="toc-text">本地剔除与注册中心删除</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%81%A2%E5%A4%8D%E5%90%8E%E7%9A%84%E7%A7%9F%E7%BA%A6%E6%A3%80%E6%9F%A5"><span class="toc-number">5.</span> <span class="toc-text">恢复后的租约检查</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%8D%E6%BC%8F%E4%BA%8B%E4%BB%B6%EF%BC%9Arevision-%E7%BB%AD%E8%AE%A2%E4%B8%8E%E5%8E%8B%E7%BC%A9"><span class="toc-number">6.</span> <span class="toc-text">不漏事件：revision 续订与压缩</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%B3%A8%E5%86%8C%E4%B8%AD%E5%BF%83%E8%87%AA%E8%BA%AB%E9%87%8D%E5%90%AF"><span class="toc-number">7.</span> <span class="toc-text">注册中心自身重启</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E7%A7%8D%E6%96%B9%E6%A1%88%E7%9A%84%E6%97%A7%E5%9C%B0%E5%9D%80%E7%AA%97%E5%8F%A3"><span class="toc-number">8.</span> <span class="toc-text">三种方案的旧地址窗口</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E4%BE%8B%E4%B8%8E%E8%AF%81%E6%8D%AE"><span class="toc-number">9.</span> <span class="toc-text">用例与证据</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%93%E8%AE%BA%E8%BE%B9%E7%95%8C"><span class="toc-number">10.</span> <span class="toc-text">结论边界</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

@@ -1,0 +1,864 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>后端系统工程 19：延迟任务的领取与取消 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="系列导航：上一篇 18 消息队列接入与积压恢复 ｜ 本篇 19 ｜ 下一篇 20 发号服务的唯一性与失败模式 “三十分钟后关闭未支付的预约”“两小时后提醒参会者”，这类需求都可以写成一句话：到了某个时刻之后，执行一次某个动作。真正实现起来，这句话里的“到了”“执行”和“一次”都要重新定义。到期时刻由谁的时钟判断？多个执行者同时扫描时，谁拿到任务？执行者拿到任务后被杀死或被暂停，任务何时由别人接手？">
+<meta property="og:type" content="article">
+<meta property="og:title" content="后端系统工程 19：延迟任务的领取与取消">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-19-%E5%BB%B6%E8%BF%9F%E4%BB%BB%E5%8A%A1%E7%9A%84%E9%A2%86%E5%8F%96%E4%B8%8E%E5%8F%96%E6%B6%88/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="系列导航：上一篇 18 消息队列接入与积压恢复 ｜ 本篇 19 ｜ 下一篇 20 发号服务的唯一性与失败模式 “三十分钟后关闭未支付的预约”“两小时后提醒参会者”，这类需求都可以写成一句话：到了某个时刻之后，执行一次某个动作。真正实现起来，这句话里的“到了”“执行”和“一次”都要重新定义。到期时刻由谁的时钟判断？多个执行者同时扫描时，谁拿到任务？执行者拿到任务后被杀死或被暂停，任务何时由别人接手？">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-102.jpg">
+<meta property="article:published_time" content="2026-10-18T14:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T08:33:36.094Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="PostgreSQL">
+<meta property="article:tag" content="后端系统工程">
+<meta property="article:tag" content="延迟任务">
+<meta property="article:tag" content="栅栏令牌">
+<meta property="article:tag" content="租约">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-102.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "后端系统工程 19：延迟任务的领取与取消",
+  "url": "https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-19-%E5%BB%B6%E8%BF%9F%E4%BB%BB%E5%8A%A1%E7%9A%84%E9%A2%86%E5%8F%96%E4%B8%8E%E5%8F%96%E6%B6%88/",
+  "image": "https://magicliang.github.io/img/wall-paper-102.jpg",
+  "datePublished": "2026-10-18T14:00:00.000Z",
+  "dateModified": "2026-10-22T08:33:36.094Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-19-%E5%BB%B6%E8%BF%9F%E4%BB%BB%E5%8A%A1%E7%9A%84%E9%A2%86%E5%8F%96%E4%B8%8E%E5%8F%96%E6%B6%88/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '后端系统工程 19：延迟任务的领取与取消',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2016</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2094</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-102.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">后端系统工程 19：延迟任务的领取与取消</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">后端系统工程 19：延迟任务的领取与取消</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-18T14:00:00.000Z" title="Created 2026-10-18 22:00:00">2026-10-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-22T08:33:36.094Z" title="Updated 2026-10-22 16:33:36">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.9k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>17mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-22 16:33:36&quot;}" hidden></div><p>系列导航：上一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-18-%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97%E6%8E%A5%E5%85%A5%E4%B8%8E%E7%A7%AF%E5%8E%8B%E6%81%A2%E5%A4%8D/" title="后端系统工程 18：消息队列接入与积压恢复">18 消息队列接入与积压恢复</a> ｜ 本篇 19 ｜ 下一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-20-%E5%8F%91%E5%8F%B7%E6%9C%8D%E5%8A%A1%E7%9A%84%E5%94%AF%E4%B8%80%E6%80%A7%E4%B8%8E%E5%A4%B1%E8%B4%A5%E6%A8%A1%E5%BC%8F/" title="后端系统工程 20：发号服务的唯一性与失败模式">20 发号服务的唯一性与失败模式</a></p>
+<p>“三十分钟后关闭未支付的预约”“两小时后提醒参会者”，这类需求都可以写成一句话：到了某个时刻之后，执行一次某个动作。真正实现起来，这句话里的“到了”“执行”和“一次”都要重新定义。到期时刻由谁的时钟判断？多个执行者同时扫描时，谁拿到任务？执行者拿到任务后被杀死或被暂停，任务何时由别人接手？原执行者恢复后又提交结果，系统听谁的？取消请求与到期同时到达，返回给调用方的“已取消”究竟保证了什么？</p>
+<p>本篇用 PostgreSQL 保存任务，多个独立 JVM 进程担任执行者，用真实的 <code>kill -9</code> 和 <code>SIGSTOP</code> 制造执行者失联，逐一回答这些问题。结论先写在契约里：系统允许同一任务有多次执行尝试，“一次”只落在副作用上，并且要靠唯一约束或幂等键来保证。代码在 <code>examples/19-delayed-tasks/</code>，输出在 <code>evidence/19/output.txt</code>。</p>
+<h2 id="需求契约">需求契约</h2>
+<p>调用方可以做两件事：安排一个任务（类型、载荷、延迟、最大尝试次数），以及取消一个任务。执行者可以做四件事：领取到期任务、续租、报告完成、报告失败。系统对这些操作承诺：</p>
+<ul>
+<li>任务不会在 <code>due_at</code> 之前被领取，<code>due_at</code> 与租约期限都以数据库时钟为准。</li>
+<li>任务的同一次尝试只被一个执行者领取。每次领取都使 <code>attempt</code> 加一，这个值同时是本次尝试的栅栏令牌。</li>
+<li>只有持有当前 <code>attempt</code> 且租约未被收回的执行者能把任务改成完成或失败。迟到的提交被拒绝，不改变状态，也不写副作用。</li>
+<li>本地副作用与“完成”在同一事务中写入，每个任务最多一行。</li>
+<li>终态 DONE、CANCELLED、DEAD 不会再改变。</li>
+<li>取消的返回值准确描述取消时任务所处的阶段，调用方据此知道还可能发生什么。</li>
+</ul>
+<p>系统不承诺任务在到期的那一刻准时执行，延迟取决于轮询间隔和执行者负载；也不承诺执行恰好一次，执行者崩溃后，任务会被再次领取。外部系统上已经发生的效果无法撤回。</p>
+<p>规模假设全部是教学取值：3 个执行者进程；租约 1–2 秒，执行期间续租；轮询间隔 10–500 毫秒；索引实验中有 4 万行任务，其中 2 万行尚未到期。这些参数用于让故障在几秒内显现，不是推荐配置。</p>
+<h2 id="数据模型与状态机">数据模型与状态机</h2>
+<p>任务表的关键字段是 <code>state</code>、<code>due_at</code>、<code>attempt</code>、<code>lease_owner</code>、<code>lease_until</code> 和 <code>cancel_requested</code>。表上有一条检查约束：状态为 CLAIMED 当且仅当两个租约字段非空，使“执行中却没有租约”这类不一致在写入时就被拒绝。两条部分索引分别只覆盖等待中和执行中的任务：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">create</span> index task_due_idx   <span class="hljs-keyword">on</span> task (due_at)      <span class="hljs-keyword">where</span> state <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;SCHEDULED&#x27;</span>;<br><span class="hljs-keyword">create</span> index task_lease_idx <span class="hljs-keyword">on</span> task (lease_until) <span class="hljs-keyword">where</span> state <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;CLAIMED&#x27;</span>;<br></code></pre></td></tr></table></figure>
+<p>PostgreSQL 的部分索引只覆盖谓词选中的行（<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/indexes-partial.html">PostgreSQL 16 §11.8</a>）。已完成的历史任务不进入到期索引，索引大小与历史量无关。</p>
+<p>图 19-1：任务状态机（前置条件写在迁移上，拒绝路径见注释）</p>
+<pre><code class="hljs mermaid">stateDiagram-v2
+    [*] --&gt; SCHEDULED: schedule
+    SCHEDULED --&gt; CLAIMED: claim（due_at ≤ now()，SKIP LOCKED，attempt+1，写租约）
+    SCHEDULED --&gt; CANCELLED: cancel → 返回 CANCELLED
+    CLAIMED --&gt; DONE: complete（attempt 匹配且未请求取消）+ 同事务写 effect
+    CLAIMED --&gt; CLAIMED: cancel → 置 cancel_requested，返回 REQUESTED
+    CLAIMED --&gt; CANCELLED: complete / fail / 租约过期，且 cancel_requested
+    CLAIMED --&gt; SCHEDULED: fail 未用尽（退避后到期）/ 租约过期回收
+    CLAIMED --&gt; DEAD: fail 或租约过期，且尝试用尽
+    DONE --&gt; [*]
+    CANCELLED --&gt; [*]
+    DEAD --&gt; [*]
+    note right of CLAIMED
+      attempt 不匹配的 complete / fail / extend：
+      REJECTED_STALE 或 false，状态与副作用不变
+      对终态 cancel：TOO_LATE 或 ALREADY_CANCELLED
+    end note</code></pre>
+<h2 id="原子领取">原子领取</h2>
+<p>领取要在一条语句里完成四件事：找出到期任务，跳过别的执行者已经锁住的行，把状态改为 CLAIMED 并写入租约，令 <code>attempt</code> 加一。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">update</span> task t<br>   <span class="hljs-keyword">set</span> state <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;CLAIMED&#x27;</span>, attempt <span class="hljs-operator">=</span> t.attempt <span class="hljs-operator">+</span> <span class="hljs-number">1</span>, lease_owner <span class="hljs-operator">=</span> ?,<br>       lease_until <span class="hljs-operator">=</span> clock_timestamp() <span class="hljs-operator">+</span> ? <span class="hljs-operator">*</span> <span class="hljs-type">interval</span> <span class="hljs-string">&#x27;1 millisecond&#x27;</span><br> <span class="hljs-keyword">where</span> t.id <span class="hljs-keyword">in</span> (<span class="hljs-keyword">select</span> id <span class="hljs-keyword">from</span> task<br>                 <span class="hljs-keyword">where</span> state <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;SCHEDULED&#x27;</span> <span class="hljs-keyword">and</span> due_at <span class="hljs-operator">&lt;=</span> now()<br>                 <span class="hljs-keyword">order</span> <span class="hljs-keyword">by</span> due_at<br>                 <span class="hljs-keyword">for</span> <span class="hljs-keyword">update</span> <span class="hljs-keyword">skip</span> locked<br>                 limit ?)<br>   <span class="hljs-keyword">and</span> t.state <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;SCHEDULED&#x27;</span><br>returning t.id, t.kind, t.payload, t.attempt, t.due_at<br></code></pre></td></tr></table></figure>
+<p>PostgreSQL 文档说明，<code>SKIP LOCKED</code> 会跳过不能立即加锁的行，由此得到的数据视图不一致，因此不适合一般用途，但适合多个消费者访问队列类表的场景（<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/sql-select.html">PostgreSQL 16 SELECT，锁定子句</a>）。同一页还指出，在 READ COMMITTED 下，带 <code>ORDER BY</code> 和锁定子句的 <code>SELECT</code> 可能返回乱序的行。所以 <code>order by due_at</code> 只让较早到期的任务大致先被领取，不构成严格的到期顺序保证，契约里也没有承诺顺序。外层的 <code>t.state = 'SCHEDULED'</code> 是第二道检查：并发更新提交后，READ COMMITTED 下的 <code>UPDATE</code> 会对新版本重新评估 <code>WHERE</code> 条件（<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/transaction-iso.html">PostgreSQL 16 §13.2.1</a>），已被别人改走的行不会被再改一次。</p>
+<p>到期条件用 <code>now()</code> 而不用 <code>clock_timestamp()</code>，这是有意的选择。<code>now()</code> 返回当前事务的开始时刻（<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/functions-datetime.html">PostgreSQL 16 §9.9.5</a>），属于 STABLE 函数，可以作为索引扫描条件；<code>clock_timestamp()</code> 是 VOLATILE，文档说明这类函数不能用作索引扫描的比较值（<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/xfunc-volatility.html">PostgreSQL 16 §38.7</a>）。<code>boundary_partial_due_index</code> 在 4 万行任务、其中 2 万行未到期的表上比较两种写法的执行计划：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">now()            → Index Scan using task_due_idx … Index Cond: (due_at &lt;= now())  Buffers: shared hit=2<br>clock_timestamp()→ Index Scan using task_due_idx … Filter: (… due_at &lt;= clock_timestamp())<br>                   Rows Removed by Filter: 20000  Buffers: shared hit=304<br></code></pre></td></tr></table></figure>
+<p>没有到期任务时，前者读 2 个缓冲块；后者把 2 万行未到期任务逐行过滤一遍，读 304 个缓冲块。执行者每隔几十毫秒空轮询一次，这个差别会乘以轮询频率。领取在自动提交下单语句执行，<code>now()</code> 就等于语句开始时刻，不会因为长事务而停留在过去。</p>
+<h3 id="对照：先查询-再更新">对照：先查询，再更新</h3>
+<p>另一种直观写法分两步：先 <code>SELECT</code> 出到期任务的 id，再按 id 执行 <code>UPDATE</code>，第二步不带状态条件，也不加行锁。<code>negative_naive_select_then_update</code> 让 3 个进程用这种写法处理 300 个任务：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE negative_naive_select_then_update  PASS expectDuplicate tasks=300 claims=408 tasksClaimedMoreThanOnce=83 byMultipleWorkers=83 effects=408 duplicateEffects=108<br>CASE control_skip_locked_same_load      PASS tasks=300 claims=300 tasksClaimedMoreThanOnce=0 byMultipleWorkers=0 effects=300 duplicateEffects=0<br></code></pre></td></tr></table></figure>
+<p>83 个任务被不止一个进程领取，副作用多出 108 条（这个对照写入的是没有唯一约束的副作用表，以便把重复暴露出来）。同样负载下改用原子领取，300 个任务恰好对应 300 次领取。两步之间的窗口里，多个进程读到同一批“仍在等待”的行，各自都认为自己领到了。</p>
+<p>正常路径 <code>normal_three_workers</code> 中，3 个进程处理 300 个任务，完成 300、副作用 300、领取 300，重复领取 0，最小延迟 0.5ms，即没有任务早于 <code>due_at</code> 被领取。同一行还给出了本机这次运行的延迟分位，p50 为 37.0ms，p99 为 143.3ms。它们只描述这一次运行，当时机器上还有其他章节的实验，不能拿来外推。</p>
+<h2 id="租约与栅栏">租约与栅栏</h2>
+<p>执行者领取任务后可能崩溃，也可能只是停住：垃圾回收暂停、进程被挂起、所在主机过载。数据库无法区分这两种情况，它只知道租约到期了。租约到期后，回收语句把任务改回 SCHEDULED（或在尝试用尽时改为 DEAD），任务可以被再次领取。</p>
+<p>租约最早作为分布式缓存一致性机制提出。Gray 与 Cheriton 在 SOSP 1989 的论文中写道，非拜占庭故障只影响性能而不影响正确性，同时也指出租约依赖行为良好的时钟。本实现让到期与租约都只使用数据库时钟，执行者本地只用 <code>System.nanoTime</code> 安排续租节奏；Java 文档说明，该值只能用来测量经过的时间，与墙钟无关（<a target="_blank" rel="noopener" href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/System.html">Java SE 21 System</a>）。</p>
+<p>租约只回答“何时允许别人接手”，回答不了“旧执行者恢复后怎么办”。被挂起的进程恢复时，并不知道自己的租约已被收回，它会继续执行，然后提交。阻止这次提交的是栅栏令牌：完成语句只在 <code>attempt</code> 与领取时拿到的值一致、状态仍是 CLAIMED 时才生效，副作用的插入放在同一事务中，并且只在更新命中一行后执行。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-comment">// TaskStore.complete（同一事务）</span><br>update task <span class="hljs-type">set</span> <span class="hljs-variable">state</span> <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;DONE&#x27;</span>, result = ?, lease_owner = <span class="hljs-literal">null</span>, lease_until = <span class="hljs-literal">null</span><br> <span class="hljs-type">where</span> <span class="hljs-variable">id</span> <span class="hljs-operator">=</span> ? <span class="hljs-type">and</span> <span class="hljs-variable">attempt</span> <span class="hljs-operator">=</span> ? <span class="hljs-type">and</span> <span class="hljs-variable">state</span> <span class="hljs-operator">=</span> <span class="hljs-string">&#x27;CLAIMED&#x27;</span> and not cancel_requested;<br><span class="hljs-comment">// 命中 1 行 → insert into effect(task_id, attempt, worker) → commit → DONE</span><br><span class="hljs-comment">// 命中 0 行 → 若本次尝试被请求取消则转 CANCELLED，否则 REJECTED_STALE</span><br></code></pre></td></tr></table></figure>
+<p>用单调递增的代号让资源一侧拒绝旧持有者，这个思路在锁服务的文献中也有讨论（例如 Burrows 关于 Chubby 的 OSDI 2006 论文中的 sequencer）。该论文原文在本环境无法访问，这里只借用这个通用概念。本实现中，资源就是任务行本身，因此栅栏由同一条 <code>UPDATE</code> 的条件执行，不需要额外协调。</p>
+<p>图 19-2：执行者被挂起超过租约后的时序（确认点为数据库提交）</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant A as 执行者 A（attempt=1）
+    participant DB as PostgreSQL task 行
+    participant B as 执行者 B
+    A-&gt;&gt;DB: claim → attempt=1，lease_until=t+1s
+    Note over A: SIGSTOP，续租停止
+    Note over DB: lease_until 过期
+    B-&gt;&gt;DB: reclaimExpired → SCHEDULED
+    B-&gt;&gt;DB: claim → attempt=2
+    B-&gt;&gt;DB: complete(attempt=2) + effect，提交 → DONE
+    Note over A: SIGCONT
+    A-&gt;&gt;DB: extend(attempt=1) → 0 行（租约已失）
+    A-&gt;&gt;DB: complete(attempt=1) → 0 行
+    DB--&gt;&gt;A: REJECTED_STALE，结果与 effect 不变</code></pre>
+<p>两个故障用例的输出：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE crash_kill9_lease_retry        PASS exitA=137 stolenWhileAliveAndRenewing=0 killToReclaimMs=753 task=[DONE,2] claims=[1,kA | 2,kB] effect=[2,kB]<br>CASE sigstop_late_commit_rejected   PASS afterB=[DONE,2,by sB attempt 2] final=[DONE,2,by sB attempt 2] oldWorker=[COMMIT task=1 attempt=1 outcome=REJECTED_STALE leaseLostSeen=true] effect=[2,sB]<br>CASE negative_unfenced_late_commit  PASS expectOverwriteAndDuplicate afterB=[DONE,2,by sB attempt 2] final=[DONE,2,by sA attempt 1] effectsNoUnique=2 oldWorker=[COMMIT task=1 attempt=1 outcome=DONE leaseLostSeen=true]<br></code></pre></td></tr></table></figure>
+<p><code>kill -9</code> 用例里，A 存活并续租期间，B 一次也没有领到（<code>stolenWhileAliveAndRenewing=0</code>）。A 被杀后 753ms，任务被回收（租约 1 秒），由 B 以 attempt=2 完成，副作用只有 attempt=2 的一行。挂起用例中，A 恢复后自己发现了租约丢失，但仍按代码路径尝试提交，结果被拒绝，任务结果仍署名 B。去掉栅栏的对照里，同样的时序让旧执行者把结果覆盖成 attempt 1 的值，副作用写了两条。注意 <code>leaseLostSeen=true</code> 在对照中同样出现：执行者自己察觉租约丢失并不能保护数据，必须由数据库一侧拒绝。</p>
+<h2 id="取消">取消</h2>
+<p>取消只有一条 <code>UPDATE</code>：等待中的任务直接变为 CANCELLED；执行中的任务只置 <code>cancel_requested</code>，状态保持 CLAIMED；更新不到任何行时，再读一次终态来区分“已完成”“已取消”和“不存在”。返回值是契约的一部分：</p>
+<table>
+<thead>
+<tr>
+<th>返回值</th>
+<th>取消时的阶段</th>
+<th>调用方能依赖的结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CANCELLED</code></td>
+<td>等待中</td>
+<td>任务不会再执行，不会有副作用</td>
+</tr>
+<tr>
+<td><code>REQUESTED</code></td>
+<td>执行中</td>
+<td>本地副作用不会提交，最终状态为 CANCELLED；执行者已经发出的外部调用无法收回</td>
+</tr>
+<tr>
+<td><code>TOO_LATE</code></td>
+<td>已 DONE 或 DEAD</td>
+<td>取消无效，副作用（如有）已经发生</td>
+</tr>
+<tr>
+<td><code>ALREADY_CANCELLED</code> / <code>NOT_FOUND</code></td>
+<td>—</td>
+<td>幂等重复 / 任务不存在</td>
+</tr>
+</tbody>
+</table>
+<p>执行者续租时检查 <code>not cancel_requested</code>，续租失败就停止；即使执行者没有及时察觉，完成语句同样带着这个条件，命中 0 行后把任务转为 CANCELLED。<code>cancel_semantics</code> 逐一检查了上表：等待中取消返回 CANCELLED，再次取消返回 ALREADY_CANCELLED，执行中取消返回 REQUESTED，之后续租返回 false、提交得到 CANCELLED_BEFORE_COMMIT，最终状态 CANCELLED，副作用 0 条。</p>
+<p>到期与取消同时发生时，结果必须落在允许的集合里。<code>race_due_vs_cancel</code> 运行 200 轮，每轮让取消请求在任务到期附近发出：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE race_due_vs_cancel  PASS rounds=200 violations=0 outcomes=&#123;CANCELLED/CANCELLED/effects=0=96, REQUESTED/CANCELLED/effects=0=77, TOO_LATE/DONE/effects=1=27&#125;<br></code></pre></td></tr></table></figure>
+<p>三种组合分别是：领取前取消；执行中取消，本地副作用未提交；完成后取消，取消返回太晚、副作用一条。“返回已取消却产生了副作用”或“返回太晚却没有副作用”的组合一次也没有出现。三类结果的比例随调度变化，断言只检查违例数为 0。</p>
+<h2 id="副作用的去重边界">副作用的去重边界</h2>
+<p>本地副作用写在同一个数据库里，靠“完成”事务和 <code>effect.task_id</code> 主键保证每个任务至多一行。外部副作用（调用另一个服务、发送一条通知）不在这个事务里，执行者只能把幂等键交给外部服务，由对方去重。键的取法决定了重复执行时会发生什么：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE ext_key_per_task_dedup        PASS crashedWorkers=1 task=[DONE,2] localEffects=1 externalApplied=1 keysSeen=[task-1]<br>CASE ext_key_per_attempt_duplicates PASS expectDuplicate crashedWorkers=1 task=[DONE,2] localEffects=1 externalApplied=2 keysSeen=[task-1-a1, task-1-a2]<br>CASE cancel_after_external_call    PASS cancel=REQUESTED final=CANCELLED localEffects=0 externalApplied=1<br></code></pre></td></tr></table></figure>
+<p>两组用例都让第一次尝试在调用外部服务之后、提交之前崩溃。键取任务 id 时，第二次尝试带着同一个键，外部只生效一次。键取“任务 + 尝试”时，两次尝试的键不同，外部生效两次，尽管本地副作用仍只有一行。第三个用例说明取消的边界：外部调用已经发出后再取消，返回 REQUESTED，本地不提交，而外部效果已经发生。按任务取键的前提是外部服务真的持久地按键去重，实验中的假服务把去重表放在内存里，重启即丢失，这一点只用来演示键的取法，不代表外部服务的持久性。</p>
+<h2 id="失败与重试">失败与重试</h2>
+<p>执行者报告失败时，同样受栅栏约束。尝试未用尽时，任务回到 SCHEDULED，<code>due_at</code> 推迟 <code>backoff × 2^(attempt−1)</code>；用尽时转为 DEAD；已请求取消时转为 CANCELLED。<code>retry_backoff_then_done</code> 让前两次尝试注入失败，退避基数为 200ms，任务在第 3 次完成；相邻两次领取的间隔为 274ms 和 423ms，分别不短于 200ms 和 400ms 的退避值，副作用 1 条。<code>retry_exhausted_dead</code> 让每次尝试都失败，第 3 次后进入 DEAD，副作用 0 条。</p>
+<h2 id="到期发现：轮询与时间轮">到期发现：轮询与时间轮</h2>
+<p>执行者发现到期任务的方式决定了延迟与数据库负载之间的权衡。数据库轮询最简单：每隔固定间隔执行一次领取语句。<code>poll_interval_tradeoff</code> 在本机比较了两个间隔：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">poll=50ms  &#123;p50=17.2 p99=57.4 max=74.7 claimQueries=134&#125;<br>poll=500ms &#123;p50=274.4 p99=501.6 max=503.6 claimQueries=20&#125;<br></code></pre></td></tr></table></figure>
+<p>间隔放大 10 倍，领取查询次数（含空轮询）从 134 降到 20，最大延迟从约 75ms 升到约 504ms，上界大致等于轮询间隔。数字只描述这一次本机运行，但形状是确定的：轮询方案的延迟上界由间隔决定，空轮询的开销与间隔成反比，有了部分索引之后每次空轮询只读少量缓冲块。</p>
+<p>另一种方案是进程内分层时间轮。Varghese 与 Lauck 在 SOSP 1987 提出时间轮（扩展版发表于 IEEE/ACM Transactions on Networking 1997）：在轮的覆盖范围内，启动和停止定时器都是常数时间；分层结构用多层不同粒度的轮覆盖更大的时间范围。本章实现了一个 3 层、每层 64 槽的模型，用受控时钟检验（输出标注 <code>model=in-process-wheel</code>）：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE wheel_fire_exact_tick          PASS model=in-process-wheel timers=20000 cancelled=4026 fired=15974 wrongTick=0 missed=0 dup=0 cascades=31430 remaining=0<br>CASE wheel_horizon_rejected         PASS model=in-process-wheel scheduleAtSpan=[beyond wheel horizon: delta=262144] scheduleAtSpanMinus1=accepted<br>CASE wheel_restart_needs_durable    PASS model=in-process-wheel tasks=2000 crashAtTick=274489 inWheelAtCrash=649 notYetLoaded=647 afterRebuild&#123;never=0 executedTwice=5 moreThanTwice=0&#125;<br></code></pre></td></tr></table></figure>
+<p>2 万个定时器在推进中被取消约两成，其余每个都恰好在到期 tick 触发，没有遗漏和重复。超出视界 64³ tick 的定时器被拒绝。第三个用例说明时间轮不能单独成为事实来源：崩溃时轮中有 649 个定时器，另有 647 个尚未装入，它们只存在于持久层；只有从持久层按“视界内到期”重新装入，才没有任务永远不执行（<code>never=0</code>），而崩溃前已触发但尚未落盘完成的 5 个任务会再执行一次。</p>
+<p>两种方案因此不是二选一。时间轮可以降低到期发现的延迟和空轮询，但它的内容是持久层的缓存，崩溃后必须重建，重建后的重复执行仍然要靠本章的栅栏和副作用去重处理。本章没有实现“时间轮 + 数据库”的混合调度，只用模型说明了它需要满足的条件。</p>
+<h2 id="用例与证据">用例与证据</h2>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th>类型</th>
+<th>观察值（evidence/19/output.txt）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>normal_three_workers</code></td>
+<td>正常，多进程</td>
+<td>300 任务，领取 300、副作用 300、重复 0</td>
+</tr>
+<tr>
+<td><code>boundary_not_before_due</code> / <code>boundary_claim_limit</code></td>
+<td>边界</td>
+<td>到期前领取 0 次；批量上限 10,10,5,0</td>
+</tr>
+<tr>
+<td><code>boundary_partial_due_index</code></td>
+<td>边界，执行计划</td>
+<td><code>now()</code> 读 2 块，<code>clock_timestamp()</code> 读 304 块</td>
+</tr>
+<tr>
+<td><code>cancel_semantics</code> / <code>race_due_vs_cancel</code></td>
+<td>取消</td>
+<td>返回值逐项符合；200 轮违例 0</td>
+</tr>
+<tr>
+<td><code>retry_backoff_then_done</code> / <code>retry_exhausted_dead</code></td>
+<td>失败重试</td>
+<td>第 3 次完成；用尽后 DEAD</td>
+</tr>
+<tr>
+<td><code>crash_kill9_lease_retry</code></td>
+<td>崩溃恢复</td>
+<td>被杀后 753ms 回收，attempt=2 完成</td>
+</tr>
+<tr>
+<td><code>sigstop_late_commit_rejected</code></td>
+<td>迟到提交</td>
+<td>REJECTED_STALE，结果未被覆盖</td>
+</tr>
+<tr>
+<td><code>negative_unfenced_late_commit</code></td>
+<td>负向对照</td>
+<td>结果被旧执行者覆盖，副作用 2 条</td>
+</tr>
+<tr>
+<td><code>negative_naive_select_then_update</code> / 对照</td>
+<td>负向对照</td>
+<td>83 个任务重复领取；原子领取 0</td>
+</tr>
+<tr>
+<td><code>ext_key_*</code> / <code>cancel_after_external_call</code></td>
+<td>外部副作用</td>
+<td>按任务取键生效 1 次，按尝试取键 2 次</td>
+</tr>
+<tr>
+<td><code>poll_interval_tradeoff</code></td>
+<td>方案对比</td>
+<td>见上文</td>
+</tr>
+<tr>
+<td><code>wheel_*</code></td>
+<td>模型</td>
+<td>精确触发；超视界拒绝；重建后不丢、5 个重复</td>
+</tr>
+</tbody>
+</table>
+<p>入口为 <code>examples/19-delayed-tasks/run.sh</code>，环境见 <code>evidence/19/env.txt</code>。<code>kill -9</code>、<code>SIGSTOP</code> 两个用例依赖 1 秒租约和 0.3–1.5 秒的等待，机器负载过高时可能需要放宽等待时间，但断言本身不需要放宽。</p>
+<h2 id="结论边界">结论边界</h2>
+<p>实验支持以下结论：在单个 PostgreSQL 实例上，原子领取保证同一次尝试只被一个执行者领取；<code>attempt</code> 栅栏使崩溃或挂起后迟到的提交无法改写结果或重复写入本地副作用；取消的四种返回值与最终状态、副作用一致；外部副作用的重复与否取决于幂等键是否跨尝试保持不变。</p>
+<p>实验没有覆盖数据库主备切换、网络分区和执行者与数据库之间的半开连接，也没有在多台机器上检验时钟偏差。由于到期与租约都只使用数据库时钟，执行者的本地时钟只影响续租节奏；数据库切换到另一台时钟有偏差的主机时会发生什么，不在本章证据之内。文中的延迟数字都不应外推。</p>
+<p>本章的栅栏令牌依赖一个单调递增的整数。下一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-20-%E5%8F%91%E5%8F%B7%E6%9C%8D%E5%8A%A1%E7%9A%84%E5%94%AF%E4%B8%80%E6%80%A7%E4%B8%8E%E5%A4%B1%E8%B4%A5%E6%A8%A1%E5%BC%8F/" title="后端系统工程 20：发号服务的唯一性与失败模式">20 发号服务的唯一性与失败模式</a> 讨论更一般的问题：在多进程、进程重启和时钟回退下，怎样产生不重复的标识，以及“不重复”的范围到底有多大。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-19-%E5%BB%B6%E8%BF%9F%E4%BB%BB%E5%8A%A1%E7%9A%84%E9%A2%86%E5%8F%96%E4%B8%8E%E5%8F%96%E6%B6%88/">https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-19-%E5%BB%B6%E8%BF%9F%E4%BB%BB%E5%8A%A1%E7%9A%84%E9%A2%86%E5%8F%96%E4%B8%8E%E5%8F%96%E6%B6%88/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/PostgreSQL/">PostgreSQL</a><a class="post-meta__tags" href="/tags/%E7%A7%9F%E7%BA%A6/">租约</a><a class="post-meta__tags" href="/tags/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B/">后端系统工程</a><a class="post-meta__tags" href="/tags/%E5%BB%B6%E8%BF%9F%E4%BB%BB%E5%8A%A1/">延迟任务</a><a class="post-meta__tags" href="/tags/%E6%A0%85%E6%A0%8F%E4%BB%A4%E7%89%8C/">栅栏令牌</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-102.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-26-%E7%A7%9F%E7%BA%A6%E4%BA%92%E6%96%A5%E4%B8%8E%E8%B5%84%E6%BA%90%E7%AB%AF%E6%A0%85%E6%A0%8F/" title="后端系统工程 26：租约互斥与资源端栅栏"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-14.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 26：租约互斥与资源端栅栏</div></div><div class="info-2"><div class="info-item-1">一个每日报表作业部署了多个实例，同一时刻只应有一个实例往报表输出库写结果。常见做法是在数据库里放一张租约表：谁抢到租约谁干活，租约到期没有续上就让给别人。这套做法能减少重复执行，但它本身不能阻止一种写入：实例 A 拿到租约、做完写前检查，然后整个进程停住；租约在停顿期间过期，实例 B 接手并写完；A 恢复后把手里那份已经过时的结果写了进去。A 自己无法察觉停顿，因为它恢复后执行的下一条指令就是“发出写请求”。 本篇的验收条件只有一条：暂停的旧持有者恢复后，无法写入受保护资源。实现上，租约在获取时原子地发出一个单调递增的 fencing token，受保护资源在写入的同一个原子操作里比较 token，拒绝比自己见过的最大值更小的请求。另外用同一时间线说明：资源端如果不检查 token，这个保证就不存在，再完善的租约也补不上。 需求、不变量与排除项 场景是合成的：报表作业 report-job 每天生成作用域 daily-report 下的若干分片（summary、detail），写入报表输出库。持有者标识形如 holder-a。 需要成立的不变量有三条：  I1，按数据库时钟，同一...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-35-%E6%96%87%E4%BB%B6%E4%B8%8A%E4%BC%A0%E4%B8%8E%E5%BC%82%E6%AD%A5%E5%A4%84%E7%90%86/" title="后端系统工程 35：文件上传与异步处理"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-151.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 35：文件上传与异步处理</div></div><div class="info-2"><div class="info-item-1">一次文件上传跨越两个互不共享事务的存储：字节落在文件系统或对象存储里，文件名、归属、处理进度落在数据库里。两边各自可以做到原子，合起来却没有一次提交能同时覆盖它们。于是有三种残局必须单独处理：字节写完了、元数据没提交，字节成了没人认领的孤儿；后台处理任务因为租约过期被执行了两次，发布动作也跟着做了两次；处理还没结束，读取接口已经把文件交了出去。示例实现基于 Java 21、PostgreSQL 16 和一个本地目录替身，覆盖从分块上传到发布读取的完整链路，三种残局分别用崩溃、重复执行和提前读取的实验构造出来。 需求与范围 操作有七个：创建上传会话、上传分块、完成上传、提交元数据、中止会话、读取文件，以及后台的处理与回收。客户端在创建会话时声明分块数、总字节数和整体 SHA-256，分块可以乱序、可以重传。 业务不变量：  F1 字节不丢、不错。任何进入内容地址 blobs/sha256/&lt;hex&gt; 的文件，其内容的 SHA-256 等于 &lt;hex&gt;；任何被 file_object 引用的 blob 在回收后仍然存在。 F2 孤儿可回收。字节已经写入但元数据...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-34-%E5%8F%AF%E6%92%A4%E9%94%80%E7%9F%AD%E9%93%BE%E4%B8%8E%E8%AE%BF%E9%97%AE%E7%BB%9F%E8%AE%A1/" title="后端系统工程 34：可撤销短链与访问统计"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-165.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 34：可撤销短链与访问统计</div></div><div class="info-2"><div class="info-item-1">短链服务的主路径只有一次查表和一个 3xx 响应，难点在三个容易被忽略的边界：两个创建者同时申请同一个别名时谁的目标留下；所有者撤销一条短链之后，旧目标还会被返回多久；统计库变慢或不可用时，跳转是否跟着变慢。实现是一个 Java 21 + PostgreSQL 16 的最小服务，三个问题各自对应一组可执行的断言。 需求与范围 操作只有五种：创建随机码短链、创建自定义别名、撤销、按码访问、记录点击。过期时间在创建时写定，之后不改；目标地址创建后不可修改，需要改目标就撤销旧码再建新码。 业务不变量：  I1 码唯一且不覆盖。一个码最多对应一个目标；任何被告知“创建成功”的调用方，其提交的目标就是库中该码的目标。 I2 撤销有界生效。撤销事务提交后，返回旧目标的 302 只会在一个可计算的窗口内出现，窗口上界由缓存参数决定，并且可以测量。 I3 统计不阻塞跳转。统计库连接失败、表锁等待或写入超时，不改变重定向的状态码，请求线程也不等待统计侧的连接或锁。 I4 点击至多计一次。同一次点击因重试被写入多次时，统计表里只有一行。点击可以因队列满而丢弃，但丢弃数必须被计数。  明确排除：账号与...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-31-Feed%E7%9A%84%E6%89%87%E5%87%BA%E6%88%90%E6%9C%AC%E4%B8%8E%E7%83%AD%E7%82%B9/" title="后端系统工程 31：Feed 的扇出成本与热点"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-131.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 31：Feed 的扇出成本与热点</div></div><div class="info-2"><div class="info-item-1">首页 Feed 要回答一个问题：读者当前关注的作者里，最近发了哪些读者有权看的帖子，按什么顺序排，翻到第二页时从哪里接着读。工程上的争议集中在“候选什么时候算出来”。发帖时把帖子写进每个粉丝的收件箱（推），代价落在写路径上，并且和作者粉丝数成正比；读 Feed 时现场到每个被关注作者的时间线里取（拉），代价落在读路径上，和读者关注的作者数成正比；按作者粉丝数分档（混合），则把两种代价按阈值切开。粉丝数呈重尾分布时，少数热点作者决定了推方案的写入峰值，也决定了拉方案里被反复读取的那几条时间线。 另一层要求来自第 30 篇：关注关系是一种授权。收件箱里的行是发帖时刻算出的候选，读者之后取消关注、被拉黑、帖子改成仅自己可见，这些行不会自己消失。如果读路径直接把物化的收件箱行返回给读者，撤销就被绕过了。 本章工程在 examples/social 的 social.feed 包中，复用第 30 篇 social.rel 的关系表、RelationService 与 AccessCheck，全部用例跑在真实 PostgreSQL 16.15 上。验收目标有两条：在同一张合成关注图上比较推、...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-20-%E5%8F%91%E5%8F%B7%E6%9C%8D%E5%8A%A1%E7%9A%84%E5%94%AF%E4%B8%80%E6%80%A7%E4%B8%8E%E5%A4%B1%E8%B4%A5%E6%A8%A1%E5%BC%8F/" title="后端系统工程 20：发号服务的唯一性与失败模式"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-77.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 20：发号服务的唯一性与失败模式</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 19 延迟任务的领取与取消 ｜ 本篇 20 ｜ 下一篇 21 有限能力的数据库路由代理 “生成一个唯一 ID”这句话省略了三个限定：在多大范围内唯一，在哪些故障之后仍然唯一，除了唯一还要求什么。一张订单表的主键只需在该表内不重复；跨系统传递的标识要在所有系统中不重复；作为分片键或排序键时，还会被要求大致按时间递增。不同方案对这些问题的回答不同，它们的失败模式也不同：数据库号段在进程崩溃后留下空洞，时间型标识在时钟回退时可能重复，节点号方案在两个进程误用同一节点号时必然重复。 本篇实现一个基于 PostgreSQL 的号段发号器，作为主方案验证并发取号、进程重启、数据库故障下的唯一性；再实现 UUIDv4、UUIDv7 和 Snowflake 式 64 位标识作为契约对照，用受控时钟测试时钟回退，用真实多进程测试节点号冲突。代码在 examples/20-id-service/，输出在 evidence/20/output.txt。 需求契约 号段服务的使用方只调用一个操作：为某个业务标签取下一个号。服务承诺：  同一业务标签下发出的号全局唯一，这一点在发号进程崩...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-33-%E9%80%9A%E7%9F%A5%E6%B8%A0%E9%81%93%E7%9A%84%E7%BB%93%E6%9E%9C%E6%9C%AA%E7%9F%A5/" title="后端系统工程 33：通知渠道的结果未知"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-9.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 33：通知渠道的结果未知</div></div><div class="info-2"><div class="info-item-1">通知服务调用外部渠道时，最难处理的结果是“没有结果”：请求发出去了，响应没回来。渠道可能根本没收到，也可能已经接受并开始外发，只是响应在路上丢了。本地数据库能把“同一事件只生成一条逻辑通知”做成硬约束，却无法替外部渠道保证“用户只收到一次”。本篇用一个最小通知服务把这两件事分开：逻辑去重由唯一约束负责，外部重复由渠道契约决定，结果未知要作为一种持久状态记录下来，并且有出口。 需求与范围 业务方提交事件，例如“订单 ord-1001 已发货”，通知服务按用户偏好为每个启用渠道生成投递任务，由工作进程领取后调用渠道。要满足的条件如下。  同一 (user_id, event_key) 无论被提交多少次、多少并发，只产生一条逻辑通知。 每条逻辑通知在每个启用渠道上最多一条任务；同一任务在同一时刻最多有一个有效令牌；被取代的持有者无法再改写任务状态，但它已发出的外部调用无法撤回。 每次调用渠道都留下一条投递记录，结果未知的调用能在表里查到，不被后续结果覆盖。 超时后的重试策略取决于渠道能力：支持幂等键就带同一键重发；不支持幂等键但可查询就先查询；两者都不具备就停止自动处理。 领取前偏好被...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9C%80%E6%B1%82%E5%A5%91%E7%BA%A6"><span class="toc-number">1.</span> <span class="toc-text">需求契约</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%B0%E6%8D%AE%E6%A8%A1%E5%9E%8B%E4%B8%8E%E7%8A%B6%E6%80%81%E6%9C%BA"><span class="toc-number">2.</span> <span class="toc-text">数据模型与状态机</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8E%9F%E5%AD%90%E9%A2%86%E5%8F%96"><span class="toc-number">3.</span> <span class="toc-text">原子领取</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%AF%B9%E7%85%A7%EF%BC%9A%E5%85%88%E6%9F%A5%E8%AF%A2-%E5%86%8D%E6%9B%B4%E6%96%B0"><span class="toc-number">3.1.</span> <span class="toc-text">对照：先查询，再更新</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%A7%9F%E7%BA%A6%E4%B8%8E%E6%A0%85%E6%A0%8F"><span class="toc-number">4.</span> <span class="toc-text">租约与栅栏</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%96%E6%B6%88"><span class="toc-number">5.</span> <span class="toc-text">取消</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%AF%E4%BD%9C%E7%94%A8%E7%9A%84%E5%8E%BB%E9%87%8D%E8%BE%B9%E7%95%8C"><span class="toc-number">6.</span> <span class="toc-text">副作用的去重边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%A4%B1%E8%B4%A5%E4%B8%8E%E9%87%8D%E8%AF%95"><span class="toc-number">7.</span> <span class="toc-text">失败与重试</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%88%B0%E6%9C%9F%E5%8F%91%E7%8E%B0%EF%BC%9A%E8%BD%AE%E8%AF%A2%E4%B8%8E%E6%97%B6%E9%97%B4%E8%BD%AE"><span class="toc-number">8.</span> <span class="toc-text">到期发现：轮询与时间轮</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E4%BE%8B%E4%B8%8E%E8%AF%81%E6%8D%AE"><span class="toc-number">9.</span> <span class="toc-text">用例与证据</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%93%E8%AE%BA%E8%BE%B9%E7%95%8C"><span class="toc-number">10.</span> <span class="toc-text">结论边界</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

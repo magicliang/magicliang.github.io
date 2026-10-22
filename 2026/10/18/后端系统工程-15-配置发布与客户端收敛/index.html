@@ -1,0 +1,874 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>后端系统工程 15：配置发布与客户端收敛 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="系列导航：上一篇 14 会话存储与登录撤销 ｜ 本篇 15 ｜ 下一篇 16 服务发现中的旧地址 一次配置发布在数据库里只是一次事务提交，真正难的是提交之后的那段路：成百上千个客户端进程要在有限时间内拿到这份新配置，中途可能错过通知、收到迟到的旧响应、整段时间离线，或者在服务端不可达时启动。发布本身也会出错，一份取值越界的配置一旦被客户端接受，后果和一次错误的代码上线相同。 本篇实现一个最小配置中">
+<meta property="og:type" content="article">
+<meta property="og:title" content="后端系统工程 15：配置发布与客户端收敛">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-15-%E9%85%8D%E7%BD%AE%E5%8F%91%E5%B8%83%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E6%94%B6%E6%95%9B/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="系列导航：上一篇 14 会话存储与登录撤销 ｜ 本篇 15 ｜ 下一篇 16 服务发现中的旧地址 一次配置发布在数据库里只是一次事务提交，真正难的是提交之后的那段路：成百上千个客户端进程要在有限时间内拿到这份新配置，中途可能错过通知、收到迟到的旧响应、整段时间离线，或者在服务端不可达时启动。发布本身也会出错，一份取值越界的配置一旦被客户端接受，后果和一次错误的代码上线相同。 本篇实现一个最小配置中">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-37.jpg">
+<meta property="article:published_time" content="2026-10-18T12:30:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T08:33:36.094Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="LISTEN&#x2F;NOTIFY">
+<meta property="article:tag" content="PostgreSQL">
+<meta property="article:tag" content="后端系统工程">
+<meta property="article:tag" content="灰度发布">
+<meta property="article:tag" content="配置中心">
+<meta property="article:tag" content="长轮询">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-37.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "后端系统工程 15：配置发布与客户端收敛",
+  "url": "https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-15-%E9%85%8D%E7%BD%AE%E5%8F%91%E5%B8%83%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E6%94%B6%E6%95%9B/",
+  "image": "https://magicliang.github.io/img/wall-paper-37.jpg",
+  "datePublished": "2026-10-18T12:30:00.000Z",
+  "dateModified": "2026-10-22T08:33:36.094Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-15-%E9%85%8D%E7%BD%AE%E5%8F%91%E5%B8%83%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E6%94%B6%E6%95%9B/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '后端系统工程 15：配置发布与客户端收敛',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2016</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2094</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-37.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">后端系统工程 15：配置发布与客户端收敛</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">后端系统工程 15：配置发布与客户端收敛</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-18T12:30:00.000Z" title="Created 2026-10-18 20:30:00">2026-10-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-22T08:33:36.094Z" title="Updated 2026-10-22 16:33:36">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">5.3k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>18mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-22 16:33:36&quot;}" hidden></div><p>系列导航：上一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-14-%E4%BC%9A%E8%AF%9D%E5%AD%98%E5%82%A8%E4%B8%8E%E7%99%BB%E5%BD%95%E6%92%A4%E9%94%80/" title="后端系统工程 14：会话存储与登录撤销">14 会话存储与登录撤销</a> ｜ 本篇 15 ｜ 下一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-16-%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0%E4%B8%AD%E7%9A%84%E6%97%A7%E5%9C%B0%E5%9D%80/" title="后端系统工程 16：服务发现中的旧地址">16 服务发现中的旧地址</a></p>
+<p>一次配置发布在数据库里只是一次事务提交，真正难的是提交之后的那段路：成百上千个客户端进程要在有限时间内拿到这份新配置，中途可能错过通知、收到迟到的旧响应、整段时间离线，或者在服务端不可达时启动。发布本身也会出错，一份取值越界的配置一旦被客户端接受，后果和一次错误的代码上线相同。</p>
+<p>本篇实现一个最小配置中心：PostgreSQL 保存不可变版本和单调递增的发布记录，一个独立 JVM 提供快照与长轮询接口，客户端是独立的 Python 进程，带本地缓存和灰度命中。实验用真实组件制造五类故障：通知丢失、旧响应、客户端离线、服务器重启、缓存损坏，再加两个负向对照，分别是只靠通知的服务器和无条件接受响应的客户端。代码在 <code>examples/15-config-center/</code>，输出在 <code>evidence/15/output.txt</code>。</p>
+<h2 id="需求契约">需求契约</h2>
+<p>操作只有四个：发布一份配置（可附灰度规则）、回退到某个旧版本、客户端读取当前快照、客户端等待下一次变化。系统承诺以下不变量：</p>
+<ul>
+<li>版本内容写入后不再修改；每次发布或回退都追加一条发布记录，<code>release_seq</code> 在 namespace 内单调递增。</li>
+<li>校验失败的配置不产生版本，也不产生发布记录，因此不可能被任何客户端看到。</li>
+<li>回退本身是一次新发布：它有自己的序号和时间，旧记录保持原样，审计时能看到“谁在什么时候把配置换回了哪个版本”。</li>
+<li>客户端的已知序号只增不减；序号不大于已知值的响应一律丢弃。</li>
+<li>只要数据库和配置服务器可达，任何一次发布都会在“兜底轮询间隔加一次查询”的时间内唤醒所有在线等待者，即使通知丢失也一样。</li>
+</ul>
+<p>不承诺：客户端在服务端不可达期间看到新配置；所有客户端在同一时刻切换；离线客户端逐条回放中间版本。最后一条是有意为之，配置的消费者通常只关心当前值，跳过中间版本可以减少无意义的切换。</p>
+<p>教学规模假设：一个 namespace，配置只有 <code>timeout_ms</code>（50–10000 的整数）、<code>retry</code>（0–5 的整数）、<code>feature_x</code>（布尔）三个键；服务器兜底轮询间隔 1s，LISTEN 断线后 4s 重连；客户端长轮询超时 20s。这些参数只服务于实验观察，不代表推荐值。</p>
+<h2 id="状态归属">状态归属</h2>
+<p>图 15-1：状态归属与持久化位置</p>
+<pre><code class="hljs mermaid">flowchart LR
+    subgraph PG[&quot;PostgreSQL b2_15（唯一事实来源）&quot;]
+        V[(cfg.config_version&lt;br/&gt;只插入，触发器拒绝改删)]
+        R[(cfg.release&lt;br/&gt;namespace + release_seq 主键)]
+        F[&quot;cfg.publish / cfg.rollback&lt;br/&gt;校验 + 追加 + pg_notify&quot;]
+    end
+    P[发布者&lt;br/&gt;角色 b2_15_pub] --&gt;|调用函数| F
+    F --&gt; V
+    F --&gt; R
+    S[&quot;ConfigServer（独立 JVM）&lt;br/&gt;内存只有唤醒计数器&quot;] --&gt;|LISTEN cfg_release| PG
+    S --&gt;|每 1s 查 count| R
+    S --&gt;|cfg.snapshot| R
+    C1[&quot;客户端进程&lt;br/&gt;内存：已知 head_seq&quot;] --&gt;|GET /watch?known=N| S
+    C1 --&gt; D[(&quot;本地缓存 app.json&lt;br/&gt;tmp + fsync + rename&quot;)]</code></pre>
+<p>配置服务器不持有任何发布状态。它重启时丢掉的只是等待者列表，客户端会重新发起长轮询，服务端在请求开始时查一次库，有新序号就立即返回。这条性质让服务器可以随时 <code>kill -9</code>，后面的实验正是这样做的。</p>
+<h2 id="发布事务">发布事务</h2>
+<p><code>cfg.publish</code> 在一个事务里完成全部步骤（<code>setup.sql</code>）：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs sql">perform pg_advisory_xact_lock(hashtext(<span class="hljs-string">&#x27;cfg:&#x27;</span> <span class="hljs-operator">||</span> ns));   <span class="hljs-comment">-- 同一 namespace 的发布串行</span><br>c :<span class="hljs-operator">=</span> content_text::jsonb;                                  <span class="hljs-comment">-- 非法 JSON 在这里抛 22P02</span><br>perform cfg.validate(c);                                   <span class="hljs-comment">-- 未知键、类型、范围：22023</span><br>perform cfg.validate_rule(r);<br><span class="hljs-keyword">insert into</span> cfg.config_version(namespace, content, checksum)<br>  <span class="hljs-keyword">values</span> (ns, c, encode(sha256(convert_to(c::text, <span class="hljs-string">&#x27;UTF8&#x27;</span>)), <span class="hljs-string">&#x27;hex&#x27;</span>)) returning version_id <span class="hljs-keyword">into</span> v;<br><span class="hljs-keyword">select</span> <span class="hljs-built_in">coalesce</span>(<span class="hljs-built_in">max</span>(release_seq), <span class="hljs-number">0</span>) <span class="hljs-operator">+</span> <span class="hljs-number">1</span> <span class="hljs-keyword">into</span> s <span class="hljs-keyword">from</span> cfg.release <span class="hljs-keyword">where</span> namespace <span class="hljs-operator">=</span> ns;<br><span class="hljs-keyword">insert into</span> cfg.release(namespace, release_seq, version_id, rule, kind) <span class="hljs-keyword">values</span> (ns, s, v, r, <span class="hljs-string">&#x27;publish&#x27;</span>);<br>perform pg_notify(<span class="hljs-string">&#x27;cfg_release&#x27;</span>, ns <span class="hljs-operator">||</span> <span class="hljs-string">&#x27;:&#x27;</span> <span class="hljs-operator">||</span> s);<br></code></pre></td></tr></table></figure>
+<p>咨询锁保证 <code>max + 1</code> 不会被两个并发发布算成同一个值；即便锁漏掉，<code>(namespace, release_seq)</code> 主键也会让第二个事务失败，而不是产生重复序号。<code>pg_notify</code> 放在事务里有一个直接好处：PostgreSQL 规定事务内的通知要等事务提交才投递，事务中止则什么都不发（<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/sql-notify.html">PostgreSQL 16 NOTIFY</a>）。校验失败导致的回滚因此不会唤醒任何客户端。通知只带 <code>ns:seq</code>，内容由服务器回表读取，这也符合文档的建议：payload 默认要短于 8000 字节，大块数据应放在表里，只传记录的键。</p>
+<p>不可变由触发器保证，对表属主同样生效。<code>versions_append_only</code> 用例分别以超级用户执行 UPDATE、DELETE，以发布角色执行 UPDATE：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE versions_append_only  PASS update_version=&#x27;ERROR:  cfg.config_version is append-only&#x27; | delete_release=&#x27;ERROR:  cfg.release is append-only&#x27; | pub_role_update=&#x27;ERROR:  permission denied for table release&#x27;<br></code></pre></td></tr></table></figure>
+<p><code>invalid_config_rejected</code> 依次提交截断的 JSON、越界的 <code>timeout_ms=20000</code>、多出一个未知键、把数字写成字符串，以及一条 <code>percent=150</code> 的灰度规则。五次全部被拒，发布记录与版本行数前后都是 <code>2/2</code>，在线客户端在随后 1.5s 内没有产生任何状态事件：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE invalid_config_rejected  PASS releases/versions before=2/2 after=2/2 client_events=0 | bad_json:invalid input syntax for type json ; out_of_range:timeout_ms must be an integer in [50, 10000] ; unknown_key:unknown key x ; wrong_type:timeout_ms must be an integer in [50, 10000] ; bad_rule:percent must be in [0, 100]<br></code></pre></td></tr></table></figure>
+<p>校验放在服务端事务里，而不是只放在发布工具里，是因为发布入口可能不止一个：控制台、脚本、批量迁移。只要它们都通过 <code>cfg.publish</code>，规则就只有一份。代价是 schema 变更需要改数据库函数，而且 PL/pgSQL 不适合表达很复杂的跨键约束；规则复杂到一定程度时，常见做法是把校验器做成独立服务，再由发布函数调用它的结果。本篇不涉及这一层。</p>
+<p>回退调用 <code>cfg.rollback('app', 1)</code>，追加一条 <code>kind=rollback</code> 的全量记录，指向版本 1：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE rollback_is_new_release  PASS rollback_seq=3 to_version=1 client_version=1 kind=rollback latency_ms=74 releases=1:1:publish,2:2:publish,3:1:rollback bad_target=version 999 does not belong to namespace app<br></code></pre></td></tr></table></figure>
+<p>序号继续增大到 3，客户端按“序号更大即接受”的规则收敛到旧内容。如果回退被实现成“把 release 表最新一行改回旧版本”，序号不变，已经应用了序号 2 的客户端会把序号 2 的回退响应当作重复而丢弃，回退在这些客户端上就不会生效。</p>
+<h2 id="灰度：序号前进与内容生效分开">灰度：序号前进与内容生效分开</h2>
+<p>灰度规则写在发布记录上：<code>&#123;&quot;percent&quot;: n&#125;</code> 按客户端标识的 md5 前 32 位取模 100 分桶，桶号小于 n 即命中；<code>&#123;&quot;labels&quot;: [...]&#125;</code> 按标签命中，两者取“或”。快照函数返回两个序号：<code>head_seq</code> 是该 namespace 的最新发布序号，<code>release_seq</code> 是对这个客户端命中的最新一条记录。</p>
+<p>客户端用 <code>head_seq</code> 判断响应新旧，用 <code>version_id</code> 判断内容是否变化。未命中灰度的客户端收到灰度发布的响应时，已知序号前进，内容不变；如果它只看 <code>release_seq</code>，每次长轮询都会因为“服务端有更新的序号”立即返回，形成忙等。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE gray_subset_only          PASS gray_seq=4 canary=applied(version=3) c-000=head_advanced(version=1) synthetic_hits=57/200 expected_by_bucket=57 stable_on_repeat=True<br>CASE gray_then_full_converges  PASS full_seq=5 canary=applied:v4 plain=applied:v4<br></code></pre></td></tr></table></figure>
+<p>带 <code>canary</code> 标签的客户端应用了灰度版本 3；桶号不小于 30 的 <code>c-000</code> 只记录了 <code>head_advanced</code>，仍停在回退后的版本 1。200 个合成标识中命中 57 个，与按 <code>cfg.bucket</code> 直接计算的期望值相同，重复请求结果不变。57 不等于 60，说明 200 个样本上的哈希分布本来就有偏差；百分比是分桶规则，不是对实际比例的保证。随后的全量发布（序号 5）让两个客户端都应用版本 4。</p>
+<h2 id="服务端怎样被唤醒">服务端怎样被唤醒</h2>
+<p>长轮询请求带着客户端已知的序号到达。服务器先查一次库，若已有更新立即返回；否则挂起，直到被唤醒或超时。唤醒有三个来源：LISTEN 连接收到通知；兜底轮询发现 <code>cfg.release</code> 行数变化（只追加的表，行数变化就意味着有新发布）；LISTEN 连接重建之后主动唤醒一次。</p>
+<p>第三个来源来自 LISTEN 文档的一条规则。新的监听会话只会收到在其 LISTEN 提交时刻之后提交的事件，文档因此要求先执行并提交 LISTEN，再查询数据库状态，之后才依赖通知（<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/sql-listen.html">PostgreSQL 16 LISTEN</a>）。会话结束时监听注册自动清除。由此推出：LISTEN 连接断开到重建之间提交的发布，重建后的连接收不到。文档没有直接写“不补发”，但它规定的投递范围已经把这段时间排除在外。</p>
+<p>等待循环要处理一个更细的窗口：查库时还没有新发布，查完、进入等待之前通知到了。若先查库再读计数器，这次唤醒会被漏掉，等待者一直睡到超时。实现先读计数器，再查库，再等计数器变化：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-comment">// ConfigServer.handle（/watch）</span><br><span class="hljs-keyword">while</span> (<span class="hljs-literal">true</span>) &#123;<br>    <span class="hljs-type">long</span> seen;<br>    <span class="hljs-keyword">synchronized</span> (mon) &#123; seen = wakeCounter; &#125;        <span class="hljs-comment">// 先读计数器</span><br>    <span class="hljs-type">Object</span>[] <span class="hljs-variable">s</span> <span class="hljs-operator">=</span> snapshot(ns, client, labels);        <span class="hljs-comment">// 再查库</span><br>    <span class="hljs-keyword">if</span> ((Long) s[<span class="hljs-number">0</span>] &gt; known) &#123; reply(ex, <span class="hljs-number">200</span>, (String) s[<span class="hljs-number">1</span>], source); <span class="hljs-keyword">return</span>; &#125;<br>    <span class="hljs-keyword">if</span> (System.nanoTime() &gt;= deadline) &#123; reply(ex, <span class="hljs-number">304</span>, <span class="hljs-string">&quot;&quot;</span>, <span class="hljs-string">&quot;timeout&quot;</span>); <span class="hljs-keyword">return</span>; &#125;<br>    <span class="hljs-keyword">synchronized</span> (mon) &#123;<br>        <span class="hljs-keyword">while</span> (wakeCounter == seen) &#123;<br>            <span class="hljs-type">long</span> <span class="hljs-variable">left</span> <span class="hljs-operator">=</span> (deadline - System.nanoTime()) / <span class="hljs-number">1_000_000</span>;<br>            <span class="hljs-keyword">if</span> (left &lt;= <span class="hljs-number">0</span>) <span class="hljs-keyword">break</span>;<br>            mon.wait(left);<br>        &#125;<br>        source = (wakeCounter == seen) ? <span class="hljs-string">&quot;deadline&quot;</span> : lastWake;<br>    &#125;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>图 15-2：通知丢失时的唤醒路径（主服务器：轮询 1s，LISTEN 重连延迟 4s）</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant C as 客户端
+    participant S as ConfigServer
+    participant L as LISTEN 连接
+    participant DB as PostgreSQL
+    C-&gt;&gt;S: GET /watch?known=5&amp;timeout=20000
+    S-&gt;&gt;DB: cfg.snapshot → head_seq=5，挂起等待
+    Note over L,DB: pg_terminate_backend(listener)：57P01
+    L--&gt;&gt;S: listener lost，4s 后重连
+    DB-&gt;&gt;DB: cfg.publish 提交 seq=6，NOTIFY 无监听者
+    S-&gt;&gt;DB: 轮询 select count(*) 发现 5→6
+    S-&gt;&gt;S: wake(&quot;poll&quot;)
+    S-&gt;&gt;DB: cfg.snapshot → head_seq=6
+    S--&gt;&gt;C: 200，X-Wake: poll
+    C-&gt;&gt;C: 6 &gt; 5，接受；写缓存
+    C-&gt;&gt;S: GET /watch?known=6（下一轮）
+    Note over L: 4s 后 LISTEN 重建，wake(&quot;reconnect&quot;) 复查一次</code></pre>
+<p><code>missed_notify_poll_fallback</code> 重复 5 轮：找到服务器 LISTEN 连接的进程号，<code>pg_terminate_backend</code> 终止它，立即发布，等客户端收敛。每轮发布时刻相对轮询周期的相位不同：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE missed_notify_poll_fallback  PASS rounds=5 latency_ms=[910, 285, 376, 1212, 1013] sources=[&#x27;watch:poll&#x27;] poll_ms=1000 reconnect_ms=4000 listener_lost_logged=5<br></code></pre></td></tr></table></figure>
+<p>五轮全部由轮询唤醒，耗时 285–1212ms。重连延迟设为 4s，正是为了让轮询和重连复查在时间上分开，确认收敛来自轮询。耗时上限略超过 1000ms，多出的部分包含 psql 进程启动、一次快照查询和 HTTP 往返。服务器日志记录了每一次断线：<code>listener lost: 57P01 FATAL: terminating connection due to administrator command</code>。</p>
+<p>负向对照是只靠通知的服务器（<code>notify-only</code>：不轮询，LISTEN 重连后也不复查），客户端长轮询超时设为 15s：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE negative_notify_only_stuck  PASS expectStuck seq=11 converged_within_6.0s=False relistened_pid_changed=True longpoll_timeout_ms=15000 eventually_converged_ms=14444 via=watch:deadline<br></code></pre></td></tr></table></figure>
+<p>故障后 6s 内客户端没有前进。这期间 LISTEN 已经在 1s 后重建，进程号变了，通知路径恢复正常，但错过的那次通知不会再来。客户端最终在 14444ms 前进，来源是 <code>deadline</code>：请求到达截止时间时，等待循环会再查一次库。长轮询的超时本身就是一次周期为 15s 的拉取，只要客户端在超时后重新请求、服务端在请求开始和截止时查库，“永不收敛”就退化为“延迟到一个长轮询周期”。若把超时调到 60s 或更长，或者服务器只在收到通知后才查库，这个延迟就会继续变长，甚至无界。</p>
+<h3 id="推-拉与两者结合">推、拉与两者结合</h3>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>正常延迟</th>
+<th>通知丢失时</th>
+<th>服务端负载</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>只推（通知触发）</td>
+<td>通知往返，实验中百毫秒量级</td>
+<td>等下一次发布，或等长轮询超时复查；实验中 14.4s</td>
+<td>只在发布时查库</td>
+</tr>
+<tr>
+<td>只拉（客户端周期轮询）</td>
+<td>平均半个轮询周期</td>
+<td>不受影响</td>
+<td>客户端数 ÷ 轮询周期，每次一次查询</td>
+</tr>
+<tr>
+<td>推 + 服务端兜底轮询（本实现）</td>
+<td>通知往返</td>
+<td>一个轮询周期内；实验中 ≤ 1212ms</td>
+<td>每周期一次 <code>count(*)</code>，与客户端数无关</td>
+</tr>
+</tbody>
+</table>
+<p>兜底轮询放在服务端而不是客户端，开销就从“客户端数 × 频率”变成“服务器实例数 × 频率”。代价是它只能发现“有变化”，还要再查快照；本实现中每个被唤醒的等待者各查一次快照，客户端很多时这一步会成为峰值负载，可以按 namespace 缓存快照来摊平，本篇没有实现。</p>
+<h3 id="全量快照还是增量">全量快照还是增量</h3>
+<p>通知只告诉服务器“序号 6 出现了”，响应给客户端的是完整快照。另一种做法是让客户端从已知序号订阅发布日志，逐条应用差量，etcd 的 watch 就是这种模型：每次修改分配一个全局递增的 revision，watch 按 revision 顺序投递事件，断开后可以从最后收到的 revision 之后续订，前提是这段历史还没有被压缩；压缩后，从旧 revision 创建的 watch 会被取消并返回可用的最小 revision（<a target="_blank" rel="noopener" href="https://etcd.io/docs/v3.4/learning/api_guarantees/">etcd v3.4 API 保证</a>、<a target="_blank" rel="noopener" href="https://etcd.io/docs/v3.4/learning/api/">etcd v3.4 API</a>）。增量订阅需要服务端保留历史，客户端需要处理“历史已不可用”的回退路径。对一份几百字节的配置，全量快照省掉了这两件事，离线客户端一步到位。本篇没有在配置场景下实验 etcd，它的续订与压缩行为在第 16 篇中实测。</p>
+<h2 id="客户端：只前进-可离线启动">客户端：只前进，可离线启动</h2>
+<p>客户端的接受规则只有三条：响应内容的 SHA-256 必须等于 <code>checksum</code>；<code>head_seq</code> 必须大于已知值；通过后先写缓存，再报告应用。</p>
+<figure class="highlight python"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs python"><span class="hljs-comment"># client.py accept()</span><br>known = state[<span class="hljs-string">&quot;head_seq&quot;</span>] <span class="hljs-keyword">if</span> state <span class="hljs-keyword">else</span> -<span class="hljs-number">1</span><br><span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> args.accept_any <span class="hljs-keyword">and</span> snap[<span class="hljs-string">&quot;head_seq&quot;</span>] &lt;= known:<br>    emit(<span class="hljs-string">&quot;rejected_stale&quot;</span>, source=source, offered_head=snap[<span class="hljs-string">&quot;head_seq&quot;</span>], known_head=known)<br>    <span class="hljs-keyword">return</span> <span class="hljs-literal">False</span><br></code></pre></td></tr></table></figure>
+<p>旧响应的来源可以是负载均衡器后面一台落后的实例、一层把 <code>/watch</code> 结果缓存起来的代理，也可能是一次超时重试后才到达的早先回复。实验在客户端和服务器之间放了一个 HTTP 代理，它记下第一份 <code>/watch</code> 响应，被激活后把下一份真实响应换成这份旧的：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE stale_response_rejected        PASS known_head=13 offered_head=12 event=rejected_stale regressions=0 then_head=14 replayed=1<br>CASE negative_accept_any_regresses  PASS expectRegression known_head=16 replayed_head=15 regressed_to_version=14 regression_events=1 later_head=17<br></code></pre></td></tr></table></figure>
+<p>正常客户端已知序号 13，收到序号 12 的响应后丢弃，下一轮请求拿到 14。关闭序号检查的对照客户端从 16 退回到序号 15 对应的版本 14，并把这份旧配置写进了缓存；它之所以随后又回到 17，是因为下一轮长轮询带的已知序号变成了 15，服务端立即返回最新值。回退期间的应用行为，以及此时进程重启读到的旧缓存，都是真实发生的错误。</p>
+<p>图 15-3：客户端处理一份响应的状态迁移</p>
+<pre><code class="hljs mermaid">stateDiagram-v2
+    [*] --&gt; Startup
+    Startup --&gt; Applied: GET /config 成功且校验通过
+    Startup --&gt; CacheCheck: 服务端不可达
+    CacheCheck --&gt; Applied: 缓存校验和一致（source=cache）
+    CacheCheck --&gt; NoConfig: 缓存缺失或校验和不符（拒绝）
+    Applied --&gt; Watching
+    NoConfig --&gt; Watching: known=0
+    Watching --&gt; Watching: 304 超时 / 连接失败后退避重试
+    Watching --&gt; Rejected: 校验和不符 或 head_seq ≤ 已知值
+    Rejected --&gt; Watching: 状态不变
+    Watching --&gt; Persist: head_seq &gt; 已知值
+    Persist --&gt; Applied: tmp 写入 → fsync → os.replace → 目录 fsync</code></pre>
+<p>缓存写入采用临时文件、<code>fsync</code>、<code>os.replace</code>、再对目录 <code>fsync</code> 的顺序。Python 文档说明 <code>os.replace</code> 成功时的重命名是原子操作，这是 POSIX 的要求；对缓冲文件对象，要先 <code>flush</code> 再 <code>fsync</code>（<a target="_blank" rel="noopener" href="https://docs.python.org/3.12/library/os.html">Python 3.12 os</a>）。读到的缓存要么是旧的完整文件，要么是新的完整文件。缓存里同时保存 <code>checksum</code>，加载时重新计算：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE corrupt_cache_rejected  PASS startup=cache_rejected:checksum_mismatch applied_from_cache=0 after_server_back=watch:initial:head=21<br></code></pre></td></tr></table></figure>
+<p>实验把缓存中的 <code>timeout_ms</code> 从 1400 改成 9999、保留原校验和，并在服务器停机时启动客户端。客户端拒绝缓存，没有应用任何配置，服务器恢复后才从服务端取得序号 21。拒绝损坏缓存意味着这段时间进程没有配置可用，调用方要为此准备内置默认值，或者干脆拒绝启动；两者的取舍取决于这份配置缺失时业务能否安全运行，配置中心本身无法替业务决定。</p>
+<p>离线与重启两个用例：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE offline_client_jumps_to_latest    PASS head_before_kill=17 published_while_offline=[18, 19, 20] restart_events=[(&#x27;applied&#x27;, &#x27;server&#x27;, 20)] intermediate_applied=0<br>CASE server_restart_cache_and_recover  PASS cold_start_source=cache cold_start_head=20 published_while_down=21 a_unreachable_events=4 recovered_ms=a:781,cold:784<br></code></pre></td></tr></table></figure>
+<p>客户端被 <code>kill -9</code> 期间连续发布 18、19、20，重启后只有一次应用事件，直接到 20。服务器被 <code>kill -9</code> 后：已在线的客户端记录了 4 次 <code>server_unreachable</code> 并按退避重试，期间继续使用内存中的配置；新启动的客户端从缓存读到序号 20；停机期间提交的序号 21 在服务器重启后约 0.78s 内被两者收敛，其中包括 JVM 启动、建立 LISTEN 连接和客户端退避间隔。</p>
+<p>接口上有一处简化需要说明：<code>/watch</code> 用查询参数 <code>known</code> 携带已知序号，没有更新时返回 304。RFC 9110 把 304 定义为对条件请求的回答，即条件求值为假、无需传输表示（<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9110#section-15.4.5">RFC 9110 §15.4.5</a>）。严格的写法应把序号放进实体标签，由客户端在 <code>If-None-Match</code> 中携带；本实现借用了状态码而没有采用条件头，中间的 HTTP 缓存不会把它当作条件请求处理。</p>
+<h2 id="用例与证据">用例与证据</h2>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th>类型</th>
+<th>观察值（evidence/15/output.txt）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>normal_publish_notify</code></td>
+<td>正常</td>
+<td>序号 1、2；两个客户端经通知唤醒，耗时 193/195ms（含 psql 启动）</td>
+</tr>
+<tr>
+<td><code>versions_append_only</code></td>
+<td>不变量</td>
+<td>UPDATE/DELETE 被触发器拒绝；发布角色无写权限</td>
+</tr>
+<tr>
+<td><code>invalid_config_rejected</code></td>
+<td>边界</td>
+<td>5 类非法输入全被拒，行数 2/2 不变，客户端 0 事件</td>
+</tr>
+<tr>
+<td><code>rollback_is_new_release</code></td>
+<td>恢复</td>
+<td>回退成为序号 3，指向版本 1</td>
+</tr>
+<tr>
+<td><code>gray_subset_only</code> / <code>gray_then_full_converges</code></td>
+<td>边界</td>
+<td>57/200 命中等于期望；全量发布后一致</td>
+</tr>
+<tr>
+<td><code>missed_notify_poll_fallback</code></td>
+<td>故障</td>
+<td>5 轮均由轮询唤醒，285–1212ms</td>
+</tr>
+<tr>
+<td><code>negative_notify_only_stuck</code></td>
+<td>负向对照</td>
+<td>6s 内不收敛；14444ms 经截止复查前进</td>
+</tr>
+<tr>
+<td><code>stale_response_rejected</code> / <code>negative_accept_any_regresses</code></td>
+<td>故障 / 负向对照</td>
+<td>旧响应被拒；对照客户端回退到版本 14</td>
+</tr>
+<tr>
+<td><code>offline_client_jumps_to_latest</code></td>
+<td>恢复</td>
+<td>离线期间 3 次发布，重启后一步到 20</td>
+</tr>
+<tr>
+<td><code>server_restart_cache_and_recover</code></td>
+<td>恢复</td>
+<td>缓存启动；重启后约 0.78s 收敛到 21</td>
+</tr>
+<tr>
+<td><code>corrupt_cache_rejected</code></td>
+<td>边界</td>
+<td>校验和不符的缓存不被应用</td>
+</tr>
+</tbody>
+</table>
+<p>环境：PostgreSQL 16.15、OpenJDK 21.0.12.1、pgJDBC 42.7.4、Python 3.12.3，4 核（<code>evidence/15/env.txt</code>）。服务器与客户端日志在 <code>evidence/15/*.log</code>，证据边界写在 <code>evidence/15/LIMITS.md</code>。</p>
+<h2 id="结论边界">结论边界</h2>
+<p>实验支持的结论：发布前校验与不可变追加让非法配置无法成为发布记录；回退以新序号出现，客户端无需特殊处理；客户端只接受更大的序号，就能抵御旧响应；通知丢失时，服务端兜底轮询把收敛时间限制在一个轮询周期左右，而只靠通知的实现退化到长轮询超时；客户端离线或服务器停机后，系统靠数据库中的序号和本地缓存恢复，不依赖服务器内存。</p>
+<p>没有覆盖的部分：配置服务器多实例、数据库主备切换与复制延迟；缓存写入中途崩溃（代码按原子替换编写，但没有做崩溃注入）；大量客户端下长轮询的连接与查询开销。灰度只验证了命中集合的正确性，没有讨论灰度期间的指标观察和自动回退。</p>
+<p>配置中心的客户端最怕“以为自己是新的”。服务发现中的地址集有同样的问题，而且更难：地址背后的进程可能已经暂停或死亡，注册中心要等租约过期才会删除它，这段时间内客户端手里的旧地址会造成多少次失败，是下一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-16-%E6%9C%8D%E5%8A%A1%E5%8F%91%E7%8E%B0%E4%B8%AD%E7%9A%84%E6%97%A7%E5%9C%B0%E5%9D%80/" title="后端系统工程 16：服务发现中的旧地址">16 服务发现中的旧地址</a> 要测量的内容。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-15-%E9%85%8D%E7%BD%AE%E5%8F%91%E5%B8%83%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E6%94%B6%E6%95%9B/">https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-15-%E9%85%8D%E7%BD%AE%E5%8F%91%E5%B8%83%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E6%94%B6%E6%95%9B/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/PostgreSQL/">PostgreSQL</a><a class="post-meta__tags" href="/tags/%E7%81%B0%E5%BA%A6%E5%8F%91%E5%B8%83/">灰度发布</a><a class="post-meta__tags" href="/tags/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B/">后端系统工程</a><a class="post-meta__tags" href="/tags/%E9%85%8D%E7%BD%AE%E4%B8%AD%E5%BF%83/">配置中心</a><a class="post-meta__tags" href="/tags/LISTEN-NOTIFY/">LISTEN/NOTIFY</a><a class="post-meta__tags" href="/tags/%E9%95%BF%E8%BD%AE%E8%AF%A2/">长轮询</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-37.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-23-%E5%88%86%E7%89%87%E6%89%A9%E5%AE%B9%E6%97%B6%E7%9A%84%E6%95%B0%E6%8D%AE%E4%BA%A4%E6%8E%A5/" title="后端系统工程 23：分片扩容时的数据交接"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-27.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 23：分片扩容时的数据交接</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 22 非分片键查询与全局分页 ｜ 本篇 23 ｜ 下一篇 24 在线变更的数据兼容 两个分片扩到三个，需要把一部分数据从旧分片搬到新分片，同时写入不停。这件事拆开看有三个难点。复制需要时间，复制期间源端还在变化，复制完的副本一出来就是旧的。路由表改了之后，已经拿着旧路由的写入方不会立刻知道，它们的写会继续打到源端。写入方遇到超时会重试，一次请求可能在源端提交了、重试却落到目标端。任何一处处理不当，结果都是某些已经告诉调用方“成功”的写，在迁移完成后不见了，或者已经删除的行又回来了。 本篇实现按桶迁移：版本化路由、快照复制、按事务水位追赶、冻结栅栏、按键与版本校验、切流。三个独立的写入进程在迁移全程持续写入、删除与重试，迁移结束后逐键核对“所有已确认写”。代码在 examples/23-shard-rebalance/，输出在 evidence/23/output.txt。 需求与不变量 数据是合成的键值记录 items(item_id, bucket, val, row_version)，写操作有三种：创建（值为 0，版本 1）、增量（val += delta，...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-32-%E7%82%B9%E8%B5%9E%E4%BA%8B%E5%AE%9E%E4%B8%8E%E8%AE%A1%E6%95%B0%E6%A0%A1%E5%87%86/" title="后端系统工程 32：点赞事实与计数校准"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-153.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 32：点赞事实与计数校准</div></div><div class="info-2"><div class="info-item-1">点赞数是派生数据。真相源是“谁赞了哪个条目”这组事实，计数只是对事实的汇总；为了让读取不必每次 count(*)，计数被单独存放、异步更新。破坏两者一致的路径有五条：用户重复点击，赞与取消交错，事件被重复投递，消费者在提交与确认之间崩溃，以及修复用的批量重算与在线增量同时改同一行。前三条会把计数推高或拉低；消费者崩溃会让已生效的事件被再投一次；批量重算若与在线增量直接冲突，修复本身就会制造新的偏差。 本章代码在 examples/social 的 social.like 包，全部用例跑在真实 PostgreSQL 16.15 上，包括独立 JVM 的 kill -9 与数据库 immediate 停机。验收目标：点赞/取消交错与事件重复之后，计数与事实记录一致；计数允许落后于事实，落后多少有明确定义，并且在任何时刻都能算出误差上界。 需求与范围 操作有三个：点赞、取消点赞、读取条目的点赞数。业务不变量写成可以用 SQL 检查的形式：  每个 (user, item) 至多一行事实，liked 表示当前是否已赞，version 每次状态变化加一。 每次状态变化恰好写一条 Outbo...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-26-%E7%A7%9F%E7%BA%A6%E4%BA%92%E6%96%A5%E4%B8%8E%E8%B5%84%E6%BA%90%E7%AB%AF%E6%A0%85%E6%A0%8F/" title="后端系统工程 26：租约互斥与资源端栅栏"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-14.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 26：租约互斥与资源端栅栏</div></div><div class="info-2"><div class="info-item-1">一个每日报表作业部署了多个实例，同一时刻只应有一个实例往报表输出库写结果。常见做法是在数据库里放一张租约表：谁抢到租约谁干活，租约到期没有续上就让给别人。这套做法能减少重复执行，但它本身不能阻止一种写入：实例 A 拿到租约、做完写前检查，然后整个进程停住；租约在停顿期间过期，实例 B 接手并写完；A 恢复后把手里那份已经过时的结果写了进去。A 自己无法察觉停顿，因为它恢复后执行的下一条指令就是“发出写请求”。 本篇的验收条件只有一条：暂停的旧持有者恢复后，无法写入受保护资源。实现上，租约在获取时原子地发出一个单调递增的 fencing token，受保护资源在写入的同一个原子操作里比较 token，拒绝比自己见过的最大值更小的请求。另外用同一时间线说明：资源端如果不检查 token，这个保证就不存在，再完善的租约也补不上。 需求、不变量与排除项 场景是合成的：报表作业 report-job 每天生成作用域 daily-report 下的若干分片（summary、detail），写入报表输出库。持有者标识形如 holder-a。 需要成立的不变量有三条：  I1，按数据库时钟，同一...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-20-%E5%8F%91%E5%8F%B7%E6%9C%8D%E5%8A%A1%E7%9A%84%E5%94%AF%E4%B8%80%E6%80%A7%E4%B8%8E%E5%A4%B1%E8%B4%A5%E6%A8%A1%E5%BC%8F/" title="后端系统工程 20：发号服务的唯一性与失败模式"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-77.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 20：发号服务的唯一性与失败模式</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 19 延迟任务的领取与取消 ｜ 本篇 20 ｜ 下一篇 21 有限能力的数据库路由代理 “生成一个唯一 ID”这句话省略了三个限定：在多大范围内唯一，在哪些故障之后仍然唯一，除了唯一还要求什么。一张订单表的主键只需在该表内不重复；跨系统传递的标识要在所有系统中不重复；作为分片键或排序键时，还会被要求大致按时间递增。不同方案对这些问题的回答不同，它们的失败模式也不同：数据库号段在进程崩溃后留下空洞，时间型标识在时钟回退时可能重复，节点号方案在两个进程误用同一节点号时必然重复。 本篇实现一个基于 PostgreSQL 的号段发号器，作为主方案验证并发取号、进程重启、数据库故障下的唯一性；再实现 UUIDv4、UUIDv7 和 Snowflake 式 64 位标识作为契约对照，用受控时钟测试时钟回退，用真实多进程测试节点号冲突。代码在 examples/20-id-service/，输出在 evidence/20/output.txt。 需求契约 号段服务的使用方只调用一个操作：为某个业务标签取下一个号。服务承诺：  同一业务标签下发出的号全局唯一，这一点在发号进程崩...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-29-%E8%AE%A2%E5%8D%95%E6%94%AF%E4%BB%98%E6%A8%A1%E6%8B%9F%E4%B8%8E%E5%BA%93%E5%AD%98%E8%A1%A5%E5%81%BF/" title="后端系统工程 29：订单、支付模拟与库存补偿"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-15.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 29：订单、支付模拟与库存补偿</div></div><div class="info-2"><div class="info-item-1">上一篇把名额收进了一张预留表：预留有效期内名额归该用户，到期由释放任务归还。本篇在它上面加一层订单和一个假支付渠道，处理三件预留层回答不了的事：调用渠道超时，钱到底扣了没有；渠道的回调重复、乱序、迟到时，订单状态会不会被改坏；支付成功的消息到达时，预留已经过期并被别人买走，这笔钱怎么办。代码在 examples/flash-sale/src/lab/flash/order，库存层原样复用第 28 篇的 lab.flash.reserve.Inventory，没有改动。全部金额是模拟积分，订单固定 1990 分，SKU 为 sku-lab-01，用户为 user-0042 这类编号，渠道替身只监听本机端口。 需求与范围 需求写成可以逐条断言的形式：  订单状态只能沿状态机迁移；任何迁移都以“当前状态等于前置状态”为条件，不满足即拒绝，不覆盖。 渠道调用没有拿到确定应答时，订单不得判为失败，也不得归还库存；结果必须通过查询或关单收敛。 同一笔支付的成功通知无论到达几次、以什么顺序到达，最多造成一次状态迁移、一次库存确认和一条下游事件。 成功通知到达时若预留已被释放：能重新占到名额就确...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-34-%E5%8F%AF%E6%92%A4%E9%94%80%E7%9F%AD%E9%93%BE%E4%B8%8E%E8%AE%BF%E9%97%AE%E7%BB%9F%E8%AE%A1/" title="后端系统工程 34：可撤销短链与访问统计"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-165.png" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 34：可撤销短链与访问统计</div></div><div class="info-2"><div class="info-item-1">短链服务的主路径只有一次查表和一个 3xx 响应，难点在三个容易被忽略的边界：两个创建者同时申请同一个别名时谁的目标留下；所有者撤销一条短链之后，旧目标还会被返回多久；统计库变慢或不可用时，跳转是否跟着变慢。实现是一个 Java 21 + PostgreSQL 16 的最小服务，三个问题各自对应一组可执行的断言。 需求与范围 操作只有五种：创建随机码短链、创建自定义别名、撤销、按码访问、记录点击。过期时间在创建时写定，之后不改；目标地址创建后不可修改，需要改目标就撤销旧码再建新码。 业务不变量：  I1 码唯一且不覆盖。一个码最多对应一个目标；任何被告知“创建成功”的调用方，其提交的目标就是库中该码的目标。 I2 撤销有界生效。撤销事务提交后，返回旧目标的 302 只会在一个可计算的窗口内出现，窗口上界由缓存参数决定，并且可以测量。 I3 统计不阻塞跳转。统计库连接失败、表锁等待或写入超时，不改变重定向的状态码，请求线程也不等待统计侧的连接或锁。 I4 点击至多计一次。同一次点击因重试被写入多次时，统计表里只有一行。点击可以因队列满而丢弃，但丢弃数必须被计数。  明确排除：账号与...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9C%80%E6%B1%82%E5%A5%91%E7%BA%A6"><span class="toc-number">1.</span> <span class="toc-text">需求契约</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%8A%B6%E6%80%81%E5%BD%92%E5%B1%9E"><span class="toc-number">2.</span> <span class="toc-text">状态归属</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%91%E5%B8%83%E4%BA%8B%E5%8A%A1"><span class="toc-number">3.</span> <span class="toc-text">发布事务</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%81%B0%E5%BA%A6%EF%BC%9A%E5%BA%8F%E5%8F%B7%E5%89%8D%E8%BF%9B%E4%B8%8E%E5%86%85%E5%AE%B9%E7%94%9F%E6%95%88%E5%88%86%E5%BC%80"><span class="toc-number">4.</span> <span class="toc-text">灰度：序号前进与内容生效分开</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%8D%E5%8A%A1%E7%AB%AF%E6%80%8E%E6%A0%B7%E8%A2%AB%E5%94%A4%E9%86%92"><span class="toc-number">5.</span> <span class="toc-text">服务端怎样被唤醒</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%8E%A8-%E6%8B%89%E4%B8%8E%E4%B8%A4%E8%80%85%E7%BB%93%E5%90%88"><span class="toc-number">5.1.</span> <span class="toc-text">推、拉与两者结合</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%85%A8%E9%87%8F%E5%BF%AB%E7%85%A7%E8%BF%98%E6%98%AF%E5%A2%9E%E9%87%8F"><span class="toc-number">5.2.</span> <span class="toc-text">全量快照还是增量</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AE%A2%E6%88%B7%E7%AB%AF%EF%BC%9A%E5%8F%AA%E5%89%8D%E8%BF%9B-%E5%8F%AF%E7%A6%BB%E7%BA%BF%E5%90%AF%E5%8A%A8"><span class="toc-number">6.</span> <span class="toc-text">客户端：只前进，可离线启动</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E4%BE%8B%E4%B8%8E%E8%AF%81%E6%8D%AE"><span class="toc-number">7.</span> <span class="toc-text">用例与证据</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%93%E8%AE%BA%E8%BE%B9%E7%95%8C"><span class="toc-number">8.</span> <span class="toc-text">结论边界</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

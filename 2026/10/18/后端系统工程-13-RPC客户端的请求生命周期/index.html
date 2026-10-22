@@ -1,0 +1,953 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>后端系统工程 13：RPC 客户端的请求生命周期 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="系列导航：上一篇 12 有界连接池与等待取消 ｜ 本篇 13 ｜ 下一篇 14 会话存储与登录撤销 本地函数调用只有两种结局：返回，或者抛出异常。远程调用多了第三种：请求可能已经发出、也可能已经在对端执行，但结果没有回来。调用方在截止时间到达时只能如实说“不知道”。RPC 客户端的大部分复杂度都来自这第三种结局：同一条连接上，迟到的响应不能交给后来的请求；超时之后，客户端要判断能不能再发一次；服务">
+<meta property="og:type" content="article">
+<meta property="og:title" content="后端系统工程 13：RPC 客户端的请求生命周期">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-13-RPC%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%AF%B7%E6%B1%82%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="系列导航：上一篇 12 有界连接池与等待取消 ｜ 本篇 13 ｜ 下一篇 14 会话存储与登录撤销 本地函数调用只有两种结局：返回，或者抛出异常。远程调用多了第三种：请求可能已经发出、也可能已经在对端执行，但结果没有回来。调用方在截止时间到达时只能如实说“不知道”。RPC 客户端的大部分复杂度都来自这第三种结局：同一条连接上，迟到的响应不能交给后来的请求；超时之后，客户端要判断能不能再发一次；服务">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-168.jpg">
+<meta property="article:published_time" content="2026-10-18T11:30:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T08:33:36.094Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="RPC">
+<meta property="article:tag" content="TCP">
+<meta property="article:tag" content="后端系统工程">
+<meta property="article:tag" content="幂等">
+<meta property="article:tag" content="截止时间">
+<meta property="article:tag" content="重试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-168.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "后端系统工程 13：RPC 客户端的请求生命周期",
+  "url": "https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-13-RPC%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%AF%B7%E6%B1%82%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/",
+  "image": "https://magicliang.github.io/img/wall-paper-168.jpg",
+  "datePublished": "2026-10-18T11:30:00.000Z",
+  "dateModified": "2026-10-22T08:33:36.094Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-13-RPC%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%AF%B7%E6%B1%82%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '后端系统工程 13：RPC 客户端的请求生命周期',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2016</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2094</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-168.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">后端系统工程 13：RPC 客户端的请求生命周期</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">后端系统工程 13：RPC 客户端的请求生命周期</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-18T11:30:00.000Z" title="Created 2026-10-18 19:30:00">2026-10-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-22T08:33:36.094Z" title="Updated 2026-10-22 16:33:36">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">5.3k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>18mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-22 16:33:36&quot;}" hidden></div><p>系列导航：上一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-12-%E6%9C%89%E7%95%8C%E8%BF%9E%E6%8E%A5%E6%B1%A0%E4%B8%8E%E7%AD%89%E5%BE%85%E5%8F%96%E6%B6%88/" title="后端系统工程 12：有界连接池与等待取消">12 有界连接池与等待取消</a> ｜ 本篇 13 ｜ 下一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-14-%E4%BC%9A%E8%AF%9D%E5%AD%98%E5%82%A8%E4%B8%8E%E7%99%BB%E5%BD%95%E6%92%A4%E9%94%80/" title="后端系统工程 14：会话存储与登录撤销">14 会话存储与登录撤销</a></p>
+<p>本地函数调用只有两种结局：返回，或者抛出异常。远程调用多了第三种：请求可能已经发出、也可能已经在对端执行，但结果没有回来。调用方在截止时间到达时只能如实说“不知道”。RPC 客户端的大部分复杂度都来自这第三种结局：同一条连接上，迟到的响应不能交给后来的请求；超时之后，客户端要判断能不能再发一次；服务端则不应该为一个已经被放弃的请求做事。</p>
+<p>本篇实现一个最小 RPC，客户端是单连接多路复用，服务端是独立 JVM 进程并带故障注入，用 20 个用例检验四件事：字节流被正确切成帧；响应只交给发起它的那次尝试；截止时间同时约束客户端等待和服务端执行；只有允许的操作才会被自动重试。代码在 <code>examples/13-rpc-client/</code>，输出在 <code>evidence/13/output.txt</code>。</p>
+<h2 id="需求契约">需求契约</h2>
+<p>调用方看到一个操作：<code>call(method, idempotency, key, payload, timeout)</code>，返回状态之一：<code>OK</code>、<code>APP_ERROR</code>、<code>INVALID_ARGUMENT</code>、<code>DEADLINE_EXCEEDED</code>、<code>UNAVAILABLE</code>、<code>UNKNOWN</code>。服务端提供两个业务方法：<code>get</code> 读余额，声明为幂等；<code>debit</code> 扣减余额，声明为非幂等，可以附带幂等键。</p>
+<p>客户端必须维持以下不变量：</p>
+<ul>
+<li>每个响应只交给发起它的那一次尝试；查不到发起者的响应被丢弃并计数，不交给任何其他请求。</li>
+<li>每次调用在 <code>timeout</code> 之内返回，重试也不能越过它。</li>
+<li>一个没有幂等键的非幂等调用，在结果未知时不会被客户端再次发送；调用方得到 <code>UNKNOWN</code>，而不是一个看起来确定的失败。</li>
+<li>一帧非法数据出现后，这条连接上的后续字节不再被解释。</li>
+</ul>
+<p>规模假设是教学取值：一个客户端进程、8 个调用线程共享一条连接；帧上限 64 KiB；单次尝试超时 300ms，调用总截止时间 2s，最多 4 次尝试；退避从 20ms 起按 2 倍增长，上限 200ms，抖动 ±20%。这些数值只服务于实验，不是推荐配置。</p>
+<p>图 13-1：状态归属（全部在进程内存，没有持久化）</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs text">+--------------------- 客户端进程 ---------------------+        +------------------- 服务端进程 RpcServer -------------------+<br>| 调用线程 x8 --call()--&gt; RpcClient                    |        | 读线程: Decoder -&gt; 控制方法内联 / 业务请求入队(记录到达时刻) |<br>|   ids: AtomicLong（每次尝试一个新 ID）               |  TCP   | 工作线程池 workers=N: 出队时检查预算 -&gt; 执行 -&gt; 响应入队    |<br>|   Conn.pending: Map&lt;requestId, Pending&gt;  &lt;-----------+--------+ 写线程: 响应队列 -&gt; socket（chunk 模式下随机切分）        |<br>|   读线程: Decoder -&gt; pending.remove(id) -&gt; complete  |        | 内存状态: 余额表、幂等键去重表(键-&gt;指纹+首次结果)、计数器  |<br>+------------------------------------------------------+        +-------------------------------------------------------------+<br></code></pre></td></tr></table></figure>
+<h2 id="字节流到帧">字节流到帧</h2>
+<p>TCP 提供的是字节流。RFC 9293 §2.2 写道：“TCP provides a reliable, in-order, byte-stream service to applications.”；§3.7 进一步说明，TCP 不保证收发两端分段边界与应用读写缓冲区边界之间存在任何对应关系（<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9293.txt">RFC 9293</a>）。Java 一侧也一样，<code>SocketChannel.read</code> 的文档说一次读取“might not fill the buffer, and in fact it might not read any bytes at all”（<a target="_blank" rel="noopener" href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/channels/SocketChannel.html">Java SE 21 SocketChannel</a>）。所以“一次 <code>write</code> 对应一次 <code>read</code>”只是低负载回环上的巧合，消息边界必须由应用协议自己表达。</p>
+<p>本实现使用长度前缀帧，字段全部定长或带长度，大端序：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>长度</th>
+<th>约束</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>frameLen</td>
+<td>4</td>
+<td>之后的字节数，必须在 [24, 65536]</td>
+</tr>
+<tr>
+<td>magic / version / type</td>
+<td>2 / 1 / 1</td>
+<td>0x5243 / 1 / 请求或响应</td>
+</tr>
+<tr>
+<td>requestId</td>
+<td>8</td>
+<td>非 0</td>
+</tr>
+<tr>
+<td>budgetMs</td>
+<td>4</td>
+<td>请求：本次尝试剩余预算（相对毫秒）</td>
+</tr>
+<tr>
+<td>status</td>
+<td>1</td>
+<td>响应状态</td>
+</tr>
+<tr>
+<td>methodLen / keyLen</td>
+<td>1 / 1</td>
+<td>1…32 / 0…64</td>
+</tr>
+<tr>
+<td>method、key、payloadLen、payload</td>
+<td>变长</td>
+<td>frameLen 必须等于各段之和</td>
+</tr>
+</tbody>
+</table>
+<p>解码器是增量的：收到多少字节就追加到缓冲区，循环取出所有完整帧，剩余部分留到下一次。长度前缀一到达就检查上限，不按对端声明的长度分配内存：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-comment">// Frame.Decoder.feed</span><br><span class="hljs-keyword">while</span> (size - pos &gt;= <span class="hljs-number">4</span>) &#123;<br>    <span class="hljs-type">int</span> <span class="hljs-variable">len</span> <span class="hljs-operator">=</span> ByteBuffer.wrap(buf, pos, <span class="hljs-number">4</span>).getInt();<br>    <span class="hljs-keyword">if</span> (len &lt; FIXED + <span class="hljs-number">1</span> || len &gt; MAX_FRAME) <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">ProtocolException</span>(<span class="hljs-string">&quot;frame length ... outside ...&quot;</span>);<br>    <span class="hljs-keyword">if</span> (size - pos - <span class="hljs-number">4</span> &lt; len) <span class="hljs-keyword">break</span>;          <span class="hljs-comment">// 半包：等待更多字节</span><br>    out.add(parseBody(buf, pos + <span class="hljs-number">4</span>, len));    <span class="hljs-comment">// 一次读取可能产生多帧（粘包）</span><br>    pos += <span class="hljs-number">4</span> + len;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>遇到非法帧时只有一种处理：关闭连接。帧内的长度字段错了，后面每一个字节的位置就都不可信，无法“跳过这一帧继续读”。客户端关闭连接时，这条连接上所有在途请求一并失败，它们的结果按下文的规则归类。</p>
+<p>解码器先在进程内用模型检验：500 个随机帧编码后，按 1 字节一段、按 1 到 97 字节随机分段两种方式喂入，解出的帧与原帧逐字段比较。随后在真实进程间检验：服务端进入 chunk 模式，把一小段时间内的多个响应拼起来，再按 1 到 13 字节随机切开写出，每段之后都 <code>flush</code>，并关闭 Nagle 算法。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE decoder_split_model      PASS model=in-process frames=500 bytes=91862 diff1byte=0 diffRandom=0 maxFrameAccepted=true maxPlus1Rejected=true early4byte=[frame length 65537 outside [24,65536]] ...<br>CASE half_packet_sticky_real  PASS ok=400 mismatch=0 nonOk=0 serverChunks=4235 serverFrames=403 clientReadsEndingMidFrame=1535 clientReadsWithMultipleFrames=11 protocolErrors=0<br></code></pre></td></tr></table></figure>
+<p>403 个帧被切成 4235 次写出，客户端有 1535 次读取停在帧中间，11 次读取一次带回多个帧，400 次调用没有一次拿错结果。服务端面对的是同一个问题：逐字节发来的请求被正确组装（<code>server_split_and_invalid_request</code>），magic 错误的帧和声明长度为 2^31−1 的帧头都让服务端关闭连接，<code>protocolErrors=2</code>。客户端编码超过 64 KiB 的请求时直接返回 <code>INVALID_ARGUMENT</code>，服务端请求计数为 0。</p>
+<h2 id="请求-id-与-pending-表">请求 ID 与 pending 表</h2>
+<p>一条连接上同时有多个请求在途时，响应的到达顺序由服务端的执行时间决定，与发送顺序无关。客户端为每次尝试分配一个新的请求 ID，放进 pending 表，读线程按 ID 取出：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-comment">// RpcClient.Conn.readLoop</span><br><span class="hljs-type">Pending</span> <span class="hljs-variable">p</span> <span class="hljs-operator">=</span> pending.remove(fr.id());<br><span class="hljs-keyword">if</span> (p == <span class="hljs-literal">null</span>) lateDropped.incrementAndGet(); <span class="hljs-comment">// 已超时放弃或未知 ID：丢弃，绝不交给别的请求</span><br><span class="hljs-keyword">else</span> p.f.complete(fr);<br></code></pre></td></tr></table></figure>
+<p>超时的那一方在放弃前执行 <code>pending.remove(id)</code>。表中查不到，正是“这个响应已经没人要”的判定条件。之后才到达的同 ID 响应只会增加 <code>lateDropped</code>。ID 按“尝试”而不是按“调用”分配：同一次调用的第二次尝试有新的 ID，第一次尝试的迟到响应因此不会冒充第二次的结果（<code>late_then_retry_new_request_id</code> 的日志里是 <code>id=1</code>、<code>id=2</code>，<code>lateDropped=1</code>）。</p>
+<p>对照实现 <code>FifoClient</code> 在同一条连接上流水线发送，收到响应时交给队首，不看 ID；超时的请求从队列中移除。这种写法单看每一步都说得通。实验时序如下：A 读 <code>acct-A</code>，服务端执行后延迟到预算加 150ms 才回应，A 在 200ms 时超时；随后 B 读 <code>acct-B</code>，服务端为 B 休眠 400ms；最后 C 读 <code>acct-C</code>。</p>
+<p>图 13-2：同一时序下按 ID 匹配与按 FIFO 匹配的差别（超时 200ms，A 的响应在约 350ms 到达）</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant Cl as 客户端
+    participant S as 服务端
+    Cl-&gt;&gt;S: A get acct-A (id=1, budget=200)
+    Note over S: 执行 A，延迟回应（late 注入）
+    Note over Cl: 200ms 超时：pending.remove(1) / FIFO 队列移除 A
+    Cl-&gt;&gt;S: B get acct-B;sleep=400 (id=2)
+    S--&gt;&gt;Cl: A 的响应 (id=1) 约 350ms 到达
+    alt ID 关联
+        Cl--&gt;&gt;Cl: pending 中没有 1 → lateDropped=1，B 继续等待
+        S--&gt;&gt;Cl: B 的响应 (id=2) → 交给 B
+    else FIFO
+        Cl--&gt;&gt;Cl: 队首是 B → B 收到 account=acct-A（串包）
+    end</code></pre>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE late_response_dropped_by_id      PASS A=DEADLINE_EXCEEDED@357ms B=[account=acct-B balance=1000 budget=1999] C=[account=acct-C ...] lateDropped=1<br>CASE negative_control_fifo_crosstalk  PASS expectCrosstalk A=TIMEOUT B=[account=acct-A balance=1000 budget=200] C=[account=acct-C ...] crosstalk=1<br></code></pre></td></tr></table></figure>
+<p>FIFO 客户端里，B 拿到了 A 的余额，而且没有任何错误信号。如果 B 是一次扣减，调用方会把别人的结果当成自己的确认。FIFO 匹配成立需要两个前提：服务端严格按序回应，客户端从不提前放弃请求。HTTP/1.1 流水线依赖第一个前提，只要客户端存在超时，第二个前提就不成立。还有一种不依赖 ID 的做法是“超时就关闭整条连接”，它也能避免串包，代价是同一连接上所有其他在途请求一起变成结果未知。</p>
+<h2 id="截止时间：本地计时与传给对端的预算">截止时间：本地计时与传给对端的预算</h2>
+<p>gRPC 的截止时间指南把截止时间定义为客户端愿意等待的最后时刻，并提到它默认不设置截止时间，客户端可能因此一直等下去（<a target="_blank" rel="noopener" href="https://grpc.io/docs/guides/deadlines/">gRPC Deadlines</a>）。同一指南说明，向下游传播时，gRPC 把截止时刻换算成扣除已耗时间的超时值，以避开两台机器的时钟偏差。本实现沿用这个做法：客户端在本地用 <code>System.nanoTime()</code> 计算总截止时刻，每次尝试发送的是一个相对值 <code>budgetMs = min(attemptTimeout, 剩余时间)</code>；服务端从收到完整帧的时刻开始计时，工作线程出队后先检查预算：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-comment">// RpcServer.Conn.handle</span><br><span class="hljs-type">long</span> <span class="hljs-variable">waitedMs</span> <span class="hljs-operator">=</span> (System.nanoTime() - arrival) / <span class="hljs-number">1_000_000</span>;<br><span class="hljs-keyword">if</span> (waitedMs &gt;= f.budgetMs()) &#123;          <span class="hljs-comment">// 客户端已经放弃：不执行，回一个 DEADLINE_EXCEEDED</span><br>    expiredRejected.incrementAndGet();<br>    send(Frame.response(f.id(), f.method(), Frame.S_DEADLINE_EXCEEDED, <span class="hljs-string">&quot;expired before execution waited=&quot;</span> + waitedMs));<br>    <span class="hljs-keyword">return</span>;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p><code>Socket.setSoTimeout</code> 不能替代这个预算。它只约束单次 <code>read</code> 的阻塞时间，超时后 socket 仍然有效（<a target="_blank" rel="noopener" href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/net/Socket.html">Java SE 21 Socket</a>）。一个响应如果每 200ms 来一个字节，单次读取永远不会超时，整个调用却可以拖很久。多路复用客户端的读线程本来就不设读超时，截止时间由每个 <code>Pending</code> 上的 <code>future.get(budget)</code> 实现。</p>
+<p><code>deadline_server_skips_expired</code> 用一个单工作线程的服务端制造排队：先发一个休眠 500ms 的 <code>get</code>，再发一个总截止时间 100ms、不带键的 <code>debit</code>。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE deadline_server_skips_expired  PASS debit=UNKNOWN@99ms attempts=1 slowGet=OK serverDebitExec=0 serverExpiredRejected=1 clientLateDropped=1 balance=1000<br></code></pre></td></tr></table></figure>
+<p>服务端日志记录 <code>EXPIRED id=2 method=debit budget=99 waited=486</code>：扣减在队列里等了 486ms，出队时预算早已用完，没有执行，余额仍是 1000。服务端随后回的 <code>DEADLINE_EXCEEDED</code> 到达时，客户端早已放弃，这个响应被计为迟到丢弃。客户端在 99ms 时返回的是 <code>UNKNOWN</code>，事后看扣减并没有发生，但客户端在那一刻不可能知道这一点。gRPC 的状态码文档对 <code>DEADLINE_EXCEEDED</code> 也有同样的提醒：对改变状态的操作，即使操作已经成功完成，也可能返回这个错误（<a target="_blank" rel="noopener" href="https://grpc.io/docs/guides/status-codes/">gRPC Status Codes</a>）。服务端检查预算，减少的是无用功；它不能把调用方的“未知”变成“已知”。服务端检查发生在执行之前，已经开始执行的扣减不会被中途取消，本实现也没有取消机制。</p>
+<h2 id="哪些失败可以重试">哪些失败可以重试</h2>
+<p>RFC 9110 §9.2.2 给出了幂等的定义：多次相同请求对服务端的预期效果与一次相同。它还给出了自动重试的界线：“A client SHOULD NOT automatically retry a request with a non-idempotent method unless it has some means to know that the request semantics are actually idempotent, regardless of the method, or some means to detect that the original request was never applied.”（<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9110.txt">RFC 9110</a>）这句话里有两个例外条件：请求语义本身幂等，或者能够确认原请求从未被执行。客户端的重试分类就按这两个条件划分：</p>
+<table>
+<thead>
+<tr>
+<th>尝试结果</th>
+<th>分类</th>
+<th>依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>连接建立失败；写出前连接已失效</td>
+<td>确定未执行</td>
+<td>请求没有离开客户端</td>
+</tr>
+<tr>
+<td>服务端 <code>UNAVAILABLE</code>、<code>DEADLINE_EXCEEDED</code></td>
+<td>确定未执行</td>
+<td>服务端协议承诺：这两个状态只在执行前返回</td>
+</tr>
+<tr>
+<td>写出后超时、断连、收到非法帧、半个响应帧</td>
+<td>结果未知</td>
+<td>服务端可能已执行</td>
+</tr>
+<tr>
+<td><code>OK</code>、<code>APP_ERROR</code>、<code>INVALID_ARGUMENT</code></td>
+<td>终态</td>
+<td>重试也不会改变结果</td>
+</tr>
+</tbody>
+</table>
+<p>确定未执行的失败对所有方法都可以重试；结果未知的失败，只有幂等方法或带幂等键的调用才重试，其余立即返回 <code>UNKNOWN</code>。gRPC 的重试文档有一个对应概念：没有配置重试策略时，gRPC 只做“透明重试”，并且只在确定 RPC 没有被服务端处理时才做；配置了重试策略后，哪些状态码可以重试由服务配置的 <code>retryableStatusCodes</code> 显式列出，没有固定的默认集合（<a target="_blank" rel="noopener" href="https://grpc.io/docs/guides/retry/">gRPC Retry</a>）。</p>
+<p>图 13-3：单次尝试的分类与重试判定</p>
+<pre><code class="hljs mermaid">stateDiagram-v2
+    [*] --&gt; Connect
+    Connect --&gt; NotSent: 连接失败
+    Connect --&gt; Writing: 已连接（pending.put，writeStarted=true）
+    Writing --&gt; Waiting: 写出成功
+    Writing --&gt; Unknown: 写出异常
+    Waiting --&gt; Final: OK / APP_ERROR / INVALID_ARGUMENT
+    Waiting --&gt; NotExecuted: UNAVAILABLE / 服务端 DEADLINE_EXCEEDED
+    Waiting --&gt; Unknown: 超时 / 断连 / 非法帧
+    NotSent --&gt; Retry
+    NotExecuted --&gt; Retry
+    Unknown --&gt; Retry: IDEMPOTENT 或带幂等键
+    Unknown --&gt; ReturnUNKNOWN: 非幂等且无键
+    Retry --&gt; Connect: 次数未满且退避后仍在截止时间内
+    Retry --&gt; GiveUp: 次数用尽或退避会越过截止时间</code></pre>
+<p>写出之前先置 <code>writeStarted=true</code>。连接若在这一步之前失效，pending 项会被标成未发送；一旦开始写，即使 <code>write</code> 抛出异常，客户端也无法知道对端收到了多少字节，只能按结果未知处理。分类的保守方向始终是“未知”。</p>
+<p>故障注入覆盖了每一行：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE retry_unavailable_non_idempotent  PASS OK attempts=3 log=[a1 ... status=4, backoff 22ms, a2 ... status=4, backoff 39ms, a3 ... status=0] serverDebitExec=1 rejectedUnavailable=2<br>CASE unknown_not_retried_without_key   PASS UNKNOWN attempts=1 log=[a1 TIMEOUT timeout id=1 budget=300] serverDebitExec=1 balance=990<br>CASE close_after_exec                  PASS get=OK attempts=2 ... debit=UNKNOWN attempts=1 ... serverDebitExec=1 clientConnections=2<br>CASE half_written_response_discarded   PASS get=OK attempts=2 log=[a1 CONN_LOST_AFTER_SEND eof (buffered partial bytes=34) id=1, ...] debit=UNKNOWN serverDebitExec=1<br>CASE invalid_frame_from_server         PASS get=OK attempts=2 log=[a1 PROTOCOL_ERROR_AFTER_SEND protocol: bad magic 0xdead id=1, ...] debit=UNKNOWN ... clientConnections=3<br></code></pre></td></tr></table></figure>
+<p>服务端两次执行前拒绝后，非幂等扣减在第 3 次尝试成功，只执行了一次。服务端执行后不回应、执行后断连、只写出半个响应帧、回一个坏帧，这四种情况下扣减都已经发生（<code>serverDebitExec=1</code>），无键扣减都返回 <code>UNKNOWN</code>，幂等读都在新连接上重试成功。半帧那一行的 <code>buffered partial bytes=34</code> 说明，客户端在连接关闭时手里有 34 个字节的残帧，它们没有被当作响应交付。</p>
+<p>次数上限与截止时间上限分别生效。连接被拒绝时，总截止时间 5s 的调用在第 4 次尝试后以 <code>UNAVAILABLE</code> 结束，用时 139ms；总截止时间 60ms 的调用尝试 2 次后，下一次退避 39ms 会越过截止时间，于是停止，用时 23ms。恢复路径也是同一套规则：服务端进程晚启动时，前 3 次尝试都是连接被拒绝，第 4 次成功，非幂等扣减执行一次（<code>server_starts_late_recovery</code>）。</p>
+<h2 id="幂等键与服务端去重">幂等键与服务端去重</h2>
+<p>结果未知时不重试，对调用方来说并不友好：它拿到 <code>UNKNOWN</code> 之后仍然要决定怎么办。幂等键把“确认原请求是否执行过”的能力交给服务端：调用方为一次逻辑操作生成一个键，所有尝试都携带同一个键，服务端第一次见到这个键时执行并记录结果，之后再见到同一个键就返回记录下的结果。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE retry_with_idempotency_key     PASS OK attempts=2 ... payload=[account=acct-K balance=990 exec=1 budget=300 replayed=true] serverDebitExec=1 dedupHits=1 balance=990<br>CASE negative_control_naive_retry   PASS expectDoubleExecution OK attempts=2 ... serverDebitExec=2 balance=980 (one logical debit of 10)<br>CASE idempotency_key_reuse_rejected PASS first=OK differentBody=INVALID_ARGUMENT[idempotency key reused with different request] sameBody=OK serverDebitExec=1<br></code></pre></td></tr></table></figure>
+<p>同样是“执行后不回应”，带键的扣减在第二次尝试时拿到首次结果（<code>replayed=true</code>），余额 990；<code>NAIVE</code> 策略在超时后照样重试，同一次扣减 10 被执行两次，余额 980，而调用方看到的只是一次 <code>OK</code>。去重表除了结果还记录请求指纹：同一个键带着不同金额再次出现时，服务端拒绝，不执行。否则调用方的键生成错误会悄悄变成“返回了别的请求的结果”。原请求仍在执行时到达的重复请求，会等待原请求的结果，最长等到自己的预算耗尽。</p>
+<p>这张去重表的边界必须写清楚：它在服务端进程内存里，没有过期，没有容量上限，进程重启就会丢失；它只对落到同一个服务端进程的重试有效。生产中的去重记录要与业务写入在同一个事务里落库，才能在崩溃后仍然成立，并且需要规定保留期，保留期必须长于客户端可能重试的时间范围。系列计划中的第 27 篇（余额扣减）把去重记录放进 PostgreSQL；本篇没有做持久化去重实验。</p>
+<h2 id="三组方案的取舍">三组方案的取舍</h2>
+<table>
+<thead>
+<tr>
+<th>对比</th>
+<th>方案一</th>
+<th>方案二</th>
+<th>本实现的选择与理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>连接使用</td>
+<td>每请求一连接：不需要 pending 表，连接关闭天然区分请求</td>
+<td>单连接多路复用：需要请求 ID、读线程和连接失效时的批量失败</td>
+<td>多路复用。400 次调用只建 1 条连接；每请求一连接新建 400 条，客户端 TIME_WAIT 从 35 增至 435</td>
+</tr>
+<tr>
+<td>响应匹配</td>
+<td>FIFO：实现最简单，要求服务端按序回应且客户端从不提前放弃</td>
+<td>ID 关联：允许乱序回应和单个请求超时</td>
+<td>ID 关联。FIFO 对照在一次迟到后即串包</td>
+</tr>
+<tr>
+<td>结果未知时</td>
+<td>客户端按方法声明决定是否重试</td>
+<td>服务端按幂等键去重，客户端可以重试任何带键调用</td>
+<td>两者并用：无键非幂等调用返回 <code>UNKNOWN</code>；需要自动恢复的写操作带键</td>
+</tr>
+</tbody>
+</table>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE compare_per_request_vs_multiplex PASS calls=400 threads=8 perRequest: ok=400 newConnections=400 clientTimeWaitBefore=35 after=435 elapsed=3252ms | multiplex: ok=400 newConnections=1 elapsed=80ms<br></code></pre></td></tr></table></figure>
+<p>耗时是一次运行的观察值，开发期间重复运行时，每请求一连接的耗时在 0.7 到 3.3 秒之间波动，这里只用它说明方向，不作吞吐结论。多路复用的代价也在实验里出现过：服务端回一个坏帧时，同一连接上所有在途请求都按结果未知失败（<code>invalid_frame_from_server</code> 中连接数增加到 3）。单连接也意味着一个慢读者、一个大载荷会拖住其他请求，本实现没有流量控制，也没有按请求分片。</p>
+<h2 id="用例与证据">用例与证据</h2>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th>类型</th>
+<th>观察值（evidence/13/output.txt）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>normal_multiplex</code></td>
+<td>正常</td>
+<td>8 线程 400 次，匹配错误 0，服务端新连接 1，<code>debitExec=200</code></td>
+</tr>
+<tr>
+<td><code>decoder_split_model</code></td>
+<td>边界（模型）</td>
+<td>1 字节与随机切分差异 0；64 KiB 接受，多 1 字节拒绝</td>
+</tr>
+<tr>
+<td><code>half_packet_sticky_real</code></td>
+<td>边界</td>
+<td>4235 次写出、403 帧，客户端匹配错误 0</td>
+</tr>
+<tr>
+<td><code>server_split_and_invalid_request</code></td>
+<td>边界 / 失败</td>
+<td>逐字节请求正确；坏 magic 与超长前缀关闭连接</td>
+</tr>
+<tr>
+<td><code>client_oversize_rejected_locally</code></td>
+<td>拒绝</td>
+<td><code>INVALID_ARGUMENT</code>，服务端请求数 0</td>
+</tr>
+<tr>
+<td><code>late_response_dropped_by_id</code> / FIFO 对照</td>
+<td>迟到响应</td>
+<td><code>lateDropped=1</code> / B 收到 <code>acct-A</code></td>
+</tr>
+<tr>
+<td><code>late_then_retry_new_request_id</code></td>
+<td>恢复</td>
+<td>第 2 次尝试 <code>id=2</code> 成功</td>
+</tr>
+<tr>
+<td><code>deadline_server_skips_expired</code></td>
+<td>截止时间</td>
+<td>服务端未执行，客户端 <code>UNKNOWN</code></td>
+</tr>
+<tr>
+<td><code>retry_unavailable_non_idempotent</code></td>
+<td>重试</td>
+<td>3 次尝试，执行 1 次</td>
+</tr>
+<tr>
+<td><code>unknown_not_retried_without_key</code></td>
+<td>结果未知</td>
+<td><code>UNKNOWN</code>，执行 1 次</td>
+</tr>
+<tr>
+<td><code>retry_with_idempotency_key</code> / NAIVE 对照</td>
+<td>去重</td>
+<td>执行 1 次 / 执行 2 次</td>
+</tr>
+<tr>
+<td><code>idempotency_key_reuse_rejected</code></td>
+<td>拒绝</td>
+<td>不同载荷 <code>INVALID_ARGUMENT</code></td>
+</tr>
+<tr>
+<td><code>close_after_exec</code>、<code>half_written_response_discarded</code>、<code>invalid_frame_from_server</code></td>
+<td>失败恢复</td>
+<td>幂等读重试成功，无键扣减 <code>UNKNOWN</code></td>
+</tr>
+<tr>
+<td><code>connect_refused_bounded_retry</code></td>
+<td>边界</td>
+<td>4 次上限 139ms；60ms 截止时间下 2 次</td>
+</tr>
+<tr>
+<td><code>server_starts_late_recovery</code></td>
+<td>恢复</td>
+<td>3 次未发送后成功，执行 1 次</td>
+</tr>
+<tr>
+<td><code>compare_per_request_vs_multiplex</code></td>
+<td>方案对比</td>
+<td>400 对 1 条新连接</td>
+</tr>
+</tbody>
+</table>
+<p>运行入口为 <code>examples/13-rpc-client/run.sh</code>，环境记录在 <code>evidence/13/env.txt</code>（OpenJDK 21.0.12.1，4 核），服务端日志为 <code>evidence/13/server-4713*.log</code>，证据边界见 <code>evidence/13/LIMITS.md</code>。</p>
+<h2 id="结论边界">结论边界</h2>
+<p>实验支持以下结论：长度前缀帧加增量解码，在任意切分下给出相同的帧序列；按尝试分配 ID 并在放弃时删除 pending 项，能保证迟到响应不会被交给其他请求，而 FIFO 匹配在第一次迟到时就会串包；把剩余预算传给服务端，可以让排队过久的请求不被执行，但客户端在截止时刻看到的仍是“未知”；把失败分成“确定未执行”和“结果未知”两类，再按方法声明和幂等键决定是否重试，在本实验的每种注入故障下，扣减都没有被客户端重复执行。</p>
+<p>实验都在单机回环上完成，没有覆盖丢包、对端主机掉电造成的半开连接、跨机时钟和网络传输时间对预算的消耗。去重表不持久、不共享，它在服务端崩溃或重试落到另一个实例时的行为没有经过实验。性能对比只是一次运行的观察。</p>
+<p>第 12 篇的连接池和本篇的客户端都把状态放在单个进程里。多个实例共同认可同一份状态时，问题变成“哪份记录说了算、撤销何时在所有实例上生效”，这是 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-14-%E4%BC%9A%E8%AF%9D%E5%AD%98%E5%82%A8%E4%B8%8E%E7%99%BB%E5%BD%95%E6%92%A4%E9%94%80/" title="后端系统工程 14：会话存储与登录撤销">14 会话存储与登录撤销</a> 的内容。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-13-RPC%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%AF%B7%E6%B1%82%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/">https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-13-RPC%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%AF%B7%E6%B1%82%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%B9%82%E7%AD%89/">幂等</a><a class="post-meta__tags" href="/tags/RPC/">RPC</a><a class="post-meta__tags" href="/tags/TCP/">TCP</a><a class="post-meta__tags" href="/tags/%E9%87%8D%E8%AF%95/">重试</a><a class="post-meta__tags" href="/tags/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B/">后端系统工程</a><a class="post-meta__tags" href="/tags/%E6%88%AA%E6%AD%A2%E6%97%B6%E9%97%B4/">截止时间</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-168.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-33-%E9%80%9A%E7%9F%A5%E6%B8%A0%E9%81%93%E7%9A%84%E7%BB%93%E6%9E%9C%E6%9C%AA%E7%9F%A5/" title="后端系统工程 33：通知渠道的结果未知"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-9.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 33：通知渠道的结果未知</div></div><div class="info-2"><div class="info-item-1">通知服务调用外部渠道时，最难处理的结果是“没有结果”：请求发出去了，响应没回来。渠道可能根本没收到，也可能已经接受并开始外发，只是响应在路上丢了。本地数据库能把“同一事件只生成一条逻辑通知”做成硬约束，却无法替外部渠道保证“用户只收到一次”。本篇用一个最小通知服务把这两件事分开：逻辑去重由唯一约束负责，外部重复由渠道契约决定，结果未知要作为一种持久状态记录下来，并且有出口。 需求与范围 业务方提交事件，例如“订单 ord-1001 已发货”，通知服务按用户偏好为每个启用渠道生成投递任务，由工作进程领取后调用渠道。要满足的条件如下。  同一 (user_id, event_key) 无论被提交多少次、多少并发，只产生一条逻辑通知。 每条逻辑通知在每个启用渠道上最多一条任务；同一任务在同一时刻最多有一个有效令牌；被取代的持有者无法再改写任务状态，但它已发出的外部调用无法撤回。 每次调用渠道都留下一条投递记录，结果未知的调用能在表里查到，不被后续结果覆盖。 超时后的重试策略取决于渠道能力：支持幂等键就带同一键重发；不支持幂等键但可查询就先查询；两者都不具备就停止自动处理。 领取前偏好被...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-28-%E7%A8%80%E7%BC%BA%E5%90%8D%E9%A2%9D%E7%9A%84%E5%87%86%E5%85%A5%E4%B8%8E%E5%BA%93%E5%AD%98%E9%A2%84%E7%95%99/" title="后端系统工程 28：稀缺名额的准入与库存预留"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-97.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 28：稀缺名额的准入与库存预留</div></div><div class="info-2"><div class="info-item-1">一个预约名额只有 40 个、同一时刻却有几百个请求到达的场景，至少要回答四件事：同时进入数据库的请求怎样限量，超出的请求是排队还是立刻拒绝；40 个名额怎样保证不多发；客户端在等待中断开或超时重发时，名额会不会被占两次；占了名额却迟迟不付款的预留到期后怎样归还，归还任务重跑时会不会多还。本篇用 examples/flash-sale 中的最小服务逐一回答。商品、用户和请求都是合成数据，SKU 固定为 sku-lab-01，用户为 user-0042 这类编号，域名只用 shop.example.test。订单与支付留给下一篇，本篇只交付“名额预留”这一层。 需求与范围 需求按可检查的形式写成五条：  任一时刻有效预留（状态为 HELD 或 CONFIRMED）的数量不超过库存总数。 同一个 request_key 无论发送多少次，最多产生一条预留；同键换用户或换 SKU 视为错误请求。 同一用户在同一 SKU 上最多持有一条有效预留。 单个服务进程内同时访问数据库的预留请求不超过并发上限；等待位置有界，满了立即返回 503。 到期的 HELD 预留由释放任务归还库存；释放任务重复...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-27-%E6%B5%8B%E8%AF%95%E8%B4%A6%E6%88%B7%E7%9A%84%E4%BD%99%E9%A2%9D%E4%B8%8E%E8%B4%A6%E6%9C%AC/" title="后端系统工程 27：测试账户的余额与账本"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-166.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 27：测试账户的余额与账本</div></div><div class="info-2"><div class="info-item-1">一个积分账户只要支持“扣减”，就会同时面对三类问题：多个请求同时扣同一个账户时会不会扣成负数；客户端超时后重发时会不会扣两次；余额列被某段代码改错以后，能不能从别的记录里算出正确值。本篇用一个测试账户服务回答这三个问题。账户、金额与请求都是合成数据，金额单位是“模拟积分”，不对应任何真实货币或支付渠道。 验收目标有三条，每条都落到具体的检查语句和用例编号上：  并发扣减不透支。 超时重试不重复扣款。 余额与流水守恒，余额可以从流水重算。  需求与范围 服务管理一组测试账户，每个账户有一个整数余额。业务方通过 HTTP 发起扣减，例如兑换一件测试奖品花掉 30 积分；运营脚本通过内部调用发放积分。不支持撤销、冻结、部分退款与多币种，也不处理跨库转账。 本章约定的业务不变量：    编号 不变量 检查位置     I1 普通账户余额不小于 0 account.balance_non_negative 约束；UPDATE ... WHERE 条件   I2 同一客户端、同一幂等键至多产生一笔交易 idem_request 主键、ledger_txn 唯一约束   I3 每笔交易的分录之...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-01-RPC%E9%87%8D%E8%AF%95%E4%B8%8E%E8%AF%B7%E6%B1%82%E5%8E%BB%E9%87%8D/" title="分布式系统 01：RPC 重试、并发与请求去重"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 01：RPC 重试、并发与请求去重</div></div><div class="info-2"><div class="info-item-1">计数器最初为 0。客户端调用 Add(1)，服务端把计数器改成 1，回复却在返回途中丢失。客户端等待超时，再调用一次，计数器变成 2。网络只丢了一条回复，业务却多执行了一次。 第 00 篇 已经区分“执行失败”与“没有观察到结果”。RPC 将这个区别带进接口设计：同一项业务操作可以对应多次网络尝试，接口必须说明如何识别它们，以及服务重启之后还保留什么证据。 RPC 隐藏了传输，没有消除失败 一次远程调用通常经过参数编码、请求传输、服务端解码与分发、业务执行、结果编码、回复传输和客户端解码。正常路径看起来接近函数调用，失败路径却多了两个独立进程和两个消息方向。 如果本地进程中的普通函数返回，调用者通常可以直接使用返回值。远程请求还可能卡在消息队列、连接缓冲区或服务端执行队列里；客户端停止等待时，服务端未必停止工作。客户端看到的超时，不能反推出业务修改已经回滚。MIT 2026 RPC 讲义把这种“不知道请求是否到达或执行”的情况作为 RPC 故障语义的起点。 TCP 提供的连接内字节流可靠性也不足以解决这个问题。服务端可以先提交业务，再在回复到达客户端之前崩溃；客户端重连之后，即使...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E05-%E5%B9%82%E7%AD%89%E5%AF%BC%E5%87%BA%E4%B8%8E%E6%96%AD%E7%82%B9%E7%BB%AD%E4%BC%A0/" title="后端系统工程 E05：幂等导出与断点续传——同一个请求，同一份字节"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-24.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 E05：幂等导出与断点续传——同一个请求，同一份字节</div></div><div class="info-2"><div class="info-item-1"> 本文属于《后端系统工程：从接口契约到故障恢复》系列。文中提到的演练工程、测试与实验证据位于博客源码仓库的 batch-4/ 目录（examples/、evidence/ 等子目录）；业务数据均为合成数据。  “导出我的聊天记录”看起来只是一次查询加一次下载，实际包含几个各自独立的问题。用户点了两次按钮，是一个任务还是两个；导出期间又有新消息、有人退群、有消息被撤回，文件里该有什么；导出跑到一半进程被杀，重跑出来的文件和不中断时是否一致；下载到 80% 断网，能否从断点继续，断点之后的字节是否属于同一个文件；下载链接被转发出去，别人能不能用。 本篇用 SQLite 和一个真实监听本机端口的 HTTP 服务实现这条链路，每个问题对应一组用例。全部数据为合成数据。  1. 需求与不变量  X1 同一用户、同一幂等键、同一请求体只产生一个导出任务；同键不同请求体被拒绝。 X2 导出内容由创建时刻的数据快照和权限快照决定，之后的写入、撤回、成员变化不改变结果。 X3 任务可以在任意分片处中断并重跑；重跑得到的产物与不中断时逐字节相同，已完成且校验通过的分片不重写。 X4 下载支持断点续传...</div></div></div></a><a class="pagination-related" href="/2026/10/01/%E6%9C%8D%E5%8A%A1%E7%BD%91%E6%A0%BC-14-%E9%87%8D%E8%AF%95%E6%94%BE%E5%A4%A7%E4%B8%8E%E5%89%AF%E4%BD%9C%E7%94%A8/" title="服务网格 14：重试为何会放大副作用"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/2026/10/01/%E6%9C%8D%E5%8A%A1%E7%BD%91%E6%A0%BC-14-%E9%87%8D%E8%AF%95%E6%94%BE%E5%A4%A7%E4%B8%8E%E5%89%AF%E4%BD%9C%E7%94%A8/cover.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-01</div><div class="info-item-2">服务网格 14：重试为何会放大副作用</div></div><div class="info-2"><div class="info-item-1">没收到响应，是否可以再发一次 不行，除非请求本身可安全重复，或者应用明确实现并验证了去重。第 13 篇已经看到客户端退出后上游仍可能完成；本篇在同一 inventory 的合成 POST /reserve 上检查响应丢失之后重发。业务输入固定为 operation_id=op-01、X-Request-ID=sm-01-repeat，两次使用相同标识不是应用幂等的证明。  库存 handler 的顺序是解析操作 ID → 追加内存账本并记录 201 → 人为延迟 400ms → 写响应。客户端第一次等待只有 100ms；看到超时，不知道服务器停在提交前还是提交后。第二次把等待放宽到 2s 并发送同一输入，若没有去重便得到第二笔。对 read 请求的重试也可能增加下游负载，但不会由此自动推出“读请求永远安全”：日志、计费、外部副作用或应用错误实现都要另查。 两层重试如何相乘 假设仅作为配置上界的示意：SDK 对失败调用最多尝试 2 次，每一次调用都被代理各尝试 2 次；一笔用户操作最多触发 2 × 2 = 4 次后端尝试，而不是“额外重试两次”。这不是本仓库实际代理配置或观测比例。...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9C%80%E6%B1%82%E5%A5%91%E7%BA%A6"><span class="toc-number">1.</span> <span class="toc-text">需求契约</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AD%97%E8%8A%82%E6%B5%81%E5%88%B0%E5%B8%A7"><span class="toc-number">2.</span> <span class="toc-text">字节流到帧</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%AF%B7%E6%B1%82-id-%E4%B8%8E-pending-%E8%A1%A8"><span class="toc-number">3.</span> <span class="toc-text">请求 ID 与 pending 表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%88%AA%E6%AD%A2%E6%97%B6%E9%97%B4%EF%BC%9A%E6%9C%AC%E5%9C%B0%E8%AE%A1%E6%97%B6%E4%B8%8E%E4%BC%A0%E7%BB%99%E5%AF%B9%E7%AB%AF%E7%9A%84%E9%A2%84%E7%AE%97"><span class="toc-number">4.</span> <span class="toc-text">截止时间：本地计时与传给对端的预算</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%93%AA%E4%BA%9B%E5%A4%B1%E8%B4%A5%E5%8F%AF%E4%BB%A5%E9%87%8D%E8%AF%95"><span class="toc-number">5.</span> <span class="toc-text">哪些失败可以重试</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B9%82%E7%AD%89%E9%94%AE%E4%B8%8E%E6%9C%8D%E5%8A%A1%E7%AB%AF%E5%8E%BB%E9%87%8D"><span class="toc-number">6.</span> <span class="toc-text">幂等键与服务端去重</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E7%BB%84%E6%96%B9%E6%A1%88%E7%9A%84%E5%8F%96%E8%88%8D"><span class="toc-number">7.</span> <span class="toc-text">三组方案的取舍</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E4%BE%8B%E4%B8%8E%E8%AF%81%E6%8D%AE"><span class="toc-number">8.</span> <span class="toc-text">用例与证据</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%93%E8%AE%BA%E8%BE%B9%E7%95%8C"><span class="toc-number">9.</span> <span class="toc-text">结论边界</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

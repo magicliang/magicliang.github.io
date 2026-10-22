@@ -1,0 +1,861 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>后端系统工程 14：会话存储与登录撤销 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="系列导航：上一篇 13 RPC 客户端的请求生命周期 ｜ 本篇 14 ｜ 下一篇 15 配置发布与客户端收敛 登录给出的是一份可撤回的授权。用户点击“退出”、管理员踢掉一台设备、用户修改口令后选择“退出所有设备”，这些操作都要在某个时刻之后让旧凭据失效。只有一个服务实例时，这件事只是删掉一条内存记录；有多个实例时，就要回答三个问题：哪一份记录说了算，撤销之后多久所有实例都会拒绝，以及一个与撤销同时">
+<meta property="og:type" content="article">
+<meta property="og:title" content="后端系统工程 14：会话存储与登录撤销">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-14-%E4%BC%9A%E8%AF%9D%E5%AD%98%E5%82%A8%E4%B8%8E%E7%99%BB%E5%BD%95%E6%92%A4%E9%94%80/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="系列导航：上一篇 13 RPC 客户端的请求生命周期 ｜ 本篇 14 ｜ 下一篇 15 配置发布与客户端收敛 登录给出的是一份可撤回的授权。用户点击“退出”、管理员踢掉一台设备、用户修改口令后选择“退出所有设备”，这些操作都要在某个时刻之后让旧凭据失效。只有一个服务实例时，这件事只是删掉一条内存记录；有多个实例时，就要回答三个问题：哪一份记录说了算，撤销之后多久所有实例都会拒绝，以及一个与撤销同时">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-87.jpg">
+<meta property="article:published_time" content="2026-10-18T12:30:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T08:33:36.094Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Cookie">
+<meta property="article:tag" content="PostgreSQL">
+<meta property="article:tag" content="会话">
+<meta property="article:tag" content="后端系统工程">
+<meta property="article:tag" content="并发">
+<meta property="article:tag" content="撤销">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-87.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "后端系统工程 14：会话存储与登录撤销",
+  "url": "https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-14-%E4%BC%9A%E8%AF%9D%E5%AD%98%E5%82%A8%E4%B8%8E%E7%99%BB%E5%BD%95%E6%92%A4%E9%94%80/",
+  "image": "https://magicliang.github.io/img/wall-paper-87.jpg",
+  "datePublished": "2026-10-18T12:30:00.000Z",
+  "dateModified": "2026-10-22T08:33:36.094Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-14-%E4%BC%9A%E8%AF%9D%E5%AD%98%E5%82%A8%E4%B8%8E%E7%99%BB%E5%BD%95%E6%92%A4%E9%94%80/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '后端系统工程 14：会话存储与登录撤销',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2016</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2094</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-87.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">后端系统工程 14：会话存储与登录撤销</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">后端系统工程 14：会话存储与登录撤销</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-18T12:30:00.000Z" title="Created 2026-10-18 20:30:00">2026-10-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-22T08:33:36.094Z" title="Updated 2026-10-22 16:33:36">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.9k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>17mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-22 16:33:36&quot;}" hidden></div><p>系列导航：上一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-13-RPC%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%AF%B7%E6%B1%82%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/" title="后端系统工程 13：RPC 客户端的请求生命周期">13 RPC 客户端的请求生命周期</a> ｜ 本篇 14 ｜ 下一篇 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-15-%E9%85%8D%E7%BD%AE%E5%8F%91%E5%B8%83%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E6%94%B6%E6%95%9B/" title="后端系统工程 15：配置发布与客户端收敛">15 配置发布与客户端收敛</a></p>
+<p>登录给出的是一份可撤回的授权。用户点击“退出”、管理员踢掉一台设备、用户修改口令后选择“退出所有设备”，这些操作都要在某个时刻之后让旧凭据失效。只有一个服务实例时，这件事只是删掉一条内存记录；有多个实例时，就要回答三个问题：哪一份记录说了算，撤销之后多久所有实例都会拒绝，以及一个与撤销同时到达的“续期”请求会不会把会话救回来。</p>
+<p>本篇用 PostgreSQL 共享会话表和四个独立 JVM 进程的 HTTP 实例回答这三个问题，并与自包含签名令牌对照。代码在 <code>examples/14-session-store/</code>，输出在 <code>evidence/14/output.txt</code>。</p>
+<h2 id="需求契约">需求契约</h2>
+<p>接口只有六个：<code>/login</code>、<code>/whoami</code>、<code>/refresh</code>、<code>/logout</code>、<code>/logout-all</code>、<code>/admin/revoke-session</code>。会话凭据放在 Cookie <code>sid</code> 中。会话在以下五个条件同时成立时才有效：</p>
+<ul>
+<li>会话行存在，令牌哈希匹配；</li>
+<li><code>revoked_at</code> 为空；</li>
+<li>会话的 <code>epoch</code> 等于用户当前的 <code>session_epoch</code>；</li>
+<li>当前时间早于 <code>idle_expires_at</code>（空闲期限）；</li>
+<li>当前时间早于 <code>absolute_expires_at</code>（绝对期限）。</li>
+</ul>
+<p>任何实例都按这五条判断，判断用的时间取数据库的 <code>now()</code>，实例本机时钟不参与会话期限。由此得出几条必须维持的不变量：撤销一旦提交，没有任何正确路径能把 <code>revoked_at</code> 写回空值；刷新只能推迟空闲期限，而且不能越过绝对期限；同一用户的活跃会话数不超过 <code>max_sessions</code>。撤销生效窗口另作规定：无缓存实例在撤销提交后的下一次请求即拒绝；启用本地缓存的实例，窗口上限等于缓存 TTL。</p>
+<p>教学取值：空闲期限 3 秒、绝对期限 6 秒（为了让实验在几秒内结束；OWASP 会话管理备忘单给出的常见空闲期限是高价值应用 2–5 分钟、低风险应用 15–30 分钟），每用户最多 3 个活跃会话，缓存 TTL 1000ms。</p>
+<p>图 14-1：多实例共享会话表的状态归属</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><code class="hljs text">浏览器 / 测试客户端 (Cookie: sid=&lt;43 字符令牌&gt;)<br>     |               |                 |                  |<br>+----v----+     +----v----+      +-----v-----+      +-----v-----+<br>| 实例 A  |     | 实例 B  |      | 实例 C    |      | 实例 U    |<br>| 无缓存  |     | 无缓存  |      | 缓存 TTL  |      | 负向对照  |<br>| :47140  |     | :47141  |      | 1000ms    |      | rmw/nolock|<br>+----+----+     +----+----+      +-----+-----+      +-----+-----+<br>     |  JDBC 连接池（每实例 8 条）    | 内存缓存：只存“有效”结果 |<br>     +---------------+----------------+--------------------------+<br>                     v<br>  PostgreSQL 16 b2_14（唯一权威状态，持久化）<br>    t14_users(session_epoch, max_sessions, 口令哈希)<br>    t14_sessions(token_hash 32B, epoch, idle_expires_at, absolute_expires_at, revoked_at, revoke_reason)<br>    t14_revoked_jti（签名令牌对照方案的撤销名单）<br></code></pre></td></tr></table></figure>
+<h2 id="令牌与-cookie">令牌与 Cookie</h2>
+<p>令牌是 <code>SecureRandom</code> 生成的 32 字节随机数，base64url 编码后 43 个字符。OWASP 会话管理备忘单要求会话标识至少有 64 位熵并由 CSPRNG 生成；对需要自行生成令牌的情况，它建议至少 128 位（<a target="_blank" rel="noopener" href="https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html">OWASP Session Management Cheat Sheet</a>）。同一份文档还指出，高熵只能防猜测，不能防泄露：能读到会话存储的人可以直接复用未过期的令牌，如果威胁模型包括存储被只读泄露，就应只存单向校验值。会话表因此只存 <code>SHA-256(令牌)</code>，列上有 <code>check (length(token_hash) = 32)</code>。令牌本身是 256 位均匀随机数，用不加盐的快速哈希即可，口令那种慢哈希是为低熵输入准备的。</p>
+<p><code>login_on_A_whoami_on_B</code> 在实例 A 登录、在实例 B 识别，并检查数据库：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE login_on_A_whoami_on_B  PASS login=200 tokenChars=43 cookieAttrs=[Path=/; HttpOnly; Secure; SameSite=Strict] whoamiB=200[user=u1 session_id=1 instance=B] storedHashBytes=32 hashIsSha256(token)=true rawTokenRows=0<br></code></pre></td></tr></table></figure>
+<p>Cookie 属性的含义各有边界。RFC 6265 §4.1.2.6 规定 <code>HttpOnly</code> 让用户代理在通过“非 HTTP”接口（例如向脚本暴露 Cookie 的浏览器 API）访问 Cookie 时省略它；§4.1.2.5 规定 <code>Secure</code> 只让 Cookie 在安全通道上发送，并说明它只保护机密性，主动攻击者仍可能从不安全通道覆写它（<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc6265.txt">RFC 6265</a>）。<code>SameSite</code> 不在 RFC 6265 中，OWASP 要求会话 Cookie 显式设置 <code>Strict</code> 或 <code>Lax</code>，并把它当作 CSRF 的纵深防御，而不是 CSRF 令牌的替代。Cookie 不带 <code>Max-Age</code> 和 <code>Expires</code>，是浏览器会话 Cookie；会话何时失效由服务端期限决定，OWASP 也明确提醒不能依赖浏览器关闭来结束会话。</p>
+<p>本地实验是 http，测试客户端手工带上 <code>Cookie</code> 头，不执行任何浏览器策略。实验只证明这些属性被设置了，浏览器是否在 <a target="_blank" rel="noopener" href="http://127.0.0.1">http://127.0.0.1</a> 上发送 <code>Secure</code> Cookie，取决于浏览器对“安全通道”的判定，本篇没有验证。</p>
+<h2 id="撤销的三种粒度">撤销的三种粒度</h2>
+<p>单会话登出把 <code>revoked_at</code> 置为当前时间；管理员撤销按 <code>session_id</code> 做同样的事；两者都带 <code>revoked_at is null</code> 条件，重复执行返回 <code>revoked=0</code>，第一次的撤销时间和原因不会被覆盖。全设备登出只做一件事：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">update</span> t14_users <span class="hljs-keyword">set</span> session_epoch <span class="hljs-operator">=</span> session_epoch <span class="hljs-operator">+</span> <span class="hljs-number">1</span> <span class="hljs-keyword">where</span> user_id <span class="hljs-operator">=</span> ?<br></code></pre></td></tr></table></figure>
+<p>这是一行更新，与该用户有多少会话无关。旧会话行一行都没改，它们的 <code>epoch</code> 不再等于用户的 <code>session_epoch</code>，于是都不满足有效条件。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE logout_on_A_rejected_on_B  PASS before=200 logout=revoked=1 clearCookie=true afterB=401[reason=revoked instance=B] refreshB=401 secondLogout=revoked=0<br>CASE admin_revoke_session       PASS wrongKey=403 stillValid=200 revoke=revoked=1 afterB=401[reason=revoked instance=B] dbReason=admin<br>CASE logout_all_by_epoch        PASS validBefore=3 logoutAll=200 rejectedAfter=6/6 reasons=[reason=epoch_mismatch] refreshOld=401 newLogin=200 newWhoami=200 rowsWrittenAsRevoked=0<br></code></pre></td></tr></table></figure>
+<p>三个会话分布在 A、B 两个实例上，全设备登出后在两个实例上各查一次，6 次全部以 <code>epoch_mismatch</code> 拒绝，库里被写成已撤销的会话行为 0；之后的新登录读到新的 epoch，正常有效。代价是会话行上看不到“为什么失效”，审计需要从用户表的 epoch 变化记录中重建。全设备登出前，实例要直接查库确认调用者的会话仍然有效，不走缓存，否则一个刚被撤销的会话还能借缓存去执行敏感操作。</p>
+<h2 id="刷新与撤销的并发">刷新与撤销的并发</h2>
+<p>滑动续期是最容易出错的地方。直观写法是先读出会话行，在内存里判断有效、改掉 <code>idle_expires_at</code>，再把整行写回去，很多对象映射框架的“加载、修改、保存”默认就是这样做的。撤销如果恰好在“读”与“写回”之间提交，写回会把读到的 <code>revoked_at = NULL</code> 一并写回去。</p>
+<p>实现采用条件 UPDATE，把有效性判断和写入放进同一条语句，并且语句只写两列：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-comment">-- SessionSql.REFRESH</span><br><span class="hljs-keyword">update</span> t14_sessions s<br>   <span class="hljs-keyword">set</span> idle_expires_at <span class="hljs-operator">=</span> least(now() <span class="hljs-operator">+</span> make_interval(secs <span class="hljs-operator">=</span><span class="hljs-operator">&gt;</span> ?), s.absolute_expires_at),<br>       last_seen_at    <span class="hljs-operator">=</span> now()<br>  <span class="hljs-keyword">from</span> t14_users u<br> <span class="hljs-keyword">where</span> s.token_hash <span class="hljs-operator">=</span> ? <span class="hljs-keyword">and</span> u.user_id <span class="hljs-operator">=</span> s.user_id<br>   <span class="hljs-keyword">and</span> s.revoked_at <span class="hljs-keyword">is</span> <span class="hljs-keyword">null</span> <span class="hljs-keyword">and</span> s.epoch <span class="hljs-operator">=</span> u.session_epoch<br>   <span class="hljs-keyword">and</span> now() <span class="hljs-operator">&lt;</span> s.idle_expires_at <span class="hljs-keyword">and</span> now() <span class="hljs-operator">&lt;</span> s.absolute_expires_at<br>returning s.session_id<br></code></pre></td></tr></table></figure>
+<p>PostgreSQL 16 文档描述了 READ COMMITTED 下的行为：UPDATE 找到的目标行若已被并发事务修改，它会等待前一个更新者提交或回滚；前者提交后，“the WHERE clause is re-evaluated to see if the updated version of the row still matches the search condition”（<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/transaction-iso.html">PostgreSQL 16 事务隔离</a>）。于是两种先后顺序都有确定结果：刷新先拿到行锁，撤销等待，提交后撤销照常生效；撤销先拿到行锁，刷新等待，撤销提交后刷新对新版本重新判断，<code>revoked_at is null</code> 不再成立，命中 0 行。这条语句从不写 <code>revoked_at</code> 和 <code>epoch</code>，所以无论谁先谁后，都不可能撤销掉撤销。</p>
+<p>实验用两条真实 JDBC 连接控制交错，用 <code>pg_stat_activity.wait_event_type = 'Lock'</code> 确认后到的一方确实在等行锁，测试执行的是服务端代码里的同一份 SQL：</p>
+<p>图 14-2：条件 UPDATE 与读改写在同一交错下的结果</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant R as 刷新事务 c1
+    participant DB as t14_sessions 行
+    participant V as 撤销 c2
+    rect rgb(235,245,235)
+    Note over R,V: 条件 UPDATE，撤销先持锁
+    V-&gt;&gt;DB: UPDATE set revoked_at=now()（未提交，持行锁）
+    R-&gt;&gt;DB: UPDATE ... WHERE revoked_at is null ...（等待行锁）
+    V-&gt;&gt;DB: COMMIT
+    DB--&gt;&gt;R: 对新版本重新求值 WHERE → 0 行，返回 401
+    end
+    rect rgb(250,235,235)
+    Note over R,V: 读改写，READ COMMITTED 事务
+    R-&gt;&gt;DB: SELECT 整行（revoked_at = NULL，不加锁）
+    V-&gt;&gt;DB: UPDATE set revoked_at=now()；COMMIT（无需等待）
+    R-&gt;&gt;DB: UPDATE 整行 set revoked_at = NULL ...；COMMIT
+    Note over DB: 会话复活：whoami 返回 200
+    end</code></pre>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE interleave_refresh_then_revoke        PASS refreshRows=1 revokeBlockedOnRowLock=true revokeRows=1 final=revoked whoamiB=401<br>CASE interleave_revoke_then_refresh        PASS revokeRows=1 refreshBlockedOnRowLock=true refreshRowsAfterRecheck=0 final=revoked whoamiB=401<br>CASE negative_control_rmw_revives_session  PASS expectRevival readRevokedAt=null revokeCommitted=1 whoamiBetween=401 writeBackRows=1 final=NOT_REVOKED whoamiB=200<br>CASE rmw_with_select_for_update            PASS revokeBlocked=true revokeRows=1 final=revoked whoamiB=401<br>CASE rmw_repeatable_read_fails             PASS writeBack=sqlstate=40001 final=revoked whoamiB=401<br></code></pre></td></tr></table></figure>
+<p>负向对照里有一个细节：撤销提交后、写回之前，B 实例对这个会话返回 401（<code>whoamiBetween=401</code>），写回之后又返回 200。撤销确实生效过，随后被一次刷新抹掉，日志里看不到任何错误。读改写还有两种修法，实验都验证了：读的时候加 <code>SELECT … FOR UPDATE</code>，撤销就得等刷新事务结束，之后照常生效；或者把事务提到 REPEATABLE READ，写回时 PostgreSQL 报 <code>40001</code>（could not serialize access due to concurrent update），刷新失败、撤销保留，调用方要处理这个错误并决定是否重试。条件 UPDATE 不需要额外加锁，也不需要重试循环，代价是业务规则写在 SQL 里，测试需要直接覆盖这条语句。</p>
+<p>交错实验之后，再用 HTTP 制造真实并发：每轮新建一个会话，同时向 A 发刷新、向 B 发管理员撤销，结束后查询会话是否仍有效。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE stress_refresh_vs_revoke_conditional  PASS rounds=60 refreshWon=41 validAfterRevoke=0 errors=0<br>CASE negative_control_stress_rmw           PASS expectRevival rounds=60 refreshWon=60 validAfterRevoke=60 errors=0 (U: 30ms between read and write-back; revoke sent 10ms after refresh)<br></code></pre></td></tr></table></figure>
+<p>条件 UPDATE 下，60 轮中刷新有 41 轮返回 200，但撤销后仍有效的会话为 0。实例 U 的读改写实现在读写之间停顿 30ms，用来模拟两次数据库往返之间的应用处理时间；撤销在刷新发出后 10ms 发出，60 轮全部复活。这个复活率由注入的时间窗口决定，不代表真实系统的发生频率；它说明的是，窗口存在时，这种实现没有任何机制阻止复活。</p>
+<h2 id="并发登录上限">并发登录上限</h2>
+<p>每用户最多 3 个活跃会话。新登录超出上限时有两种策略：拒绝新登录，或淘汰最旧的会话。OWASP 把是否允许同时登录列为应用的设计决定，并要求在不允许时于每次认证后采取有效动作。本实现选择淘汰最旧的会话，理由是用户换设备时不会被锁在门外，被淘汰的设备下一次请求就会收到 401；拒绝策略适合同时在线本身就是风险信号的场景，但需要给用户一个“踢掉其他设备”的入口，否则丢失旧设备的用户无法登录。</p>
+<p>计数和插入必须串行，否则并发登录会各自数到同一个旧计数。实现先锁用户行，再计数、淘汰、插入，整个过程在一个事务里：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-comment">// SessionSql.login（lockUser=true）</span><br>select session_epoch, max_sessions from t14_users <span class="hljs-type">where</span> <span class="hljs-variable">user_id</span> <span class="hljs-operator">=</span> ? <span class="hljs-keyword">for</span> update<br>select session_id from t14_sessions <span class="hljs-type">where</span> <span class="hljs-variable">user_id</span> <span class="hljs-operator">=</span> ? <span class="hljs-type">and</span> <span class="hljs-variable">epoch</span> <span class="hljs-operator">=</span> ? and revoked_at is <span class="hljs-literal">null</span> and ... order by created_at, session_id<br><span class="hljs-comment">// 超出部分：update ... set revoked_at = now(), revoke_reason = &#x27;evicted&#x27;；然后 insert 新会话；commit</span><br></code></pre></td></tr></table></figure>
+<p>READ COMMITTED 下每条语句取新快照，所以拿到行锁后的计数能看到前一个持锁者已提交的插入。用户行锁也让登录与全设备登出串行：先登录的会话会被随后的 epoch 递增作废，后登录的会话读到新 epoch，保持有效。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE session_limit_lock_user_row          PASS logins=8/8 activeInDb=3 whoami200=3 evictedTotal=5 max=3<br>CASE negative_control_limit_without_lock  PASS expectOverLimit logins=8/8 activeInDb=6 evictedPerLogin=00122020 max=3 (U: no row lock, 30ms between count and insert)<br></code></pre></td></tr></table></figure>
+<p>8 个并发登录分布在两个实例上，加锁后恰好剩 3 个活跃会话，淘汰 5 个。不加锁的对照在计数与插入之间停顿 30ms，结束时有 6 个活跃会话，超出上限一倍；各次登录的淘汰数是 0、0、1、2、2、0、2、0，说明它们各自依据过期的计数做了决定。</p>
+<h2 id="期限">期限</h2>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE idle_expiry_3s                     PASS t0=200 t3.4s=401[reason=idle_expired instance=B] refreshAfter=401<br>CASE absolute_expiry_6s_despite_refresh PASS refreshes=[1.0s:200, 2.0s:200, 3.0s:200, 4.0s:200, 5.0s:200, 6.0s:200, 7.0s:401] whoamiEnd=401[reason=absolute_expired] idleCappedByAbsolute=true<br></code></pre></td></tr></table></figure>
+<p>空闲超过 3 秒后，会话被拒绝，刷新也救不回来，因为刷新的 WHERE 要求当前仍在空闲期限内。每秒刷新一次的会话，在第 7 秒被拒绝，原因是 <code>absolute_expired</code>。6.0 秒那次刷新仍返回 200，是因为会话在测试计时开始后才创建，绝对期限比计时零点晚几毫秒。<code>least(..., absolute_expires_at)</code> 保证空闲期限从不越过绝对期限，表约束 <code>idle_expires_at &lt;= absolute_expires_at</code> 又在库这一层兜底。OWASP 要求两种超时都有：只有空闲期限时，窃得会话的人可以靠周期性请求让它永远不过期。</p>
+<h2 id="撤销生效窗口与本地缓存">撤销生效窗口与本地缓存</h2>
+<p>每次请求查一次库，是共享会话表方案的固定成本。降低它最直接的办法是在实例内缓存校验结果，代价是撤销对这个实例不再立即生效。缓存只存“有效”的结果，命中时不访问数据库；本实例上的登出会清掉自己的缓存项，其他实例的缓存不受影响。本实现没有跨实例失效通知，于是撤销窗口的上限就是 TTL。</p>
+<p>测量方法：在 A 上登录，在 C（TTL 1000ms）上请求一次以填充缓存，随机等待 0 到 900ms，在 A 上登出；从收到登出响应开始，B 请求一次，C 每 10ms 请求一次直到 401。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE revocation_window_cache_ttl  PASS ttlMs=1000 firstPollB=[401, 401, 401, 401, 401, 401] windowC_ms=[287, 640, 838, 321, 940, 735] cacheHitsC=129<br></code></pre></td></tr></table></figure>
+<p>6 次测量中，B 每次都在第一次请求时拒绝；C 在撤销提交后继续接受了 287 到 940ms，取决于缓存项在撤销时已经存在了多久。这些是观察值，只说明结果落在 TTL 以内，不是窗口分布，也不能推到别的负载上。RFC 7009 §2.1 在令牌撤销的语境下承认同样的现实：撤销立即生效，但实践中可能存在传播延迟，部分服务器已经知道、另一些还不知道，实现应尽量缩小这个窗口（<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc7009.txt">RFC 7009</a>）。是否接受一个窗口，取决于被保护的操作：读取个人资料可以接受 1 秒，修改口令、转账这类操作应绕过缓存直接查库，就像本实现的 <code>/logout-all</code> 那样。</p>
+<h2 id="对照：自包含签名令牌">对照：自包含签名令牌</h2>
+<p>另一种做法是把会话信息签进令牌，实例只验签、看过期时间，不查库。对照实现用 JDK 的 <code>HmacSHA256</code> 生成 JWS 紧凑形式 <code>header.payload.signature</code>，载荷含 <code>sub</code>、<code>jti</code>、<code>exp</code>。RFC 7519 §4.1.4 规定，在 <code>exp</code> 所示时间及之后，JWT 不得被接受（<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc7519.txt">RFC 7519</a>）。验证端只接受本服务签发的固定头部 <code>&#123;&quot;alg&quot;:&quot;HS256&quot;,&quot;typ&quot;:&quot;JWT&quot;&#125;</code>，对应 RFC 8725 §3.1 的要求：调用方指定允许的算法集合，库不得使用其他算法（<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc8725.txt">RFC 8725</a>）。</p>
+<p>RFC 7519 和 RFC 8725 都没有规定撤销机制。RFC 7009 §3 讨论了自包含访问令牌：资源服务器本地校验时，若要立即撤销，需要授权服务器与资源服务器之间某种（目前未标准化的）后端交互；另一种做法是签发短寿命令牌，用刷新令牌续期，以此限制撤销后令牌仍可使用的时间。实验对两种做法各取一种最小形态：不查任何名单，或者每次请求查一次 <code>jti</code> 撤销名单。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs text">CASE signed_token_vs_session_table  PASS beforeRevoke=200 denylistAfterRevoke=401[reason=revoked_jti] noDenylistAcceptedPolls=48 noDenylistRejectedAfter=2569ms[reason=expired] tampered=401[reason=bad_signature] algNone=401[reason=bad_header] dbCallsPer50: sessionLookup=50 tokenNoDenylist=0 tokenDenylist=50 elapsedPer50Ms: 482/421/522<br></code></pre></td></tr></table></figure>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>服务端会话查表</th>
+<th>签名令牌，不查名单</th>
+<th>签名令牌 + 撤销名单</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>撤销生效</td>
+<td>下一次请求（无缓存）；有缓存时 ≤ TTL</td>
+<td>直到 <code>exp</code>；实验中撤销后又被接受 48 次、约 2.6 秒</td>
+<td>下一次请求</td>
+</tr>
+<tr>
+<td>每请求数据库访问（50 次请求）</td>
+<td>50</td>
+<td>0</td>
+<td>50</td>
+</tr>
+<tr>
+<td>服务端存储</td>
+<td>每个会话一行</td>
+<td>无（只有签名密钥）</td>
+<td>每个被撤销且未过期的 <code>jti</code> 一行</td>
+</tr>
+<tr>
+<td>全设备登出</td>
+<td>一行 epoch 更新</td>
+<td>无法表达，只能等过期或轮换密钥</td>
+<td>要列出该用户所有未过期 <code>jti</code>，或另加按用户的版本号</td>
+</tr>
+<tr>
+<td>期限所用时钟</td>
+<td>数据库 <code>now()</code></td>
+<td>各实例本机时钟</td>
+<td>各实例本机时钟</td>
+</tr>
+</tbody>
+</table>
+<p>查名单的令牌在每请求成本上与会话查表相同，却多了一份需要和令牌寿命同步清理的名单；不查名单的令牌免掉了数据库访问，代价是撤销窗口等于剩余寿命。缩短寿命就是缩短窗口，但会增加续期频率，而续期本身又需要一个可撤销的长期凭据，问题回到了会话表。耗时 482/421/522ms 是单次回环运行的观察值，三者差距在测量噪声以内，可比的是数据库访问次数。篡改载荷得到 <code>bad_signature</code>，<code>alg=none</code> 的头部得到 <code>bad_header</code>。</p>
+<h2 id="用例与证据">用例与证据</h2>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th>类型</th>
+<th>观察值（evidence/14/output.txt）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>login_on_A_whoami_on_B</code></td>
+<td>正常</td>
+<td>跨实例识别；库存 32 字节哈希，原令牌行数 0</td>
+</tr>
+<tr>
+<td><code>reject_missing_unknown_badpassword</code></td>
+<td>拒绝</td>
+<td>无 Cookie、随机令牌、错误口令均 401</td>
+</tr>
+<tr>
+<td><code>logout_on_A_rejected_on_B</code> / <code>admin_revoke_session</code></td>
+<td>撤销</td>
+<td>B 下一次请求 401</td>
+</tr>
+<tr>
+<td><code>logout_all_by_epoch</code></td>
+<td>撤销</td>
+<td>6/6 次 <code>epoch_mismatch</code>，未写会话行</td>
+</tr>
+<tr>
+<td><code>session_limit_lock_user_row</code> / 无锁对照</td>
+<td>并发</td>
+<td>活跃 3 / 活跃 6</td>
+</tr>
+<tr>
+<td><code>idle_expiry_3s</code> / <code>absolute_expiry_6s_despite_refresh</code></td>
+<td>边界</td>
+<td>空闲与绝对期限都由服务端执行</td>
+</tr>
+<tr>
+<td><code>interleave_*</code> 两种顺序</td>
+<td>并发</td>
+<td>观察到行锁等待，最终都是 revoked</td>
+</tr>
+<tr>
+<td><code>negative_control_rmw_revives_session</code></td>
+<td>负向对照</td>
+<td>撤销后被写回，whoami 200</td>
+</tr>
+<tr>
+<td><code>rmw_with_select_for_update</code> / <code>rmw_repeatable_read_fails</code></td>
+<td>修正</td>
+<td>不复活 / <code>40001</code></td>
+</tr>
+<tr>
+<td><code>stress_*</code></td>
+<td>真实并发</td>
+<td>条件 UPDATE 复活 0；读改写复活 60/60</td>
+</tr>
+<tr>
+<td><code>revocation_window_cache_ttl</code></td>
+<td>窗口</td>
+<td>无缓存首查即拒；TTL 1000ms 时 287–940ms</td>
+</tr>
+<tr>
+<td><code>signed_token_vs_session_table</code></td>
+<td>方案对比</td>
+<td>见上表</td>
+</tr>
+</tbody>
+</table>
+<p>运行入口为 <code>examples/14-session-store/run.sh</code>，每次运行用 <code>setup.sql</code> 重建表。环境记录在 <code>evidence/14/env.txt</code>（PostgreSQL 16.15、OpenJDK 21.0.12.1、pgJDBC 42.7.4），实例日志为 <code>evidence/14/instance-*.log</code>，证据边界见 <code>evidence/14/LIMITS.md</code>。</p>
+<h2 id="结论边界">结论边界</h2>
+<p>实验支持以下结论：以 PostgreSQL 会话表为唯一权威，多个实例对登出、管理员撤销和全设备登出的判断，在下一次请求时一致；刷新写成只改期限、带全部有效性条件的 UPDATE 后，无论与撤销谁先提交，都不会让会话复活，而读改写整行写回在 READ COMMITTED 下会复活；锁住用户行后，并发登录不会超出会话上限；本地缓存把撤销窗口从“下一次请求”放宽到 TTL，签名令牌不查名单时则放宽到剩余寿命。</p>
+<p>实验没有覆盖浏览器对 Cookie 属性的实际执行（本地是 http，客户端手工带 Cookie 头），没有覆盖主备切换和从只读副本读取会话时复制延迟对撤销窗口的影响，没有实现会话标识轮换、CSRF 令牌和登录限速。窗口与耗时都是单机观察值。</p>
+<p>会话表回答的是“这个凭据现在是否有效”。实例怎样拿到一份同时生效的配置（例如缓存 TTL 本身），以及配置变更怎样在所有实例上收敛，是 <a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-15-%E9%85%8D%E7%BD%AE%E5%8F%91%E5%B8%83%E4%B8%8E%E5%AE%A2%E6%88%B7%E7%AB%AF%E6%94%B6%E6%95%9B/" title="后端系统工程 15：配置发布与客户端收敛">15 配置发布与客户端收敛</a> 的内容。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-14-%E4%BC%9A%E8%AF%9D%E5%AD%98%E5%82%A8%E4%B8%8E%E7%99%BB%E5%BD%95%E6%92%A4%E9%94%80/">https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-14-%E4%BC%9A%E8%AF%9D%E5%AD%98%E5%82%A8%E4%B8%8E%E7%99%BB%E5%BD%95%E6%92%A4%E9%94%80/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Cookie/">Cookie</a><a class="post-meta__tags" href="/tags/%E5%B9%B6%E5%8F%91/">并发</a><a class="post-meta__tags" href="/tags/PostgreSQL/">PostgreSQL</a><a class="post-meta__tags" href="/tags/%E4%BC%9A%E8%AF%9D/">会话</a><a class="post-meta__tags" href="/tags/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B/">后端系统工程</a><a class="post-meta__tags" href="/tags/%E6%92%A4%E9%94%80/">撤销</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-87.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-12-%E6%9C%89%E7%95%8C%E8%BF%9E%E6%8E%A5%E6%B1%A0%E4%B8%8E%E7%AD%89%E5%BE%85%E5%8F%96%E6%B6%88/" title="后端系统工程 12：有界连接池与等待取消"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-63.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 12：有界连接池与等待取消</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 11 撤回、历史保留与消息系统集成验收 ｜ 本篇 12 ｜ 下一篇 13 RPC 客户端的请求生命周期 数据库连接的数量不由应用决定。PostgreSQL 为每个客户端会话分配一个后端进程，max_connections 规定服务器同时接受的连接上限，并且只能在启动时设置（PostgreSQL 16 连接设置）。应用侧连接池是这份服务端预算在单个进程里的记账员：每借出一条连接，它就替调用方占用了服务端的一个槽位。记账错一次，可能表现为请求永远等不到连接，也可能表现为若干实例同时扩容后，整个数据库拒绝新会话。 本篇实现一个有界连接池，并用真实 PostgreSQL 检验四类结果：容量不超预算；等待超时、等待取消与归还交错时没有槽位丢失；连接在服务端被终止或会话状态被污染后不会交给下一个调用方；多实例的总连接数受数据库侧上限约束。代码在 examples/12-connection-pool/，全部输出在 evidence/12/output.txt。 需求契约 调用方只看到四个操作：在截止时间内获取一条连接；使用后归还；发现连接损坏时声明它不可复用；服务关闭时让池...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-28-%E7%A8%80%E7%BC%BA%E5%90%8D%E9%A2%9D%E7%9A%84%E5%87%86%E5%85%A5%E4%B8%8E%E5%BA%93%E5%AD%98%E9%A2%84%E7%95%99/" title="后端系统工程 28：稀缺名额的准入与库存预留"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-97.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 28：稀缺名额的准入与库存预留</div></div><div class="info-2"><div class="info-item-1">一个预约名额只有 40 个、同一时刻却有几百个请求到达的场景，至少要回答四件事：同时进入数据库的请求怎样限量，超出的请求是排队还是立刻拒绝；40 个名额怎样保证不多发；客户端在等待中断开或超时重发时，名额会不会被占两次；占了名额却迟迟不付款的预留到期后怎样归还，归还任务重跑时会不会多还。本篇用 examples/flash-sale 中的最小服务逐一回答。商品、用户和请求都是合成数据，SKU 固定为 sku-lab-01，用户为 user-0042 这类编号，域名只用 shop.example.test。订单与支付留给下一篇，本篇只交付“名额预留”这一层。 需求与范围 需求按可检查的形式写成五条：  任一时刻有效预留（状态为 HELD 或 CONFIRMED）的数量不超过库存总数。 同一个 request_key 无论发送多少次，最多产生一条预留；同键换用户或换 SKU 视为错误请求。 同一用户在同一 SKU 上最多持有一条有效预留。 单个服务进程内同时访问数据库的预留请求不超过并发上限；等待位置有界，满了立即返回 503。 到期的 HELD 预留由释放任务归还库存；释放任务重复...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-20-%E5%8F%91%E5%8F%B7%E6%9C%8D%E5%8A%A1%E7%9A%84%E5%94%AF%E4%B8%80%E6%80%A7%E4%B8%8E%E5%A4%B1%E8%B4%A5%E6%A8%A1%E5%BC%8F/" title="后端系统工程 20：发号服务的唯一性与失败模式"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-77.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 20：发号服务的唯一性与失败模式</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 19 延迟任务的领取与取消 ｜ 本篇 20 ｜ 下一篇 21 有限能力的数据库路由代理 “生成一个唯一 ID”这句话省略了三个限定：在多大范围内唯一，在哪些故障之后仍然唯一，除了唯一还要求什么。一张订单表的主键只需在该表内不重复；跨系统传递的标识要在所有系统中不重复；作为分片键或排序键时，还会被要求大致按时间递增。不同方案对这些问题的回答不同，它们的失败模式也不同：数据库号段在进程崩溃后留下空洞，时间型标识在时钟回退时可能重复，节点号方案在两个进程误用同一节点号时必然重复。 本篇实现一个基于 PostgreSQL 的号段发号器，作为主方案验证并发取号、进程重启、数据库故障下的唯一性；再实现 UUIDv4、UUIDv7 和 Snowflake 式 64 位标识作为契约对照，用受控时钟测试时钟回退，用真实多进程测试节点号冲突。代码在 examples/20-id-service/，输出在 evidence/20/output.txt。 需求契约 号段服务的使用方只调用一个操作：为某个业务标签取下一个号。服务承诺：  同一业务标签下发出的号全局唯一，这一点在发号进程崩...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-22-%E9%9D%9E%E5%88%86%E7%89%87%E9%94%AE%E6%9F%A5%E8%AF%A2%E4%B8%8E%E5%85%A8%E5%B1%80%E5%88%86%E9%A1%B5/" title="后端系统工程 22：非分片键查询与全局分页"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-113.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 22：非分片键查询与全局分页</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 21 有限能力的数据库路由代理 ｜ 本篇 22 ｜ 下一篇 23 分片扩容时的数据交接 订单按买家 user_id 分片之后，“某个买家的订单”只落在一个库里，查询直接路由即可。“某个商户的订单，按下单时间倒序分页”就不同了：同一商户的订单散在每一个分片上，路由层手里没有能把它收窄到单个分片的条件。上一篇的路由代理对这类语句的处理是拒绝。业务上这个查询不能不做，于是有两条路：每次都问遍所有分片，再在协调方合并；或者额外维护一张按商户组织的全局索引，先查索引再回分片取数。 两条路都要回答同一组问题：翻页时同一行会不会出现两次，会不会有行永远翻不到；翻页期间有新订单写入时，边界划在哪里；索引和主数据不一致时返回什么；一次查询最多允许打到几个分片、等多久。代码在 examples/22-shard-query/，输出在 evidence/22/output.txt。 查询契约与规模假设 查询只有一种：给定 merchant_id，按 (created_at desc, order_id desc) 返回一页订单，以及一个用于取下一页的不透明游标。对它的承诺如下：  翻...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-18-%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97%E6%8E%A5%E5%85%A5%E4%B8%8E%E7%A7%AF%E5%8E%8B%E6%81%A2%E5%A4%8D/" title="后端系统工程 18：消息队列接入与积压恢复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-149.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 18：消息队列接入与积压恢复</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 17 从持久日志构建最小消息队列 ｜ 本篇 18 ｜ 下一篇 19 延迟任务的领取与取消 上一篇把“受理”“落盘”“消费确认”拆成了三条线，用一个自制的单机日志逐一观察。换成成熟的消息中间件之后，这三条线依然存在，只是分别落到了客户端协议里：publisher confirm 说明 broker 接下了消息，消费确认把消息的所有权交给消费者，两者之间还隔着队列、重投和消费者自己的数据库事务。中间件不会替应用决定先提交还是先确认，也不会替应用判断一条消息是不是已经处理过。 本篇用真实的 RabbitMQ 3.12.1 节点和 PostgreSQL 16 检验接入方的契约：生产确认与不可路由消息、提交后再确认与去重表、毒消息的有限次重试和隔离、积压时的有界预取。输入是与第 17 章共用的 3000 条合成订单事件，代码在 examples/18-rabbitmq-consumer/，输出在 evidence/18/output.txt。 实验只有一个 RabbitMQ 节点。它能说明单个 broker 进程重启或被 kill -9 之后，已确认的持久消息还在不在；它...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-24-%E5%9C%A8%E7%BA%BF%E5%8F%98%E6%9B%B4%E7%9A%84%E6%95%B0%E6%8D%AE%E5%85%BC%E5%AE%B9/" title="后端系统工程 24：在线变更的数据兼容"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-171.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 24：在线变更的数据兼容</div></div><div class="info-2"><div class="info-item-1">在线修改表结构时，系统里同时存在一份正在变化的表定义和至少两个版本的应用代码。旧代码按旧列读写，新代码按新列读写，后台回填任务又在补写历史行。三方都在提交事务，任何一方都可能把另一方刚写下的值改掉。DDL 本身还要拿表锁，一条看起来只改元数据的 ALTER TABLE 也可能让整张表的普通查询排队。 本篇用一张合成工单表，把“整数优先级”迁成“文本优先级”，并在迁移后期引入一个旧格式表达不了的新取值。要回答的问题有三个：回填期间新写入的值怎样不被覆盖；旧代码还在只写旧列时，新列怎样不落后；从哪一步开始，回退到旧代码就会丢语义，系统怎样拒绝一次假装无损的回退。实验结论都在本地 PostgreSQL 16.15 上用真实事务、真实线程和独立进程验证，证据在 evidence/24/；只引用文档、没有实验的论断在文中单独标出。 需求、不变量与范围 合成表 ticket 有主键 id、标题 title 和整数列 priority，取值 1、2、3。目标结构用文本列 priority_level 表示优先级，取值 low、normal、high，迁移后期再允许 urgent。映射固定为 1...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9C%80%E6%B1%82%E5%A5%91%E7%BA%A6"><span class="toc-number">1.</span> <span class="toc-text">需求契约</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BB%A4%E7%89%8C%E4%B8%8E-cookie"><span class="toc-number">2.</span> <span class="toc-text">令牌与 Cookie</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%92%A4%E9%94%80%E7%9A%84%E4%B8%89%E7%A7%8D%E7%B2%92%E5%BA%A6"><span class="toc-number">3.</span> <span class="toc-text">撤销的三种粒度</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%88%B7%E6%96%B0%E4%B8%8E%E6%92%A4%E9%94%80%E7%9A%84%E5%B9%B6%E5%8F%91"><span class="toc-number">4.</span> <span class="toc-text">刷新与撤销的并发</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B9%B6%E5%8F%91%E7%99%BB%E5%BD%95%E4%B8%8A%E9%99%90"><span class="toc-number">5.</span> <span class="toc-text">并发登录上限</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%9F%E9%99%90"><span class="toc-number">6.</span> <span class="toc-text">期限</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%92%A4%E9%94%80%E7%94%9F%E6%95%88%E7%AA%97%E5%8F%A3%E4%B8%8E%E6%9C%AC%E5%9C%B0%E7%BC%93%E5%AD%98"><span class="toc-number">7.</span> <span class="toc-text">撤销生效窗口与本地缓存</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%AF%B9%E7%85%A7%EF%BC%9A%E8%87%AA%E5%8C%85%E5%90%AB%E7%AD%BE%E5%90%8D%E4%BB%A4%E7%89%8C"><span class="toc-number">8.</span> <span class="toc-text">对照：自包含签名令牌</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E4%BE%8B%E4%B8%8E%E8%AF%81%E6%8D%AE"><span class="toc-number">9.</span> <span class="toc-text">用例与证据</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%BB%93%E8%AE%BA%E8%BE%B9%E7%95%8C"><span class="toc-number">10.</span> <span class="toc-text">结论边界</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

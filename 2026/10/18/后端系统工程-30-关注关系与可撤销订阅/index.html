@@ -1,0 +1,937 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>后端系统工程 30：关注关系与可撤销订阅 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="关注关系看起来只是一张两列的表，难点在于它同时是一种授权。用户 A 关注私密账号 B 并获批后，A 就能读 B 的“仅粉丝可见”内容；B 拉黑 A 之后，这项授权必须收回，而且收回之后 B 新发的内容不能再被 A 看到。关系表之外通常还有粉丝列表、粉丝计数、下一篇要讲的 Feed 收件箱等派生视图，它们靠消费关系事件异步更新。重复点击关注、关注与取消交错、事件乱序和重复投递、消费者丢失进度，都会让">
+<meta property="og:type" content="article">
+<meta property="og:title" content="后端系统工程 30：关注关系与可撤销订阅">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-30-%E5%85%B3%E6%B3%A8%E5%85%B3%E7%B3%BB%E4%B8%8E%E5%8F%AF%E6%92%A4%E9%94%80%E8%AE%A2%E9%98%85/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="关注关系看起来只是一张两列的表，难点在于它同时是一种授权。用户 A 关注私密账号 B 并获批后，A 就能读 B 的“仅粉丝可见”内容；B 拉黑 A 之后，这项授权必须收回，而且收回之后 B 新发的内容不能再被 A 看到。关系表之外通常还有粉丝列表、粉丝计数、下一篇要讲的 Feed 收件箱等派生视图，它们靠消费关系事件异步更新。重复点击关注、关注与取消交错、事件乱序和重复投递、消费者丢失进度，都会让">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-150.jpg">
+<meta property="article:published_time" content="2026-10-18T02:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T08:33:36.098Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="PostgreSQL">
+<meta property="article:tag" content="事件投影">
+<meta property="article:tag" content="关注关系">
+<meta property="article:tag" content="后端系统工程">
+<meta property="article:tag" content="权限撤销">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-150.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "后端系统工程 30：关注关系与可撤销订阅",
+  "url": "https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-30-%E5%85%B3%E6%B3%A8%E5%85%B3%E7%B3%BB%E4%B8%8E%E5%8F%AF%E6%92%A4%E9%94%80%E8%AE%A2%E9%98%85/",
+  "image": "https://magicliang.github.io/img/wall-paper-150.jpg",
+  "datePublished": "2026-10-18T02:00:00.000Z",
+  "dateModified": "2026-10-22T08:33:36.098Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-30-%E5%85%B3%E6%B3%A8%E5%85%B3%E7%B3%BB%E4%B8%8E%E5%8F%AF%E6%92%A4%E9%94%80%E8%AE%A2%E9%98%85/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '后端系统工程 30：关注关系与可撤销订阅',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2016</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2094</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-150.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">后端系统工程 30：关注关系与可撤销订阅</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">后端系统工程 30：关注关系与可撤销订阅</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-18T02:00:00.000Z" title="Created 2026-10-18 10:00:00">2026-10-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-22T08:33:36.098Z" title="Updated 2026-10-22 16:33:36">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">6.2k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>21mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-22 16:33:36&quot;}" hidden></div><p>关注关系看起来只是一张两列的表，难点在于它同时是一种授权。用户 A 关注私密账号 B 并获批后，A 就能读 B 的“仅粉丝可见”内容；B 拉黑 A 之后，这项授权必须收回，而且收回之后 B 新发的内容不能再被 A 看到。关系表之外通常还有粉丝列表、粉丝计数、下一篇要讲的 Feed 收件箱等派生视图，它们靠消费关系事件异步更新。重复点击关注、关注与取消交错、事件乱序和重复投递、消费者丢失进度，都会让派生视图与真相源出现差距；差距一旦落在权限上，就是越权读取。</p>
+<p>本章的工程放在 <code>examples/social</code> 的 <code>social.rel</code> 包中，全部用例跑在真实 PostgreSQL 16.15 事务上。验收目标有两条：重复关注、取消与事件乱序不会让已经取消的关系“复活”；内容入口与派生视图在权限判断上给出一致的结论，或者明确声明二者允许相差的窗口。</p>
+<h2 id="需求与范围">需求与范围</h2>
+<p>操作只有六个：关注、取消关注、私密账号审批（同意或拒绝）、拉黑、解除拉黑、发布带可见性的内容。可见性分三档：<code>PUBLIC</code> 任何未被拉黑的人可读，<code>FOLLOWERS</code> 只有有效粉丝可读，<code>SELF</code> 只有作者本人可读。</p>
+<p>业务不变量写成可以用 SQL 检查的形式：</p>
+<ol>
+<li>每个有序对 (follower, followee) 至多一行关系，状态取 <code>ACTIVE</code>、<code>PENDING</code>、<code>REMOVED</code> 之一，不能自关注。</li>
+<li>关系每改变一次状态，版本加一，并且恰好写一条事件；不改变状态的操作不写事件。</li>
+<li>只要 block 表中存在 A、B 任一方向的拉黑记录，A→B 与 B→A 两行关系都必须是 <code>REMOVED</code>。</li>
+<li>解除拉黑只删除拉黑记录，不恢复拉黑前的关系。</li>
+<li>派生视图在消费完全部事件后，有效粉丝集合与计数都和真相源一致。</li>
+</ol>
+<p>排除项：账号在公开与私密之间切换、关注上限、批量导入、跨库分片、事件经由外部消息组件传输。本章的“事件投递”由测试代码从 <code>relation_event</code> 表读出后打乱、复制再交给消费者，模拟至少一次且无序的传输语义，不验证任何消息中间件。</p>
+<h2 id="教学规模假设">教学规模假设</h2>
+<p>以下数字只是教学假设，用来说明结构选择，不对应任何实际产品，也没有做过性能测量：账号 10⁶ 个，平均每人关注 200 个账号，粉丝数呈重尾分布，少数账号的粉丝数在 10⁵ 量级；关系写入远少于内容读取。在这个假设下，“按被关注者列出粉丝”和“判断 A 是否是 B 的粉丝”都是高频查询，前者需要反向索引，后者需要主键点查；粉丝数大的账号如果每次读取都对关系表做 <code>count(*)</code>，代价随粉丝数增长，因此计数要放进派生视图。</p>
+<p>本章实验的实际规模远小于此：关系对数百个、事件一千多条，只用来检查不变量。</p>
+<h2 id="接口与返回语义">接口与返回语义</h2>
+<p>每个写操作都返回三类结果之一，调用方能据此区分“这次请求改变了状态”“状态本来就是目标值”和“请求不被允许”。</p>
+<p>表 30-1：关系操作接口与结果</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>前置条件</th>
+<th>CHANGED</th>
+<th>NOOP</th>
+<th>REJECTED</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>follow(a, b)</td>
+<td>a≠b，双方无拉黑</td>
+<td>REMOVED→ACTIVE（公开）或 REMOVED→PENDING（私密）</td>
+<td>已是 ACTIVE 或 PENDING</td>
+<td>自关注、任一方向存在拉黑</td>
+</tr>
+<tr>
+<td>unfollow(a, b)</td>
+<td>无</td>
+<td>ACTIVE/PENDING→REMOVED</td>
+<td>已是 REMOVED</td>
+<td>—</td>
+</tr>
+<tr>
+<td>decide(b, a, ok)</td>
+<td>关系为 PENDING</td>
+<td>PENDING→ACTIVE 或 REMOVED</td>
+<td>—</td>
+<td>非 PENDING</td>
+</tr>
+<tr>
+<td>block(b, a)</td>
+<td>b≠a</td>
+<td>写入拉黑记录，双向非 REMOVED 关系置 REMOVED</td>
+<td>已拉黑且双向均为 REMOVED</td>
+<td>自拉黑</td>
+</tr>
+<tr>
+<td>unblock(b, a)</td>
+<td>无</td>
+<td>删除拉黑记录</td>
+<td>不存在拉黑记录</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>重复关注返回 NOOP 而不是错误，这让客户端重试成为安全操作：重试不会写出第二条事件，也不会把版本再加一。用例 30-B 中，私密账号的第二次关注请求输出 <code>NOOP(PENDING,v1,already PENDING)</code>。</p>
+<h2 id="数据模型">数据模型</h2>
+<p>真相源是 <code>relation</code> 与 <code>block</code> 两张表。<code>relation</code> 以 (follower, followee) 为主键，<code>CHECK (follower &lt;&gt; followee)</code> 排除自关注，<code>version</code> 是该行自己的单调计数。按被关注者查粉丝用一个部分索引 <code>relation_by_followee ON relation (followee, follower) WHERE state = 'ACTIVE'</code>，只索引有效关系，<code>REMOVED</code> 占位行不进入索引（PostgreSQL 16 文档 11.8 节描述了部分索引只包含满足谓词的行）。</p>
+<p>事件表 <code>relation_event</code> 的主键是全局序号 <code>seq</code>，另有 <code>UNIQUE (follower, followee, version)</code> 约束，保证同一对的同一个版本不可能写出两条事件。序号由单行计数表 <code>event_seq</code> 分配：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">UPDATE</span> event_seq <span class="hljs-keyword">SET</span> <span class="hljs-keyword">last</span> <span class="hljs-operator">=</span> <span class="hljs-keyword">last</span> <span class="hljs-operator">+</span> <span class="hljs-number">1</span> <span class="hljs-keyword">WHERE</span> id <span class="hljs-operator">=</span> <span class="hljs-number">1</span> RETURNING <span class="hljs-keyword">last</span><br></code></pre></td></tr></table></figure>
+<p>这条语句给计数行加上行锁并持有到事务结束，下一个写关系的事务必须等前一个提交或回滚后才能拿到下一个序号。由此得到两个性质：序号没有空洞（回滚会连同计数一起撤销），序号顺序等于提交顺序。第二个性质是后面权限令牌的基础。代价也很直接，所有关系写入在这一行上串行化，这是教学实现为了换取简单的连续水位而接受的限制。</p>
+<p>派生视图有四张表：<code>proj_follower</code> 是按被关注者组织的粉丝列表，每行带着它最后接受的版本；<code>proj_count</code> 是粉丝计数；<code>proj_seen</code> 记录已经处理过的事件序号；<code>proj_watermark</code> 记录连续水位，即最大的 s，使 1…s 都已经出现在 <code>proj_seen</code> 中。内容表 <code>post</code> 的 <code>acl_token</code> 字段保存发布时已提交的最高关系事件序号。</p>
+<h2 id="状态机">状态机</h2>
+<p>关系行的状态只在写事务中改变，每次改变都伴随版本加一和一条事件。<code>REMOVED</code> 同时充当“从未关注”的占位状态，版本为 0 的占位行由加锁步骤插入，不产生事件。</p>
+<p>图 30-1：关系行状态机（标出前置条件与拒绝路径）</p>
+<pre><code class="hljs mermaid">stateDiagram-v2
+    [*] --&gt; REMOVED: 首次加锁插入占位行 v0（无事件）
+    REMOVED --&gt; ACTIVE: follow，公开账号，且无拉黑
+    REMOVED --&gt; PENDING: follow，私密账号，且无拉黑
+    PENDING --&gt; ACTIVE: decide(同意)，当前为 PENDING
+    PENDING --&gt; REMOVED: decide(拒绝) / unfollow / block
+    ACTIVE --&gt; REMOVED: unfollow / block
+    REMOVED --&gt; REMOVED: follow 遇到拉黑 → REJECTED（无事件）
+    ACTIVE --&gt; ACTIVE: 重复 follow → NOOP（无事件）
+    PENDING --&gt; PENDING: 重复 follow → NOOP（无事件）</code></pre>
+<p>取消之后再关注不会复用旧版本。用例 30-C 对同一对依次执行关注、取消、关注，第三次得到 <code>CHANGED(ACTIVE,v3,seq8)</code>。版本只增不减，是消费端识别旧事件的唯一依据。</p>
+<h2 id="正常路径与锁顺序">正常路径与锁顺序</h2>
+<p>一次关注在一个 Read Committed 事务中完成四步：确保关系行存在并锁住，检查拉黑，按当前状态决定是否转移，转移时写事件。关键在第一步和第二步的先后。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs java">cur = lockPair(follower, followee);<br>hook.at(<span class="hljs-string">&quot;follow.afterLock&quot;</span>);<br><span class="hljs-comment">// 拉黑事务也必须先锁这一行，所以此处读到的 block 不会在提交前失效</span><br><span class="hljs-keyword">if</span> (blockedEitherWay(follower, followee))<br>    <span class="hljs-keyword">return</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Result</span>(Outcome.REJECTED, cur[<span class="hljs-number">0</span>], Long.parseLong(cur[<span class="hljs-number">1</span>]), <span class="hljs-number">0</span>, <span class="hljs-string">&quot;blocked&quot;</span>);<br></code></pre></td></tr></table></figure>
+<p><code>lockPair</code> 先执行 <code>INSERT ... ON CONFLICT DO NOTHING</code> 插入占位行，再用 <code>SELECT ... FOR UPDATE</code> 锁住并读出状态和版本。16 个线程同时关注同一对时（用例 30-D），只有一个线程把状态从 REMOVED 改为 ACTIVE，其余 15 个读到的是已提交的新版本，返回 NOOP：输出为 <code>CHANGED=1 NOOP=15 errors=0</code>，关系版本为 1，事件为 1 条。这依赖 PostgreSQL 16 文档 13.2.1 节描述的 Read Committed 行为：<code>SELECT FOR UPDATE</code> 遇到被并发事务更新或锁定的行时，等待对方结束；对方提交后，锁住并返回更新后的版本。同一节还说明，<code>ON CONFLICT DO NOTHING</code> 可能因为另一个尚未对本快照可见的事务而不插入；随后的 <code>SELECT ... FOR UPDATE</code> 是新语句、取新快照，因此能读到那一行。</p>
+<p>拉黑事务要改两行关系，它按 (follower, followee) 的字典序依次加锁，再写拉黑记录，最后把非 REMOVED 的行转为 REMOVED：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-type">String</span>[][] <span class="hljs-variable">pairs</span> <span class="hljs-operator">=</span> blocker.compareTo(blocked) &lt; <span class="hljs-number">0</span><br>        ? <span class="hljs-keyword">new</span> <span class="hljs-title class_">String</span>[][]&#123;&#123;blocker, blocked&#125;, &#123;blocked, blocker&#125;&#125;<br>        : <span class="hljs-keyword">new</span> <span class="hljs-title class_">String</span>[][]&#123;&#123;blocked, blocker&#125;, &#123;blocker, blocked&#125;&#125;;<br><span class="hljs-type">String</span>[][] <span class="hljs-variable">cur</span> <span class="hljs-operator">=</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">String</span>[<span class="hljs-number">2</span>][];<br><span class="hljs-keyword">for</span> (<span class="hljs-type">int</span> <span class="hljs-variable">i</span> <span class="hljs-operator">=</span> <span class="hljs-number">0</span>; i &lt; <span class="hljs-number">2</span>; i++) cur[i] = lockPair(pairs[i][<span class="hljs-number">0</span>], pairs[i][<span class="hljs-number">1</span>]);<br>hook.at(<span class="hljs-string">&quot;block.afterLock&quot;</span>);<br><span class="hljs-type">int</span> <span class="hljs-variable">ins</span> <span class="hljs-operator">=</span> Db.update(cx, <span class="hljs-string">&quot;INSERT INTO block(blocker, blocked) VALUES (?, ?) ON CONFLICT DO NOTHING&quot;</span>, blocker, blocked);<br></code></pre></td></tr></table></figure>
+<p>全系统的锁顺序固定为：关系行（字典序）→ <code>event_seq</code>。关注只锁一行关系，拉黑锁两行且按同一顺序，事件序号总在最后获取，因此不会形成锁环。PostgreSQL 16 文档 13.3.4 节把“所有事务按一致顺序获取多个对象上的锁”作为避免死锁的首要办法；<code>social.common.Tx</code> 仍然对 40P01 和 40001 整体重试，作为兜底。本次运行输出 <code>tx retries observed (40001/40P01): 0</code>，即这批用例没有触发重试，这个计数不能推广到其他负载。</p>
+<p>拉黑判断为什么必须放在加锁之后？因为保证来自“读 block 的时刻”与“拉黑事务写 block 的时刻”之间的先后关系。关注事务持有关系行锁时，任何拉黑事务都还卡在同一行的锁上，尚未写入拉黑记录；关注事务提交后，拉黑事务拿到锁，读到的是关注已生效的新版本，接着把它转为 REMOVED。反过来，如果拉黑先提交，关注事务的 <code>blockedEitherWay</code> 是一条新语句，Read Committed 下取新快照，必然看到拉黑记录。两个方向都落在不变量 3 之内。</p>
+<h2 id="方案比较">方案比较</h2>
+<p>表 30-2：关系写入与派生视图的候选做法</p>
+<table>
+<thead>
+<tr>
+<th>做法</th>
+<th>能防住什么</th>
+<th>防不住什么</th>
+<th>本章观察</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>先查拉黑再锁关系行</td>
+<td>串行请求</td>
+<td>检查与加锁之间提交的拉黑</td>
+<td>30-I 负向对照：拉黑已提交，关系仍 ACTIVE</td>
+</tr>
+<tr>
+<td>先锁关系行再查拉黑</td>
+<td>并发拉黑与关注</td>
+<td>绕过本入口直接写表</td>
+<td>30-H、30-J 通过</td>
+</tr>
+<tr>
+<td>消费者按到达顺序覆盖</td>
+<td>无乱序、无重复的传输</td>
+<td>乱序与重复投递</td>
+<td>30-G 负向对照：大量已取消关系复活</td>
+</tr>
+<tr>
+<td>消费者按行版本取大并去重</td>
+<td>乱序、重复、并发消费者</td>
+<td>事件丢失（由水位暴露）</td>
+<td>30-F、30-G、30-L 通过</td>
+</tr>
+<tr>
+<td>权限只读派生视图</td>
+<td>视图已追平的时刻</td>
+<td>视图滞后期间的撤销</td>
+<td>30-K 负向对照：被拉黑者读到新内容</td>
+</tr>
+<tr>
+<td>权限每次读真相源</td>
+<td>全部情形</td>
+<td>真相源读负载随访问量增长</td>
+<td>30-K 中 TRUTH 两篇均拒绝</td>
+</tr>
+<tr>
+<td>带令牌的派生视图读取</td>
+<td>令牌声明的新鲜度</td>
+<td>令牌之外的滞后窗口</td>
+<td>30-K 中两种令牌各自符合声明</td>
+</tr>
+</tbody>
+</table>
+<h2 id="消费端：版本取大与连续水位">消费端：版本取大与连续水位</h2>
+<p>消费者 <code>Projector.apply</code> 在一个事务里完成去重、版本比较、计数增量和水位推进：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-type">int</span> <span class="hljs-variable">fresh</span> <span class="hljs-operator">=</span> Db.update(cx, <span class="hljs-string">&quot;INSERT INTO proj_seen(seq) VALUES (?) ON CONFLICT DO NOTHING&quot;</span>, e.seq());<br></code></pre></td></tr></table></figure>
+<p><code>fresh == 0</code> 表示序号已经处理过，判为 dup。否则锁住 <code>proj_follower</code> 中对应的行，比较版本：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-keyword">if</span> (e.version() &lt;= oldVer) &#123;<br>    verdict = <span class="hljs-string">&quot;stale&quot;</span>;<br>&#125; <span class="hljs-keyword">else</span> &#123;<br>    Db.update(cx, <span class="hljs-string">&quot;UPDATE proj_follower SET state = ?, version = ? WHERE followee = ? AND follower = ?&quot;</span>,<br>            e.state(), e.version(), e.followee(), e.follower());<br>    <span class="hljs-type">int</span> <span class="hljs-variable">delta</span> <span class="hljs-operator">=</span> (e.state().equals(<span class="hljs-string">&quot;ACTIVE&quot;</span>) ? <span class="hljs-number">1</span> : <span class="hljs-number">0</span>) - (oldState.equals(<span class="hljs-string">&quot;ACTIVE&quot;</span>) ? <span class="hljs-number">1</span> : <span class="hljs-number">0</span>);<br></code></pre></td></tr></table></figure>
+<p>计数增量由“被替换掉的旧状态”和“新状态”共同决定，而不是由事件类型决定。一条 ACTIVE 事件如果覆盖的是 PENDING，计数加一；覆盖的是另一条版本更低的 ACTIVE，计数不变。这样，<code>proj_count</code> 与 <code>proj_follower</code> 的修改在同一事务里提交，计数始终等于该被关注者在视图中的 ACTIVE 行数，不会因为重复投递多加。</p>
+<p>去重集合 <code>proj_seen</code> 与版本比较各管一件事。版本比较已经足以挡住旧事件和重复事件对状态的影响，<code>proj_seen</code> 的作用是支撑连续水位：消费者在同一事务末尾锁住 <code>proj_watermark</code>，从当前水位往后数连续出现的序号。四个消费者并发时，后拿到水位锁的事务在前一个提交之后才执行查找 <code>proj_seen</code> 的语句，能看到前者写入的序号，所以水位不会漏推。水位的含义是“1…s 的事件都已应用”，它是下一节权限令牌比较的对象。</p>
+<h2 id="故障反例">故障反例</h2>
+<h3 id="乱序与重复把已取消的关系复活">乱序与重复把已取消的关系复活</h3>
+<p>用例 30-F 是最小反例：同一对先关注（v1）后取消（v2），事件按 v2、v1、v1 到达。</p>
+<p>图 30-2：单对事件乱序到达时版本化消费者的判定</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant T as relation（真相源）
+    participant Q as 投递
+    participant P as Projector
+    T-&gt;&gt;Q: seq a: ACTIVE v1
+    T-&gt;&gt;Q: seq b: REMOVED v2
+    Q-&gt;&gt;P: REMOVED v2
+    P--&gt;&gt;P: v2 &gt; v0，applied，视图 REMOVED
+    Q-&gt;&gt;P: ACTIVE v1（迟到）
+    P--&gt;&gt;P: v1 ≤ v2，stale，视图不变
+    Q-&gt;&gt;P: ACTIVE v1（重复）
+    P--&gt;&gt;P: seq a 已在 proj_seen，dup</code></pre>
+<p>输出为 <code>arrivals v2,v1,v1 -&gt; [applied, stale, dup]</code>，视图保持 REMOVED。如果消费者按到达顺序直接覆盖，迟到的 v1 会把关系写回 ACTIVE，这就是“复活”。</p>
+<p>用例 30-G 放大这一反例：在前面用例的基础上追加 300 对关系，每对执行 2 到 4 次关注或取消，全部事件按 30% 的比例复制后用固定种子打乱。同一份投递序列先交给 <code>applyNaive</code>（按到达顺序覆盖、不比版本、不去重），再清空视图交给 4 个并发消费者线程执行版本化消费：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">note events=1485 deliveries=1942 seed=302026<br>note naive: resurrected=100 missing=37 wrongCounts=43<br>ok   negative control exposes: 按到达顺序应用时已取消的关系复活 (100 对)<br>note versioned: verdicts=&#123;applied=580, dup=457, stale=905&#125; resurrected=0 missing=0 wrongCounts=0<br></code></pre></td></tr></table></figure>
+<p><code>resurrected</code> 是视图为 ACTIVE 而真相源不是 ACTIVE 的行数，<code>missing</code> 是反方向的差异，<code>wrongCounts</code> 是计数不一致的被关注者个数，三者由 <code>Projector.diff</code> 的三条 SQL 直接对比两边得到。事件总数包含前面并发用例 30-E 产生的事件，后者由线程调度决定，所以这几个数在每次运行之间会变化；断言检查的是负向对照出现复活、正确实现三项差异为 0、水位等于事件总数。</p>
+<p>这项保证的成立条件是：每对关系的版本由真相源在行锁下单调递增，事件携带该版本。观察位置是 <code>Projector.diff</code>。失败边界有两个：如果有写入绕过 <code>RelationService</code> 直接改 <code>relation</code> 而不写事件，视图将永远追不上；如果事件丢失，版本比较本身察觉不到，只能由水位停在缺口前暴露出来。</p>
+<h3 id="拉黑与关注并发">拉黑与关注并发</h3>
+<p>用例 30-H 用插桩点构造确定的交错：关注事务锁住 user-0070→user-0071 的关系行后暂停，拉黑事务启动，测试线程通过另一条连接查询 <code>pg_locks</code>，直到看到拉黑事务所在后端存在 <code>granted = false</code> 的锁记录（PostgreSQL 16 文档 54.12 节说明 <code>granted</code> 为假表示该进程正在等待这把锁），才让关注继续。</p>
+<p>图 30-3：先锁后查时拉黑与关注的时间线（用例 30-H）</p>
+<pre><code class="hljs mermaid">sequenceDiagram
+    participant F as 关注事务
+    participant R as relation 行 (0070→0071)
+    participant B as 拉黑事务
+    F-&gt;&gt;R: INSERT 占位 + SELECT FOR UPDATE（持锁）
+    B-&gt;&gt;R: lockPair（等待，pg_locks granted=false）
+    F-&gt;&gt;F: 查 block：无记录
+    F-&gt;&gt;R: REMOVED→ACTIVE v1，写事件，提交
+    R--&gt;&gt;B: 获得锁，读到 ACTIVE v1
+    B-&gt;&gt;B: 写 block，ACTIVE→REMOVED v2，写事件，提交</code></pre>
+<p>输出为 <code>follow result=CHANGED(ACTIVE,v1,seq1486) final relation=REMOVED block rows=1 blockTxWaitedOnRowLock=true</code>：关注先成功，随后被拉黑撤销，最终状态符合不变量 3。</p>
+<p>负向对照 30-I 打开 <code>checkBeforeLock</code>：关注事务先查拉黑（此时无记录），在加锁前暂停，等拉黑事务完整提交之后再加锁、转移。拉黑事务提交时这对关系还是 REMOVED，无事可撤；关注事务随后凭着过期的检查结果把它改成 ACTIVE。输出 <code>final relation=ACTIVE block rows=1</code>，违反不变量 3。两组用例的 SQL 完全一样，差别只在检查与加锁的先后，说明保证来自“在锁内读拉黑”这一步，事务本身并不提供它。</p>
+<p>用例 30-J 不加插桩，40 轮里每轮用真实线程同时发起 A 关注 B、B 关注 A、B 拉黑 A，偶数轮的 B 是私密账号。输出 <code>rounds=40 blockRows=40</code>、<code>errors=0 violations=0</code>。这是随机调度下的抽查，能发现常见交错下的违规，但不能穷举所有交错；穷举性的论证由上一段的锁顺序给出，30-H 和 30-I 分别固定了两种关键交错。</p>
+<h3 id="撤销之后的新内容：新敌人问题">撤销之后的新内容：新敌人问题</h3>
+<p>Zanzibar 论文（USENIX ATC 2019）用过 new enemy problem 与 zookie 两个术语，本环境取不到全文。本章用“新敌人问题”指：权限撤销之后发布的内容被刚被撤销的人看到。本环境取不到该论文全文，下文的令牌规则是本章自行设计的，只借用问题名称，不代表该系统的实现。</p>
+<p>用例 30-K 的事件序列：私密账号 user-0300 审批 user-0342 的关注，发布 P1，视图追平到水位 1614；随后 user-0300 拉黑 user-0342（事件序号 1615），再发布 P2，P2 的 <code>acl_token</code> 记为 1615；此时故意不运行消费者，视图水位停在 1614。四种检查模式的结论：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs text">note TRUTH           P1=DENY/truth P2=DENY/truth<br>note PROJECTION_ONLY P1=ALLOW/projection P2=ALLOW/projection<br>note CONTENT_TOKEN   P1=ALLOW/projection P2=DENY/fallback-truth<br>note FRESH_TOKEN     P1=DENY/fallback-truth P2=DENY/fallback-truth<br></code></pre></td></tr></table></figure>
+<p><code>PROJECTION_ONLY</code> 让被拉黑者读到了拉黑之后发布的 P2，这就是新敌人问题的本地复现。<code>CONTENT_TOKEN</code> 要求视图水位不低于内容的 <code>acl_token</code>，否则回退真相源：P2 的令牌 1615 高于水位，回退后被拒；P1 的令牌 1614 不高于水位，仍按视图放行。它保证的是：发帖事务读取 <code>event_seq</code> 时已经提交的撤销一定生效。与发帖事务并发提交的撤销不在保证范围内：<code>createPost</code> 在 READ COMMITTED 下不加锁地读取 <code>last</code>，若拉黑事务已拿到序号 k+1 但尚未提交，发帖读到 k，拉黑随后可能先于帖子提交，令牌 k 覆盖不到它。若要把保证扩大到“帖子提交前已提交的撤销”，可以改用 <code>SELECT last FROM event_seq WHERE id = 1 FOR SHARE</code>，让在途的关系写入先结束；本章没有实现和测试这一改法，30-K 是串行构造，覆盖不到这个交错。对旧内容，对旧内容则允许视图滞后，这个窗口在 30-K 中被显式断言为预期行为，视图追平后 P1 也被拒（<code>after drain watermark=1615 P1 CONTENT_TOKEN=DENY/projection</code>）。<code>FRESH_TOKEN</code> 取检查时刻已提交的最高序号作为令牌，视图未追平就回退，结论与 TRUTH 相同。</p>
+<p>令牌比较之所以成立，依赖序号顺序等于提交顺序：内容事务读到 <code>event_seq.last = k</code> 时，序号不大于 k 的事件都已提交；水位达到 k 时，这些事件都已应用到视图。如果换成允许空洞或乱序提交的序号（例如普通 sequence 加并发事务），“水位 ≥ k”就不再蕴含“序号不大于 k 的事件都已应用”，令牌失效。</p>
+<p>入口与派生视图的一致性由同一个 <code>AccessCheck.canRead</code> 承担：本章只有 <code>AccessCheck.canRead</code> 一个判定入口；任何读路径（直接打开、从列表进入）只要都调用它并使用同一模式，结论就一致。本章没有单独实现列表入口。在 <code>FRESH_TOKEN</code> 下，两条路径的结论都不早于检查开始时已提交的关系状态；在 <code>CONTENT_TOKEN</code> 下，二者可能在旧内容上相差一个消费延迟，这个差距是该模式声明的边界。<code>PUBLIC</code> 内容不看关注关系，只读 <code>block</code> 表，因为拉黑记录本身不进入视图；用例 30-M 显示非粉丝在四种模式下都能读公开内容，拉黑后四种模式都拒绝（<code>DENY/public-block-check</code>），<code>SELF</code> 内容对有效粉丝也拒绝。</p>
+<h2 id="恢复流程">恢复流程</h2>
+<p>派生视图可以随时从事件表重建，所以消费者故障的恢复手段是重放。用例 30-L 清空视图后，先按打乱顺序投递 60% 的事件，模拟消费者在中途失去进度；再由新的消费者连接从头投递全量事件，并带 30% 重复：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><code class="hljs text">note after partial: watermark=3/1615 diff=72,39,53<br>note after restart replay: watermark=1615 diff=0,0,0<br></code></pre></td></tr></table></figure>
+<p>中途的水位为 3，原因是序号 4 恰好不在先投递的那一部分里，连续水位停在缺口之前，这正是它的用途：水位低于事件总数，说明视图尚不可用于令牌比较，权限检查会回退真相源。重放时已处理的事件被判 dup 或 stale，不会重复计数。恢复的成立条件是事件表完整保留、不被截断；如果事件表按保留期清理，重建需要先从真相源做一次快照，再从快照对应的序号往后重放，本章没有实现这一步。</p>
+<p>恢复的检查顺序：先看 <code>proj_watermark.applied_upto</code> 是否等于 <code>event_seq.last</code>；不等就继续消费，或者清空后重放；等于之后用 <code>Projector.diff</code> 的三条 SQL 确认差异为 0，才把视图重新用于权限判断。真相源这一侧没有异步状态，崩溃后由 PostgreSQL 的事务原子性保证关系行、拉黑记录、事件三者要么一起提交、要么一起消失。本章没有对数据库做 immediate 停机实验，这一点只来自事务语义，未经本地崩溃验证。</p>
+<h2 id="证据与限制">证据与限制</h2>
+<p>运行入口是 <code>examples/social/run.sh 30</code>，它启动端口 55430 的 b3-30 集群、重建 <code>social30</code> 库、编译运行 <code>social.rel.Ch30Main</code>，把输出写入 <code>evidence/30/output.txt</code>，最后停止集群。本次运行的汇总行是 <code>SUMMARY passed=58 failed=0</code>，退出码为 0。</p>
+<p>表 30-3：用例与保证的对应</p>
+<table>
+<thead>
+<tr>
+<th>用例</th>
+<th>类别</th>
+<th>检查的保证</th>
+<th>观察位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>30-A、30-B</td>
+<td>真实组件</td>
+<td>正常关注、私密审批、PENDING 不计数</td>
+<td>relation、proj_count</td>
+</tr>
+<tr>
+<td>30-C</td>
+<td>真实组件</td>
+<td>自关注、空取消、版本递增、解除拉黑不恢复</td>
+<td>relation_event 行数、relation.state</td>
+</tr>
+<tr>
+<td>30-D、30-E</td>
+<td>真实组件，真实线程</td>
+<td>重复关注只写一条事件；版本连续且等于事件数</td>
+<td>relation_event 的 count 与 max(version)</td>
+</tr>
+<tr>
+<td>30-F、30-G</td>
+<td>真实组件，并发消费者</td>
+<td>乱序与重复不复活；负向对照复活</td>
+<td>Projector.diff</td>
+</tr>
+<tr>
+<td>30-H、30-I、30-J</td>
+<td>真实组件，插桩交错与随机并发</td>
+<td>拉黑存在时双向关系均为 REMOVED；负向对照违反</td>
+<td>pg_locks、relation 与 block 的连接查询</td>
+</tr>
+<tr>
+<td>30-K、30-M</td>
+<td>真实组件</td>
+<td>撤销后新内容不可读；令牌模式边界；可见性边界</td>
+<td>AccessCheck 返回的来源标记</td>
+</tr>
+<tr>
+<td>30-L</td>
+<td>真实组件，消费者重启</td>
+<td>重放后视图与真相源一致</td>
+<td>proj_watermark、Projector.diff</td>
+</tr>
+</tbody>
+</table>
+<p>限制写在 <code>evidence/30/LIMITS.md</code>，要点如下。所有用例在单机、单个 PostgreSQL 实例上运行，不证明跨库分片、主从复制延迟下的行为；读副本上的权限检查需要另行论证令牌与复制位置的关系。事件投递由测试代码模拟，不验证任何消息组件的确认语义。消费者“丢失进度”由新建连接从头投递模拟，没有使用独立 JVM 进程和 <code>kill -9</code>。全局单行序号把所有关系写入串行化，本章没有测量它的吞吐，也不建议把这一结构直接用于高写入场景。30-J 是随机抽查，不是穷举。</p>
+<h2 id="本批导航">本批导航</h2>
+<ul>
+<li>上一篇：<a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-29-%E8%AE%A2%E5%8D%95%E6%94%AF%E4%BB%98%E6%A8%A1%E6%8B%9F%E4%B8%8E%E5%BA%93%E5%AD%98%E8%A1%A5%E5%81%BF/" title="后端系统工程 29：订单、支付模拟与库存补偿">29 订单、支付模拟与库存补偿</a></li>
+<li>下一篇：<a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-31-Feed%E7%9A%84%E6%89%87%E5%87%BA%E6%88%90%E6%9C%AC%E4%B8%8E%E7%83%AD%E7%82%B9/" title="后端系统工程 31：Feed 的扇出成本与热点">31 Feed 的扇出成本与热点</a></li>
+<li>本批索引：仓库 <code>batch-3/INDEX.md</code>（阅读顺序与运行入口），<code>batch-3/STATUS.md</code>、<code>batch-3/SOURCES.md</code></li>
+<li>运行入口：<code>batch-3/examples/social/run.sh</code>，证据目录：<code>batch-3/evidence/30/</code></li>
+<li>本篇工程与证据快照：<a href="./backend-systems-30.tar.gz">backend-systems-30.tar.gz</a>（SHA-256 见同目录 <code>backend-systems-30.tar.gz.sha256</code>）。正文中的 <code>examples/</code>、<code>evidence/</code>、<code>SOURCES.md</code> 路径都相对仓库的 <code>batch-3/</code> 目录，与快照包内布局一致。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-30-%E5%85%B3%E6%B3%A8%E5%85%B3%E7%B3%BB%E4%B8%8E%E5%8F%AF%E6%92%A4%E9%94%80%E8%AE%A2%E9%98%85/">https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-30-%E5%85%B3%E6%B3%A8%E5%85%B3%E7%B3%BB%E4%B8%8E%E5%8F%AF%E6%92%A4%E9%94%80%E8%AE%A2%E9%98%85/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/PostgreSQL/">PostgreSQL</a><a class="post-meta__tags" href="/tags/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B/">后端系统工程</a><a class="post-meta__tags" href="/tags/%E5%85%B3%E6%B3%A8%E5%85%B3%E7%B3%BB/">关注关系</a><a class="post-meta__tags" href="/tags/%E6%9D%83%E9%99%90%E6%92%A4%E9%94%80/">权限撤销</a><a class="post-meta__tags" href="/tags/%E4%BA%8B%E4%BB%B6%E6%8A%95%E5%BD%B1/">事件投影</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-150.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-31-Feed%E7%9A%84%E6%89%87%E5%87%BA%E6%88%90%E6%9C%AC%E4%B8%8E%E7%83%AD%E7%82%B9/" title="后端系统工程 31：Feed 的扇出成本与热点"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-131.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 31：Feed 的扇出成本与热点</div></div><div class="info-2"><div class="info-item-1">首页 Feed 要回答一个问题：读者当前关注的作者里，最近发了哪些读者有权看的帖子，按什么顺序排，翻到第二页时从哪里接着读。工程上的争议集中在“候选什么时候算出来”。发帖时把帖子写进每个粉丝的收件箱（推），代价落在写路径上，并且和作者粉丝数成正比；读 Feed 时现场到每个被关注作者的时间线里取（拉），代价落在读路径上，和读者关注的作者数成正比；按作者粉丝数分档（混合），则把两种代价按阈值切开。粉丝数呈重尾分布时，少数热点作者决定了推方案的写入峰值，也决定了拉方案里被反复读取的那几条时间线。 另一层要求来自第 30 篇：关注关系是一种授权。收件箱里的行是发帖时刻算出的候选，读者之后取消关注、被拉黑、帖子改成仅自己可见，这些行不会自己消失。如果读路径直接把物化的收件箱行返回给读者，撤销就被绕过了。 本章工程在 examples/social 的 social.feed 包中，复用第 30 篇 social.rel 的关系表、RelationService 与 AccessCheck，全部用例跑在真实 PostgreSQL 16.15 上。验收目标有两条：在同一张合成关注图上比较推、...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-38-%E6%95%B0%E6%8D%AE%E5%A4%87%E4%BB%BD%E6%81%A2%E5%A4%8D%E4%B8%8E%E5%9C%B0%E5%9F%9F%E5%88%87%E6%8D%A2/" title="后端系统工程 38：数据备份、恢复与地域切换——恢复演练要检查数据，不只检查进程"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-95.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 38：数据备份、恢复与地域切换——恢复演练要检查数据，不只检查进程</div></div><div class="info-2"><div class="info-item-1"> 本文属于《后端系统工程：从接口契约到故障恢复》系列。文中提到的演练工程、测试与实验证据位于博客源码仓库的 batch-4/ 目录（examples/、evidence/ 等子目录）；业务数据均为合成数据。  “备份成功”是一条日志，“能恢复到指定时刻且数据正确”才是一项能力。两者之间隔着几个容易略过的问题：恢复点到底落在哪里，归档的 WAL 是否完整，恢复出来的实例里账是否平，角色和权限是否还在，切换之后旧主库会不会继续接受写入。 本篇在一台机器上启动多个隔离的 PostgreSQL 16 实例，实际执行基础备份、WAL 归档、按命名还原点的时间点恢复（PITR）、计划内切换和注入复制中断的非计划切换，每一步都用 SQL 检查数据本身。所有演练证明的是脚本与步骤在单机上可执行、检查项能发现错误；它们不证明跨地域网络、存储、DNS 或权限体系的行为。  1. 需求、目标与不变量 被保护的数据是一个合成的双边记账库：account(id, balance) 有 200 个账户，entry(request_id, account_id, amount, batch) 记录每笔转账的借...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-23-%E5%88%86%E7%89%87%E6%89%A9%E5%AE%B9%E6%97%B6%E7%9A%84%E6%95%B0%E6%8D%AE%E4%BA%A4%E6%8E%A5/" title="后端系统工程 23：分片扩容时的数据交接"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-27.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 23：分片扩容时的数据交接</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 22 非分片键查询与全局分页 ｜ 本篇 23 ｜ 下一篇 24 在线变更的数据兼容 两个分片扩到三个，需要把一部分数据从旧分片搬到新分片，同时写入不停。这件事拆开看有三个难点。复制需要时间，复制期间源端还在变化，复制完的副本一出来就是旧的。路由表改了之后，已经拿着旧路由的写入方不会立刻知道，它们的写会继续打到源端。写入方遇到超时会重试，一次请求可能在源端提交了、重试却落到目标端。任何一处处理不当，结果都是某些已经告诉调用方“成功”的写，在迁移完成后不见了，或者已经删除的行又回来了。 本篇实现按桶迁移：版本化路由、快照复制、按事务水位追赶、冻结栅栏、按键与版本校验、切流。三个独立的写入进程在迁移全程持续写入、删除与重试，迁移结束后逐键核对“所有已确认写”。代码在 examples/23-shard-rebalance/，输出在 evidence/23/output.txt。 需求与不变量 数据是合成的键值记录 items(item_id, bucket, val, row_version)，写操作有三种：创建（值为 0，版本 1）、增量（val += delta，...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-20-%E5%8F%91%E5%8F%B7%E6%9C%8D%E5%8A%A1%E7%9A%84%E5%94%AF%E4%B8%80%E6%80%A7%E4%B8%8E%E5%A4%B1%E8%B4%A5%E6%A8%A1%E5%BC%8F/" title="后端系统工程 20：发号服务的唯一性与失败模式"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-77.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 20：发号服务的唯一性与失败模式</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 19 延迟任务的领取与取消 ｜ 本篇 20 ｜ 下一篇 21 有限能力的数据库路由代理 “生成一个唯一 ID”这句话省略了三个限定：在多大范围内唯一，在哪些故障之后仍然唯一，除了唯一还要求什么。一张订单表的主键只需在该表内不重复；跨系统传递的标识要在所有系统中不重复；作为分片键或排序键时，还会被要求大致按时间递增。不同方案对这些问题的回答不同，它们的失败模式也不同：数据库号段在进程崩溃后留下空洞，时间型标识在时钟回退时可能重复，节点号方案在两个进程误用同一节点号时必然重复。 本篇实现一个基于 PostgreSQL 的号段发号器，作为主方案验证并发取号、进程重启、数据库故障下的唯一性；再实现 UUIDv4、UUIDv7 和 Snowflake 式 64 位标识作为契约对照，用受控时钟测试时钟回退，用真实多进程测试节点号冲突。代码在 examples/20-id-service/，输出在 evidence/20/output.txt。 需求契约 号段服务的使用方只调用一个操作：为某个业务标签取下一个号。服务承诺：  同一业务标签下发出的号全局唯一，这一点在发号进程崩...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-19-%E5%BB%B6%E8%BF%9F%E4%BB%BB%E5%8A%A1%E7%9A%84%E9%A2%86%E5%8F%96%E4%B8%8E%E5%8F%96%E6%B6%88/" title="后端系统工程 19：延迟任务的领取与取消"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-102.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 19：延迟任务的领取与取消</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 18 消息队列接入与积压恢复 ｜ 本篇 19 ｜ 下一篇 20 发号服务的唯一性与失败模式 “三十分钟后关闭未支付的预约”“两小时后提醒参会者”，这类需求都可以写成一句话：到了某个时刻之后，执行一次某个动作。真正实现起来，这句话里的“到了”“执行”和“一次”都要重新定义。到期时刻由谁的时钟判断？多个执行者同时扫描时，谁拿到任务？执行者拿到任务后被杀死或被暂停，任务何时由别人接手？原执行者恢复后又提交结果，系统听谁的？取消请求与到期同时到达，返回给调用方的“已取消”究竟保证了什么？ 本篇用 PostgreSQL 保存任务，多个独立 JVM 进程担任执行者，用真实的 kill -9 和 SIGSTOP 制造执行者失联，逐一回答这些问题。结论先写在契约里：系统允许同一任务有多次执行尝试，“一次”只落在副作用上，并且要靠唯一约束或幂等键来保证。代码在 examples/19-delayed-tasks/，输出在 evidence/19/output.txt。 需求契约 调用方可以做两件事：安排一个任务（类型、载荷、延迟、最大尝试次数），以及取消一个任务。执行者可以做四件...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-28-%E7%A8%80%E7%BC%BA%E5%90%8D%E9%A2%9D%E7%9A%84%E5%87%86%E5%85%A5%E4%B8%8E%E5%BA%93%E5%AD%98%E9%A2%84%E7%95%99/" title="后端系统工程 28：稀缺名额的准入与库存预留"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-97.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 28：稀缺名额的准入与库存预留</div></div><div class="info-2"><div class="info-item-1">一个预约名额只有 40 个、同一时刻却有几百个请求到达的场景，至少要回答四件事：同时进入数据库的请求怎样限量，超出的请求是排队还是立刻拒绝；40 个名额怎样保证不多发；客户端在等待中断开或超时重发时，名额会不会被占两次；占了名额却迟迟不付款的预留到期后怎样归还，归还任务重跑时会不会多还。本篇用 examples/flash-sale 中的最小服务逐一回答。商品、用户和请求都是合成数据，SKU 固定为 sku-lab-01，用户为 user-0042 这类编号，域名只用 shop.example.test。订单与支付留给下一篇，本篇只交付“名额预留”这一层。 需求与范围 需求按可检查的形式写成五条：  任一时刻有效预留（状态为 HELD 或 CONFIRMED）的数量不超过库存总数。 同一个 request_key 无论发送多少次，最多产生一条预留；同键换用户或换 SKU 视为错误请求。 同一用户在同一 SKU 上最多持有一条有效预留。 单个服务进程内同时访问数据库的预留请求不超过并发上限；等待位置有界，满了立即返回 503。 到期的 HELD 预留由释放任务归还库存；释放任务重复...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9C%80%E6%B1%82%E4%B8%8E%E8%8C%83%E5%9B%B4"><span class="toc-number">1.</span> <span class="toc-text">需求与范围</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%99%E5%AD%A6%E8%A7%84%E6%A8%A1%E5%81%87%E8%AE%BE"><span class="toc-number">2.</span> <span class="toc-text">教学规模假设</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%8E%A5%E5%8F%A3%E4%B8%8E%E8%BF%94%E5%9B%9E%E8%AF%AD%E4%B9%89"><span class="toc-number">3.</span> <span class="toc-text">接口与返回语义</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%B0%E6%8D%AE%E6%A8%A1%E5%9E%8B"><span class="toc-number">4.</span> <span class="toc-text">数据模型</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%8A%B6%E6%80%81%E6%9C%BA"><span class="toc-number">5.</span> <span class="toc-text">状态机</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%AD%A3%E5%B8%B8%E8%B7%AF%E5%BE%84%E4%B8%8E%E9%94%81%E9%A1%BA%E5%BA%8F"><span class="toc-number">6.</span> <span class="toc-text">正常路径与锁顺序</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%96%B9%E6%A1%88%E6%AF%94%E8%BE%83"><span class="toc-number">7.</span> <span class="toc-text">方案比较</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%B6%88%E8%B4%B9%E7%AB%AF%EF%BC%9A%E7%89%88%E6%9C%AC%E5%8F%96%E5%A4%A7%E4%B8%8E%E8%BF%9E%E7%BB%AD%E6%B0%B4%E4%BD%8D"><span class="toc-number">8.</span> <span class="toc-text">消费端：版本取大与连续水位</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%85%E9%9A%9C%E5%8F%8D%E4%BE%8B"><span class="toc-number">9.</span> <span class="toc-text">故障反例</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B9%B1%E5%BA%8F%E4%B8%8E%E9%87%8D%E5%A4%8D%E6%8A%8A%E5%B7%B2%E5%8F%96%E6%B6%88%E7%9A%84%E5%85%B3%E7%B3%BB%E5%A4%8D%E6%B4%BB"><span class="toc-number">9.1.</span> <span class="toc-text">乱序与重复把已取消的关系复活</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%8B%89%E9%BB%91%E4%B8%8E%E5%85%B3%E6%B3%A8%E5%B9%B6%E5%8F%91"><span class="toc-number">9.2.</span> <span class="toc-text">拉黑与关注并发</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%92%A4%E9%94%80%E4%B9%8B%E5%90%8E%E7%9A%84%E6%96%B0%E5%86%85%E5%AE%B9%EF%BC%9A%E6%96%B0%E6%95%8C%E4%BA%BA%E9%97%AE%E9%A2%98"><span class="toc-number">9.3.</span> <span class="toc-text">撤销之后的新内容：新敌人问题</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%81%A2%E5%A4%8D%E6%B5%81%E7%A8%8B"><span class="toc-number">10.</span> <span class="toc-text">恢复流程</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E8%AF%81%E6%8D%AE%E4%B8%8E%E9%99%90%E5%88%B6"><span class="toc-number">11.</span> <span class="toc-text">证据与限制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%AC%E6%89%B9%E5%AF%BC%E8%88%AA"><span class="toc-number">12.</span> <span class="toc-text">本批导航</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

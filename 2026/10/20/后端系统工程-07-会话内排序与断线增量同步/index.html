@@ -1,0 +1,1001 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>后端系统工程 07：会话内排序与断线增量同步 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="后端系统工程 07：会话内排序与断线增量同步  本批导航：00 技术方案怎样接受验证｜01 API 契约与业务不变量｜02 负载模型与容量预算｜03 单库基线与故障实验工具｜04 持久化边界｜05 长连接接入｜06 发送确认｜07 排序与增量同步｜08 群消息扇出｜09 多设备已读｜10 网关故障与路由收敛｜11 撤回与集成验收  第 06 篇让投递变成“至少一次”：推送可能重复，可能丢失后由同步">
+<meta property="og:type" content="article">
+<meta property="og:title" content="后端系统工程 07：会话内排序与断线增量同步">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-07-%E4%BC%9A%E8%AF%9D%E5%86%85%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%96%AD%E7%BA%BF%E5%A2%9E%E9%87%8F%E5%90%8C%E6%AD%A5/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="后端系统工程 07：会话内排序与断线增量同步  本批导航：00 技术方案怎样接受验证｜01 API 契约与业务不变量｜02 负载模型与容量预算｜03 单库基线与故障实验工具｜04 持久化边界｜05 长连接接入｜06 发送确认｜07 排序与增量同步｜08 群消息扇出｜09 多设备已读｜10 网关故障与路由收敛｜11 撤回与集成验收  第 06 篇让投递变成“至少一次”：推送可能重复，可能丢失后由同步">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-81.jpg">
+<meta property="article:published_time" content="2026-10-19T16:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T08:33:36.100Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="即时通信">
+<meta property="article:tag" content="增量同步">
+<meta property="article:tag" content="消息顺序">
+<meta property="article:tag" content="游标分页">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-81.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "后端系统工程 07：会话内排序与断线增量同步",
+  "url": "https://magicliang.github.io/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-07-%E4%BC%9A%E8%AF%9D%E5%86%85%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%96%AD%E7%BA%BF%E5%A2%9E%E9%87%8F%E5%90%8C%E6%AD%A5/",
+  "image": "https://magicliang.github.io/img/wall-paper-81.jpg",
+  "datePublished": "2026-10-19T16:00:00.000Z",
+  "dateModified": "2026-10-22T08:33:36.100Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-07-%E4%BC%9A%E8%AF%9D%E5%86%85%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%96%AD%E7%BA%BF%E5%A2%9E%E9%87%8F%E5%90%8C%E6%AD%A5/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '后端系统工程 07：会话内排序与断线增量同步',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2016</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2094</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-81.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">后端系统工程 07：会话内排序与断线增量同步</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">后端系统工程 07：会话内排序与断线增量同步</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-19T16:00:00.000Z" title="Created 2026-10-20 00:00:00">2026-10-20</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-22T08:33:36.100Z" title="Updated 2026-10-22 16:33:36">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.4k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>15mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-22 16:33:36&quot;}" hidden></div><h1 id="后端系统工程-07：会话内排序与断线增量同步">后端系统工程 07：会话内排序与断线增量同步</h1>
+<blockquote>
+<p>本批导航：<a href="/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-00-%E4%B8%80%E4%BB%BD%E6%8A%80%E6%9C%AF%E6%96%B9%E6%A1%88%E6%80%8E%E6%A0%B7%E6%8E%A5%E5%8F%97%E9%AA%8C%E8%AF%81/" title="后端系统工程 00：一份技术方案怎样接受验证">00 技术方案怎样接受验证</a>｜<a href="/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-01-API%E5%A5%91%E7%BA%A6%E4%B8%8E%E4%B8%9A%E5%8A%A1%E4%B8%8D%E5%8F%98%E9%87%8F/" title="后端系统工程 01：API 契约与业务不变量">01 API 契约与业务不变量</a>｜<a href="/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-02-%E8%B4%9F%E8%BD%BD%E6%A8%A1%E5%9E%8B%E4%B8%8E%E5%AE%B9%E9%87%8F%E9%A2%84%E7%AE%97/" title="后端系统工程 02：负载模型与容量预算">02 负载模型与容量预算</a>｜<a href="/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-03-%E5%8D%95%E5%BA%93%E5%9F%BA%E7%BA%BF%E4%B8%8E%E6%95%85%E9%9A%9C%E5%AE%9E%E9%AA%8C%E5%B7%A5%E5%85%B7/" title="后端系统工程 03：单库基线与故障实验工具">03 单库基线与故障实验工具</a>｜<a href="/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-04-%E4%BC%9A%E8%AF%9D%E6%88%90%E5%91%98%E4%B8%8E%E6%B6%88%E6%81%AF%E7%9A%84%E6%8C%81%E4%B9%85%E5%8C%96%E8%BE%B9%E7%95%8C/" title="后端系统工程 04：会话、成员与消息的持久化边界">04 持久化边界</a>｜<a href="/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-05-%E9%95%BF%E8%BF%9E%E6%8E%A5%E6%8E%A5%E5%85%A5%E4%B8%8E%E8%BF%9E%E6%8E%A5%E5%BD%92%E5%B1%9E/" title="后端系统工程 05：长连接接入与连接归属">05 长连接接入</a>｜<a href="/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-06-%E5%8F%91%E9%80%81%E7%A1%AE%E8%AE%A4%E4%B8%8E%E5%8F%AF%E6%81%A2%E5%A4%8D%E7%9A%84%E6%B6%88%E6%81%AF%E6%8A%95%E9%80%92/" title="后端系统工程 06：发送确认与可恢复的消息投递">06 发送确认</a>｜<strong>07 排序与增量同步</strong>｜<a href="/2026/10/21/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-08-%E7%BE%A4%E6%B6%88%E6%81%AF%E6%89%87%E5%87%BA%E4%B8%8E%E6%88%90%E5%91%98%E7%89%88%E6%9C%AC/" title="后端系统工程 08：群消息扇出与成员版本">08 群消息扇出</a>｜<a href="/2026/10/21/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-09-%E5%A4%9A%E8%AE%BE%E5%A4%87%E5%B7%B2%E8%AF%BB%E4%B8%8E%E6%9C%AA%E8%AF%BB%E7%8A%B6%E6%80%81/" title="后端系统工程 09：多设备已读与未读状态">09 多设备已读</a>｜<a href="/2026/10/21/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-10-%E7%BD%91%E5%85%B3%E6%95%85%E9%9A%9C%E5%90%8E%E7%9A%84%E9%87%8D%E8%BF%9E%E4%B8%8E%E8%B7%AF%E7%94%B1%E6%94%B6%E6%95%9B/" title="后端系统工程 10：网关故障后的重连与路由收敛">10 网关故障与路由收敛</a>｜<a href="/2026/10/21/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-11-%E6%92%A4%E5%9B%9E%E5%8E%86%E5%8F%B2%E4%BF%9D%E7%95%99%E4%B8%8E%E6%B6%88%E6%81%AF%E7%B3%BB%E7%BB%9F%E9%9B%86%E6%88%90%E9%AA%8C%E6%94%B6/" title="后端系统工程 11：撤回、历史保留与消息系统集成验收">11 撤回与集成验收</a></p>
+</blockquote>
+<p>第 06 篇让投递变成“至少一次”：推送可能重复，可能丢失后由同步补齐。这带来两个新问题。第一，消息以什么顺序显示？推送和同步是两条独立的路径，到达顺序可能与发送顺序不同。第二，客户端怎样记住“已经拿到了哪里”，使得断线重连后只拉取缺少的部分，既不重复也不遗漏？</p>
+<p>本篇的答案围绕一个数展开：会话内序号 <code>seq</code>。服务端保证序号在已提交事件中连续，并且提交顺序与序号顺序一致；客户端维护一个只在连续范围上前进的游标；同步接口以游标为键分页。三者合起来，使得任意交错的推送、同步与新写入都不会让客户端漏掉或重复应用事件。</p>
+<h2 id="1-需求与不变量">1. 需求与不变量</h2>
+<table>
+<thead>
+<tr>
+<th>编号</th>
+<th>不变量</th>
+<th>承担者</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>O1</td>
+<td>同一会话内，所有成员看到的事件顺序相同，即序号顺序</td>
+<td>服务端（第 04 篇的会话行锁）</td>
+</tr>
+<tr>
+<td>O2</td>
+<td>序号为 n+1 的事件提交时，序号 ≤ n 的事件都已提交</td>
+<td>服务端</td>
+</tr>
+<tr>
+<td>O3</td>
+<td>客户端游标 <code>cursor</code> 满足：本地已保存 <code>(min_seq, cursor]</code> 内全部可见事件</td>
+<td>客户端</td>
+</tr>
+<tr>
+<td>O4</td>
+<td>以 <code>after=cursor</code> 发起的同步，逐页推进，最终到达 head，期间不重复、不跳过</td>
+<td>服务端 + 客户端</td>
+</tr>
+<tr>
+<td>O5</td>
+<td>游标失效（超过 head、纪元变化、历史被清理）时，服务端返回明确的错误或标记，而不是静默返回错误数据</td>
+<td>服务端</td>
+</tr>
+</tbody>
+</table>
+<p>O2 不是 O1 的推论，需要单独说明。设想序号由数据库序列分配（第 04 篇方案 A）：事务 T1 取得序号 10，事务 T2 取得序号 11，T2 先提交。此时一个读者同步，看到 11 但看不到 10，于是把游标推进到 11；之后 T1 提交，序号 10 出现，但读者的下一次同步从 <code>after=11</code> 开始，永远拿不到 10。O2 排除了这种情况：在本实现中，分配序号的事务持有会话行锁直到提交，下一个事务要等锁释放才能分配序号 n+1，因此读者看到 n+1 时，n 必然已经可见。</p>
+<p>O3 中“可见”指落在调用者成员区间内（第 08 篇）。不可见的序号范围在游标推进时被跳过，O3 不要求客户端保存它们。</p>
+<h2 id="2-规模假设">2. 规模假设</h2>
+<p>第 02 篇假设网关故障时 30% 的设备在 60 秒内重连，每台平均补拉 25 条。单页上限为 200 条（<code>Store.MAX_PAGE</code>），客户端默认每页 50 条，所以多数重连一页即可完成。长期离线的设备可能积压数千条，需要多页；分页过程中会话还在继续写入，这正是 O4 要处理的场景。</p>
+<h2 id="3-接口">3. 接口</h2>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs json"><span class="hljs-punctuation">&#123;</span><span class="hljs-attr">&quot;t&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;sync&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;rid&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;r9&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;conv&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;c-g&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;after&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">120</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;limit&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">50</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;epoch&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">1</span><span class="hljs-punctuation">&#125;</span><br><br><span class="hljs-punctuation">&#123;</span><span class="hljs-attr">&quot;t&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;page&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;rid&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;r9&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;conv&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;c-g&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;epoch&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">1</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;min_seq&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">1</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;head&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">213</span><span class="hljs-punctuation">,</span><br> <span class="hljs-attr">&quot;next_after&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">170</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;has_more&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-literal"><span class="hljs-keyword">true</span></span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;trimmed&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-literal"><span class="hljs-keyword">false</span></span><span class="hljs-punctuation">,</span><br> <span class="hljs-attr">&quot;events&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-punctuation">[</span><span class="hljs-punctuation">&#123;</span><span class="hljs-attr">&quot;seq&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">121</span><span class="hljs-punctuation">,</span>…<span class="hljs-punctuation">&#125;</span><span class="hljs-punctuation">,</span>…<span class="hljs-punctuation">,</span><span class="hljs-punctuation">&#123;</span><span class="hljs-attr">&quot;seq&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">170</span><span class="hljs-punctuation">,</span>…<span class="hljs-punctuation">&#125;</span><span class="hljs-punctuation">]</span><span class="hljs-punctuation">&#125;</span><br></code></pre></td></tr></table></figure>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>after</code></td>
+<td>客户端游标；返回 <code>seq &gt; after</code> 的可见事件</td>
+</tr>
+<tr>
+<td><code>epoch</code></td>
+<td>可选；客户端记录的会话纪元。与服务端不同时返回 <code>EPOCH_CHANGED</code></td>
+</tr>
+<tr>
+<td><code>head</code></td>
+<td>本页快照中的会话最大序号</td>
+</tr>
+<tr>
+<td><code>next_after</code></td>
+<td>客户端应用完本页后可以保存的游标值</td>
+</tr>
+<tr>
+<td><code>has_more</code></td>
+<td>是否还有下一页</td>
+</tr>
+<tr>
+<td><code>trimmed</code></td>
+<td><code>after + 1 &lt; min_seq</code>：请求的起点已被保留策略清理（第 11 篇）</td>
+</tr>
+</tbody>
+</table>
+<p><code>next_after</code> 的取值规则：</p>
+<ul>
+<li><code>has_more=true</code>：本页最后一个事件的序号。</li>
+<li><code>has_more=false</code>：<code>max(after, head)</code>。</li>
+</ul>
+<p>第二条规则让游标可以越过调用者不可见的序号范围。例如用户在序号 64 退群，之后会话继续写到 70；用户同步时，事件只返回到 64，但 <code>next_after</code> 为 70。如果 <code>next_after</code> 只取“最后一个返回事件的序号”，游标会停在 64，每次同步都重新扫描 65–70 却得不到任何事件。</p>
+<h2 id="4-数据模型">4. 数据模型</h2>
+<p>服务端不需要新的表。序号、head、<code>min_seq</code>、<code>epoch</code> 都在第 04 篇的 <code>conversations</code> 与 <code>events</code> 中。</p>
+<p>客户端维护每个会话的四项状态（<code>examples/im/src/im/Client.java</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>local[conv]</code></td>
+<td>以序号为键的有序映射，保存已应用的事件</td>
+</tr>
+<tr>
+<td><code>cursor[conv]</code></td>
+<td>连续游标，满足 O3</td>
+</tr>
+<tr>
+<td><code>pending[conv]</code></td>
+<td>已收到但不连续的推送，等待缺口补齐</td>
+</tr>
+<tr>
+<td><code>epochs[conv]</code></td>
+<td>最近一次同步得到的纪元</td>
+</tr>
+</tbody>
+</table>
+<h2 id="5-正常路径">5. 正常路径</h2>
+<h3 id="5-1-推送到达">5.1 推送到达</h3>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><code class="hljs text">图 7-1  客户端对一条推送的处理分支（连续游标策略）<br>收到 event&#123;seq&#125;<br>   │<br>   ├─ seq ≤ cursor ............ 重复：按序号覆盖写入（幂等），游标不动<br>   │<br>   ├─ seq = cursor + 1 ........ 连续：写入，cursor = seq，<br>   │                            再从 pending 中取出能接上的事件，继续推进<br>   │                            持久化本地状态后发送 ack&#123;cursor&#125;<br>   │<br>   └─ seq &gt; cursor + 1 ........ 缺口：放入 pending，计数 gapsDetected，<br>                                发起 sync(after=cursor)；<br>                                同步完成后 drainPending，游标越过缺口<br></code></pre></td></tr></table></figure>
+<p>关键在第三个分支：收到一个不连续的事件时，客户端保存它，但不推进游标。游标只在两种情况下前进：一个序号恰好是 <code>cursor+1</code> 的事件，或者一页同步结果（它的 <code>next_after</code> 由服务端保证覆盖了整个范围）。</p>
+<h3 id="5-2-同步">5.2 同步</h3>
+<p>客户端同步一个会话时循环请求，直到 <code>has_more=false</code>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-comment">// examples/im/src/im/Client.java（节选）</span><br><span class="hljs-keyword">while</span> (<span class="hljs-literal">true</span>) &#123;<br>    <span class="hljs-type">long</span> <span class="hljs-variable">after</span> <span class="hljs-operator">=</span> cursor.getOrDefault(conv, <span class="hljs-number">0L</span>);<br>    <span class="hljs-type">Map</span>&lt;String, Object&gt; <span class="hljs-variable">page</span> <span class="hljs-operator">=</span> call(Json.map(<span class="hljs-string">&quot;t&quot;</span>, <span class="hljs-string">&quot;sync&quot;</span>, <span class="hljs-string">&quot;conv&quot;</span>, conv, <span class="hljs-string">&quot;after&quot;</span>, after, <span class="hljs-string">&quot;limit&quot;</span>, (<span class="hljs-type">long</span>) limit, ...));<br>    applyLock.lock();<br>    <span class="hljs-keyword">try</span> &#123;<br>        <span class="hljs-keyword">for</span> (Map&lt;String, Object&gt; ev : events) applyEvent(conv, ev);    <span class="hljs-comment">// 按序号写入，幂等</span><br>        <span class="hljs-type">long</span> <span class="hljs-variable">next</span> <span class="hljs-operator">=</span> ((Number) page.get(<span class="hljs-string">&quot;next_after&quot;</span>)).longValue();<br>        <span class="hljs-keyword">if</span> (next &gt;= cursor.getOrDefault(conv, <span class="hljs-number">0L</span>)) cursor.put(conv, next);<br>        drainPending(conv);<br>        persist();<br>    &#125; <span class="hljs-keyword">finally</span> &#123; applyLock.unlock(); &#125;<br>    <span class="hljs-keyword">if</span> (autoAck) safeAck(conv);<br>    <span class="hljs-keyword">if</span> (!Boolean.TRUE.equals(page.get(<span class="hljs-string">&quot;has_more&quot;</span>))) <span class="hljs-keyword">return</span> applied;<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>推送和同步可能并发执行，二者都在 <code>applyLock</code> 下修改本地状态。游标只增不减（<code>next &gt;= cursor</code> 时才更新），因此即使一次较早发起的同步在一次推送之后才返回，也不会把游标拉回去。</p>
+<p>多个提示（<code>hint</code>）可能在短时间内到达，例如大群中连续多条消息（第 08 篇）。客户端对每个会话最多保持一个进行中的同步；同步期间到达的提示只设置一个“还需要再同步一轮”的标记，同步结束后若标记存在就再执行一轮。这样 N 个提示最多引起两轮同步，而不是 N 次。</p>
+<h3 id="5-3-服务端同步查询">5.3 服务端同步查询</h3>
+<p>服务端在一个 <code>REPEATABLE READ</code> 只读事务中完成整个同步：读取 head、<code>min_seq</code>、<code>epoch</code>，读取成员区间，再查询事件。PostgreSQL 的 REPEATABLE READ 在事务的第一条语句时获取快照，之后所有语句看到同一快照。这保证了 <code>head</code> 与 <code>events</code> 描述的是同一时刻，<code>next_after = head</code> 不会越过一个在快照之后才提交、但序号不大于 head 的事件；结合 O2，快照中可见的序号集合本身就是从 <code>min_seq</code> 到 head 的连续区间。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs sql"><span class="hljs-keyword">SELECT</span> e.seq, e.kind, … <span class="hljs-keyword">FROM</span> events e<br> <span class="hljs-keyword">WHERE</span> e.conv_id<span class="hljs-operator">=</span>? <span class="hljs-keyword">AND</span> e.seq<span class="hljs-operator">&gt;</span>? <span class="hljs-keyword">AND</span> e.seq<span class="hljs-operator">&lt;=</span>?          <span class="hljs-comment">-- after &lt; seq ≤ visibleEnd</span><br>   <span class="hljs-keyword">AND</span> <span class="hljs-keyword">EXISTS</span> (成员区间覆盖 e.seq)<br> <span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> e.seq LIMIT ?                              <span class="hljs-comment">-- limit+1，用于判断 has_more</span><br></code></pre></td></tr></table></figure>
+<p>多取一行用于判断 <code>has_more</code>，避免额外的计数查询。</p>
+<h2 id="6-方案比较">6. 方案比较</h2>
+<h3 id="6-1-排序依据">6.1 排序依据</h3>
+<table>
+<thead>
+<tr>
+<th>依据</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>客户端时间戳</td>
+<td>设备时钟不一致，可被篡改；同一毫秒内的消息无法排序</td>
+</tr>
+<tr>
+<td>服务端接收时间</td>
+<td>多个网关的时钟不同步；时间戳相同的消息无法排序；时间顺序不等于提交顺序</td>
+</tr>
+<tr>
+<td>全局唯一标识（时间加机器号加计数）</td>
+<td>只能排序，不能判断是否有遗漏</td>
+</tr>
+<tr>
+<td>会话内连续序号</td>
+<td>需要每会话串行化分配（第 04 篇已承担此成本）</td>
+</tr>
+</tbody>
+</table>
+<p>只有连续序号能让客户端做缺口检测：看到 5 和 7，就知道缺 6。时间戳和全局标识只能告诉客户端“7 在 5 后面”，不能告诉它“中间还有东西”。</p>
+<p>O1 的范围限定在单个会话内。跨会话的顺序（例如会话列表按最后一条消息排序）使用消息的服务端时间戳近似，属于显示层的启发式规则，系统不对它做保证，这在第 00 篇的排除项 X1 中写明。</p>
+<h3 id="6-2-游标策略">6.2 游标策略</h3>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>游标更新规则</th>
+<th>乱序推送时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>连续游标</td>
+<td>只越过连续范围</td>
+<td>缓存不连续的事件，同步补缺口</td>
+</tr>
+<tr>
+<td>最大已见序号</td>
+<td><code>cursor = max(cursor, seq)</code></td>
+<td>越过缺口，缺失的事件永远不会被同步返回</td>
+</tr>
+</tbody>
+</table>
+<p>“最大已见序号”实现简单，并且在推送从不乱序、从不丢失时与连续游标表现相同，所以它的缺陷在正常测试中不会暴露。负对照 <code>07-control-max-seen-skips</code> 专门制造乱序来暴露它。</p>
+<h3 id="6-3-分页方式">6.3 分页方式</h3>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>写法</th>
+<th>并发写入时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>偏移分页，从新到旧</td>
+<td><code>ORDER BY seq DESC OFFSET k LIMIT n</code></td>
+<td>新行插入到“第一页”之前，后续页整体后移，出现重复</td>
+</tr>
+<tr>
+<td>偏移分页，从旧到新</td>
+<td><code>ORDER BY seq OFFSET k LIMIT n</code></td>
+<td>不受尾部插入影响，但清理头部会导致跳过；深分页需要扫描并丢弃 k 行</td>
+</tr>
+<tr>
+<td>键集分页</td>
+<td><code>WHERE seq &gt; after ORDER BY seq LIMIT n</code></td>
+<td>不受插入与清理影响；任意深度都是索引范围扫描</td>
+</tr>
+</tbody>
+</table>
+<p>键集分页（keyset pagination）以上一页最后一个键作为下一页的起点，它的结果不依赖于“前面有多少行”，因此前面的插入或删除都不会使它重复或跳过。增量同步本质上就是一次从游标开始的键集分页。</p>
+<h2 id="7-关键实现：缺口检测">7. 关键实现：缺口检测</h2>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><code class="hljs java"><span class="hljs-comment">// examples/im/src/im/Client.java（节选）</span><br><span class="hljs-type">void</span> <span class="hljs-title function_">onPush</span><span class="hljs-params">(Map&lt;String, Object&gt; ev)</span> &#123;<br>    <span class="hljs-type">long</span> <span class="hljs-variable">seq</span> <span class="hljs-operator">=</span> …;<br>    applyLock.lock();<br>    <span class="hljs-keyword">try</span> &#123;<br>        <span class="hljs-type">long</span> <span class="hljs-variable">cur</span> <span class="hljs-operator">=</span> cursor.getOrDefault(conv, <span class="hljs-number">0L</span>);<br>        <span class="hljs-keyword">if</span> (seq &lt;= cur) &#123;<br>            applyEvent(conv, ev);                                  <span class="hljs-comment">// 重复，幂等</span><br>        &#125; <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (seq == cur + <span class="hljs-number">1</span> || policy == CursorPolicy.MAX_SEEN) &#123;<br>            applyEvent(conv, ev);<br>            cursor.put(conv, policy == CursorPolicy.MAX_SEEN ? Math.max(cur, seq) : seq);<br>            drainPending(conv);<br>        &#125; <span class="hljs-keyword">else</span> &#123;<br>            pending.computeIfAbsent(conv, k -&gt; <span class="hljs-keyword">new</span> <span class="hljs-title class_">TreeMap</span>&lt;&gt;()).put(seq, ev);<br>            gapsDetected.incrementAndGet();<br>            gap = <span class="hljs-literal">true</span>;<br>        &#125;<br>        persist();<br>    &#125; <span class="hljs-keyword">finally</span> &#123; applyLock.unlock(); &#125;<br>    <span class="hljs-keyword">if</span> (gap &amp;&amp; autoSync) safeSync(conv); <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (autoAck) safeAck(conv);<br>&#125;<br></code></pre></td></tr></table></figure>
+<p>缺口检测有一个盲区：会话中最后一条消息的推送丢失时，后面没有新推送到达，客户端无从得知存在缺口。第 06 篇的重投扫描覆盖了这个盲区：服务端发现该设备的送达游标落后于 head，就发一个提示。</p>
+<h3 id="7-1-发送方自身的顺序">7.1 发送方自身的顺序</h3>
+<p>同一连接上的请求由网关的读线程逐个处理（<code>Gateway.readLoop</code>），因此同一连接上先到达的发送请求先获得会话行锁，序号更小。但重连会打破这一点：设备在连接 1 上发送了 A，回复丢失；在连接 2 上先发送新消息 B，再重发 A，那么 B 的序号小于 A。为保持发送方视角的顺序，客户端在重连后必须先重发持久发件箱中的消息，再发送新消息。这是客户端的义务，测试客户端提供 <code>resendPending</code> 供调用方在重连后首先执行。</p>
+<h2 id="8-验证">8. 验证</h2>
+<p>运行方式：真实 PostgreSQL 16 与网关 JVM，测试客户端在测试进程内；乱序通过在客户端直接注入推送事件（<code>onPushForTest</code>）制造，即“推送 n+2 已到达、n+1 的推送尚未到达”。结果见 <code>evidence/im-07/result.json</code>。</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>检查</th>
+<th>预期</th>
+<th>观测</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正常</td>
+<td><code>07-concurrent-total-order</code></td>
+<td>3 个用户经网关并发发送 150 条，150 个不同序号，会话日志无空洞</td>
+<td>150 个序号，空洞 0</td>
+</tr>
+<tr>
+<td>边界</td>
+<td><code>07-paging-under-writes</code></td>
+<td>每页 20 条从 0 开始分页，同时另一线程追加 60 条；最终本地事件数等于 head，无重复</td>
+<td>80 页，持有 213 条，head 213，重复 0</td>
+</tr>
+<tr>
+<td>负对照</td>
+<td><code>07-control-offset-paging</code></td>
+<td>30 行数据，从新到旧偏移分页，每页之间插入 3 行</td>
+<td>3 页中出现 6 个重复行</td>
+</tr>
+<tr>
+<td>失败</td>
+<td><code>07-out-of-order-contiguous</code></td>
+<td>先注入 n+2：检测到 1 个缺口，同步补齐，游标到达 n+2</td>
+<td>base 213，a=214，b=215，游标 215，持有 214</td>
+</tr>
+<tr>
+<td>负对照</td>
+<td><code>07-control-max-seen-skips</code></td>
+<td>最大已见策略：游标直接跳到 n+2，不持有 n+1</td>
+<td>a=216，b=217，游标 217，不持有 216</td>
+</tr>
+<tr>
+<td>负对照</td>
+<td><code>07-control-max-seen-permanent</code></td>
+<td>再做一次完整同步后，216 仍然缺失</td>
+<td>仍缺失</td>
+</tr>
+<tr>
+<td>边界</td>
+<td><code>07-cursor-ahead-and-epoch</code></td>
+<td><code>after</code> 大于 head → <code>CURSOR_AHEAD</code>；纪元加一后用旧纪元同步 → <code>EPOCH_CHANGED</code></td>
+<td>两者均符合</td>
+</tr>
+</tbody>
+</table>
+<p>分页实验中 80 页的构成：初始约 153 个事件（3 个 <code>join</code> 与 150 条消息），加上分页期间追加的 60 条；每页 20 条，但写入速度与分页速度交错，部分页只拿到一两条新事件。页数取决于调度，不是确定值，断言只针对“无重复、无遗漏、到达 head”。</p>
+<p>偏移对照的 6 个重复来自：读取第 2 页之前插入了 3 行，第 2 页的前 3 行就是第 1 页的后 3 行；读取第 3 页之前又插入 3 行，累计偏移 6 行，第 3 页的前 6 行重复。对照使用的是负对照专用表 <code>seq_events</code>，不经过网关。</p>
+<p>最大已见对照中的“永久缺失”是这个策略最严重的后果：之后的同步都从 <code>after=217</code> 开始，服务端正确地不再返回 216。缺失的消息没有任何机制可以补回，除非客户端把游标清零、重新同步全部历史。</p>
+<h2 id="9-故障与恢复">9. 故障与恢复</h2>
+<table>
+<thead>
+<tr>
+<th>情形</th>
+<th>服务端回复</th>
+<th>客户端动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>推送乱序</td>
+<td>—</td>
+<td>缓存，同步补缺口</td>
+</tr>
+<tr>
+<td>推送重复</td>
+<td>—</td>
+<td>按序号幂等覆盖</td>
+</tr>
+<tr>
+<td>同步与推送并发</td>
+<td>—</td>
+<td>二者在本地锁下合并，游标只增</td>
+</tr>
+<tr>
+<td>分页期间有新写入</td>
+<td><code>has_more</code> 与 <code>next_after</code> 照常</td>
+<td>继续分页，最后一页 <code>next_after=head</code></td>
+</tr>
+<tr>
+<td>游标超过 head（例如服务端从较旧的备份恢复，或客户端状态来自另一个环境）</td>
+<td><code>CURSOR_AHEAD</code></td>
+<td>丢弃该会话的本地游标，从可信位置（0 或 <code>min_seq-1</code>）重新同步</td>
+</tr>
+<tr>
+<td>纪元变化</td>
+<td><code>EPOCH_CHANGED</code></td>
+<td>清空该会话本地状态，按新纪元重新同步</td>
+</tr>
+<tr>
+<td>起点已被清理</td>
+<td>正常返回，<code>trimmed=true</code></td>
+<td>提示用户“更早的历史已过期”，从 <code>min_seq</code> 开始保存（第 11 篇）</td>
+</tr>
+</tbody>
+</table>
+<p><code>CURSOR_AHEAD</code> 与 <code>EPOCH_CHANGED</code> 的区别在于服务端是否知道日志被重建了。纪元是服务端主动声明“旧序号不再有意义”；<code>CURSOR_AHEAD</code> 是服务端被动发现“你的游标在我这里不存在”。后者只能发现游标超前的情况：如果服务端恢复到较旧的状态后又写入了新消息，使得 head 重新超过客户端游标，同一个序号在两边可能对应不同的事件，<code>CURSOR_AHEAD</code> 无法发现。因此任何导致日志回退的运维操作（例如从备份恢复）都必须同时增加纪元。本批中纪元只由实验直接修改，没有实现配套的恢复流程。</p>
+<h2 id="10-限制">10. 限制</h2>
+<ul>
+<li>O2 依赖“分配序号的事务持有会话行锁直到提交”。若将来改为批量预分配序号（例如为了降低锁争用），O2 将不再成立，客户端需要处理“序号可见但前面仍有未提交事件”的情况，例如引入服务端返回的“已稳定水位”。</li>
+<li>乱序是在客户端注入的，没有在网络层制造真实的乱序。在单个 WebSocket 连接上，TCP 保证帧按发送顺序到达；乱序来自推送与同步两条路径的交错，以及跨连接（重连前后）的推送。</li>
+<li>分页实验的页数和交错方式取决于调度，结论只依赖断言。</li>
+</ul>
+<p>下一篇把会话扩展到群：成员数增加时推送怎样扇出，成员加入与退出怎样影响可见范围，以及推送模式与提示加拉取模式的取舍。</p>
+<h2 id="参考资料">参考资料</h2>
+<ul>
+<li>PostgreSQL 16 文档，13.2.2 Repeatable Read Isolation Level（事务看到的是第一条非事务控制语句开始时的快照）。<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/transaction-iso.html">https://www.postgresql.org/docs/16/transaction-iso.html</a></li>
+<li>PostgreSQL 16 文档，7.6 LIMIT and OFFSET（OFFSET 跳过的行仍需在服务端计算，大的 OFFSET 可能低效）。<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/queries-limit.html">https://www.postgresql.org/docs/16/queries-limit.html</a></li>
+<li>PostgreSQL 16 文档，9.17 Sequence Manipulation Functions（序列值在回滚后不归还）。<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/functions-sequence.html">https://www.postgresql.org/docs/16/functions-sequence.html</a></li>
+<li>RFC 6455，§5.4 Fragmentation（消息分片必须按发送方的发送顺序交付给接收方）。<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc6455">https://www.rfc-editor.org/rfc/rfc6455</a></li>
+<li>RFC 9293，Transmission Control Protocol（TCP 向应用按序交付字节流）。<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9293">https://www.rfc-editor.org/rfc/rfc9293</a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-07-%E4%BC%9A%E8%AF%9D%E5%86%85%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%96%AD%E7%BA%BF%E5%A2%9E%E9%87%8F%E5%90%8C%E6%AD%A5/">https://magicliang.github.io/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-07-%E4%BC%9A%E8%AF%9D%E5%86%85%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%96%AD%E7%BA%BF%E5%A2%9E%E9%87%8F%E5%90%8C%E6%AD%A5/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%B8%B8%E6%A0%87%E5%88%86%E9%A1%B5/">游标分页</a><a class="post-meta__tags" href="/tags/%E5%8D%B3%E6%97%B6%E9%80%9A%E4%BF%A1/">即时通信</a><a class="post-meta__tags" href="/tags/%E6%B6%88%E6%81%AF%E9%A1%BA%E5%BA%8F/">消息顺序</a><a class="post-meta__tags" href="/tags/%E5%A2%9E%E9%87%8F%E5%90%8C%E6%AD%A5/">增量同步</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-81.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/21/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-10-%E7%BD%91%E5%85%B3%E6%95%85%E9%9A%9C%E5%90%8E%E7%9A%84%E9%87%8D%E8%BF%9E%E4%B8%8E%E8%B7%AF%E7%94%B1%E6%94%B6%E6%95%9B/" title="后端系统工程 10：网关故障后的重连与路由收敛"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-145.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">后端系统工程 10：网关故障后的重连与路由收敛</div></div><div class="info-2"><div class="info-item-1">后端系统工程 10：网关故障后的重连与路由收敛  本批导航：00 技术方案怎样接受验证｜01 API 契约与业务不变量｜02 负载模型与容量预算｜03 单库基线与故障实验工具｜04 持久化边界｜05 长连接接入｜06 发送确认｜07 排序与增量同步｜08 群消息扇出｜09 多设备已读｜10 网关故障与路由收敛｜11 撤回与集成验收  第 05 篇处理的是单个连接的生命周期：握手、心跳、慢接收端，以及同一设备的新连接取代旧连接。那里的故障都是局部的，一次只影响一个连接。网关进程整体失效则不同。一个进程上挂着成千上万个连接，进程消失的瞬间它们同时断开，随后几乎同时尝试重连。这时有三个问题需要回答：  死掉的网关没有机会清理自己的路由记录，谁来清理，什么时候清理？ 大量设备同时重连，怎样避免它们把剩下的网关和数据库一起压垮？ 重连过程中网络会产生延迟和重复。某个旧握手在新连接建立之后才到达，怎样保证它不会把设备的归属改回已经失效的连接？  本篇在第 05 篇的路由声明之上增加三样东西：网关租约、握手准入和带抖动的重连退避。另外补上计划内下线（排空）的流程。所有结论都来自本地多进程实验：...</div></div></div></a><a class="pagination-related" href="/2026/10/21/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-11-%E6%92%A4%E5%9B%9E%E5%8E%86%E5%8F%B2%E4%BF%9D%E7%95%99%E4%B8%8E%E6%B6%88%E6%81%AF%E7%B3%BB%E7%BB%9F%E9%9B%86%E6%88%90%E9%AA%8C%E6%94%B6/" title="后端系统工程 11：撤回、历史保留与消息系统集成验收"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-132.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">后端系统工程 11：撤回、历史保留与消息系统集成验收</div></div><div class="info-2"><div class="info-item-1">后端系统工程 11：撤回、历史保留与消息系统集成验收  本批导航：00 技术方案怎样接受验证｜01 API 契约与业务不变量｜02 负载模型与容量预算｜03 单库基线与故障实验工具｜04 持久化边界｜05 长连接接入｜06 发送确认｜07 排序与增量同步｜08 群消息扇出｜09 多设备已读｜10 网关故障与路由收敛｜11 撤回与集成验收｜下一篇 12 有界连接池与等待取消  前面七篇都在处理一条消息“怎样写进去、怎样送出去”。本篇处理消息写入之后的变化：发送者撤回、保留期满后被删除、整个数据库从备份恢复。三者有一个共同点，都会和前面建立的不变量发生冲突。  第 07 篇假定已提交事件不可变，客户端可以只按序号增量同步。撤回却要求修改一条已经被别人收到的消息。 第 04 篇保证会话内序号从 min_seq 起连续，第 01 篇保证同一请求键只产生一条消息。保留清理要删除的，正好是序号和请求键的载体。 备份恢复会把数据库带回过去某个时刻，所有不变量都需要在副本上重新检查，而不能默认成立。  本篇的另一项任务是集成验收：把第 04–11 篇的全部 71 项检查与第 00 篇的需求卡 R...</div></div></div></a><a class="pagination-related" href="/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-04-%E4%BC%9A%E8%AF%9D%E6%88%90%E5%91%98%E4%B8%8E%E6%B6%88%E6%81%AF%E7%9A%84%E6%8C%81%E4%B9%85%E5%8C%96%E8%BE%B9%E7%95%8C/" title="后端系统工程 04：会话、成员与消息的持久化边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-143.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-20</div><div class="info-item-2">后端系统工程 04：会话、成员与消息的持久化边界</div></div><div class="info-2"><div class="info-item-1">后端系统工程 04：会话、成员与消息的持久化边界  本批导航：00 技术方案怎样接受验证｜01 API 契约与业务不变量｜02 负载模型与容量预算｜03 单库基线与故障实验工具｜04 持久化边界｜05 长连接接入｜06 发送确认｜07 排序与增量同步｜08 群消息扇出｜09 多设备已读｜10 网关故障与路由收敛｜11 撤回与集成验收  从本篇开始，第 00–03 篇建立的方法落到一个逐步演进的最小即时通信工程上（代码在 examples/im/）。第一个问题是持久化边界：哪些状态必须在同一个事务里写入，哪些可以分开；哪个状态是权威来源，哪个只是派生。边界划错的后果往往要到故障时才显现——例如消息写入了，但请求键的记录在另一个存储里没写成功，客户端重发后就多出一条消息。 本篇确定会话、成员、消息三者的表结构，说明会话内序号在哪个锁下分配、请求键为何与消息放在同一行，以及成员资格为何用序号区间而不是一个“当前成员”标志表示。所有实验直接调用存储层，连接真实的 PostgreSQL 16，不经过网关。 1. 需求与不变量 本篇负责需求卡中的 R1（部分）、R2、R3（数据模型部分），以...</div></div></div></a><a class="pagination-related" href="/2026/10/20/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-05-%E9%95%BF%E8%BF%9E%E6%8E%A5%E6%8E%A5%E5%85%A5%E4%B8%8E%E8%BF%9E%E6%8E%A5%E5%BD%92%E5%B1%9E/" title="后端系统工程 05：长连接接入与连接归属"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-24.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-20</div><div class="info-item-2">后端系统工程 05：长连接接入与连接归属</div></div><div class="info-2"><div class="info-item-1">后端系统工程 05：长连接接入与连接归属  本批导航：00 技术方案怎样接受验证｜01 API 契约与业务不变量｜02 负载模型与容量预算｜03 单库基线与故障实验工具｜04 持久化边界｜05 长连接接入｜06 发送确认｜07 排序与增量同步｜08 群消息扇出｜09 多设备已读｜10 网关故障与路由收敛｜11 撤回与集成验收  第 04 篇的存储层回答了“消息写到哪里”。要把消息送到设备，服务端需要一条可以主动下发数据的通道，并且知道每台设备此刻连在哪一个网关进程的哪一条连接上。本篇实现这条通道：基于 WebSocket 的网关进程 examples/im/src/im/Gateway.java，以及记录连接归属的 routes 表。 长连接的难点不在建立，而在于连接的状态不可靠：TCP 连接可能已经失效，两端却都不知道；对端可能还连着，但已经不读数据；同一台设备可能同时存在新旧两条连接，旧连接的清理逻辑可能误删新连接的记录。本篇针对这三类情况分别给出检测与处理方法，并用本地多进程实验验证。 1. 需求与不变量    编号 不变量 对应需求     G1 一台设备在任一时刻至多有...</div></div></div></a><a class="pagination-related" href="/2026/10/21/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-09-%E5%A4%9A%E8%AE%BE%E5%A4%87%E5%B7%B2%E8%AF%BB%E4%B8%8E%E6%9C%AA%E8%AF%BB%E7%8A%B6%E6%80%81/" title="后端系统工程 09：多设备已读与未读状态"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-39.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">后端系统工程 09：多设备已读与未读状态</div></div><div class="info-2"><div class="info-item-1">后端系统工程 09：多设备已读与未读状态  本批导航：00 技术方案怎样接受验证｜01 API 契约与业务不变量｜02 负载模型与容量预算｜03 单库基线与故障实验工具｜04 持久化边界｜05 长连接接入｜06 发送确认｜07 排序与增量同步｜08 群消息扇出｜09 多设备已读｜10 网关故障与路由收敛｜11 撤回与集成验收  一个用户同时登录手机和电脑时，“这条消息看过了吗”有两个不同的问题：这台设备上有没有这条消息，以及这个人有没有读过它。前者属于设备，后者属于用户。用户在手机上读完消息，电脑上的未读数应该消失；但电脑并没有因此获得这些消息的数据，如果它此后离线，打开会话时仍然要从服务端拉取。 本篇把两类状态分开存储：送达游标按设备，已读位置按用户；未读数不存储，而是在查询时由已读位置和事件推导出来。重点处理三种异常：两台设备的已读上报乱序到达，设备重装后旧安装发来的确认，以及设备从旧的本地备份恢复后上报一个更小的游标。 1. 需求与不变量    编号 不变量 观察位置     M1 送达游标按 (设备, 会话) 记录，单调，不超过 head device_cursors  ...</div></div></div></a><a class="pagination-related" href="/2026/10/21/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-08-%E7%BE%A4%E6%B6%88%E6%81%AF%E6%89%87%E5%87%BA%E4%B8%8E%E6%88%90%E5%91%98%E7%89%88%E6%9C%AC/" title="后端系统工程 08：群消息扇出与成员版本"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-43.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">后端系统工程 08：群消息扇出与成员版本</div></div><div class="info-2"><div class="info-item-1">后端系统工程 08：群消息扇出与成员版本  本批导航：00 技术方案怎样接受验证｜01 API 契约与业务不变量｜02 负载模型与容量预算｜03 单库基线与故障实验工具｜04 持久化边界｜05 长连接接入｜06 发送确认｜07 排序与增量同步｜08 群消息扇出｜09 多设备已读｜10 网关故障与路由收敛｜11 撤回与集成验收  单聊的一条消息只送达两个人的几台设备，群消息要送达几十到几百名成员的设备。第 02 篇的模型已经表明，扇出带来的送达成本远大于消息写入本身，而且随群规模线性增长。本篇处理群消息的两个问题：送达成本怎样控制，以及在成员不断加入、退出的情况下，每条消息应该送给谁、谁可以读取它。 第二个问题比第一个更容易出错。成员变更与消息发送是并发的；推送是异步的，从消息提交到推送发出之间，成员可能已经变化。若推送目标按“推送时刻的成员”计算，刚退群的成员可能收到退群之后的消息，刚入群的成员可能收到入群之前的消息。本篇按事件序号计算成员资格，使这两种情况都不会发生。 1. 需求与不变量    编号 不变量 对应需求     F1 序号为 s 的事件，只推送给在 s 上属于成员...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-07%EF%BC%9A%E4%BC%9A%E8%AF%9D%E5%86%85%E6%8E%92%E5%BA%8F%E4%B8%8E%E6%96%AD%E7%BA%BF%E5%A2%9E%E9%87%8F%E5%90%8C%E6%AD%A5"><span class="toc-number">1.</span> <span class="toc-text">后端系统工程 07：会话内排序与断线增量同步</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#1-%E9%9C%80%E6%B1%82%E4%B8%8E%E4%B8%8D%E5%8F%98%E9%87%8F"><span class="toc-number">1.1.</span> <span class="toc-text">1. 需求与不变量</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#2-%E8%A7%84%E6%A8%A1%E5%81%87%E8%AE%BE"><span class="toc-number">1.2.</span> <span class="toc-text">2. 规模假设</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#3-%E6%8E%A5%E5%8F%A3"><span class="toc-number">1.3.</span> <span class="toc-text">3. 接口</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#4-%E6%95%B0%E6%8D%AE%E6%A8%A1%E5%9E%8B"><span class="toc-number">1.4.</span> <span class="toc-text">4. 数据模型</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#5-%E6%AD%A3%E5%B8%B8%E8%B7%AF%E5%BE%84"><span class="toc-number">1.5.</span> <span class="toc-text">5. 正常路径</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E6%8E%A8%E9%80%81%E5%88%B0%E8%BE%BE"><span class="toc-number">1.5.1.</span> <span class="toc-text">5.1 推送到达</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E5%90%8C%E6%AD%A5"><span class="toc-number">1.5.2.</span> <span class="toc-text">5.2 同步</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E6%9C%8D%E5%8A%A1%E7%AB%AF%E5%90%8C%E6%AD%A5%E6%9F%A5%E8%AF%A2"><span class="toc-number">1.5.3.</span> <span class="toc-text">5.3 服务端同步查询</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#6-%E6%96%B9%E6%A1%88%E6%AF%94%E8%BE%83"><span class="toc-number">1.6.</span> <span class="toc-text">6. 方案比较</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E6%8E%92%E5%BA%8F%E4%BE%9D%E6%8D%AE"><span class="toc-number">1.6.1.</span> <span class="toc-text">6.1 排序依据</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E6%B8%B8%E6%A0%87%E7%AD%96%E7%95%A5"><span class="toc-number">1.6.2.</span> <span class="toc-text">6.2 游标策略</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E5%88%86%E9%A1%B5%E6%96%B9%E5%BC%8F"><span class="toc-number">1.6.3.</span> <span class="toc-text">6.3 分页方式</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#7-%E5%85%B3%E9%94%AE%E5%AE%9E%E7%8E%B0%EF%BC%9A%E7%BC%BA%E5%8F%A3%E6%A3%80%E6%B5%8B"><span class="toc-number">1.7.</span> <span class="toc-text">7. 关键实现：缺口检测</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#7-1-%E5%8F%91%E9%80%81%E6%96%B9%E8%87%AA%E8%BA%AB%E7%9A%84%E9%A1%BA%E5%BA%8F"><span class="toc-number">1.7.1.</span> <span class="toc-text">7.1 发送方自身的顺序</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#8-%E9%AA%8C%E8%AF%81"><span class="toc-number">1.8.</span> <span class="toc-text">8. 验证</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#9-%E6%95%85%E9%9A%9C%E4%B8%8E%E6%81%A2%E5%A4%8D"><span class="toc-number">1.9.</span> <span class="toc-text">9. 故障与恢复</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#10-%E9%99%90%E5%88%B6"><span class="toc-number">1.10.</span> <span class="toc-text">10. 限制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%82%E8%80%83%E8%B5%84%E6%96%99"><span class="toc-number">1.11.</span> <span class="toc-text">参考资料</span></a></li></ol></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>

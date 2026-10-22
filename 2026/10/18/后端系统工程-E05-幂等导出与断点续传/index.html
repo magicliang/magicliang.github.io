@@ -1,0 +1,948 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>后端系统工程 E05：幂等导出与断点续传——同一个请求，同一份字节 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="本文属于《后端系统工程：从接口契约到故障恢复》系列。文中提到的演练工程、测试与实验证据位于博客源码仓库的 batch-4&#x2F; 目录（examples&#x2F;、evidence&#x2F; 等子目录）；业务数据均为合成数据。  “导出我的聊天记录”看起来只是一次查询加一次下载，实际包含几个各自独立的问题。用户点了两次按钮，是一个任务还是两个；导出期间又有新消息、有人退群、有消息被撤回，文件里该有什么；导出跑到一半进">
+<meta property="og:type" content="article">
+<meta property="og:title" content="后端系统工程 E05：幂等导出与断点续传——同一个请求，同一份字节">
+<meta property="og:url" content="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E05-%E5%B9%82%E7%AD%89%E5%AF%BC%E5%87%BA%E4%B8%8E%E6%96%AD%E7%82%B9%E7%BB%AD%E4%BC%A0/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="本文属于《后端系统工程：从接口契约到故障恢复》系列。文中提到的演练工程、测试与实验证据位于博客源码仓库的 batch-4&#x2F; 目录（examples&#x2F;、evidence&#x2F; 等子目录）；业务数据均为合成数据。  “导出我的聊天记录”看起来只是一次查询加一次下载，实际包含几个各自独立的问题。用户点了两次按钮，是一个任务还是两个；导出期间又有新消息、有人退群、有消息被撤回，文件里该有什么；导出跑到一半进">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/wall-paper-24.jpg">
+<meta property="article:published_time" content="2026-10-18T02:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T08:33:36.099Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="Range 请求">
+<meta property="article:tag" content="下载授权">
+<meta property="article:tag" content="后端系统工程">
+<meta property="article:tag" content="导出">
+<meta property="article:tag" content="幂等">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/wall-paper-24.jpg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "后端系统工程 E05：幂等导出与断点续传——同一个请求，同一份字节",
+  "url": "https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E05-%E5%B9%82%E7%AD%89%E5%AF%BC%E5%87%BA%E4%B8%8E%E6%96%AD%E7%82%B9%E7%BB%AD%E4%BC%A0/",
+  "image": "https://magicliang.github.io/img/wall-paper-24.jpg",
+  "datePublished": "2026-10-18T02:00:00.000Z",
+  "dateModified": "2026-10-22T08:33:36.099Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E05-%E5%B9%82%E7%AD%89%E5%AF%BC%E5%87%BA%E4%B8%8E%E6%96%AD%E7%82%B9%E7%BB%AD%E4%BC%A0/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '后端系统工程 E05：幂等导出与断点续传——同一个请求，同一份字节',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2016</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2094</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">40</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/wall-paper-24.jpg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">后端系统工程 E05：幂等导出与断点续传——同一个请求，同一份字节</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">后端系统工程 E05：幂等导出与断点续传——同一个请求，同一份字节</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-10-18T02:00:00.000Z" title="Created 2026-10-18 10:00:00">2026-10-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-10-22T08:33:36.099Z" title="Updated 2026-10-22 16:33:36">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84/">系统架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">4.6k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>15mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-10-22 16:33:36&quot;}" hidden></div><blockquote>
+<p>本文属于《后端系统工程：从接口契约到故障恢复》系列。文中提到的演练工程、测试与实验证据位于博客源码仓库的 <code>batch-4/</code> 目录（<code>examples/</code>、<code>evidence/</code> 等子目录）；业务数据均为合成数据。</p>
+</blockquote>
+<p>“导出我的聊天记录”看起来只是一次查询加一次下载，实际包含几个各自独立的问题。用户点了两次按钮，是一个任务还是两个；导出期间又有新消息、有人退群、有消息被撤回，文件里该有什么；导出跑到一半进程被杀，重跑出来的文件和不中断时是否一致；下载到 80% 断网，能否从断点继续，断点之后的字节是否属于同一个文件；下载链接被转发出去，别人能不能用。</p>
+<p>本篇用 SQLite 和一个真实监听本机端口的 HTTP 服务实现这条链路，每个问题对应一组用例。全部数据为合成数据。</p>
+<span id="more"></span>
+<h2 id="1-需求与不变量">1. 需求与不变量</h2>
+<ul>
+<li>X1 同一用户、同一幂等键、同一请求体只产生一个导出任务；同键不同请求体被拒绝。</li>
+<li>X2 导出内容由创建时刻的数据快照和权限快照决定，之后的写入、撤回、成员变化不改变结果。</li>
+<li>X3 任务可以在任意分片处中断并重跑；重跑得到的产物与不中断时逐字节相同，已完成且校验通过的分片不重写。</li>
+<li>X4 下载支持断点续传；续传的字节必须来自同一个产物，产物变化时客户端得到完整的新文件而不是拼接错的文件。</li>
+<li>X5 下载链接短期有效，绑定任务与用户；篡改、过期、换用户、账号停用、任务被撤销都会被拒绝。</li>
+</ul>
+<p>规模假设：一个用户在 2 个会话中可见约 930 条消息，分片大小 200 条，产物经 gzip 压缩后约 5 KB。这个规模只用来覆盖分支，不用于评估导出吞吐。</p>
+<h2 id="2-接口契约">2. 接口契约</h2>
+<table>
+<thead>
+<tr>
+<th>请求</th>
+<th>成功</th>
+<th>错误</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /exports</code>，头 <code>Idempotency-Key</code>，体 <code>&#123;&quot;scope&quot;: &quot;all&quot; 或 &quot;conv:&lt;id&gt;&quot;&#125;</code></td>
+<td>202 新建 <code>&#123;job_id, state&#125;</code>；200 重放 <code>&#123;job_id, state, replayed: true&#125;</code></td>
+<td>400 缺少键或 scope 非法；422 同键不同请求体；401 未认证</td>
+</tr>
+<tr>
+<td><code>GET /exports/&#123;id&#125;</code></td>
+<td>200 状态；完成时附签名下载链接（300 秒有效）、sha256、字节数</td>
+<td>404：任务不存在或不属于当前用户（不区分两者）</td>
+</tr>
+<tr>
+<td><code>GET /download/&#123;id&#125;?u=&amp;exp=&amp;sig=</code></td>
+<td>200 全量；206 部分（<code>Range</code> 生效时）；头含 <code>ETag</code>、<code>Accept-Ranges: bytes</code>、<code>Cache-Control: private, no-store</code></td>
+<td>403 签名错误、过期、用户不符、账号停用；410 导出已撤销；416 范围无法满足（带 <code>Content-Range: bytes */长度</code>）</td>
+</tr>
+</tbody>
+</table>
+<p>幂等键的错误码参照 IETF 草案 draft-ietf-httpapi-idempotency-key-header 的第 07 版：缺少键返回 400，同键不同请求体返回 422，原请求仍在处理中又收到重试时返回 409。这份草案在 2026 年 4 月已经过期，没有成为 RFC，所以这里只把它当作约定参考。本接口的创建请求在一个数据库事务内完成，不存在“原请求仍在处理中”的窗口，因而没有用到 409；导出任务本身是异步的，重放时返回任务当前状态，而不是等待任务完成。</p>
+<p>草案还要求资源方定义并公布幂等键的过期策略。本实现的键永久有效，因为任务记录本身就是键的存储；如果任务记录会被清理，键的有效期就不能长于记录的保留期。</p>
+<h2 id="3-快照：权限与数据">3. 快照：权限与数据</h2>
+<p>所有写入（消息、撤回、入群、退群）共享一个全局递增序号 <code>gseq</code>。创建任务时，在同一个写事务内取当前最大 <code>gseq</code> 作为数据快照，并按这个快照计算权限：用户在每个会话中的可见区间 <code>[入群 gseq, 退群 gseq)</code>。</p>
+<figure class="highlight python"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><code class="hljs python">snap = <span class="hljs-variable language_">self</span>.db.execute(<span class="hljs-string">&quot;SELECT coalesce(max(gseq),0) FROM log&quot;</span>).fetchone()[<span class="hljs-number">0</span>]<br>q = <span class="hljs-string">&quot;SELECT conv, from_gseq, coalesce(to_gseq, ?) FROM member WHERE user=? AND from_gseq&lt;=?&quot;</span><br>...<br>perms = [<span class="hljs-built_in">list</span>(r) <span class="hljs-keyword">for</span> r <span class="hljs-keyword">in</span> <span class="hljs-variable language_">self</span>.db.execute(q + <span class="hljs-string">&quot; ORDER BY conv, from_gseq&quot;</span>, args)]<br></code></pre></td></tr></table></figure>
+<p>导出时只取 <code>gseq ≤ 快照</code> 且落在可见区间内的消息；撤回只认快照之前发生的。导出结果因此等价于“用户在点击导出那一刻，往回翻页能看到的全部内容”。</p>
+<p>这个做法依赖一个前提：<code>gseq</code> 的分配顺序与提交顺序一致。SQLite 只有一个写者，前提成立。换到 PostgreSQL 这样的多写者数据库，序列号在事务开始写入时分配，较小的号可能晚于较大的号提交，“取最大序号”得到的快照会漏掉一个还没提交的小号事务，事后又把它读进来，X2 不再成立。PostgreSQL 的做法是使用事务快照：可重复读事务从第一条非事务控制语句开始看到一个固定快照；<code>pg_export_snapshot()</code> 可以把这个快照导出给其他会话，导入方用 <code>SET TRANSACTION SNAPSHOT</code> 在可重复读或可串行化事务的开头导入，并且只能在导出事务结束之前导入。导出任务如果要跨多个进程分片执行，就需要这样一个长时间保持的事务，代价是这段时间内，快照建立之后被删除或更新的旧行版本都不能被 VACUUM 回收。另一种做法是让写入路径维护一个按提交顺序递增的序号，这需要在写入路径上加锁或单点分配，本篇没有实现。</p>
+<p>这个异常与修正都在真实的 PostgreSQL 16.15 实例上演示过（<code>examples/e05_export/pg_snapshot.py</code>，输出 <code>evidence/E05/pg-snapshot.json</code>）。表 <code>msg</code> 的 <code>gseq</code> 为 <code>bigserial</code>，预置 3 行，用四个常驻 <code>psql</code> 会话交错执行：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>会话</th>
+<th>操作</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>W1</td>
+<td>开启事务，插入一行</td>
+<td>分到 <code>gseq=4</code>，未提交</td>
+</tr>
+<tr>
+<td>2</td>
+<td>W2</td>
+<td>插入一行并自动提交</td>
+<td>分到 <code>gseq=5</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td>导出方</td>
+<td>取 <code>max(gseq)</code> 作为快照值，读取 <code>gseq ≤ 5</code></td>
+<td><code>1,2,3,5</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>W1</td>
+<td>提交</td>
+<td>—</td>
+</tr>
+<tr>
+<td>5</td>
+<td>导出方</td>
+<td>用同一个快照值再读</td>
+<td><code>1,2,3,4,5</code></td>
+</tr>
+<tr>
+<td>6</td>
+<td>导出方</td>
+<td>开启可重复读事务，<code>pg_export_snapshot()</code>，读取</td>
+<td><code>1,2,3,4,5</code></td>
+</tr>
+<tr>
+<td>7</td>
+<td>W1、W2</td>
+<td>各插入一行并提交</td>
+<td>当前已提交数据为 <code>1,…,7</code></td>
+</tr>
+<tr>
+<td>8</td>
+<td>第二个导出会话</td>
+<td>可重复读事务开头 <code>SET TRANSACTION SNAPSHOT</code> 导入，读取</td>
+<td><code>1,2,3,4,5</code></td>
+</tr>
+<tr>
+<td>9</td>
+<td>导出方</td>
+<td>在原事务中再读</td>
+<td><code>1,2,3,4,5</code></td>
+</tr>
+<tr>
+<td>10</td>
+<td>第二个导出会话</td>
+<td>导出事务提交后再导入同一快照</td>
+<td><code>ERROR: invalid snapshot identifier</code></td>
+</tr>
+<tr>
+<td>11</td>
+<td>第二个导出会话</td>
+<td>在读已提交事务中导入</td>
+<td><code>ERROR: a snapshot-importing transaction must have isolation level SERIALIZABLE or REPEATABLE READ</code></td>
+</tr>
+</tbody>
+</table>
+<p>第 3、5 步用同一个“快照值”读出了不同的结果：<code>gseq=4</code> 的事务在取快照值时还没提交，之后才出现。如果导出任务按分片执行，前面的分片用的是第 3 步的视图，后面的分片用的是第 5 步的视图，同一个快照值就生成了自相矛盾的文件，中断重跑也无法得到相同的字节。第 6–9 步中，两个会话共享同一个事务快照，期间的两次并发提交对它们都不可见。第 10、11 步对应文档中的两条限制。</p>
+<p>权限快照有一个需要明确的取舍：用户在导出之后被移出某个会话，已生成的导出文件是否还要包含这个会话的内容。本实现选择“以创建时的权限为准”，理由是导出内容不超过用户在那一刻能在界面上看到的范围。下载时仍然重新校验账号状态与任务归属，管理员还可以撤销整个导出（410）。更严格的选择是在下载时比较当前权限与快照权限，有任何收缩就让文件失效并要求重建，这适合权限收回本身就是安全事件的场景。</p>
+<h2 id="4-分片-确定性与中断恢复">4. 分片、确定性与中断恢复</h2>
+<p>导出计划把每个会话的可见消息按 200 条切片，每片写成一个 JSONL 文件：行按 <code>seq</code> 排序，JSON 键排序，不含时间戳、主机名等运行时信息。分片的 sha256 记入 <code>part</code> 表。</p>
+<figure class="highlight python"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs python">prev = <span class="hljs-variable language_">self</span>.db.execute(<span class="hljs-string">&quot;SELECT sha256, state FROM part WHERE job=? AND idx=?&quot;</span>, (jid, idx)).fetchone()<br><span class="hljs-keyword">if</span> prev <span class="hljs-keyword">and</span> prev[<span class="hljs-number">1</span>] == <span class="hljs-string">&quot;done&quot;</span> <span class="hljs-keyword">and</span> os.path.exists(path) <span class="hljs-keyword">and</span> _sha_file(path) == prev[<span class="hljs-number">0</span>]:<br>    <span class="hljs-keyword">if</span> prev[<span class="hljs-number">0</span>] != sha:<br>        <span class="hljs-keyword">raise</span> RuntimeError(<span class="hljs-string">&quot;non-deterministic part content&quot;</span>)   <span class="hljs-comment"># 同一快照必须得到相同字节</span><br>    <span class="hljs-keyword">continue</span><br></code></pre></td></tr></table></figure>
+<p>重跑时，已完成且文件校验通过的分片被跳过；文件存在但校验不符（被截断或篡改）的分片被重写。重新计算出的内容与记录的校验和不同，说明生成过程本身不确定，这时直接报错，不在不确定的基础上继续。全部分片完成后按顺序拼接，用 <code>mtime=0</code> 的 gzip 压缩为最终产物，产物的 sha256 就是 <code>ETag</code>。</p>
+<pre><code class="hljs mermaid">---
+title: 图 E05-1 导出任务的状态与确认位置
+---
+stateDiagram-v2
+    [*] --&gt; queued: POST /exports（事务内固定快照与权限）
+    queued --&gt; running: 工作者领取
+    running --&gt; running: 分片 i 写临时文件→fsync→改名→记录 sha256
+    running --&gt; running: 崩溃后重跑：跳过已校验分片
+    running --&gt; done: 拼接 + gzip(mtime=0) → 记录产物 sha256 与字节数
+    done --&gt; revoked: 管理员撤销（下载返回 410）</code></pre>
+<h2 id="5-下载：签名-range-与-if-range">5. 下载：签名、Range 与 If-Range</h2>
+<p>下载链接的签名是 <code>HMAC-SHA256(job_id | user | exp)</code>，比较时使用常量时间比较。签名只证明“这个链接由服务端签发、没有被改过”；服务端在每次下载时仍然重新检查账号是否启用、任务是否属于该用户、是否被撤销。签名不能代替授权检查，否则账号停用之后，已发出的链接在过期之前仍然可用。</p>
+<p>断点续传遵循 RFC 9110 的 Range 语义。客户端第一次下载时记下 <code>ETag</code>，中断后带 <code>Range: bytes=N-</code> 与 <code>If-Range: &lt;ETag&gt;</code> 继续。RFC 9110 §13.1.5 把 <code>If-Range</code> 的含义概括为“如果表示没有变化，就发我请求的那部分；否则发完整的表示”，接收方在条件为假时必须忽略 <code>Range</code>；客户端不得在 <code>If-Range</code> 中使用弱 ETag。416 响应应当在 <code>Content-Range</code> 中给出当前长度。RFC 还指出 Range 请求是 HTTP 的可选特性，许多实现会直接返回 200 全量，所以客户端不能假设断点续传一定生效，必须检查状态码是 206 还是 200。</p>
+<figure class="highlight python"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><code class="hljs python"><span class="hljs-keyword">if</span> rng <span class="hljs-keyword">and</span> (if_range <span class="hljs-keyword">is</span> <span class="hljs-literal">None</span> <span class="hljs-keyword">or</span> if_range == etag):<br>    ...<br>    <span class="hljs-keyword">if</span> start &gt;= size <span class="hljs-keyword">or</span> start &gt; end:<br>        <span class="hljs-variable language_">self</span>.send_response(<span class="hljs-number">416</span>)<br>        <span class="hljs-variable language_">self</span>.send_header(<span class="hljs-string">&quot;Content-Range&quot;</span>, <span class="hljs-string">f&quot;bytes */<span class="hljs-subst">&#123;size&#125;</span>&quot;</span>)<br></code></pre></td></tr></table></figure>
+<p><code>If-Range</code> 是 X4 的关键。没有它，产物在两次请求之间如果被重新生成（例如任务被撤销后重建），服务器会把新文件的后半段接到旧文件的前半段后面，客户端得到一个校验失败或者更糟、能解压但内容错乱的文件。</p>
+<h2 id="6-实验">6. 实验</h2>
+<p>运行入口 <code>examples/e05_export/</code>：<code>python3 -m unittest test_exporter -v</code>，13 个用例通过。所有 HTTP 用例都通过 <code>http.client</code> 连接本机 <code>ThreadingHTTPServer</code> 的真实端口。<code>python3 trace.py</code> 记录了一次完整交互（<code>evidence/E05/http-trace.jsonl</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>状态码</th>
+<th>关键结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /exports</code>，键 k1</td>
+<td>202</td>
+<td>新任务，<code>replayed=false</code></td>
+</tr>
+<tr>
+<td>同键同体重放</td>
+<td>200</td>
+<td>同一 <code>job_id</code>，<code>replayed=true</code></td>
+</tr>
+<tr>
+<td>同键、<code>scope</code> 改为单个会话</td>
+<td>422</td>
+<td>拒绝</td>
+</tr>
+<tr>
+<td><code>GET /exports/&#123;id&#125;</code>（任务完成后）</td>
+<td>200</td>
+<td>5038 字节，附签名链接</td>
+</tr>
+<tr>
+<td>下载，服务端在 1000 字节后断开</td>
+<td>200</td>
+<td>收到 1000 字节与 ETag</td>
+</tr>
+<tr>
+<td><code>Range: bytes=1000-</code>，<code>If-Range: &lt;ETag&gt;</code></td>
+<td>206</td>
+<td><code>Content-Range: bytes 1000-5037/5038</code>，收到 4038 字节</td>
+</tr>
+<tr>
+<td>拼接两段计算 sha256</td>
+<td>—</td>
+<td>与任务记录的 sha256 一致</td>
+</tr>
+<tr>
+<td><code>Range</code> 起点等于文件长度</td>
+<td>416</td>
+<td><code>Content-Range: bytes */5038</code></td>
+</tr>
+</tbody>
+</table>
+<p>其他用例：</p>
+<ul>
+<li>快照：任务创建后再写入一条消息、撤回一条旧消息。导出中 <code>c-team</code> 的序号恰好是 51–550（1–50 发生在用户入群之前），<code>c-big</code> 是 1–430（431–440 发生在退群之后），无权查看的 <code>c-private</code> 不出现；快照前撤回的第 60 条正文为空、<code>recalled=1</code>，快照后撤回的第 70 条仍是原文。</li>
+<li>中断恢复：写完 2 个分片后注入崩溃，重跑得到的产物 sha256 与另一个目录中用相同数据、不中断生成的产物相同；两次运行合计写入的分片数等于分片总数，说明已完成分片没有重写。</li>
+<li>分片篡改：中断后在第 0 片末尾追加垃圾行，重跑时该片校验不符被重写，垃圾行消失。</li>
+<li><code>If-Range</code> 带一个旧 ETag 请求 <code>bytes=100-</code>：返回 200 和完整文件。</li>
+<li>授权：换用户的链接、改动一位签名的链接、过期 301 秒的链接均为 403；他人查询任务状态为 404；任务撤销后下载为 410，恢复撤销标记但停用账号后下载为 403。</li>
+<li>幂等键按用户隔离：两个用户使用相同的键得到不同的任务。</li>
+</ul>
+<h2 id="7-产物的生命周期与观测">7. 产物的生命周期与观测</h2>
+<p>导出产物是一份用户数据的完整副本，它的保留时间应当比消息本身更短，并且有明确的清理路径。本实现没有实现清理任务，契约上应当包括：</p>
+<ul>
+<li>产物与分片文件在任务完成后保留固定天数，到期删除文件并把任务标为 <code>expired</code>；之后的下载返回 410，用户可以用新的幂等键重新导出。</li>
+<li>分片文件只在任务运行期间需要，产物生成后即可删除；保留它们只是为了在产物损坏时快速重建，这个收益要和多一份用户数据副本的风险放在一起权衡。</li>
+<li>用户删除消息或注销账号时，未过期的导出产物是删除流程必须覆盖的一份系统内副本（E03 第 8 节列出了不受系统控制的副本），删除流程要能找到并处理它。</li>
+</ul>
+<p>需要记录的观测项：任务从创建到完成的耗时分布；中断重跑次数与每次跳过的分片数；下载请求按状态码（200、206、403、410、416）分别计数；同一个产物的下载次数与来源。最后一项用于发现链接被转发：一个 300 秒有效的链接在短时间内被多个来源使用，签名本身仍然合法，只有下载日志能看出异常。</p>
+<h2 id="8-方案比较">8. 方案比较</h2>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>重复点击</th>
+<th>中断恢复</th>
+<th>断点续传正确性</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>同步流式导出（请求内边查边写响应）</td>
+<td>每次点击一次全量查询</td>
+<td>只能从头开始</td>
+<td>无法续传</td>
+<td>长连接占用；查询期间数据在变</td>
+</tr>
+<tr>
+<td>异步任务，无幂等键</td>
+<td>多个任务</td>
+<td>依实现而定</td>
+<td>依产物是否确定</td>
+<td>重复计算</td>
+</tr>
+<tr>
+<td>异步任务 + 幂等键 + 快照 + 确定性分片（本文）</td>
+<td>一个任务</td>
+<td>从断点分片继续，字节一致</td>
+<td><code>ETag</code> + <code>If-Range</code></td>
+<td>需要快照能力；分片文件占用临时空间</td>
+</tr>
+<tr>
+<td>产物放对象存储，用预签名链接直传</td>
+<td>同上</td>
+<td>同上</td>
+<td>由对象存储实现</td>
+<td>授权只在签发时检查</td>
+</tr>
+</tbody>
+</table>
+<p>最后一种方案把下载流量卸给对象存储，代价是授权检查只发生在签发链接的那一刻。以 AWS S3 为例，用 CLI 或 SDK 生成的预签名链接最长可有 7 天有效期，用临时凭证签发的链接在凭证过期时失效。链接有效期内账号被停用，链接仍然可以下载。这类方案应当把有效期缩到分钟级，需要撤销能力时改为经由服务端代理下载。大文件上传到对象存储时还会遇到分段上传的约束：每段 5 MiB 到 5 GiB（最后一段不限），最多 10000 段；本文的分片是导出计划的单位，与上传分段是两件事，两者可以对齐，但不必相同。</p>
+<h2 id="9-限制">9. 限制</h2>
+<ul>
+<li>导出主流程只在单写者的 SQLite 上实现；PostgreSQL 上只演示了快照异常与事务快照修正（第 3 节），没有把分片导出整体迁到 PostgreSQL，也没有测量长事务对 VACUUM 的影响。</li>
+<li>工作者的领取、租约与并发执行没有实现；用例中由测试直接调用 <code>run_job</code>。</li>
+<li>产物在内存中拼接与压缩，没有覆盖大文件的流式写出与磁盘空间不足。</li>
+<li>签名密钥是写死的测试值，没有轮换；下载没有限速，也没有审计日志。</li>
+<li>只支持单段 <code>bytes=N-</code> 与 <code>bytes=N-M</code> 范围，不支持多段范围和后缀范围（<code>bytes=-N</code>），遇到时返回 400。</li>
+<li>导出文件被下载后在用户设备上的副本不受任何约束；撤销只阻止新的下载。</li>
+</ul>
+<h2 id="10-来源">10. 来源</h2>
+<p>核对日期 2026-10-18。</p>
+<ul>
+<li>RFC 9110 §14（Range 请求为可选特性）、§13.1.5（If-Range 的语义、条件为假时忽略 Range、禁止弱 ETag）、§15.3.7（206）、§15.5.17（416 应带当前长度）。<a target="_blank" rel="noopener" href="https://www.rfc-editor.org/rfc/rfc9110">https://www.rfc-editor.org/rfc/rfc9110</a></li>
+<li>draft-ietf-httpapi-idempotency-key-header-07（2025-10-15，已于 2026-04-18 过期，非 RFC）：键不得用于不同请求体；缺键 400、不同请求体 422、并发重试 409；资源应公布键的过期策略。</li>
+<li>PostgreSQL 16 文档 9.27.5 快照同步函数与 <code>SET TRANSACTION</code>：导出的快照只在导出事务结束前可导入；必须在可重复读或可串行化事务开头导入。13.2.2：可重复读快照起点。<a target="_blank" rel="noopener" href="https://www.postgresql.org/docs/16/functions-admin.html">https://www.postgresql.org/docs/16/functions-admin.html</a></li>
+<li>AWS S3 用户指南：分段上传 5 MiB–5 GiB、最多 10000 段；预签名链接经 CLI/SDK 最长 7 天，临时凭证过期则链接失效。</li>
+</ul>
+<h2 id="本批导航">本批导航</h2>
+<ul>
+<li>上一篇选修：<a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E04-%E6%B6%88%E6%81%AF%E9%80%9A%E9%81%93%E6%9B%BF%E6%8D%A2%E4%B8%8E%E8%BF%81%E7%A7%BB/" title="后端系统工程 E04：消息通道替换与迁移——迟到事件与回退边界">E04 消息通道替换与迁移</a></li>
+<li>下一篇选修：<a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E06-%E9%85%8D%E9%A2%9D%E4%B8%8E%E5%A4%9A%E7%A7%9F%E6%88%B7%E5%85%AC%E5%B9%B3%E6%80%A7/" title="后端系统工程 E06：配额与多租户公平性——先定义指标，再比较调度">E06 配额与多租户公平性</a></li>
+<li>相关：<a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E03-%E5%A4%A7%E7%BE%A4%E5%8E%86%E5%8F%B2%E7%9A%84%E5%86%B7%E7%83%AD%E5%88%86%E5%B1%82/" title="后端系统工程 E03：大群历史的冷热分层——归档之后，删除还要能追上去">E03 大群历史的冷热分层</a>；<a href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-35-%E6%96%87%E4%BB%B6%E4%B8%8A%E4%BC%A0%E4%B8%8E%E5%BC%82%E6%AD%A5%E5%A4%84%E7%90%86/" title="后端系统工程 35：文件上传与异步处理">35 文件上传与异步处理</a></li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E05-%E5%B9%82%E7%AD%89%E5%AF%BC%E5%87%BA%E4%B8%8E%E6%96%AD%E7%82%B9%E7%BB%AD%E4%BC%A0/">https://magicliang.github.io/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-E05-%E5%B9%82%E7%AD%89%E5%AF%BC%E5%87%BA%E4%B8%8E%E6%96%AD%E7%82%B9%E7%BB%AD%E4%BC%A0/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%B9%82%E7%AD%89/">幂等</a><a class="post-meta__tags" href="/tags/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B/">后端系统工程</a><a class="post-meta__tags" href="/tags/%E5%AF%BC%E5%87%BA/">导出</a><a class="post-meta__tags" href="/tags/Range-%E8%AF%B7%E6%B1%82/">Range 请求</a><a class="post-meta__tags" href="/tags/%E4%B8%8B%E8%BD%BD%E6%8E%88%E6%9D%83/">下载授权</a></div><div class="post-share"><div class="social-share" data-image="/img/wall-paper-24.jpg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-13-RPC%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%9A%84%E8%AF%B7%E6%B1%82%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F/" title="后端系统工程 13：RPC 客户端的请求生命周期"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-168.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 13：RPC 客户端的请求生命周期</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 12 有界连接池与等待取消 ｜ 本篇 13 ｜ 下一篇 14 会话存储与登录撤销 本地函数调用只有两种结局：返回，或者抛出异常。远程调用多了第三种：请求可能已经发出、也可能已经在对端执行，但结果没有回来。调用方在截止时间到达时只能如实说“不知道”。RPC 客户端的大部分复杂度都来自这第三种结局：同一条连接上，迟到的响应不能交给后来的请求；超时之后，客户端要判断能不能再发一次；服务端则不应该为一个已经被放弃的请求做事。 本篇实现一个最小 RPC，客户端是单连接多路复用，服务端是独立 JVM 进程并带故障注入，用 20 个用例检验四件事：字节流被正确切成帧；响应只交给发起它的那次尝试；截止时间同时约束客户端等待和服务端执行；只有允许的操作才会被自动重试。代码在 examples/13-rpc-client/，输出在 evidence/13/output.txt。 需求契约 调用方看到一个操作：call(method, idempotency, key, payload, timeout)，返回状态之一：OK、APP_ERROR、INVALID_ARGUMENT、DE...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-33-%E9%80%9A%E7%9F%A5%E6%B8%A0%E9%81%93%E7%9A%84%E7%BB%93%E6%9E%9C%E6%9C%AA%E7%9F%A5/" title="后端系统工程 33：通知渠道的结果未知"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-9.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 33：通知渠道的结果未知</div></div><div class="info-2"><div class="info-item-1">通知服务调用外部渠道时，最难处理的结果是“没有结果”：请求发出去了，响应没回来。渠道可能根本没收到，也可能已经接受并开始外发，只是响应在路上丢了。本地数据库能把“同一事件只生成一条逻辑通知”做成硬约束，却无法替外部渠道保证“用户只收到一次”。本篇用一个最小通知服务把这两件事分开：逻辑去重由唯一约束负责，外部重复由渠道契约决定，结果未知要作为一种持久状态记录下来，并且有出口。 需求与范围 业务方提交事件，例如“订单 ord-1001 已发货”，通知服务按用户偏好为每个启用渠道生成投递任务，由工作进程领取后调用渠道。要满足的条件如下。  同一 (user_id, event_key) 无论被提交多少次、多少并发，只产生一条逻辑通知。 每条逻辑通知在每个启用渠道上最多一条任务；同一任务在同一时刻最多有一个有效令牌；被取代的持有者无法再改写任务状态，但它已发出的外部调用无法撤回。 每次调用渠道都留下一条投递记录，结果未知的调用能在表里查到，不被后续结果覆盖。 超时后的重试策略取决于渠道能力：支持幂等键就带同一键重发；不支持幂等键但可查询就先查询；两者都不具备就停止自动处理。 领取前偏好被...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-28-%E7%A8%80%E7%BC%BA%E5%90%8D%E9%A2%9D%E7%9A%84%E5%87%86%E5%85%A5%E4%B8%8E%E5%BA%93%E5%AD%98%E9%A2%84%E7%95%99/" title="后端系统工程 28：稀缺名额的准入与库存预留"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-97.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 28：稀缺名额的准入与库存预留</div></div><div class="info-2"><div class="info-item-1">一个预约名额只有 40 个、同一时刻却有几百个请求到达的场景，至少要回答四件事：同时进入数据库的请求怎样限量，超出的请求是排队还是立刻拒绝；40 个名额怎样保证不多发；客户端在等待中断开或超时重发时，名额会不会被占两次；占了名额却迟迟不付款的预留到期后怎样归还，归还任务重跑时会不会多还。本篇用 examples/flash-sale 中的最小服务逐一回答。商品、用户和请求都是合成数据，SKU 固定为 sku-lab-01，用户为 user-0042 这类编号，域名只用 shop.example.test。订单与支付留给下一篇，本篇只交付“名额预留”这一层。 需求与范围 需求按可检查的形式写成五条：  任一时刻有效预留（状态为 HELD 或 CONFIRMED）的数量不超过库存总数。 同一个 request_key 无论发送多少次，最多产生一条预留；同键换用户或换 SKU 视为错误请求。 同一用户在同一 SKU 上最多持有一条有效预留。 单个服务进程内同时访问数据库的预留请求不超过并发上限；等待位置有界，满了立即返回 503。 到期的 HELD 预留由释放任务归还库存；释放任务重复...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-27-%E6%B5%8B%E8%AF%95%E8%B4%A6%E6%88%B7%E7%9A%84%E4%BD%99%E9%A2%9D%E4%B8%8E%E8%B4%A6%E6%9C%AC/" title="后端系统工程 27：测试账户的余额与账本"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-166.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 27：测试账户的余额与账本</div></div><div class="info-2"><div class="info-item-1">一个积分账户只要支持“扣减”，就会同时面对三类问题：多个请求同时扣同一个账户时会不会扣成负数；客户端超时后重发时会不会扣两次；余额列被某段代码改错以后，能不能从别的记录里算出正确值。本篇用一个测试账户服务回答这三个问题。账户、金额与请求都是合成数据，金额单位是“模拟积分”，不对应任何真实货币或支付渠道。 验收目标有三条，每条都落到具体的检查语句和用例编号上：  并发扣减不透支。 超时重试不重复扣款。 余额与流水守恒，余额可以从流水重算。  需求与范围 服务管理一组测试账户，每个账户有一个整数余额。业务方通过 HTTP 发起扣减，例如兑换一件测试奖品花掉 30 积分；运营脚本通过内部调用发放积分。不支持撤销、冻结、部分退款与多币种，也不处理跨库转账。 本章约定的业务不变量：    编号 不变量 检查位置     I1 普通账户余额不小于 0 account.balance_non_negative 约束；UPDATE ... WHERE 条件   I2 同一客户端、同一幂等键至多产生一笔交易 idem_request 主键、ledger_txn 唯一约束   I3 每笔交易的分录之...</div></div></div></a><a class="pagination-related" href="/2026/10/18/%E5%90%8E%E7%AB%AF%E7%B3%BB%E7%BB%9F%E5%B7%A5%E7%A8%8B-12-%E6%9C%89%E7%95%8C%E8%BF%9E%E6%8E%A5%E6%B1%A0%E4%B8%8E%E7%AD%89%E5%BE%85%E5%8F%96%E6%B6%88/" title="后端系统工程 12：有界连接池与等待取消"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-63.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">后端系统工程 12：有界连接池与等待取消</div></div><div class="info-2"><div class="info-item-1">系列导航：上一篇 11 撤回、历史保留与消息系统集成验收 ｜ 本篇 12 ｜ 下一篇 13 RPC 客户端的请求生命周期 数据库连接的数量不由应用决定。PostgreSQL 为每个客户端会话分配一个后端进程，max_connections 规定服务器同时接受的连接上限，并且只能在启动时设置（PostgreSQL 16 连接设置）。应用侧连接池是这份服务端预算在单个进程里的记账员：每借出一条连接，它就替调用方占用了服务端的一个槽位。记账错一次，可能表现为请求永远等不到连接，也可能表现为若干实例同时扩容后，整个数据库拒绝新会话。 本篇实现一个有界连接池，并用真实 PostgreSQL 检验四类结果：容量不超预算；等待超时、等待取消与归还交错时没有槽位丢失；连接在服务端被终止或会话状态被污染后不会交给下一个调用方；多实例的总连接数受数据库侧上限约束。代码在 examples/12-connection-pool/，全部输出在 evidence/12/output.txt。 需求契约 调用方只看到四个操作：在截止时间内获取一条连接；使用后归还；发现连接损坏时声明它不可复用；服务关闭时让池...</div></div></div></a><a class="pagination-related" href="/2026/09/19/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F-01-RPC%E9%87%8D%E8%AF%95%E4%B8%8E%E8%AF%B7%E6%B1%82%E5%8E%BB%E9%87%8D/" title="分布式系统 01：RPC 重试、并发与请求去重"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-distributed-systems.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">分布式系统 01：RPC 重试、并发与请求去重</div></div><div class="info-2"><div class="info-item-1">计数器最初为 0。客户端调用 Add(1)，服务端把计数器改成 1，回复却在返回途中丢失。客户端等待超时，再调用一次，计数器变成 2。网络只丢了一条回复，业务却多执行了一次。 第 00 篇 已经区分“执行失败”与“没有观察到结果”。RPC 将这个区别带进接口设计：同一项业务操作可以对应多次网络尝试，接口必须说明如何识别它们，以及服务重启之后还保留什么证据。 RPC 隐藏了传输，没有消除失败 一次远程调用通常经过参数编码、请求传输、服务端解码与分发、业务执行、结果编码、回复传输和客户端解码。正常路径看起来接近函数调用，失败路径却多了两个独立进程和两个消息方向。 如果本地进程中的普通函数返回，调用者通常可以直接使用返回值。远程请求还可能卡在消息队列、连接缓冲区或服务端执行队列里；客户端停止等待时，服务端未必停止工作。客户端看到的超时，不能反推出业务修改已经回滚。MIT 2026 RPC 讲义把这种“不知道请求是否到达或执行”的情况作为 RPC 故障语义的起点。 TCP 提供的连接内字节流可靠性也不足以解决这个问题。服务端可以先提交业务，再在回复到达客户端之前崩溃；客户端重连之后，即使...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#1-%E9%9C%80%E6%B1%82%E4%B8%8E%E4%B8%8D%E5%8F%98%E9%87%8F"><span class="toc-number">1.</span> <span class="toc-text">1. 需求与不变量</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#2-%E6%8E%A5%E5%8F%A3%E5%A5%91%E7%BA%A6"><span class="toc-number">2.</span> <span class="toc-text">2. 接口契约</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#3-%E5%BF%AB%E7%85%A7%EF%BC%9A%E6%9D%83%E9%99%90%E4%B8%8E%E6%95%B0%E6%8D%AE"><span class="toc-number">3.</span> <span class="toc-text">3. 快照：权限与数据</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#4-%E5%88%86%E7%89%87-%E7%A1%AE%E5%AE%9A%E6%80%A7%E4%B8%8E%E4%B8%AD%E6%96%AD%E6%81%A2%E5%A4%8D"><span class="toc-number">4.</span> <span class="toc-text">4. 分片、确定性与中断恢复</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#5-%E4%B8%8B%E8%BD%BD%EF%BC%9A%E7%AD%BE%E5%90%8D-range-%E4%B8%8E-if-range"><span class="toc-number">5.</span> <span class="toc-text">5. 下载：签名、Range 与 If-Range</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#6-%E5%AE%9E%E9%AA%8C"><span class="toc-number">6.</span> <span class="toc-text">6. 实验</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#7-%E4%BA%A7%E7%89%A9%E7%9A%84%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F%E4%B8%8E%E8%A7%82%E6%B5%8B"><span class="toc-number">7.</span> <span class="toc-text">7. 产物的生命周期与观测</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#8-%E6%96%B9%E6%A1%88%E6%AF%94%E8%BE%83"><span class="toc-number">8.</span> <span class="toc-text">8. 方案比较</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#9-%E9%99%90%E5%88%B6"><span class="toc-number">9.</span> <span class="toc-text">9. 限制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#10-%E6%9D%A5%E6%BA%90"><span class="toc-number">10.</span> <span class="toc-text">10. 来源</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%9C%AC%E6%89%B9%E5%AF%BC%E8%88%AA"><span class="toc-number">11.</span> <span class="toc-text">本批导航</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>
