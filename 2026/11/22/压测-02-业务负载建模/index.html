@@ -1,0 +1,756 @@
+<!DOCTYPE html><html lang="zh-Hans" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>深入压测（02）从业务漏斗推导负载 | 守株阁</title><meta name="author" content="magicliang"><meta name="copyright" content="magicliang"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="活动预测给出每秒 1,000 次购物会话，网关、订单库和消息队列却各有自己的计量单位。给三个系统都填 1,000 QPS，会让订单写入过重，也可能把热门商品上的库存锁争用压轻。负载模型是从业务入口推导每层工作量的过程。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="深入压测（02）从业务漏斗推导负载">
+<meta property="og:url" content="https://magicliang.github.io/2026/11/22/%E5%8E%8B%E6%B5%8B-02-%E4%B8%9A%E5%8A%A1%E8%B4%9F%E8%BD%BD%E5%BB%BA%E6%A8%A1/index.html">
+<meta property="og:site_name" content="守株阁">
+<meta property="og:description" content="活动预测给出每秒 1,000 次购物会话，网关、订单库和消息队列却各有自己的计量单位。给三个系统都填 1,000 QPS，会让订单写入过重，也可能把热门商品上的库存锁争用压轻。负载模型是从业务入口推导每层工作量的过程。">
+<meta property="og:locale">
+<meta property="og:image" content="https://magicliang.github.io/img/cover-engineering-practice.svg">
+<meta property="article:published_time" content="2026-11-21T16:02:00.000Z">
+<meta property="article:modified_time" content="2026-11-22T10:43:27.756Z">
+<meta property="article:author" content="magicliang">
+<meta property="article:tag" content="容量规划">
+<meta property="article:tag" content="性能测试">
+<meta property="article:tag" content="系统设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://magicliang.github.io/img/cover-engineering-practice.svg"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "深入压测（02）从业务漏斗推导负载",
+  "url": "https://magicliang.github.io/2026/11/22/%E5%8E%8B%E6%B5%8B-02-%E4%B8%9A%E5%8A%A1%E8%B4%9F%E8%BD%BD%E5%BB%BA%E6%A8%A1/",
+  "image": "https://magicliang.github.io/img/cover-engineering-practice.svg",
+  "datePublished": "2026-11-21T16:02:00.000Z",
+  "dateModified": "2026-11-22T10:43:27.756Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "magicliang",
+      "url": "https://magicliang.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://magicliang.github.io/2026/11/22/%E5%8E%8B%E6%B5%8B-02-%E4%B8%9A%E5%8A%A1%E8%B4%9F%E8%BD%BD%E5%BB%BA%E6%A8%A1/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.7.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.css" media="print" onload="this.media='all'"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!true && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', 'undefined')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: {"path":"/search.json","preload":false,"top_n_per_article":1,"unescape":false,"pagination":{"enable":false,"hitsPerPage":8},"languages":{"hits_empty":"No results found for: ${query}","hits_stats":"${hits} articles found"}},
+  translate: {"defaultEncoding":1,"translateDelay":0,"msgToTraditionalChinese":"繁","msgToSimplifiedChinese":"簡"},
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":true},
+  copy: {
+    success: 'Copy Successful',
+    error: 'Copy Failed',
+    noSupport: 'Browser Not Supported'
+  },
+  relativeDate: {
+    homepage: true,
+    post: true
+  },
+  runtime: '',
+  dateSuffix: {
+    just: 'Just now',
+    min: 'minutes ago',
+    hour: 'hours ago',
+    day: 'days ago',
+    month: 'months ago'
+  },
+  copyright: {"limitCount":50,"languages":{"author":"Author: magicliang","link":"Link: ","source":"Source: 守株阁","info":"Copyright belongs to the author. For commercial use, please contact the author for authorization. For non-commercial use, please indicate the source."}},
+  lightbox: 'null',
+  Snackbar: {"chs_to_cht":"You have switched to Traditional Chinese","cht_to_chs":"You have switched to Simplified Chinese","day_to_night":"You have switched to Dark Mode","night_to_day":"You have switched to Light Mode","bgLight":"#49b1f5","bgDark":"#2d3035","position":"bottom-left"},
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: 'Load More'
+  },
+  isPhotoFigcaption: true,
+  islazyloadPlugin: true,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: true,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '深入压测（02）从业务漏斗推导负载',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><meta name="generator" content="Hexo 8.1.2"><link rel="alternate" href="/atom.xml" title="守株阁" type="application/atom+xml">
+<link href="https://cdn.bootcss.com/KaTeX/0.11.1/katex.min.css" rel="stylesheet" /></head><body><div id="loading-box"><div class="loading-left-bg"></div><div class="loading-right-bg"></div><div class="spinner-box"><div class="configure-border-1"><div class="configure-core"></div></div><div class="configure-border-2"><div class="configure-core"></div></div><div class="loading-word">Loading...</div></div></div><script>(()=>{
+  const $loadingBox = document.getElementById('loading-box')
+  const $body = document.body
+  const preloader = {
+    endLoading: () => {
+      if ($loadingBox.classList.contains('loaded')) return
+      $body.style.overflow = ''
+      $loadingBox.classList.add('loaded')
+    },
+    initLoading: () => {
+      $body.style.overflow = 'hidden'
+      $loadingBox.classList.remove('loaded')
+    }
+  }
+
+  preloader.initLoading()
+
+  if (document.readyState === 'complete') {
+    preloader.endLoading()
+  } else {
+    window.addEventListener('load', preloader.endLoading)
+    document.addEventListener('DOMContentLoaded', preloader.endLoading)
+    // Add timeout protection: force end after 7 seconds
+    setTimeout(preloader.endLoading, 7000)
+  }
+
+  if (true) {
+    btf.addGlobalFn('pjaxSend', preloader.initLoading, 'preloader_init')
+    btf.addGlobalFn('pjaxComplete', preloader.endLoading, 'preloader_end')
+  }
+})()</script><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/rei.jpeg" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">Articles</div><div class="length-num">2422</div></a><a href="/tags/"><div class="headline">Tags</div><div class="length-num">2260</div></a><a href="/categories/"><div class="headline">Categories</div><div class="length-num">47</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header" style="background-image: url(/img/cover-engineering-practice.svg);"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">守株阁</span></a><a class="nav-page-title" href="/"><span class="site-name">深入压测（02）从业务漏斗推导负载</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  Back to Home</span></span></a></span><div id="menus"><div id="search-button"><span class="site-page social-icon search"><i class="fas fa-search fa-fw"></i><span> Search</span></span></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> Home</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> Archives</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> Tags</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> Categories</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> About</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">深入压测（02）从业务漏斗推导负载</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">Created</span><time class="post-meta-date-created" datetime="2026-11-21T16:02:00.000Z" title="Created 2026-11-22 00:02:00">2026-11-22</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">Updated</span><time class="post-meta-date-updated" datetime="2026-11-22T10:43:27.756Z" title="Updated 2026-11-22 18:43:27">2026-11-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E5%B7%A5%E7%A8%8B%E5%AE%9E%E8%B7%B5/">工程实践</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-wordcount"><i class="far fa-file-word fa-fw post-meta-icon"></i><span class="post-meta-label">Word Count:</span><span class="word-count">1.5k</span><span class="post-meta-separator">|</span><i class="far fa-clock fa-fw post-meta-icon"></i><span class="post-meta-label">Reading Time:</span><span>4mins</span></span><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">Post Views:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><div id="post-outdate-notice" data="{&quot;limitDay&quot;:365,&quot;messagePrev&quot;:&quot;本文距上次更新已过&quot;,&quot;messageNext&quot;:&quot;天，内容可能已过时。&quot;,&quot;postUpdate&quot;:&quot;2026-11-22 18:43:27&quot;}" hidden></div><p>活动预测给出每秒 1,000 次购物会话，网关、订单库和消息队列却各有自己的计量单位。给三个系统都填 1,000 QPS，会让订单写入过重，也可能把热门商品上的库存锁争用压轻。负载模型是从业务入口推导每层工作量的过程。</p>
+<span id="more"></span>
+<h2 id="把业务漏斗换成请求速率">把业务漏斗换成请求速率</h2>
+<p>以下数字沿用系列的虚构交易。比例是以上层 1,000 次会话为同一基数的简化统计，表中的校验和提交仍存在真实前置状态。</p>
+<table>
+<thead>
+<tr>
+<th>动作</th>
+<th>假设</th>
+<th>估算量级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>商品浏览</td>
+<td>每次会话平均 3 次</td>
+<td>3,000 HTTP 请求/秒</td>
+</tr>
+<tr>
+<td>搜索</td>
+<td>30% 的会话搜索一次</td>
+<td>300 HTTP 请求/秒</td>
+</tr>
+<tr>
+<td>结算校验</td>
+<td>12% 的会话校验一次</td>
+<td>120 HTTP 请求/秒</td>
+</tr>
+<tr>
+<td>提交订单</td>
+<td>8% 的会话提交一笔</td>
+<td>80 个逻辑请求/秒</td>
+</tr>
+<tr>
+<td>重试下单</td>
+<td>原始订单请求中 10% 额外尝试一次</td>
+<td>88 次提交尝试/秒，包含首次请求</td>
+</tr>
+</tbody>
+</table>
+<p>若每笔新订单平均涉及两个 SKU，且每个 SKU 独立执行一次库存处理，每秒受理 80 笔时，平均对应 160 次初次 SKU 处理/秒。这里假定订单去重发生在库存请求之前。若重试也进入库存层，或者一次批量库存 API 合并两个 SKU，调用数和资源成本都要改算。容量模型应在链路图上写出幂等位置、扇出、批合并和失败后的重试次数。</p>
+<p>抽样统计先对齐时间窗。秒杀开场的一秒峰值不能由五分钟平均等量替代。按常态、活动峰值和恢复分别计算动作混合，给上游促销节奏变化留一组单独的情景。举例说，库存热点突然从前 100 个商品集中到 3 个，即使全站 RPS 相同，单分片请求和行锁竞争也会改变。</p>
+<h2 id="用会话保住因果-用接口补足独立负载">用会话保住因果，用接口补足独立负载</h2>
+<p>下单脚本需要先取得有效商品、购物车版本和合成账号身份。每笔新业务使用独立幂等键，重试时复用原键。若反复提交同一个业务键，测到的主要是去重查询。若每次重试重新造键，测试会错误增加订单数。</p>
+<p>一种可行的混合模型是给整个购物会话设置独立到达计划，把浏览、校验、提交与结果查询留在会话内部按业务顺序执行。对来自合作方、独立调度任务或定时回调的请求再单独建输入场景。会话本身是开环到达，内部依然等待前一个动作完成；故障时后续 API 的 RPS 会按业务进度改变，报告应同时看会话与 API 两层数据。<a target="_blank" rel="noopener" href="https://www.usenix.org/legacy/event/nsdi06/tech/full_papers/schroeder/schroeder_html/">Schroeder 等，NSDI 2006</a></p>
+<table>
+<thead>
+<tr>
+<th>输入来源</th>
+<th>保留的信息</th>
+<th>需要补齐的内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>构造脚本</td>
+<td>可复现的业务顺序、状态和断言</td>
+<td>真实参数分布、突发及罕见分支</td>
+</tr>
+<tr>
+<td>脱敏日志回放</td>
+<td>参数形态、流量混合与部分时间关系</td>
+<td>过期令牌、动态 ID、响应依赖和原始系统边界</td>
+</tr>
+<tr>
+<td>实时镜像</td>
+<td>此刻已有流量的组合</td>
+<td>高于现有峰值的负载和独立的业务结果验证</td>
+</tr>
+</tbody>
+</table>
+<p>回放原始请求时，应在目标环境重新建立身份、对象和会话关系，按用户或业务键保留必要顺序。采样率要记录，敏感载荷需筛掉或脱敏。提速回放以前，先确认调度不会打乱前置依赖。镜像是复制已有流量，例如 Istio 默认丢弃镜像响应，镜像侧有无正确完成仍需独立观测。<a target="_blank" rel="noopener" href="https://istio.io/latest/docs/tasks/traffic-management/mirroring/">Istio 流量镜像文档</a></p>
+<h2 id="数据规模与数据分布同时属于负载">数据规模与数据分布同时属于负载</h2>
+<p>一张只装几千条记录的订单表，即使请求比例正确，索引工作集、缓存命中率与实际业务也可能相差很远。数据准备记录应包括表和索引的规模、活跃工作集、热点键比例、读写路径、记录年龄、载荷大小及可见状态。冷热两个阶段分别跑，冷态看依赖承压与恢复，热态看活动计划假定的缓存命中能否被维持。</p>
+<p>旧文用历史活动和新增场景组装业务模型，再从线上基础数据中采样、过滤、脱敏。这个方法可以直接移植到合成数据：用历史分布控制合成账号和 SKU，新增玩法用明确假设补足。每个假设都能反馈到表格里的一个数，比如热点转移、校验次数或支付回调时延。<a href="/2019/11/10/%E5%A6%82%E4%BD%95%E5%81%9A%E5%85%A8%E9%93%BE%E8%B7%AF%E5%8E%8B%E6%B5%8B/" title="如何做全链路压测">如何做全链路压测</a></p>
+<h2 id="发压前做一次小样对账">发压前做一次小样对账</h2>
+<p>先启动少量能人工核对的会话。观测每个业务分支的次数、参数差异、成功率、缓存命中与消息结果。会话转化有随机波动，应在足够大的样本上和模型比较。用固定样本集验证确定性分支和幂等，再在接近峰值时检查热点和到达形状。预跑中的业务断言若只要看见某个 HTTP 状态码就通过，应补一个跨越最终状态的断言。</p>
+<p>最终把脚本版本、数据种子、比例来源、到达调度和验证口径写进同一份运行配置。下次回归用同一版本比性能，真正的业务变化则另建一版负载模型。</p>
+<h2 id="系列导航">系列导航</h2>
+<table>
+<thead>
+<tr>
+<th>上一篇</th>
+<th>系列目录</th>
+<th>下一篇</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="/2026/11/22/%E5%8E%8B%E6%B5%8B-01-%E6%8C%87%E6%A0%87%E4%B8%8E%E6%8E%92%E9%98%9F/" title="深入压测（01）吞吐、尾延迟与排队">吞吐、尾延迟与排队</a></td>
+<td><a href="/2026/11/22/%E5%8E%8B%E6%B5%8B-00-%E5%AE%B9%E9%87%8F%E9%9C%80%E8%A6%81%E4%BB%80%E4%B9%88%E8%AF%81%E6%8D%AE/" title="深入压测（00）容量需要什么证据">深入压测</a></td>
+<td><a href="/2026/11/22/%E5%8E%8B%E6%B5%8B-03-%E5%BC%80%E7%8E%AF%E9%97%AD%E7%8E%AF%E4%B8%8E%E5%8F%91%E5%8E%8B/" title="深入压测（03）开环、闭环与发压端的测量偏差">开环、闭环与发压端的测量偏差</a></td>
+</tr>
+</tbody>
+</table>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>Author: </span><span class="post-copyright-info"><a href="https://magicliang.github.io">magicliang</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>Link: </span><span class="post-copyright-info"><a href="https://magicliang.github.io/2026/11/22/%E5%8E%8B%E6%B5%8B-02-%E4%B8%9A%E5%8A%A1%E8%B4%9F%E8%BD%BD%E5%BB%BA%E6%A8%A1/">https://magicliang.github.io/2026/11/22/%E5%8E%8B%E6%B5%8B-02-%E4%B8%9A%E5%8A%A1%E8%B4%9F%E8%BD%BD%E5%BB%BA%E6%A8%A1/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>Copyright Notice: </span><span class="post-copyright-info">All articles on this blog are licensed under <a target="_blank" rel="noopener" href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a> unless otherwise stated.</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E6%B5%8B%E8%AF%95/">性能测试</a><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92/">容量规划</a></div><div class="post-share"><div class="social-share" data-image="/img/cover-engineering-practice.svg" data-sites="wechat,weibo,qq,x"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>Related Articles</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/11/22/%E5%8E%8B%E6%B5%8B-04-%E5%85%A8%E9%93%BE%E8%B7%AF%E8%BE%B9%E7%95%8C%E4%B8%8E%E8%AF%95%E9%AA%8C%E7%8E%AF%E5%A2%83/" title="深入压测（04）怎样划定全链路边界"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-ops-reliability.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-22</div><div class="info-item-2">深入压测（04）怎样划定全链路边界</div></div><div class="info-2"><div class="info-item-1">画拓扑时沿调用方向走一遍，就能看到网关、订单服务、数据库和消息队列。画压测边界还需要再问两次。订单状态出现以前，哪些工作必须真正完成？哪些其他业务同时占用同一组资源？前一个问题决定纵向深度，后一个问题决定横向覆盖。  沿业务承诺画到可以验收的位置 --- title: 交易链路中的完成边界与共享资源 --- flowchart LR     B[浏览与结算] --&gt; G[网关]     G --&gt; O[订单服务]     O --&gt; D[(订单库与待发送事件)]     D --&gt; P[事件发布器]     P --&gt; Q[队列]     Q --&gt; C[消费者]     C --&gt; I[库存写入和终态查询]     O --&gt; S[支付替身]     R[商家报表] --&gt; D     N[其他批处理] --&gt; Q 库存写入和终态查询属于「订单确认」场景的关键路径。商家报表不经过订单接口，却可能争用数据库连接和磁盘。批处理也可能与消费者共用 broker 或网络配额。因此先画业务的最长真实依赖，再按资源向旁边展开，核查...</div></div></div></a><a class="pagination-related" href="/2026/11/22/%E5%8E%8B%E6%B5%8B-01-%E6%8C%87%E6%A0%87%E4%B8%8E%E6%8E%92%E9%98%9F/" title="深入压测（01）吞吐、尾延迟与排队"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-engineering-practice.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-22</div><div class="info-item-2">深入压测（01）吞吐、尾延迟与排队</div></div><div class="info-2"><div class="info-item-1">同样是「每秒处理 100 个请求」，可能指每秒到达 100 个，也可能是每秒返回 100 个，其中多数因为超时而被拒绝。将这两个含义画成一条曲线，容量到了边界反而最难读。  一份报告里的四个计数 RPS 通常指每秒请求数，QPS 原意是每秒查询数，日常监控有时也用来称接口请求率。TPS 可以指每秒业务事务或数据库事务，需要在图例中写清楚。一个迭代能发多次 HTTP 请求，一次数据库事务也能包含多条语句。速率应连同计数单位和边界写，例如「网关结算提交尝试 88 请求/秒」或「确认成功 80 订单/秒」。    计数 采集位置 计入什么     计划启动 发压调度器 应当启动的迭代，包含最终没有发出的那部分   实际到达 网关或服务入口 被测边界收到的尝试，包括重试   完成 响应端或业务状态机 已结束的处理，按成功、拒绝、失败和超时分类   有效完成 业务结果校验 在期限内得到正确结果的逻辑请求，也就是这里使用的 goodput    一次运行能记录 1,000 次计划启动、940 次实际启动、910 次网关收到以及 880 次期限内成功。前三个数字之间的差值可能来自不同位置。压测...</div></div></div></a><a class="pagination-related" href="/2026/10/02/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1-04-%E4%BB%8E%E5%8D%95%E6%9C%BA%E5%88%B0%E5%88%86%E5%B8%83%E5%BC%8F%E5%85%88%E6%B5%8B%E7%93%B6%E9%A2%88/" title="系统设计 04：从单机到分布式——先测瓶颈，再加节点"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/wall-paper-42.jpg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">系统设计 04：从单机到分布式——先测瓶颈，再加节点</div></div><div class="info-2"><div class="info-item-1">“流量涨了，就把应用从一台扩到四台”没有回答瓶颈在哪。如果应用实例尚有余量，但每个请求都在等同一处数据库写入，加应用机器只会让更多请求同时排队。扩容先要有一份能被负载实验推翻的容量假设。 沿用访问模式与游标分页里的分享元数据服务：创建、按 ID 读取、按所有者列表读取。但以下流量是新的教学输入，不是 03 的实测流量，更不是某家服务的生产配置。  单机版本先说清楚承诺 服务包含 HTTP 应用和一个权威数据库；POST /shares 写分享与幂等键映射，GET /shares/{id} 查主键，GET /users/{owner}/shares?after=... 按 (owner_id,created_at,id) 读有序索引。应用实例可重启，不在实例内保存权限、游标或写入归属；授权检查仍发生在每次读之前。已确认的撤销请求不能再返回公开内容；这是数据不变量，不可通过增加只读节点放松。本文排除对象上传、跨地域容灾和多主写入，暂不把读副本当成默认选项。 目标先限定为合法读取服务端 p99 小于 200 ms、十秒峰值窗口的请求拒绝率小于 0.1%；写入确认还需要单独记录成功率与延...</div></div></div></a><a class="pagination-related" href="/2026/11/22/%E5%8E%8B%E6%B5%8B-06-%E5%8D%87%E5%8E%8B%E7%A8%B3%E5%8E%8B%E4%B8%8E%E6%AD%A2%E5%8E%8B/" title="深入压测（06）升压、稳压、过载和恢复"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-ops-reliability.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-22</div><div class="info-item-2">深入压测（06）升压、稳压、过载和恢复</div></div><div class="info-2"><div class="info-item-1">服务可以在 1,000 会话/秒下平稳运行十分钟，也可能在相同峰值的第一秒被冷缓存和扩容时差拖垮。试验的负载形状决定了容量数字能代表哪类事件。阶梯、脉冲和长稳测试各自观察不同的时间尺度。  一条曲线测稳态，另一条测变化    阶段 施压方式 要回答的问题     预跑 极低流量，逐条核对终态 路由、断言、监控与停压是否可用   预热 按实际活动前的方式准备会话、缓存和连接 活动开始时处于哪一种热态   阶梯与稳压 逐级加到若干平台，每段保持固定输入 哪一级开始违反 SLO，哪个队列最先增长   峰值脉冲与长稳 分两次跑突然跃升、目标负载持续运行 峰值是否越过扩容时间，长跑是否累积债务   减压与恢复 回到背景负载并持续观察 积压、拒绝、延迟和资源何时恢复    预跑需要在可控规模下完整走链。预热只在正式场景确实具备预热时把系统推入相同状态，不能抹平一个本就要承受的冷启动。冷、热两组分开留结果。提前登录同理，如果活动规则让大部分用户事先在线，可以预建会话；如果到点才开放入口，登录峰值就属于场景本身。 对虚构交易，可以先按 400、700、1,000 会话/秒跑阶梯，在每个平台等到预...</div></div></div></a><a class="pagination-related" href="/2026/11/22/%E5%8E%8B%E6%B5%8B-00-%E5%AE%B9%E9%87%8F%E9%9C%80%E8%A6%81%E4%BB%80%E4%B9%88%E8%AF%81%E6%8D%AE/" title="深入压测（00）容量需要什么证据"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-engineering-practice.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-22</div><div class="info-item-2">深入压测（00）容量需要什么证据</div></div><div class="info-2"><div class="info-item-1">压测端每秒启动 1,000 次会话，订单接口返回了 24,000 个 HTTP 202，消费者却还有几千条消息没处理。要验收一次大促，三个数字里只有第一个描述输入，第二个描述同步受理，第三个暴露了尚未结清的后台工作。用户能否在承诺时间里拿到订单结果，要把三处记录按同一批订单对起来。  一条容量结论需要同时说明负载形状、系统边界、业务完成条件和观察时间。任何一个条件改变，结论都需要重新解释。   从一次购物会话开始 以下是贯穿本系列的虚构交易系统。每秒发起 1,000 次购物会话，其中约 80 次最终提交订单。一次订单受理后写入订单状态和待发送事件，后台将事件送入消息队列，消费者确认库存并更新可以查询的订单状态。业务约定 99.5% 的逻辑订单在 2 秒内得到正确终态，这就是例子中的服务等级目标（SLO）。实验数字只用于说明计算。    位置 计数单位 可以证明的事实     压测机 启动的会话 / 秒 调度器实际启动了多少脚本迭代   网关 HTTP 请求 / 秒 路由收到多少次请求，包括重试   订单服务 不重复的逻辑订单 / 秒 多少订单被受理并进入处理链   消费端与结果库...</div></div></div></a><a class="pagination-related" href="/2026/11/22/%E5%8E%8B%E6%B5%8B-08-%E5%AE%B9%E9%87%8F%E9%AA%8C%E6%94%B6%E4%B8%8E%E5%9B%9E%E5%BD%92/" title="深入压测（08）怎样签出可复验的容量结论"><img class="cover" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-lazy-src="/img/cover-ops-reliability.svg" alt="cover"><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-22</div><div class="info-item-2">深入压测（08）怎样签出可复验的容量结论</div></div><div class="info-2"><div class="info-item-1">团队要签的是「活动期间可以承接每秒 1,000 次会话」，而压测最高跑到每秒 1,200 次。若要求丢失一个可用区后仍可服务，同样的混合流量在剩余两个可用区只通过了 850，会签结论就要改。容量是给定约束下通过验收的负载档位。  先写验收口径，再选择最高通过档 虚构交易把「在 2 秒内正确确认的订单比例」作为服务等级指标（SLI）。计时从提交逻辑订单开始，结束于用户可读的正确终态。每个业务 ID 只计一次，重试仍占用入口和下游资源。按提交时间归属五分钟订单批次，窗口结束后等待每笔订单的期限到达，再对账。若五分钟提交 24,000 笔，99.5% 的 SLO 至少需要 23,880 笔按时正确完成。超时未完成、业务失败、错误终态和不允许的拒绝都记入未达标。 同一档位还要满足负载有效性的前提。以模型允许的容差检查实际会话启动、入口动作混合、热点、重试量和订单流量，没有达到目标输入的运行不用于该档位签字。验收还要确认积压无持续增长、正式侧无测试写入，以及停压后能恢复到预设基线。固定版本下做多次有效运行，约定在每次运行都通过这些条件时签出通过档。    拓扑 输入档位 五分钟提交 / 按...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>Contents</span><span class="toc-percentage"></span></div><div class="toc-content is-expand"><ol class="toc"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%8A%8A%E4%B8%9A%E5%8A%A1%E6%BC%8F%E6%96%97%E6%8D%A2%E6%88%90%E8%AF%B7%E6%B1%82%E9%80%9F%E7%8E%87"><span class="toc-number">1.</span> <span class="toc-text">把业务漏斗换成请求速率</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%94%A8%E4%BC%9A%E8%AF%9D%E4%BF%9D%E4%BD%8F%E5%9B%A0%E6%9E%9C-%E7%94%A8%E6%8E%A5%E5%8F%A3%E8%A1%A5%E8%B6%B3%E7%8B%AC%E7%AB%8B%E8%B4%9F%E8%BD%BD"><span class="toc-number">2.</span> <span class="toc-text">用会话保住因果，用接口补足独立负载</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%95%B0%E6%8D%AE%E8%A7%84%E6%A8%A1%E4%B8%8E%E6%95%B0%E6%8D%AE%E5%88%86%E5%B8%83%E5%90%8C%E6%97%B6%E5%B1%9E%E4%BA%8E%E8%B4%9F%E8%BD%BD"><span class="toc-number">3.</span> <span class="toc-text">数据规模与数据分布同时属于负载</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8F%91%E5%8E%8B%E5%89%8D%E5%81%9A%E4%B8%80%E6%AC%A1%E5%B0%8F%E6%A0%B7%E5%AF%B9%E8%B4%A6"><span class="toc-number">4.</span> <span class="toc-text">发压前做一次小样对账</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E7%B3%BB%E5%88%97%E5%AF%BC%E8%88%AA"><span class="toc-number">5.</span> <span class="toc-text">系列导航</span></a></li></ol></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2017 - 2026 By magicliang</span><span class="framework-info"><span>Framework </span><a target="_blank" rel="noopener" href="https://hexo.io">Hexo 8.1.2</a><span class="footer-separator">|</span><span>Theme </span><a target="_blank" rel="noopener" href="https://github.com/jerryc127/hexo-theme-butterfly">Butterfly 5.7.0</a></span></div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="Reading Mode"><i class="fas fa-book-open"></i></button><button id="translateLink" type="button" title="Toggle Between Traditional and Simplified Chinese">簡</button><button id="darkmode" type="button" title="Toggle Between Light and Dark Mode"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="Toggle Between Single-column and Double-column"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="Settings"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="Table of Contents"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="Back to Top"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.7.0"></script><script src="/js/main.js?v=5.7.0"></script><script src="/js/tw_cn.js?v=5.7.0"></script><script src="https://cdn.jsdelivr.net/npm/instant.page@5.2.0/instantpage.min.js" type="module"></script><script src="https://cdn.jsdelivr.net/npm/vanilla-lazyload@19.1.3/dist/lazyload.iife.min.js"></script><script src="https://cdn.jsdelivr.net/npm/node-snackbar@0.1.16/dist/snackbar.min.js"></script><div class="js-pjax"><script>(() => {
+  const parseViewBox = viewBox => {
+    if (!viewBox) return null
+    const parts = viewBox.trim().split(/[\s,]+/).map(n => Number(n))
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return null
+    return parts
+  }
+
+  const getSvgViewBox = svg => {
+    const attr = parseViewBox(svg.getAttribute('viewBox'))
+    if (attr) return attr
+
+    // Fallback: use bbox to build a viewBox
+    try {
+      const bbox = svg.getBBox()
+      if (bbox && bbox.width && bbox.height) return [bbox.x, bbox.y, bbox.width, bbox.height]
+    } catch (e) {
+      // getBBox may fail on some edge cases; ignore
+    }
+
+    const w = Number(svg.getAttribute('width')) || 0
+    const h = Number(svg.getAttribute('height')) || 0
+    if (w > 0 && h > 0) return [0, 0, w, h]
+    return [0, 0, 100, 100]
+  }
+
+  const setSvgViewBox = (svg, vb) => {
+    svg.setAttribute('viewBox', `${vb[0]} ${vb[1]} ${vb[2]} ${vb[3]}`)
+  }
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v))
+
+  const openSvgInNewTab = ({ source, initViewBox }) => {
+    const getClonedSvg = () => {
+      if (typeof source === 'string') {
+        const template = document.createElement('template')
+        template.innerHTML = source.trim()
+        const svg = template.content.querySelector('svg')
+        return svg ? svg.cloneNode(true) : null
+      }
+      if (source && typeof source.cloneNode === 'function') {
+        return source.cloneNode(true)
+      }
+      return null
+    }
+
+    const clone = getClonedSvg()
+    if (!clone) return
+    if (initViewBox && initViewBox.length === 4) {
+      clone.setAttribute('viewBox', initViewBox.join(' '))
+    }
+    if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    if (!clone.getAttribute('xmlns:xlink') && clone.innerHTML.includes('xlink:')) {
+      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    }
+    // inject background to match current theme
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const bg = getComputedStyle(document.body).backgroundColor || (isDark ? '#1e1e1e' : '#ffffff')
+    if (!clone.style.background) clone.style.background = bg
+
+    const serializer = new XMLSerializer()
+    const svgSource = serializer.serializeToString(clone)
+    const htmlSource = `<!doctype html><html><head><meta charset="utf-8" />
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; display: flex; align-items: center; justify-content: center; background: ${bg}; }
+        svg { max-width: 100%; max-height: 100%; height: auto; width: auto; }
+      </style>
+      </head><body>${svgSource}</body></html>`
+    const blob = new Blob([htmlSource], { type: 'text/html;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener')
+
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
+  const attachMermaidViewerButton = wrap => {
+    let btn = wrap.querySelector('.mermaid-open-btn')
+    if (!btn) {
+      btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mermaid-open-btn'
+      wrap.appendChild(btn)
+    }
+
+    btn.innerHTML = '<i class="fa fa-search fa-fw" aria-hidden="true"></i>'
+
+    if (!btn.__mermaidViewerBound) {
+      btn.addEventListener('click', e => {
+        e.preventDefault()
+        e.stopPropagation()
+        const svg = wrap.__mermaidOriginalSvg || wrap.querySelector('svg')
+        if (!svg) return
+        const initViewBox = wrap.__mermaidInitViewBox
+        openSvgInNewTab({ source: svg, initViewBox })
+      })
+      btn.__mermaidViewerBound = true
+    }
+  }
+
+  // Zoom around a point (px, py) in the SVG viewport (in viewBox coordinates)
+  const zoomAtPoint = (vb, factor, px, py) => {
+    const w = vb[2] * factor
+    const h = vb[3] * factor
+    const nx = px - (px - vb[0]) * factor
+    const ny = py - (py - vb[1]) * factor
+    return [nx, ny, w, h]
+  }
+
+  const initMermaidGestures = wrap => {
+    // Clean up previous event listeners and pending frames
+    if (wrap.__mermaidAbortController) {
+      wrap.__mermaidAbortController.abort()
+      if (wrap.__mermaidRafId) cancelAnimationFrame(wrap.__mermaidRafId)
+    }
+    const ac = new AbortController()
+    wrap.__mermaidAbortController = ac
+    const svg = wrap.querySelector('svg')
+    if (!svg) return
+
+    // Ensure viewBox exists so gestures always work
+    const initVb = getSvgViewBox(svg)
+    wrap.__mermaidInitViewBox = initVb
+    wrap.__mermaidCurViewBox = initVb.slice()
+    setSvgViewBox(svg, initVb)
+    // Disable default gestures to prevent scroll chaining and pinch-zoom penetration in Chrome
+    svg.style.touchAction = 'none'
+
+    // Cache BoundingClientRect, throttled on scroll to reduce reflow
+    let cachedRect = svg.getBoundingClientRect()
+    let rectDirty = false
+    const markRectDirty = () => { rectDirty = true }
+    window.addEventListener('resize', markRectDirty, { signal: ac.signal })
+    window.addEventListener('scroll', markRectDirty, { signal: ac.signal, capture: true })
+    const getRect = () => {
+      if (rectDirty) {
+        cachedRect = svg.getBoundingClientRect()
+        rectDirty = false
+      }
+      return cachedRect
+    }
+
+    // Precompute clamp bounds from initial viewBox
+    const minW = initVb[2] * 0.1
+    const maxW = initVb[2] * 10
+    const minH = initVb[3] * 0.1
+    const maxH = initVb[3] * 10
+    const clampVb = vb => {
+      const out = vb.slice()
+      out[2] = clamp(out[2], minW, maxW)
+      out[3] = clamp(out[3], minH, maxH)
+      return out
+    }
+
+    // Throttle DOM updates using requestAnimationFrame
+    let pendingVb = null
+    let rafId = null
+    const applyVb = () => {
+      if (pendingVb) {
+        wrap.__mermaidCurViewBox = pendingVb
+        setSvgViewBox(svg, pendingVb)
+        pendingVb = null
+      }
+      rafId = null
+      wrap.__mermaidRafId = null
+    }
+    const setCurVb = vb => {
+      pendingVb = clampVb(vb)
+      if (!rafId) {
+        rafId = requestAnimationFrame(applyVb)
+        wrap.__mermaidRafId = rafId
+      }
+    }
+
+    const state = {
+      pointers: new Map(),
+      startVb: null,
+      startDist: 0,
+      lastPointerX: 0,
+      lastPointerY: 0
+    }
+
+    const onPointerDown = e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return
+      svg.setPointerCapture(e.pointerId)
+      const curVb = wrap.__mermaidCurViewBox
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (state.pointers.size === 1) {
+        state.startVb = curVb.slice()
+        state.lastPointerX = e.clientX
+        state.lastPointerY = e.clientY
+      } else if (state.pointers.size === 2) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        state.startDist = Math.hypot(dx, dy)
+        state.startVb = curVb.slice()
+      }
+    }
+
+    const onPointerMove = e => {
+      if (!state.pointers.has(e.pointerId)) return
+      state.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      if (state.pointers.size === 1 && state.startVb) {
+        const p = state.pointers.values().next().value
+        const dxClient = p.x - state.lastPointerX
+        const dyClient = p.y - state.lastPointerY
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+        const dx = dxClient * (curVb[2] / rect.width)
+        const dy = dyClient * (curVb[3] / rect.height)
+        setCurVb([curVb[0] - dx, curVb[1] - dy, curVb[2], curVb[3]])
+        return
+      }
+      if (state.pointers.size === 2 && state.startVb && state.startDist > 0) {
+        const pts = [...state.pointers.values()]
+        const dx = pts[0].x - pts[1].x
+        const dy = pts[0].y - pts[1].y
+        const dist = Math.hypot(dx, dy)
+        if (!dist) return
+        const factor = state.startDist / dist
+        const cx = (pts[0].x + pts[1].x) / 2
+        const cy = (pts[0].y + pts[1].y) / 2
+        const px = curVb[0] + (cx - rect.left) * (curVb[2] / rect.width)
+        const py = curVb[1] + (cy - rect.top) * (curVb[3] / rect.height)
+        setCurVb(zoomAtPoint(state.startVb, factor, px, py))
+      }
+    }
+
+    const onPointerUpOrCancel = e => {
+      // Release PointerCapture to avoid event capture anomalies
+      if (svg.hasPointerCapture && svg.hasPointerCapture(e.pointerId)) {
+        svg.releasePointerCapture(e.pointerId)
+      }
+      state.pointers.delete(e.pointerId)
+      if (state.pointers.size === 0) {
+        state.startVb = null
+        state.startDist = 0
+      } else if (state.pointers.size === 1) {
+        const p = state.pointers.values().next().value
+        state.lastPointerX = p.x
+        state.lastPointerY = p.y
+      }
+    }
+
+    const onWheel = e => {
+      // Prevent event bubbling from triggering external scroll
+      e.preventDefault()
+      e.stopPropagation()
+      // Normalize deltaY across deltaMode (Chrome uses pixels, Safari uses lines)
+      let delta = e.deltaY
+      if (e.deltaMode === 1) delta *= 16
+      else if (e.deltaMode === 2) delta *= 400
+
+      // Continuous zoom factor: smoother than fixed 1.1/0.9 steps
+      const zoomFactor = Math.pow(1.001, delta)
+
+      const curVb = wrap.__mermaidCurViewBox
+      const rect = getRect()
+      const px = curVb[0] + (e.clientX - rect.left) * (curVb[2] / rect.width)
+      const py = curVb[1] + (e.clientY - rect.top) * (curVb[3] / rect.height)
+      setCurVb(zoomAtPoint(curVb, zoomFactor, px, py))
+    }
+
+    const onDblClick = () => {
+      const init = wrap.__mermaidInitViewBox
+      if (init) setCurVb(init)
+    }
+
+    svg.addEventListener('pointerdown', onPointerDown, { signal: ac.signal })
+    svg.addEventListener('pointermove', onPointerMove, { signal: ac.signal })
+    svg.addEventListener('pointerup', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('pointercancel', onPointerUpOrCancel, { signal: ac.signal })
+    svg.addEventListener('wheel', onWheel, { passive: false, signal: ac.signal })
+    svg.addEventListener('dblclick', onDblClick, { signal: ac.signal })
+  }
+
+  const runMermaid = ele => {
+    window.loadMermaid = true
+    const theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default'
+    ele.forEach((item, index) => {
+      const mermaidSrc = item.firstElementChild
+      // Clean up event listeners before removing old SVG
+      if (item.__mermaidAbortController) {
+        item.__mermaidAbortController.abort()
+      }
+      const oldSvg = item.querySelector('svg')
+      if (oldSvg) oldSvg.remove()
+      let config = {}
+      try {
+        config = mermaidSrc.dataset.config ? JSON.parse(mermaidSrc.dataset.config) : {}
+      } catch (e) {
+        console.warn('[mermaid] failed to parse dataset.config:', e)
+      }
+      if (!config.theme) {
+        config.theme = theme
+      }
+      const mermaidThemeConfig = `%%{init: ${JSON.stringify(config)}}%%\n`
+      const mermaidID = `mermaid-${index}`
+      const mermaidDefinition = mermaidThemeConfig + mermaidSrc.textContent
+
+      const renderMermaid = svg => {
+        mermaidSrc.insertAdjacentHTML('afterend', svg)
+        if (true) initMermaidGestures(item)
+        item.__mermaidOriginalSvg = svg
+        if (true) attachMermaidViewerButton(item)
+      }
+
+      const handleError = err => {
+        console.error(`[mermaid] render failed for block #${index}:`, err)
+        const errorEl = document.createElement('div')
+        errorEl.className = 'mermaid-error'
+        errorEl.textContent = `Mermaid render error: ${err.message || err}`
+        mermaidSrc.insertAdjacentElement('afterend', errorEl)
+      }
+
+      try {
+        const renderFn = mermaid.render(mermaidID, mermaidDefinition)
+        // mermaid v9 and v10 compatibility
+        if (typeof renderFn === 'string') {
+          renderMermaid(renderFn)
+        } else {
+          renderFn.then(({ svg }) => renderMermaid(svg)).catch(handleError)
+        }
+      } catch (err) {
+        handleError(err)
+      }
+    })
+  }
+
+  const codeToMermaid = $article => {
+    const codeMermaidEle = $article.querySelectorAll('pre > code.mermaid')
+    if (codeMermaidEle.length === 0) return
+
+    codeMermaidEle.forEach(ele => {
+      const preEle = document.createElement('pre')
+      preEle.className = 'mermaid-src'
+      preEle.hidden = true
+      preEle.textContent = ele.textContent
+      const newEle = document.createElement('div')
+      newEle.className = 'mermaid-wrap'
+      newEle.appendChild(preEle)
+      ele.parentNode.replaceWith(newEle)
+    })
+  }
+
+  const loadMermaid = () => {
+    const $article = document.getElementById('article-container')
+    if (!$article) return
+
+    if (true) codeToMermaid($article)
+    const $mermaid = $article.querySelectorAll('.mermaid-wrap')
+    if ($mermaid.length === 0) return
+
+    const runMermaidFn = () => runMermaid($mermaid)
+    btf.addGlobalFn('themeChange', runMermaidFn, 'mermaid')
+    window.loadMermaid ? runMermaidFn() : btf.getScript('https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js').then(runMermaidFn)
+  }
+
+  btf.addGlobalFn('encrypt', loadMermaid, 'mermaid')
+  window.pjax ? loadMermaid() : document.addEventListener('DOMContentLoaded', loadMermaid)
+})()</script></div><script defer="defer" id="fluttering_ribbon" mobile="false" src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/canvas-fluttering-ribbon.min.js"></script><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/dist/activate-power-mode.min.js"></script><script>POWERMODE.colorful = true;
+POWERMODE.shake = false;
+POWERMODE.mobile = false;
+document.body.addEventListener('input', POWERMODE);
+</script><script src="https://cdn.jsdelivr.net/npm/pjax@0.2.8/pjax.min.js" defer="defer"></script><script>document.addEventListener('DOMContentLoaded', () => {
+  const pjaxSelectors = ["head > title","#config-diff","#body-wrap","#rightside-config-hide","#rightside-config-show",".js-pjax"]
+
+  window.pjax = new Pjax({
+    elements: 'a:not([target="_blank"]):not([data-fancybox])',
+    selectors: pjaxSelectors,
+    cacheBust: false,
+    analytics: false,
+    scrollRestoration: false
+  })
+
+  const triggerPjaxFn = (val) => {
+    if (!val) return
+    Object.values(val).forEach(fn => {
+      try {
+        fn()
+      } catch (err) {
+        console.debug('Pjax callback failed:', err)
+      }
+    })
+  }
+
+  document.addEventListener('pjax:send', () => {
+    // removeEventListener
+    btf.removeGlobalFnEvent('pjaxSendOnce')
+    btf.removeGlobalFnEvent('themeChange')
+
+    // reset readmode
+    const $bodyClassList = document.body.classList
+    if ($bodyClassList.contains('read-mode')) $bodyClassList.remove('read-mode')
+
+    triggerPjaxFn(window.globalFn.pjaxSend)
+  })
+
+  document.addEventListener('pjax:complete', () => {
+    btf.removeGlobalFnEvent('pjaxCompleteOnce')
+    document.querySelectorAll('script[data-pjax]').forEach(item => {
+      if (!item.parentNode) return
+      const newScript = document.createElement('script')
+      const content = item.text || item.textContent || ''
+      Array.from(item.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value))
+      newScript.appendChild(document.createTextNode(content))
+      item.parentNode.replaceChild(newScript, item)
+    })
+
+    triggerPjaxFn(window.globalFn.pjaxComplete)
+  })
+
+  document.addEventListener('pjax:error', e => {
+    const responseURL = e.request && e.request.responseURL
+    if (e.request && e.request.status === 404) {
+      true
+        ? pjax.loadUrl('/404.html')
+        : responseURL && (window.location.href = responseURL)
+    } else if (responseURL) {
+      window.location.href = responseURL
+    }
+  })
+})</script><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script><div id="local-search"><div class="search-dialog"><nav class="search-nav"><span class="search-dialog-title">Search</span><i class="fas fa-spinner fa-pulse" id="loading-status" hidden="hidden"></i><button class="search-close-button"><i class="fas fa-times"></i></button></nav><div class="text-center" id="loading-database"><i class="fas fa-spinner fa-pulse"></i><span>  Loading Database</span></div><div class="local-search-input"><input placeholder="搜索文章..." type="text"/></div><hr/><div id="local-search-results"></div><div class="ais-Pagination" id="local-search-pagination" style="display:none;"><ul class="ais-Pagination-list"></ul></div><div id="local-search-stats"></div></div><div id="search-mask"></div><script src="/js/search/local-search.js?v=5.7.0"></script></div></div></body></html>
